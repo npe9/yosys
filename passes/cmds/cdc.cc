@@ -41,6 +41,7 @@ struct CdcFinding {
 	std::string dst;
 	std::string bit;
 	std::string cell;
+	std::string module;
 };
 
 struct CdcAnalyzer
@@ -459,8 +460,8 @@ struct CdcPass : public Pass {
 		log("\n");
 		log("    -json <file>\n");
 		log("        write all findings to the given file as a JSON array of objects\n");
-		log("        with the fields 'severity', 'class', 'src', 'dst', 'bit' and\n");
-		log("        'cell'.\n");
+		log("        with the fields 'severity', 'class', 'src', 'dst', 'bit',\n");
+		log("        'cell' and 'module'.\n");
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
@@ -506,6 +507,7 @@ struct CdcPass : public Pass {
 				log("  %-9s %-22s %s -> %s, bit %s (ff %s)\n",
 						(f.severity + ":").c_str(), f.cls.c_str(), f.src.c_str(), f.dst.c_str(),
 						f.bit.c_str(), f.cell.c_str());
+				f.module = log_id(module);
 				all_findings.push_back(f);
 				total++;
 				if (f.severity == "ERROR")
@@ -531,6 +533,7 @@ struct CdcPass : public Pass {
 					{"dst", f.dst},
 					{"bit", f.bit},
 					{"cell", f.cell},
+					{"module", f.module},
 				});
 			std::string out = json11::Json(arr).dump();
 			FILE *fp = fopen(json_file.c_str(), "wt");

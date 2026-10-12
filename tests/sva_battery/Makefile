@@ -8,5 +8,6 @@ export YOSYS
 
 test:
 	python3 run_battery.py
+	python3 run_cdc.py
 
 .PHONY: test

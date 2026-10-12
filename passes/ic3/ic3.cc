@@ -25,6 +25,8 @@
 
 #include "libs/minisat/Solver.h"
 
+#include <chrono>
+
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
@@ -135,13 +137,28 @@ struct Ic3Solver
 	int init_act;
 	std::vector<std::vector<std::vector<int>>> frames;
 
+	// per-timestep state vectors (index 0 unused) and bad predicates,
+	// filled by encode(prop, ntf); state1/state2 alias states[1]/states[2]
+	std::vector<std::vector<int>> states;
+	std::vector<int> badv;
+
+	// k-induction depth tried before the IC3 loop (0 = disabled)
+	int kind_max;
+
+	// CTG-guided generalization recursion depth (0 = disabled)
+	int ctg_depth_max;
+
 	int nsolves;
-	long long n_bad, n_blockq, n_gen, n_init;
+	long long n_bad, n_blockq, n_gen, n_init, n_ctg;
+	double t_addclause, t_generalize;
 
 	Ic3Solver(RTLIL::Module *module, bool init_zero, int max_frames) :
 			module(module), sigmap(module), ez(), satgen(&ez, &sigmap),
-			init_zero(init_zero), max_frames(max_frames), nsolves(0),
-			n_bad(0), n_blockq(0), n_gen(0), n_init(0)
+			init_zero(init_zero), max_frames(max_frames), kind_max(0),
+			ctg_depth_max(0),
+			nsolves(0),
+			n_bad(0), n_blockq(0), n_gen(0), n_init(0), n_ctg(0),
+			t_addclause(0), t_generalize(0)
 	{
 		act.push_back(0);
 		frames.emplace_back();
@@ -155,7 +172,10 @@ struct Ic3Solver
 				ID($live), ID($fair), ID($print));
 	}
 
-	void encode(RTLIL::Cell *prop)
+	// encode the design unrolled to ntf timeframes: comb logic at each
+	// timestep, SatGen ties Q@t to D@(t-1) on FF import. The IC3 loop uses
+	// ntf=2; the k-induction pre-pass uses ntf=k+1.
+	void encode(RTLIL::Cell *prop, int ntf = 2)
 	{
 		if (!module->processes.empty())
 			log_error("ic3: module %s still contains processes -- run `proc` first.\n", log_id(module));
@@ -221,9 +241,10 @@ struct Ic3Solver
 			}
 		}
 
-		// two-timeframe unraveling: comb logic at t=1 and t=2, FF transition
-		// constraints tie Q@2 to D@1; Q@1 stays a free variable
-		for (int t = 1; t <= 2; t++)
+		// two-timeframe unraveling: comb logic at each timestep, FF
+		// transition constraints tie Q@t to D@(t-1); Q@1 stays a free
+		// variable modulo the init constraints below
+		for (int t = 1; t <= ntf; t++)
 			for (auto cell : coi_cells) {
 				if (cell->type == ID($mem) || cell->type == ID($pow))
 					log_error("ic3: %s cell %s.%s is not supported -- run `memory_dff; memory_collect; opt_clean` first.\n",
@@ -233,9 +254,9 @@ struct Ic3Solver
 							log_id(module), log_id(cell), log_id(cell->type));
 			}
 
-		// assume-flavor checks are permanent constraints at both timeframes
+		// assume-flavor checks are permanent constraints at all timeframes
 		for (auto cell : assume_cells)
-			for (int t = 1; t <= 2; t++) {
+			for (int t = 1; t <= ntf; t++) {
 				std::vector<int> a = satgen.importSigSpec(cell->getPort(ID::A), t);
 				std::vector<int> en = satgen.importSigSpec(cell->getPort(ID::EN), t);
 				while (a.size() < en.size()) a.push_back(ez.CONST_TRUE);
@@ -275,12 +296,14 @@ struct Ic3Solver
 		if (big_lhs.size())
 			ez.assume(ez.OR(satgen.signals_eq(big_lhs, big_rhs, 1), init_act));
 
-		// ordered state vector (register Q bits only)
+		// ordered state vector (register Q bits only) per timestep
 		RTLIL::SigSpec istates = satgen.initial_state.export_all();
-		for (auto bit : istates) {
-			state1.push_back(satgen.importSigBit(bit, 1));
-			state2.push_back(satgen.importSigBit(bit, 2));
-		}
+		states.assign(ntf + 1, {});
+		for (auto bit : istates)
+			for (int t = 1; t <= ntf; t++)
+				states[t].push_back(satgen.importSigBit(bit, t));
+		state1 = states[1];
+		state2 = ntf >= 2 ? states[2] : states[1];
 
 		// bad := en && !a  (per bit, padded vacuously with zeros)
 		auto build_bad = [&](int t) {
@@ -290,8 +313,11 @@ struct Ic3Solver
 			while (en.size() < a.size()) en.push_back(ez.CONST_FALSE);
 			return ez.vec_reduce_and(ez.vec_and(en, ez.vec_not(a)));
 		};
-		bad1 = build_bad(1);
-		bad2 = build_bad(2);
+		badv.assign(ntf + 1, 0);
+		for (int t = 1; t <= ntf; t++)
+			badv[t] = build_bad(t);
+		bad1 = badv[1];
+		bad2 = badv[2];
 	}
 
 	int new_frame()
@@ -353,6 +379,7 @@ struct Ic3Solver
 	// copy of every cube and SAT propagation dominates runtime.
 	void add_clause(const std::vector<int> &cube, int lo, int hi)
 	{
+		auto t0 = std::chrono::steady_clock::now();
 		std::vector<int> clause;
 		clause.reserve(cube.size());
 		for (int lit : cube)
@@ -377,6 +404,7 @@ struct Ic3Solver
 			ez.assume(ez.OR(id, act[i]));
 			fc.push_back(cube);
 		}
+		t_addclause += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 	}
 
 	bool solve_assum(const std::vector<int> &assumptions)
@@ -385,8 +413,8 @@ struct Ic3Solver
 		std::vector<bool> vals;
 		nsolves++;
 		if (nsolves % 100000 == 0)
-			fprintf(stderr, "ic3-debug: %d solves, %d frames, clauses=%d (blk=%lld gen=%lld init=%lld bad=%lld)\n",
-					nsolves, (int)act.size(), ez.numCnfClauses(), n_blockq, n_gen, n_init, n_bad);
+			fprintf(stderr, "ic3-debug: %d solves, %d frames, clauses=%d (blk=%lld gen=%lld init=%lld bad=%lld ctg=%lld) t_add=%.1fs t_gen=%.1fs\n",
+					nsolves, (int)act.size(), ez.numCnfClauses(), n_blockq, n_gen, n_init, n_bad, n_ctg, t_addclause, t_generalize);
 		return ez.solve(exprs, vals, assumptions);
 	}
 
@@ -396,8 +424,8 @@ struct Ic3Solver
 		model.clear();
 		nsolves++;
 		if (nsolves % 100000 == 0)
-			fprintf(stderr, "ic3-debug: %d solves, %d frames, clauses=%d (blk=%lld gen=%lld init=%lld bad=%lld)\n",
-					nsolves, (int)act.size(), ez.numCnfClauses(), n_blockq, n_gen, n_init, n_bad);
+			fprintf(stderr, "ic3-debug: %d solves, %d frames, clauses=%d (blk=%lld gen=%lld init=%lld bad=%lld ctg=%lld) t_add=%.1fs t_gen=%.1fs\n",
+					nsolves, (int)act.size(), ez.numCnfClauses(), n_blockq, n_gen, n_init, n_bad, n_ctg, t_addclause, t_generalize);
 		return ez.solve(exprs, model, assumptions);
 	}
 
@@ -411,43 +439,85 @@ struct Ic3Solver
 	}
 
 	// drop literals (set to don't-care) while the cube stays disjoint from
-	// Init and inductive relative to frame lvl
-	std::vector<int> generalize(std::vector<int> cube, int lvl)
+	// Init and inductive relative to frame lvl. MIC-style: repeat the drop
+	// scan until a full pass drops nothing — a literal that was blocked
+	// early may become droppable once other literals are gone, and smaller
+	// cubes mean fewer block() rounds downstream.
+	//
+	// CTG-guided (abc-pdr style, experimental -- enable with -ctg): a failed
+	// drop returns a predecessor state (counterexample to generalization);
+	// recursively blocking it at this level can make the retry succeed and
+	// shrinks cubes on control-heavy designs. Off by default: the recursion
+	// multiplies block()/init obligations on easy properties (measured:
+	// 60x more blk/init queries on the async FIFO), so it is only worth it
+	// on designs where plain MIC stalls.
+	std::vector<int> generalize(std::vector<int> cube, int lvl, int ctg_depth = 0)
 	{
+		auto t0 = std::chrono::steady_clock::now();
 		std::vector<int> ind_assumptions = act_assumptions(lvl);
 		// with -init-zero the unique initial state is the all-zero state,
 		// so Init-disjointness of a cube is just "has a positive literal"
 		bool init_is_allzero = init_zero;
 		std::vector<int> init_assumptions;
 		push_assum(init_assumptions, -init_act);
-		for (int x = 0; x < (int)cube.size(); x++) {
-			if (cube[x] == 0)
-				continue;
-			int saved = cube[x];
-			cube[x] = 0;
-			n_gen++;
-			std::vector<int> a = ind_assumptions;
-			push_cube(a, cube, state2);
-			bool ok = !solve_assum(a);
-			if (ok && !init_is_allzero) {
-				std::vector<int> b = init_assumptions;
-				push_cube(b, cube, state1);
-				ok = !solve_assum(b);
+		for (int pass = 0; pass < 4; pass++) {
+			bool dropped_any = false;
+			for (int x = 0; x < (int)cube.size(); x++) {
+				if (cube[x] == 0)
+					continue;
+				int saved = cube[x];
+				cube[x] = 0;
+				bool ok = false;
+				if (ctg_depth_max == 0) {
+					n_gen++;
+					std::vector<int> a = ind_assumptions;
+					push_cube(a, cube, state2);
+					ok = !solve_assum(a);
+				} else
+				for (int attempt = 0; attempt < 4; attempt++) {
+					n_gen++;
+					std::vector<int> a = ind_assumptions;
+					push_cube(a, cube, state2);
+					std::vector<bool> cti_model;
+					if (!solve_model(a, state1, cti_model)) {
+						ok = true;
+						break;
+					}
+					if (ctg_depth >= ctg_depth_max)
+						break;
+					std::vector<int> cti;
+					cti.reserve(state1.size());
+					for (int i = 0; i < (int)state1.size(); i++)
+						cti.push_back(cti_model[i] ? state1[i] : -state1[i]);
+					n_ctg++;
+					if (!block(cti, lvl, ctg_depth + 1))
+						break;
+				}
+				if (ok && !init_is_allzero) {
+					std::vector<int> b = init_assumptions;
+					push_cube(b, cube, state1);
+					ok = !solve_assum(b);
+				}
+				if (ok && init_is_allzero) {
+					bool has_pos = false;
+					for (int lit : cube)
+						if (lit > 0)
+							has_pos = true;
+					ok = has_pos;
+				}
+				if (!ok)
+					cube[x] = saved;
+				else
+					dropped_any = true;
 			}
-			if (ok && init_is_allzero) {
-				bool has_pos = false;
-				for (int lit : cube)
-					if (lit > 0)
-						has_pos = true;
-				ok = has_pos;
-			}
-			if (!ok)
-				cube[x] = saved;
+			if (!dropped_any)
+				break;
 		}
+		t_generalize += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 		return cube;
 	}
 
-	bool block(std::vector<int> cube, int k)
+	bool block(std::vector<int> cube, int k, int ctg_depth = 0)
 	{
 		// counterexample if an initial state is inside the cube
 		std::vector<int> init_assumptions;
@@ -463,7 +533,7 @@ struct Ic3Solver
 				push_cube(assumptions, cube, state2);
 				std::vector<bool> model;
 				if (!solve_model(assumptions, state1, model)) {
-					add_clause(generalize(cube, j-1), j, k);
+					add_clause(generalize(cube, j-1, ctg_depth), j, k);
 					return true;
 				}
 				std::vector<int> cti;
@@ -497,9 +567,47 @@ struct Ic3Solver
 		return !solve_assum(assumptions);
 	}
 
+	// k-induction on the ntf=kmax+1 timeframe encoding from encode():
+	// base case -- bad reachable from init within kmax steps (disproof);
+	// step case -- k consecutive non-bad states cannot reach a bad state
+	// (proof). Returns 0 proved, 1 disproved (depth = cex step), 2
+	// inconclusive (fall through to the IC3 loop).
+	int run_kind(int kmax, int &depth)
+	{
+		for (int d = 1; d <= kmax; d++) {
+			std::vector<int> assumptions;
+			push_assum(assumptions, -init_act);
+			assumptions.push_back(badv.at(d));
+			std::vector<bool> model;
+			if (solve_model(assumptions, states.at(d), model)) {
+				depth = d - 1;
+				return 1;
+			}
+		}
+		for (int k = 1; k <= kmax; k++) {
+			std::vector<int> assumptions;
+			for (int t = 1; t <= k; t++)
+				assumptions.push_back(ez.NOT(badv.at(t)));
+			assumptions.push_back(badv.at(k + 1));
+			if (!solve_assum(assumptions)) {
+				depth = k;
+				return 0;
+			}
+		}
+		return 2;
+	}
+
 	// 0 = proved, 1 = disproved (depth set), 2 = undecided (depth set)
 	int prove(RTLIL::Cell *prop, int &depth)
 	{
+		if (kind_max > 0) {
+			Ic3Solver ks(module, init_zero, max_frames);
+			ks.assume_cells = assume_cells;
+			ks.encode(prop, kind_max + 1);
+			int r = ks.run_kind(kind_max, depth);
+			if (r != 2)
+				return r;
+		}
 		encode(prop);
 		fprintf(stderr, "ic3-debug: proving %s clauses=%d vars=%d states=%d\n", log_id(prop), ez.numCnfClauses(), ez.numCnfVariables(), GetSize(state1));
 
@@ -549,7 +657,7 @@ struct Ic3Pass : Pass
 	void help() override
 	{
 		log("\n");
-		log("    ic3 [-top <name>] [-check-cells] [-init-zero] [-max <frames>] [-v]\n");
+		log("    ic3 [-top <name>] [-check-cells] [-init-zero] [-max <frames>] [-kind <k>] [-v]\n");
 		log("\n");
 		log("Proves (or disproves) the safety properties given as $assert cells and\n");
 		log("$check cells with FLAVOR \"assert\" in the selected module, using the\n");
@@ -576,6 +684,15 @@ struct Ic3Pass : Pass
 		log("        maximum number of IC3 frames before giving up as undecided\n");
 		log("        (default: 1000)\n");
 		log("\n");
+		log("    -kind <k>\n");
+		log("        try k-induction up to depth k before the IC3 loop\n");
+		log("        (default: 8; 0 disables)\n");
+		log("\n");
+		log("    -ctg <depth>\n");
+		log("        CTG-guided generalization recursion depth, abc-pdr style\n");
+		log("        (default: 0 = disabled; experimental, can multiply\n");
+		log("        obligations on easy properties)\n");
+		log("\n");
 		log("    -v\n");
 		log("        print per-property solve statistics\n");
 		log("\n");
@@ -588,6 +705,8 @@ struct Ic3Pass : Pass
 		bool init_zero = false;
 		bool verbose = false;
 		int max_frames = 1000;
+		int kind_max = 8;
+		int ctg_depth_max = 0;
 
 		log_header(design, "Executing IC3 pass (safety model checking).\n");
 
@@ -607,6 +726,14 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-max") {
 				max_frames = atoi(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-kind") {
+				kind_max = atoi(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-ctg") {
+				ctg_depth_max = atoi(args[++argidx].c_str());
 				continue;
 			}
 			if (args[argidx] == "-v") {
@@ -673,6 +800,8 @@ struct Ic3Pass : Pass
 
 			Ic3Solver solver(module, init_zero, max_frames);
 			solver.assume_cells = assumes;
+			solver.kind_max = kind_max;
+			solver.ctg_depth_max = ctg_depth_max;
 
 			int depth = 0;
 			int result = solver.prove(cell, depth);

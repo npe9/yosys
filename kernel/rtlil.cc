@@ -2384,7 +2384,12 @@ namespace {
 
 			if (cell->type == ID($check)) {
 				std::string flavor = param_string(ID(FLAVOR));
-				if (!(flavor == "assert" || flavor == "assume" || flavor == "live" || flavor == "fair" || flavor == "cover"))
+				// "liveness" is the native ic3 liveness flavor (sva2check
+				// lowers unbounded eventually/s_eventually to it) and
+				// "restrict" reaches $check cells from restrict-property
+				// flows; both are valid flavors beyond the classic five
+				if (!(flavor == "assert" || flavor == "assume" || flavor == "live" || flavor == "fair" || flavor == "cover" ||
+						flavor == "liveness" || flavor == "restrict"))
 					error(__LINE__);
 				param(ID(FORMAT));
 				param_bool(ID::TRG_ENABLE);

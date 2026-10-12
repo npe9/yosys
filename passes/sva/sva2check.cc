@@ -30,6 +30,10 @@
 //     always/s_always (optionally bounded), nexttime/s_nexttime [k],
 //     until/until_with, accept_on/reject_on and sync variants,
 //     bounded eventually, strong bounded sequences
+//   liveness v1: unbounded eventually/s_eventually of a plain expression
+//     lowers to a FLAVOR "liveness" $check (A = p, not negated, EN = 1'b1)
+//     for the native ic3 liveness engine; the operand must be a plain
+//     boolean expression (no temporal operators, locals, or named decls)
 //   v1 multi-clock: the direct consequent of |->/|=> may be a `clocked`
 //     sub-sequence on a different clock (optionally under strong/weak):
 //     it compiles as its own monitor island on the inner clock, started by
@@ -39,8 +43,8 @@
 // Rejected with a clear message: any other multi-clock element (mid-sequence
 //   or antecedent `clocked`, `clocked` under throughout/within/first_match,
 //   or_event/bare-identifier clocking events, instance bodies), unbounded
-//   strong operators (s_eventually, s_until, ...), local variable
-//   assignments, within, matches/streaming.
+//   eventually over a temporal operand, remaining unbounded strong operators
+//   (s_until, ...), local variable assignments, within, matches/streaming.
 //
 // Sequences compile to nondeterministic-start transducers shared across
 // attempts: compile_seq(node, start, gate) returns an "ends at this tick"
@@ -2773,8 +2777,10 @@ struct Sva2CheckPass : public Pass {
 		log("v1 multi-clock: a |->/|=> consequent `clocked` on a different clock\n");
 		log("compiles as its own island on that clock; such $check cells keep\n");
 		log("EN=1'b1 and carry no \\CLK attributes.  Other multi-clock elements\n");
-		log("abort with an error, as do liveness operators, local variables,\n");
-		log("within, and matches.\n");
+		log("abort with an error, as do local variables, within, and matches.\n");
+		log("Unbounded eventually/s_eventually of a plain expression lowers to a\n");
+		log("FLAVOR \"liveness\" $check (A = p, EN = 1'b1) for the native ic3\n");
+		log("liveness engine; temporal operands keep the \"bound it\" error.\n");
 		log("\n");
 		log("With -expose_bad, additionally create a module output port per\n");
 		log("converted check named bad_<check> driven by EN && !A, for AIGER\n");
@@ -3005,31 +3011,63 @@ struct Sva2CheckPass : public Pass {
 				comp.lower_sampled_value_cells(lowered_sv);
 				comp.lower_sequence_methods();
 
-				SigSpec fail;
-				if (body) {
-					pool<Cell *> seen;
-					bool had_slots = comp.slots_mode;
-					if (comp.tree_has_locals(body, seen)) {
-						int l = comp.seq_max_len(body);
-						if (l < 0 || l > 64)
-							log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(body));
-						comp.init_slots(l);
-					}
-					fail = comp.prop_dispatch(SigSpec(), body, Const(1, 1));
-					if (!had_slots && comp.slots_mode) {
-						// slot state is per-property: do not leak it into
-						// the next $check of this module
-						comp.slots_mode = false;
-						comp.nslots = 0;
-						comp.age = SigSpec();
-						comp.slotfiles.clear();
-						comp.pending_wr.clear();
-					}
-				} else {
-					fail = mod->Not(NEW_ID, comp.reduce1(body_sig));
+				// v1 liveness: an unbounded eventually/s_eventually whose
+				// operand is a plain boolean expression is F p with p a
+				// state predicate; the ic3 pass proves it via a gfp over
+				// (reachable ∧ ¬p).  Lower to A = p (NOT negated), EN =
+				// 1'b1, FLAVOR "liveness".  A temporal operand (a non-bounds
+				// $sva child) keeps the existing "bound it" error via
+				// prop_fail below.
+				bool liveness = false;
+				if (flavor == "assert" && body &&
+						(sva_op(body) == "eventually" || sva_op(body) == "s_eventually")) {
+					auto bp = comp.ports_of(body);
+					Cell *bcell = bp.empty() ? nullptr : comp.child_cell(body->getPort(bp[0]));
+					liveness = !bcell;
 				}
 
-				SigSpec new_a = mod->Not(NEW_ID, fail);
+				SigSpec fail;
+				SigSpec new_a;
+				if (liveness) {
+					pool<Cell *> seen;
+					if (comp.tree_has_locals(body, seen))
+						log_error("sva2check: local variables in unbounded %s are not supported in %s.\n",
+								sva_op(body).c_str(), log_id(cell));
+					SigSpec psig = comp.resolve(comp.ports_of(body).empty() ? SigSpec()
+							: body->getPort(comp.ports_of(body)[0]));
+					if (Cell *decl = comp.decl_for_wire(psig))
+						log_error("sva2check: named declaration operand of unbounded %s is not supported in %s.\n",
+								sva_op(body).c_str(), log_id(cell));
+					// A = p directly (ic3: bad := !A = !p); fail = !p for
+					// -expose_bad
+					new_a = comp.reduce1(psig);
+					fail = mod->Not(NEW_ID, new_a);
+				} else {
+					if (body) {
+						pool<Cell *> seen;
+						bool had_slots = comp.slots_mode;
+						if (comp.tree_has_locals(body, seen)) {
+							int l = comp.seq_max_len(body);
+							if (l < 0 || l > 64)
+								log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(body));
+							comp.init_slots(l);
+						}
+						fail = comp.prop_dispatch(SigSpec(), body, Const(1, 1));
+						if (!had_slots && comp.slots_mode) {
+							// slot state is per-property: do not leak it into
+							// the next $check of this module
+							comp.slots_mode = false;
+							comp.nslots = 0;
+							comp.age = SigSpec();
+							comp.slotfiles.clear();
+							comp.pending_wr.clear();
+						}
+					} else {
+						fail = mod->Not(NEW_ID, comp.reduce1(body_sig));
+					}
+					new_a = mod->Not(NEW_ID, fail);
+				}
+
 				std::string dop = disable ? sva_op(disable) : "no_disable";
 				if (dop == "disable_iff") {
 					SigSpec dsig = comp.reduce1(disable->getPort(ID(A)));
@@ -3038,6 +3076,8 @@ struct Sva2CheckPass : public Pass {
 
 				cell->setPort(ID(EN), SigSpec(State::S1));
 				cell->setPort(ID(A), new_a);
+				if (liveness)
+					cell->setParam(ID(FLAVOR), std::string("liveness"));
 				if (!comp.multiclock) {
 					cell->attributes[ID(CLK)] = Const(clksig[0].wire->name.str());
 					cell->attributes[ID(CLK_POLARITY)] = Const(comp.clk_pos ? 1 : 0, 1);

@@ -32,6 +32,12 @@ expression proves the engine honors the assumption).
 ## File classes
 
 - `t*.sv` — the green battery. Run all: `for f in t*.sv; do ...`.
+- `xlive*.sv` — liveness (`s_eventually` of a plain expression), handled
+  by ic3's native two-phase gfp engine, not by BMC (`run_bmc.py` does not
+  support liveness). Expectations are `// PROVED` / `// DIS` with no `@N`
+  (v1 disproofs report depth 0; lasso-witness export is out of scope).
+  Read the verdict lines manually -- files with a `DIS` expectation exit
+  nonzero from `run_ic3.py` by design.
 - `xfifo_dist.sv` — stress case, outside the `t*.sv` glob on purpose:
   pointer-distance invariants of a two-clock async FIFO that are ic3-hard
   (CTI explosion near stale-flag boundaries) and k-induction-hard

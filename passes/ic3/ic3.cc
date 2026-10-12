@@ -59,6 +59,38 @@ struct Ic3MiniSat : public ezSAT
 		std::vector<std::vector<int>> cnf;
 		consumeCnf(cnf);
 
+		if (getenv("IC3_CNF_DUMP")) {
+			fprintf(stderr, "ic3-cnf: dump: vars=%d newclauses=%zu assum=%zu model=%zu\n",
+					numCnfVariables(), cnf.size(), assumptions.size(), modelExpressions.size());
+			for (auto &cl : cnf) {
+				fprintf(stderr, "ic3-cnf:  +");
+				for (auto l : cl) fprintf(stderr, " %d", l);
+				fprintf(stderr, "\n");
+			}
+		}
+		if (getenv("IC3_MS_DUMP")) {
+			static int ms_dump_ctr = 0;
+			ms_dump_ctr++;
+			if (ms_dump_ctr == atoi(getenv("IC3_MS_DUMP"))) {
+				fprintf(stderr, "ic3-ms: vars=%d solver-clauses=%d\n", numCnfVariables(), minisat_solver->nClauses());
+				int ci = 0;
+				for (auto it = minisat_solver->clausesBegin(); it != minisat_solver->clausesEnd(); ++it, ci++) {
+					const Minisat::Clause &c = *it;
+					fprintf(stderr, "ic3-ms: c%d:", ci);
+					for (int li = 0; li < c.size(); li++) {
+						int v = Minisat::var(c[li]);
+						bool s = Minisat::sign(c[li]);
+						int cnfidx = -1;
+						for (int k = 0; k < (int)minisat_vars.size(); k++)
+							if (minisat_vars[k] == v) { cnfidx = k+1; break; }
+						fprintf(stderr, " %s%d", s ? "-" : "+", cnfidx < 0 ? v : cnfidx);
+					}
+					fprintf(stderr, "\n");
+				}
+				fflush(stderr);
+			}
+		}
+
 		while ((int)minisat_vars.size() < numCnfVariables())
 			minisat_vars.push_back(minisat_solver->newVar());
 
@@ -163,6 +195,7 @@ struct Ic3Solver
 		act.push_back(0);
 		frames.emplace_back();
 		init_act = ez.frozen_literal("init");
+		live2_act = ez.frozen_literal("live2");
 		bad1 = bad2 = 0;
 	}
 
@@ -597,17 +630,23 @@ struct Ic3Solver
 		return 2;
 	}
 
-	// 0 = proved, 1 = disproved (depth set), 2 = undecided (depth set)
-	int prove(RTLIL::Cell *prop, int &depth)
+	// k-induction pre-pass on a throwaway encoding; 2 = "not decided, fall
+	// through to the IC3 loop on the caller's solver"
+	int kind_prepass(RTLIL::Cell *prop, int &depth)
 	{
-		if (kind_max > 0) {
-			Ic3Solver ks(module, init_zero, max_frames);
-			ks.assume_cells = assume_cells;
-			ks.encode(prop, kind_max + 1);
-			int r = ks.run_kind(kind_max, depth);
-			if (r != 2)
-				return r;
-		}
+		if (kind_max <= 0)
+			return 2;
+		Ic3Solver ks(module, init_zero, max_frames);
+		ks.assume_cells = assume_cells;
+		ks.encode(prop, kind_max + 1);
+		return ks.run_kind(kind_max, depth);
+	}
+
+	// safety IC3 core on THIS solver; requires that encode() has not run
+	// yet on this solver.  0 = proved, 1 = disproved (depth set),
+	// 2 = undecided (depth set)
+	int prove_core(RTLIL::Cell *prop, int &depth)
+	{
 		auto t0 = std::chrono::steady_clock::now();
 		encode(prop);
 		t_encode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -650,11 +689,199 @@ struct Ic3Solver
 			n = new_frame();
 		}
 	}
+
+	// 0 = proved, 1 = disproved (depth set), 2 = undecided (depth set)
+	int prove(RTLIL::Cell *prop, int &depth)
+	{
+		int r = kind_prepass(prop, depth);
+		if (r != 2)
+			return r;
+		return prove_core(prop, depth);
+	}
+
+	// --- liveness (v1) ----------------------------------------------------
+	// F p ("assert property (s_eventually p)", lowered by sva2check to a
+	// FLAVOR "liveness" $check with A = p) is FALSE iff there is a
+	// reachable cycle all of whose states satisfy !p.  Proof:
+	//   Phase A: safety IC3 with bad := !p (exactly what encode() builds
+	//     for this cell).  If it proves, !p is unreachable and F p holds
+	//     trivially; otherwise the final frames (each an over-approximation
+	//     of the reachable states) seed S.
+	//   Phase B: greatest-fixpoint pruning of S: repeatedly remove cubes c
+	//     of (S ∧ !p) whose states cannot stay -- c(s1) ∧ T(s1,s2) ∧
+	//     S(s2) ∧ !p(s2) UNSAT means every c-state must exit S ∧ !p, so no
+	//     !p-cycle can pass through c.  Survivors (states with a successor
+	//     in S ∧ !p) are excluded for the rest of the round via a
+	//     per-round activation literal; rounds repeat until a full scan
+	//     adds no clause (then S ∧ !p = S*).
+	//   Phase C: SAT(Init ∧ !p ∧ S*) -- SAT gives the initial state of an
+	//     infinite !p-path (disproof), UNSAT proves F p.
+	// Returns 0 proved, 1 disproved (depth 0; minimal lasso witness export
+	// is out of scope in v1).
+	int prove_liveness(RTLIL::Cell *prop, int &depth)
+	{
+		// A k-induction proof of bad := !p also proves F p; any other
+		// pre-pass outcome falls through to the IC3 loop on this solver,
+		// whose encoding and frames Phase B/C reuse (they must live in
+		// this solver -- a pre-pass that decides on a throwaway solver
+		// leaves this one unencoded).
+		int rk = kind_prepass(prop, depth);
+		if (rk == 0)
+			return 0;
+		int r = prove_core(prop, depth);
+		if (r == 0)
+			return 0;
+		bool trace = getenv("IC3_LIVE_TRACE") != nullptr;
+		if (trace)
+			fprintf(stderr, "ic3-live: %s phaseA r=%d depth=%d frames=%zu state=%zu\n",
+					log_id(prop), r, depth, frames.size(), state1.size());
+
+		// Phase B: S seeded with the union of the Phase A frame clauses
+		int sf = new_frame();
+		for (int i = 1; i < sf; i++)
+			for (auto &cube : frames[i])
+				add_live_clause(cube, sf);
+		if (trace)
+			fprintf(stderr, "ic3-live: S seeded clauses=%zu\n", frames[sf].size());
+
+		std::vector<int> round_lits;
+		if (!state1.empty()) {
+			bool pruned_any = true;
+			while (pruned_any) {
+				pruned_any = false;
+				int rl = ez.frozen_literal(stringf("lvr%d", GetSize(round_lits)));
+				round_lits.push_back(rl);
+				int n_cand = 0, n_prune = 0;
+				while (1) {
+					// pick an unexamined state of S ∧ !p
+					std::vector<int> assumptions = act_assumptions(sf);
+					push_assum(assumptions, -rl);
+					for (int i = 0; i+1 < GetSize(round_lits); i++)
+						push_assum(assumptions, round_lits[i]);
+					assumptions.push_back(bad1);
+					std::vector<bool> model;
+					n_bad++;
+					if (!solve_model(assumptions, state1, model))
+						break;
+					n_cand++;
+					std::vector<int> csub(state1.size());
+					for (int i = 0; i < (int)state1.size(); i++)
+						csub[i] = model[i] ? state1[i] : -state1[i];
+					// consecution: does it have a successor in S ∧ !p?
+					// (the S twin over state2 is activated here and in
+					// generalization only -- never in candidate queries)
+					std::vector<int> a2 = act_assumptions(sf);
+					push_assum(a2, -live2_act);
+					push_cube(a2, csub, state1);
+					a2.push_back(bad2);
+					n_blockq++;
+					if (!solve_assum(a2))
+						goto prune;
+					{
+						// survivor: exclude this exact state for the rest
+						// of the round (permanent clause, active while the
+						// round literal is assumed false)
+						std::vector<int> clause;
+						for (int i = 0; i < (int)csub.size(); i++)
+							clause.push_back(csub[i] > 0 ? ez.NOT(csub[i]) : -csub[i]);
+						clause.push_back(rl);
+						int id = clause.size() == 1 ? clause[0] : ez.expression(ezSAT::OpOr, clause);
+						ez.assume(id);
+						continue;
+					}
+				prune:;
+					// must exit: prune (generalized)
+					std::vector<int> gen = generalize_prune(csub, sf);
+					bool has_lit = false;
+					for (int lit : gen)
+						if (lit)
+							has_lit = true;
+					add_live_clause(has_lit ? gen : csub, sf);
+					pruned_any = true;
+					n_prune++;
+				}
+				if (trace)
+					fprintf(stderr, "ic3-live: round %d: cand=%d pruned=%d S-clauses=%zu\n",
+							GetSize(round_lits), n_cand, n_prune, frames[sf].size());
+			}
+		}
+
+		// Phase C: Init ∧ !p ∧ S (round literals pinned so the per-round
+		// survivor exclusions are neutralized)
+		std::vector<int> assumptions;
+		push_assum(assumptions, -init_act);
+		for (int i = 1; i < (int)act.size(); i++)
+			push_assum(assumptions, i == sf ? -act[i] : act[i]);
+		for (int rl : round_lits)
+			push_assum(assumptions, rl);
+		assumptions.push_back(bad1);
+		n_init++;
+		bool cex = solve_assum(assumptions);
+		if (trace)
+			fprintf(stderr, "ic3-live: phaseC sat=%d\n", cex ? 1 : 0);
+		if (cex) {
+			depth = 0;
+			return 1;
+		}
+		return 0;
+	}
+
+private:
+	// S clauses are asserted over the state1 variables by add_clause and
+	// additionally over state2 by this twin, so the consecution query can
+	// constrain the successor side as well; add_clause keeps the single
+	// bookkeeping entry (subsumption) in frames[sf].  The twin hangs off
+	// its OWN activation literal: it may only constrain the consecution
+	// query (and generalization), never candidate or Phase C queries --
+	// there state2 is the T-forced successor of state1, so an active twin
+	// would silently turn "s1 in S" into "s1's successor in S" and invert
+	// the gfp (observed on xlive1: state 3 vanished from the candidate
+	// pool the moment state 4 was pruned, and the fixpoint collapsed to a
+	// false disproof).
+	int live2_act;
+	void add_live_clause(const std::vector<int> &cube, int sf)
+	{
+		add_clause(cube, sf, sf);
+		std::vector<int> clause;
+		for (int i = 0; i < (int)cube.size(); i++)
+			if (cube[i])
+				clause.push_back(cube[i] > 0 ? ez.NOT(state2[i]) : state2[i]);
+		int id = clause.size() == 1 ? clause[0] : ez.expression(ezSAT::OpOr, clause);
+		ez.assume(ez.OR(id, live2_act));
+	}
+
+	// drop literals while "no successor in S ∧ !p" holds (MIC-style)
+	std::vector<int> generalize_prune(std::vector<int> cube, int sf)
+	{
+		auto t0 = std::chrono::steady_clock::now();
+		for (int pass = 0; pass < 4; pass++) {
+			bool dropped_any = false;
+			for (int x = 0; x < (int)cube.size(); x++) {
+				if (cube[x] == 0)
+					continue;
+				int saved = cube[x];
+				cube[x] = 0;
+				std::vector<int> a = act_assumptions(sf);
+				push_assum(a, -live2_act);
+				push_cube(a, cube, state1);
+				a.push_back(bad2);
+				n_gen++;
+				if (solve_assum(a))
+					cube[x] = saved;
+				else
+					dropped_any = true;
+			}
+			if (!dropped_any)
+				break;
+		}
+		t_generalize += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+		return cube;
+	}
 };
 
 struct Ic3Pass : Pass
 {
-	Ic3Pass() : Pass("ic3", "prove safety properties via IC3/PDR") { }
+	Ic3Pass() : Pass("ic3", "prove safety and liveness properties via IC3/PDR") { }
 
 	void help() override
 	{
@@ -664,6 +891,12 @@ struct Ic3Pass : Pass
 		log("Proves (or disproves) the safety properties given as $assert cells and\n");
 		log("$check cells with FLAVOR \"assert\" in the selected module, using the\n");
 		log("IC3/PDR algorithm on a two-timeframe SAT encoding of the design.\n");
+		log("Liveness properties -- $check cells with FLAVOR \"liveness\" (lowered by\n");
+		log("sva2check from unbounded eventually/s_eventually, A = p) and $live\n");
+		log("cells -- are proved by a two-phase argument: safety IC3 with bad := !p\n");
+		log("yields a reachable-state over-approximation, then a greatest-fixpoint\n");
+		log("pruning removes states that cannot stay in !p forever; F p holds iff no\n");
+		log("initial state survives the pruning.\n");
 		log("\n");
 		log("The design must be prepared with 'proc; async2sync; flatten; opt_clean'\n");
 		log("first: only synchronous flip-flops and combinatorial cells can be\n");
@@ -710,7 +943,7 @@ struct Ic3Pass : Pass
 		int kind_max = 8;
 		int ctg_depth_max = 0;
 
-		log_header(design, "Executing IC3 pass (safety model checking).\n");
+		log_header(design, "Executing IC3 pass (safety and liveness model checking).\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
@@ -759,12 +992,17 @@ struct Ic3Pass : Pass
 		(void) check_cells;
 
 		std::vector<RTLIL::Cell*> props;
+		std::vector<RTLIL::Cell*> live_props;
 		std::vector<RTLIL::Cell*> assumes;
 		for (auto cell : module->cells()) {
 			if (cell->type == ID($assert)) {
 				props.push_back(cell);
 			} else if (cell->type == ID($assume)) {
 				assumes.push_back(cell);
+			} else if (cell->type == ID($live)) {
+				// $check FLAVOR "live" cells reach $live form via
+				// chformal -lower (async2sync); same F p semantics
+				live_props.push_back(cell);
 			} else if (cell->type == ID($check)) {
 				if (cell->getParam(ID::TRG_ENABLE).as_bool())
 					log_error("ic3: $check cell %s.%s is edge-triggered -- run `async2sync` first.\n",
@@ -776,12 +1014,14 @@ struct Ic3Pass : Pass
 					props.push_back(cell);
 				else if (flavor == "assume" || flavor == "restrict")
 					assumes.push_back(cell);
+				else if (flavor == "liveness" || flavor == "live")
+					live_props.push_back(cell);
 				else
 					log_warning("ic3: skipping %s.%s (flavor %s)\n", log_id(module), log_id(cell), flavor.c_str());
 			}
 		}
 
-		if (props.empty()) {
+		if (props.empty() && live_props.empty()) {
 			log("ic3: no properties found in module %s.\n", log_id(module));
 			return;
 		}
@@ -829,8 +1069,40 @@ struct Ic3Pass : Pass
 			}
 		}
 
+		for (auto cell : live_props) {
+			std::string name = cell->name.unescape();
+			std::string src;
+			if (cell->attributes.count(ID::src))
+				src = cell->attributes.at(ID::src).decode_string();
+
+			Ic3Solver solver(module, init_zero, max_frames);
+			solver.assume_cells = assumes;
+			solver.kind_max = kind_max;
+			solver.ctg_depth_max = ctg_depth_max;
+
+			int depth = 0;
+			int result = solver.prove_liveness(cell, depth);
+
+			if (result == 0) {
+				log("ic3: %s: proved\n", name.c_str());
+				n_proved++;
+			} else {
+				log("ic3: %s: disproved (depth %d)\n", name.c_str(), depth);
+				n_disproved++;
+			}
+
+			if (verbose) {
+				int nclauses = 0;
+				for (int i = 1; i < GetSize(solver.frames); i++)
+					nclauses += GetSize(solver.frames[i]);
+				log("ic3: %s: src=%s frames=%d clauses=%d solves=%d liveness (bad=%lld blk=%lld gen=%lld init=%lld)\n",
+						name.c_str(), src.c_str(), GetSize(solver.act)-1, nclauses, solver.nsolves,
+						solver.n_bad, solver.n_blockq, solver.n_gen, solver.n_init);
+			}
+		}
+
 		log("ic3: %d properties: proved=%d disproved=%d undecided=%d\n",
-				GetSize(props), n_proved, n_disproved, n_undecided);
+				GetSize(props) + GetSize(live_props), n_proved, n_disproved, n_undecided);
 	}
 } Ic3Pass;
 

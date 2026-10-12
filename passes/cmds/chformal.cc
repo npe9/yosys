@@ -40,6 +40,12 @@ static RTLIL::IdString formal_flavor(RTLIL::Cell *cell)
 		return ID($live);
 	else if (flavor_param == "fair")
 		return ID($fair);
+	else if (flavor_param == "liveness")
+		// native ic3 liveness flavor: not one of the classic constraint
+		// types, so no -lower/-remove/-delay mode may touch it; report
+		// it as the generic $check it already is and the cell passes
+		// through with FLAVOR param and A/EN/CLK attributes intact
+		return ID($check);
 	else
 		log_abort();
 }

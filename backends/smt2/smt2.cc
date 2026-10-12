@@ -1107,9 +1107,18 @@ struct Smt2Worker
 
 		for (auto cell : module->cells())
 		{
-			if (cell->type == ID($check))
+			if (cell->type == ID($check)) {
+				if (cell->getParam(ID(FLAVOR)).decode_string() == "liveness") {
+					// native ic3 liveness flavor (s_eventually / s_until
+					// lowering): no SMT-LIB encoding -- the ic3 pass
+					// proves these; skip like xlive cells, keep the
+					// safety legs flowing
+					log_warning("skipping liveness-flavored $check cell %s.%s in write_smt2 (ic3-only flavor).\n", module, cell);
+					continue;
+				}
 				log_error("Unsupported cell type %s for cell %s.%s -- please run `async2sync` or `clk2fflogic` before `write_smt2`.\n",
 						cell->type.unescape(), module, cell);
+			}
 			if (cell->type.in(ID($live), ID($fair), ID($equiv)))
 				log_error("Unsupported cell type %s for cell %s.%s",
 						cell->type.unescape(), module, cell);

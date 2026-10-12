@@ -43,8 +43,13 @@
 // Rejected with a clear message: any other multi-clock element (mid-sequence
 //   or antecedent `clocked`, `clocked` under throughout/within/first_match,
 //   or_event/bare-identifier clocking events, instance bodies), unbounded
-//   eventually over a temporal operand, remaining unbounded strong operators
-//   (s_until, ...), local variable assignments, within, matches/streaming.
+//   eventually over a temporal operand, s_until over a temporal operand,
+//   local variable assignments, within, matches/streaming.
+//
+// Strong until v1: p s_until q / s_until_with with p, q plain booleans
+//   splits into the weak-until monitor on the main $check plus an F q
+//   obligation as a second $check named <name>$live with FLAVOR
+//   "liveness"; the ic3 pass proves each leg independently.
 //
 // Sequences compile to nondeterministic-start transducers shared across
 // attempts: compile_seq(node, start, gate) returns an "ends at this tick"
@@ -2149,6 +2154,31 @@ struct SvaCompiler {
 
 	// violation pulse: "the property is violated at the current tick by an
 	// attempt started per `start`".
+	// weak-until monitor shared by the "until"/"until_with" prop_dispatch
+	// branch and the s_until/s_until_with split below (strong until =
+	// weak monitor plus an F q liveness twin).  with = until_with
+	// semantics: q completes only together with p.
+	SigSpec until_fail(SigSpec p, SigSpec q, SigSpec start, bool with)
+	{
+		SigSpec active = feedback([=](SigSpec qq) {
+			return orN({start, qq});
+		}, "until_active", 1);
+		SigSpec q_seen = feedback([=](SigSpec qq) {
+			SigSpec hit = with ? andN({q, p}) : q;
+			// restart at each start, otherwise accumulate
+			return orN({andN({start, hit}), mod->And(NEW_ID, orN({qq, hit}), mod->Not(NEW_ID, start))});
+		}, "until_qseen", 1);
+		// until: at t either p holds (continue) or q holds (complete);
+		//        fail if neither and no q has been seen since the last start
+		// until_with: q completes only together with p; fail if p fails
+		//        before such a q
+		SigSpec fail_now = with ? andN({active, mod->Not(NEW_ID, p)})
+		                        : andN({active, mod->Not(NEW_ID, p), mod->Not(NEW_ID, q)});
+		if (with)
+			return andN({fail_now, mod->Not(NEW_ID, orN({q, q_seen}))});
+		return andN({fail_now, mod->Not(NEW_ID, q_seen)});
+	}
+
 	SigSpec prop_fail(Cell *n, SigSpec start)
 	{
 		static int depth_ctr = 0;
@@ -2444,23 +2474,7 @@ struct SvaCompiler {
 		if (op == "until" || op == "until_with") {
 			SigSpec p = reduce1(resolve(port(0)));
 			SigSpec q = reduce1(resolve(port(1)));
-			SigSpec active = feedback([=](SigSpec qq) {
-				return orN({start, qq});
-			}, "until_active", 1);
-			SigSpec q_seen = feedback([=](SigSpec qq) {
-				SigSpec hit = op == "until" ? q : andN({q, p});
-				// restart at each start, otherwise accumulate
-				return orN({andN({start, hit}), mod->And(NEW_ID, orN({qq, hit}), mod->Not(NEW_ID, start))});
-			}, "until_qseen", 1);
-			// until: at t either p holds (continue) or q holds (complete);
-			//        fail if neither and no q has been seen since the last start
-			// until_with: q completes only together with p; fail if p fails
-			//        before such a q
-			SigSpec fail_now = op == "until" ? andN({active, mod->Not(NEW_ID, p), mod->Not(NEW_ID, q)})
-			                                 : andN({active, mod->Not(NEW_ID, p)});
-			if (op == "until")
-				return andN({fail_now, mod->Not(NEW_ID, q_seen)});
-			return andN({fail_now, mod->Not(NEW_ID, orN({q, q_seen}))});
+			return until_fail(p, q, start, op == "until_with");
 		}
 		if (op == "accept_on" || op == "sync_accept_on" || op == "reject_on" || op == "sync_reject_on") {
 			SigSpec b = reduce1(resolve(port(0)));
@@ -2948,6 +2962,11 @@ struct Sva2CheckPass : public Pass {
 					again = true;
 
 				std::string flavor = cell->getParam(ID(FLAVOR).c_str()).decode_string();
+				if (flavor == "liveness")
+					// already compiled in place (eventually lowering) or
+					// emitted pre-compiled by the s_until split (<name>$live
+					// twin); not part of the assert/assume conversion loop
+					continue;
 				if (flavor != "assert" && flavor != "assume" && flavor != "restrict") {
 					unsupported++;
 					log("Skipping %s/%s: flavor %s not supported.\n", log_id(mod), log_id(cell), flavor.c_str());
@@ -3108,6 +3127,8 @@ struct Sva2CheckPass : public Pass {
 
 				SigSpec fail;
 				SigSpec new_a;
+				bool strong_until = false;
+				SigSpec su_p, su_q;
 				if (liveness) {
 					pool<Cell *> seen;
 					if (comp.tree_has_locals(body, seen))
@@ -3123,7 +3144,26 @@ struct Sva2CheckPass : public Pass {
 					new_a = comp.reduce1(psig);
 					fail = mod->Not(NEW_ID, new_a);
 				} else {
-					if (body) {
+					// v1.5 strong until: p s_until q == (p until q) && F q
+					// with p, q plain booleans; the weak monitor keeps this
+					// $check, the F q obligation is emitted below as a
+					// "<name>$live" liveness twin (same scheme as the
+					// eventually v1 lowering).  Temporal operands fall
+					// through to prop_dispatch's unsupported-op error.
+					bool su_with = false;
+					if (body && (sva_op(body) == "s_until" || sva_op(body) == "s_until_with")) {
+						auto bp = comp.ports_of(body);
+						if (bp.size() == 2 && !comp.child_cell(body->getPort(bp[0])) &&
+								!comp.child_cell(body->getPort(bp[1]))) {
+							strong_until = true;
+							su_with = sva_op(body) == "s_until_with";
+							su_p = comp.reduce1(comp.resolve(body->getPort(bp[0])));
+							su_q = comp.reduce1(comp.resolve(body->getPort(bp[1])));
+						}
+					}
+					if (strong_until) {
+						fail = comp.until_fail(su_p, su_q, Const(1, 1), su_with);
+					} else if (body) {
 						pool<Cell *> seen;
 						bool had_slots = comp.slots_mode;
 						if (comp.tree_has_locals(body, seen)) {
@@ -3149,8 +3189,9 @@ struct Sva2CheckPass : public Pass {
 				}
 
 				std::string dop = disable ? sva_op(disable) : "no_disable";
+				SigSpec dsig;
 				if (dop == "disable_iff") {
-					SigSpec dsig = comp.reduce1(disable->getPort(ID(A)));
+					dsig = comp.reduce1(disable->getPort(ID(A)));
 					new_a = mod->Or(NEW_ID, dsig, new_a);
 				}
 
@@ -3172,6 +3213,28 @@ struct Sva2CheckPass : public Pass {
 					log("sva2check: %s: multi-clock property; $check left unclocked (checked at every step).\n", log_id(cell));
 				}
 				cell->attributes[ID(sva2check)] = Const(1, 1);
+
+				if (strong_until) {
+					if (comp.multiclock)
+						log_error("sva2check: s_until in a multi-clock property is not supported in %s.\n", log_id(cell));
+					// F q twin: the ic3 pass proves FLAVOR "liveness"
+					// $checks with its two-phase gfp engine.  Named
+					// <name>$live so the battery (and humans) can tell
+					// the legs apart; run_battery folds it into the base
+					// property verdict.  Mirror every parameter/port of
+					// the main cell (TRG/ARGS/PRIORITY/...), overriding
+					// FLAVOR, A and EN -- a partial $check trips
+					// parameter assertions in downstream passes.
+					RTLIL::Cell *live = mod->addCell(cell->name.str() + "$live", ID($check));
+					live->parameters = cell->parameters;
+					live->connections_ = cell->connections_;
+					live->attributes = cell->attributes;
+					live->setParam(ID(FLAVOR), std::string("liveness"));
+					SigSpec la = disable ? mod->Or(NEW_ID, dsig, su_q) : su_q;
+					live->setPort(ID(A), la);
+					live->setPort(ID(EN), SigSpec(State::S1));
+					live->attributes[ID(sva2check)] = Const(1, 1);
+				}
 
 				if (expose_bad) {
 					Wire *bad = mod->addWire("\\" + std::string("bad_") + log_id(cell));

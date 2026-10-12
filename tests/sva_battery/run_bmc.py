@@ -175,6 +175,13 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
         print("  %-9s %s (no expectation)" % ("cex@%d" % v[1] if v[0] == "cex" else "holds", name))
     for name in sorted(exp):
         kind, n = exp[name]
+        if kind == "dis" and n is None:
+            # liveness-class expectation (s_until/s_eventually family): the
+            # bmc leg checks the safety half only, the F-half is ic3-only
+            # (write_smt2 skips the liveness legs) -- not a mismatch, just
+            # not bmc-checkable
+            print("  skipped   %s (liveness DIS, ic3-only)" % name)
+            continue
         v = verdicts.get(name)
         if v is None:
             print("  MISSING   %s (expected %s)" % (name, kind))

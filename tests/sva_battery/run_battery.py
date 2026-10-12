@@ -34,6 +34,26 @@ def expectations(path):
     return out
 
 
+def fold_live_legs(results):
+    """s_until/s_until_with split into a safety leg `n` and a liveness
+    twin `n$live`: the property is proved iff every leg is proved,
+    disproved if any leg is (depth: the disproved safety leg's depth if
+    any, else the liveness leg's)."""
+    out = {}
+    for name, verdict in results.items():
+        if name.endswith("$live"):
+            continue
+        legs = [verdict]
+        live = results.get(name + "$live")
+        if live:
+            legs.append(live)
+        status = "proved" if all(s == "proved" for s, _ in legs) else \
+                 "disproved" if any(s == "disproved" for s, _ in legs) else "undecided"
+        depth = next((d for s, d in legs if s == "disproved" and d is not None), None)
+        out[name] = (status, depth)
+    return out
+
+
 def run_ic3(path):
     proc = subprocess.run(
         [sys.executable, os.path.join(HERE, "run_ic3.py"), path, "--timeout", "90", "--yosys", YOSYS],
@@ -64,7 +84,7 @@ def run_ic3(path):
         if name in results:
             continue
         results[name] = (status, int(depth) if depth else None)
-    return results, []
+    return fold_live_legs(results), []
 
 
 def run_bmc(path):

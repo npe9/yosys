@@ -22,16 +22,25 @@
 // assert-flavor $check into classic EN/A form for model checkers.
 //
 // Supported: single-clock spec(posedge|negedge clk, disable_iff?, body) with
-//   sequences: boolean exprs, true, ##const/##[m:n]/##[*]/##[+], [*m:n]/[+]/
-//     [->m:n]/[=m:n] (of booleans or sub-sequences), throughout, clocked
-//     sub-sequences on the same clock, inside, weq/wne
+//   sequences: boolean exprs, true, ##const/##[m:n]/##[*]/##[+] (also as a
+//     leading `@(c) ##k body` resampling delay), [*m:n]/[+]/[->m:n]/[=m:n]
+//     (of booleans or sub-sequences), throughout, clocked sub-sequences on
+//     the same clock (transparent), inside, weq/wne
 //   properties: |->, |=>, implies, iff, or, and, not, if/ifelse, case,
 //     always/s_always (optionally bounded), nexttime/s_nexttime [k],
 //     until/until_with, accept_on/reject_on and sync variants,
 //     bounded eventually, strong bounded sequences
-// Rejected with a clear message: multi-clock properties, unbounded strong
-// operators (s_eventually, s_until, ...), local variable assignments,
-// named sequence/property instances, within, matches/streaming.
+//   v1 multi-clock: the direct consequent of |->/|=> may be a `clocked`
+//     sub-sequence on a different clock (optionally under strong/weak):
+//     it compiles as its own monitor island on the inner clock, started by
+//     the antecedent end/start pulse; the enclosing $check keeps EN=1'b1
+//     and carries no CLK attributes (checked at every formal step; use the
+//     clk2fflogic prep so both islands advance under interleaving semantics)
+// Rejected with a clear message: any other multi-clock element (mid-sequence
+//   or antecedent `clocked`, `clocked` under throughout/within/first_match,
+//   or_event/bare-identifier clocking events, instance bodies), unbounded
+//   strong operators (s_eventually, s_until, ...), local variable
+//   assignments, within, matches/streaming.
 //
 // Sequences compile to nondeterministic-start transducers shared across
 // attempts: compile_seq(node, start, gate) returns an "ends at this tick"
@@ -67,6 +76,10 @@ struct SvaCompiler {
 	Module *mod;
 	SigSpec clk;
 	bool clk_pos;
+	// set when the property compiled with a clock switch (multi-clock
+	// consequent island): the enclosing $check monitors more than one
+	// clock, so it must not carry the outer sampling clock
+	bool multiclock = false;
 	std::string prefix;
 	int uid = 0;
 
@@ -488,6 +501,38 @@ struct SvaCompiler {
 			return nullptr;
 		}
 		return inner ? inner : body;
+	}
+
+	// Extract the sampling clock of a `clocked` node (clocking event in
+	// port A, body in port B).  Only plain posedge/negedge/edge event
+	// cells are recognized; or_event lists and bare identifiers return
+	// false (their clock is not a single signal).
+	bool clocked_event(Cell *n, SigSpec &clksig, bool &clksig_pos)
+	{
+		Cell *ev = child_cell(n->getPort(ID(A)));
+		if (!ev)
+			return false;
+		std::string eop = sva_op(ev);
+		if (eop != "posedge" && eop != "negedge" && eop != "edge")
+			return false;
+		SigSpec s = ev->getPort(ID(A));
+		if (s.empty() || !s[0].is_wire())
+			return false;
+		clksig = s;
+		clksig_pos = eop != "negedge";
+		return true;
+	}
+
+	// Is this `clocked` node on a different sampling clock than the one
+	// currently compiled?  Unrecognized events conservatively count as
+	// different (the caller then rejects or re-checks them).
+	bool clocked_differs(Cell *n)
+	{
+		SigSpec cclk;
+		bool cpos;
+		if (!clocked_event(n, cclk, cpos))
+			return false;
+		return cclk[0] != clk[0] || cpos != clk_pos;
 	}
 
 	// --- tree access -------------------------------------------------------
@@ -1254,8 +1299,13 @@ struct SvaCompiler {
 			return i < GetSize(ports) ? child_cell(n->getPort(ports[i])) : nullptr;
 		};
 		if (op == "##") {
-			SigSpec cyc = n->getPort(ports[1]);
-			Cell *cyc_cell = child(1);
+			// a two-port ## is the leading-delay form `@(c) ##k body`
+			// (IEEE 16.5): an implicit true lhs occupies the resample
+			// tick, so the ports are (cycle, tail); normalize to the
+			// three-port (lhs, cycle, tail) view
+			bool lead2 = GetSize(ports) == 2;
+			SigSpec cyc = n->getPort(ports[lead2 ? 0 : 1]);
+			Cell *cyc_cell = child_cell(cyc);
 			std::string cop = cyc_cell ? sva_op(cyc_cell) : "";
 			int lo = 0, hi = -1;
 			if (cyc_cell && (cop == "##[*]" || cop == "##[+]")) {
@@ -1276,9 +1326,14 @@ struct SvaCompiler {
 			}
 			if (hi < 0 || hi > 64 || hi - lo + 1 > split_budget)
 				return finish({{SvaEnd{seq_end(n, start, gate), -1}}, false});
-			auto lhs = seq_ends_split(child(0), port(0), start, gate, depth + 1);
-			if (!lhs.second)
-				return finish({{SvaEnd{seq_end(n, start, gate), -1}}, false});
+			std::pair<std::vector<SvaEnd>, bool> lhs;
+			if (lead2)
+				lhs = {{SvaEnd{andN({start, gate_now(gate)}), 0}}, true};
+			else {
+				lhs = seq_ends_split(child(0), port(0), start, gate, depth + 1);
+				if (!lhs.second)
+					return finish({{SvaEnd{seq_end(n, start, gate), -1}}, false});
+			}
 			split_budget -= hi - lo + 1;
 			std::vector<SvaEnd> r;
 			SigSpec entry_age = age;
@@ -1301,7 +1356,7 @@ struct SvaCompiler {
 						age = age_tick(age);
 					slot_epoch++;
 					pending_wr.clear();
-					auto te = seq_ends_split(child(2), port(2),
+					auto te = seq_ends_split(child(lead2 ? 1 : 2), port(lead2 ? 1 : 2),
 							k == 0 ? le.end : delay(le.end, k, "dspl"), gate, depth + 1);
 					if (!te.second) { ok = false; break; }
 					for (auto &t : te.first)
@@ -1361,8 +1416,13 @@ struct SvaCompiler {
 			dyn_gate = saved;
 			return finish(r);
 		}
-		if (op == "clocked")
+		if (op == "clocked") {
+			// a different inner clock is only supported as the direct
+			// consequent of |->/|=> (compiled in prop_fail) in v1
+			if (clocked_differs(n))
+				log_error("sva2check: multi-clock sequence element only supported as the direct consequent of |->/|=> in v1 (%s).\n", log_id(n));
 			return finish(seq_ends_split(child(1), port(1), start, gate, depth + 1));
+		}
 		int lmin = seq_min_len(n), lmax = seq_max_len(n);
 		if (lmin >= 0 && lmin == lmax && lmax <= 64)
 			return finish({{SvaEnd{seq_end(n, start, gate), lmax - 1}}, true});
@@ -1404,11 +1464,18 @@ struct SvaCompiler {
 			return andN({start, gate_now(gate)});
 
 		if (op == "##") {
-			SigSpec s_end = seq_dispatch(port(0), child(0), start, gate);
+			// a two-port ## is the leading-delay form `@(c) ##k body`
+			// (IEEE 16.5): an implicit true lhs occupies the resample
+			// tick, so the ports are (cycle, tail); normalize to the
+			// three-port (lhs, cycle, tail) view
+			bool lead2 = GetSize(ports) == 2;
+			int ti = lead2 ? 1 : 2;
+			SigSpec s_end = lead2 ? andN({start, gate_now(gate)})
+			                      : seq_dispatch(port(0), child(0), start, gate);
 			// the cycle count lives on the original cell (a bounds child is
 			// a data cell the walk never visits; its clone is a shell)
-			SigSpec cyc = n->getPort(ports[1]);
-			Cell *cyc_cell = child(1);
+			SigSpec cyc = n->getPort(ports[lead2 ? 0 : 1]);
+			Cell *cyc_cell = child_cell(cyc);
 			std::string cop = cyc_cell ? sva_op(cyc_cell) : "";
 			SigSpec t_start;
 			SigSpec t_age;
@@ -1453,7 +1520,7 @@ struct SvaCompiler {
 				log_error("sva2check: ## delay bound %d too large in %s.\n", hi, log_id(n));
 			}
 			if (!slots_mode)
-				return seq_dispatch(port(2), child(2), t_start, gate);
+				return seq_dispatch(port(ti), child(ti), t_start, gate);
 			// the tail is one or more ticks later: ages shift, same-tick
 			// pending writes expire
 			SigSpec saved_age = age;
@@ -1466,16 +1533,16 @@ struct SvaCompiler {
 			// below when a subsequence cannot be decomposed (documented
 			// approximation).
 			if (split_ranges && hi >= 0 && !in_split && getenv("SVA_NOSPLIT") == nullptr) {
-				Cell *tailc = child(2);
+				Cell *tailc = child(ti);
 				auto sig_uses_locals = [&](SigSpec s) {
 					for (auto bit : s)
 						if (bit.is_wire() && (slotfiles.count(bit.wire) || clone_lmap.count(bit.wire)))
 							return true;
 					return false;
 				};
-				Cell *lhsc = child(0);
+				Cell *lhsc = lead2 ? nullptr : child(0);
 				bool tailu = (tailc && tree_uses_locals(tailc)) ||
-						sig_uses_locals(n->getPort(ports[2]));
+						sig_uses_locals(n->getPort(ports[ti]));
 				bool lhsvar = false;
 				if (lhsc) {
 					int l0 = seq_min_len(lhsc), l1 = seq_max_len(lhsc);
@@ -1496,7 +1563,7 @@ struct SvaCompiler {
 			slot_epoch++;
 			if (lo > 0 || hi > 0)
 				pending_wr.clear();  // the tail is a later tick
-			SigSpec r = seq_dispatch(port(2), child(2), t_start, gate);
+			SigSpec r = seq_dispatch(port(ti), child(ti), t_start, gate);
 			age = saved_age;
 			pending_wr = saved_pending;
 			return r;
@@ -1587,8 +1654,12 @@ struct SvaCompiler {
 		}
 
 		if (op == "clocked") {
-			// nested sub-clock; only the identical clock is supported and it
-			// is treated as transparent (single-clock approximation)
+			// nested sub-clock on the same clock is transparent
+			// (single-clock approximation); a different clock is only
+			// supported as the direct consequent of |->/|=> (v1, compiled
+			// in prop_fail) -- anywhere else is an error
+			if (clocked_differs(n))
+				log_error("sva2check: multi-clock sequence element only supported as the direct consequent of |->/|=> in v1 (%s).\n", log_id(n));
 			return seq_dispatch(port(1), child(1), start, gate);
 		}
 
@@ -1798,10 +1869,14 @@ struct SvaCompiler {
 			return std::make_pair(e, e);
 		};
 		if (op == "##") {
-			SigSpec s_any = seq_dispatch(port(0), child(0), start, gate);
-			SigSpec s_first = child(0) ? seq_end_fm(child(0), start, gate).first : s_any;
-			SigSpec cyc = n->getPort(ports[1]);
-			Cell *cyc_cell = child(1);
+			// two-port ##: leading-delay form `@(c) ##k body` (see seq_end)
+			bool lead2 = GetSize(ports) == 2;
+			int ti = lead2 ? 1 : 2;
+			SigSpec s_any = lead2 ? andN({start, gate_now(gate)})
+			                      : seq_dispatch(port(0), child(0), start, gate);
+			SigSpec s_first = (!lead2 && child(0)) ? seq_end_fm(child(0), start, gate).first : s_any;
+			SigSpec cyc = n->getPort(ports[lead2 ? 0 : 1]);
+			Cell *cyc_cell = child_cell(cyc);
 			std::string cop = cyc_cell ? sva_op(cyc_cell) : "";
 			int lo = 0, hi = -1;
 			if (cyc_cell && (cop == "##[*]" || cop == "##[+]")) {
@@ -1833,11 +1908,11 @@ struct SvaCompiler {
 				if (k >= lo)
 					t_any = orN({t_any, tap});
 			}
-			SigSpec any = seq_dispatch(port(2), child(2), t_any, gate);
+			SigSpec any = seq_dispatch(port(ti), child(ti), t_any, gate);
 			int span = hi - lo + 1;
 			if (span > fm_budget) {
 				// splitting would blow up: .first degrades to .any
-				SigSpec e = seq_dispatch(port(2), child(2), t_any, gate);
+				SigSpec e = seq_dispatch(port(ti), child(ti), t_any, gate);
 				return std::make_pair(e, any);
 			}
 			fm_budget -= span;
@@ -1847,18 +1922,18 @@ struct SvaCompiler {
 			// tail-length behind the candidate end (the offset gap plus
 			// the tail's own stretch; beyond that the ends belong to
 			// other attempts -- documented approximation).
-			int w = (hi - lo) + (child(2) ? seq_max_len(child(2)) : 1);
+			int w = (hi - lo) + (child(ti) ? seq_max_len(child(ti)) : 1);
 			if (w < 0 || w > 64) {
-				SigSpec e = seq_dispatch(port(2), child(2), t_any, gate);
+				SigSpec e = seq_dispatch(port(ti), child(ti), t_any, gate);
 				return std::make_pair(e, any);
 			}
 			SigSpec first = Const(0, 1);
 			SigSpec earlier_any = Const(0, 1);   // 1 = some earlier offset ended
 			for (int k = lo; k <= hi; k++) {
 				SigSpec t_f = k == 0 ? s_first : delay(s_first, k, "fmd");
-				auto tk = child(2) ? seq_end_fm(child(2), t_f, gate)
-						   : std::make_pair(andN({t_f, gate, reduce1(port(2))}),
-								    andN({t_f, gate, reduce1(port(2))}));
+				auto tk = child(ti) ? seq_end_fm(child(ti), t_f, gate)
+						   : std::make_pair(andN({t_f, gate, reduce1(port(ti))}),
+								    andN({t_f, gate, reduce1(port(ti))}));
 				SigSpec earlier_ever = earlier_any;
 				for (int j = 1; j <= w; j++)
 					earlier_ever = orN({earlier_ever, delay(earlier_any, j, "fmx")});
@@ -1913,8 +1988,11 @@ struct SvaCompiler {
 			auto r = seq_end_fm(child(0), start, gate);
 			return r;
 		}
-		if (op == "clocked")
+		if (op == "clocked") {
+			if (clocked_differs(n))
+				log_error("sva2check: multi-clock sequence element only supported as the direct consequent of |->/|=> in v1 (%s).\n", log_id(n));
 			return sub_fm(1);
+		}
 		if (op == "[*]" || op == "[+]") {
 			Cell *b = child(1);
 			int m = op == "[*]" ? 0 : 1, hi = -1;
@@ -2068,6 +2146,76 @@ struct SvaCompiler {
 			SigSpec ant_end = seq_dispatch(port(0), child(0), start, Const(1, 1));
 			bool shift = op == "|=>" || op == "#=#";
 			SigSpec c_start = shift ? delay(ant_end, 1, "impl") : ant_end;
+			// v1 multi-clock: a consequent rooted at a `clocked` node whose
+			// clock differs from the property clock compiles as its own
+			// monitor island on the inner clock.  The island start is
+			// derived from the antecedent end/start signal with
+			// attempt-delimiting logic (NOT a CDC synchronizer): the raw
+			// level would spawn shadow attempts at every inner-clock edge
+			// while the outer clock stalls (the start value only changes on
+			// outer edges, but the island's deadline chains sample it at
+			// inner edges), falsely failing true properties; and a bare
+			// outer-edge pulse could fall between inner edges and never be
+			// seen.  So the start is delimited to the LRM attempt ticks
+			// (outer edges where it holds, persisted across the rest of the
+			// outer cycle) and then sampled by the inner clock into a
+			// single inner-tick pulse at the first inner edge at or after
+			// the handoff -- which is also the ##0/##1 first-element
+			// sampling semantics.
+			{
+				Cell *cc = child(1);
+				while (cc && (sva_op(cc) == "strong" || sva_op(cc) == "weak"))
+					cc = child_cell(cc->getPort(ID(A)));
+				if (cc && sva_op(cc) == "clocked") {
+					SigSpec iclk;
+					bool ipos;
+					if (clocked_event(cc, iclk, ipos) &&
+							(iclk[0] != clk[0] || ipos != clk_pos)) {
+						if (clone_scope)
+							log_error("sva2check: multi-clock consequent inside an instantiated property/sequence is not supported in v1 (%s).\n", log_id(n));
+						if (slots_mode)
+							log_error("sva2check: local variables with a multi-clock consequent are not supported in v1 (%s).\n", log_id(n));
+						SigSpec cbody = cc->getPort(ID(B));
+						Cell *cbc = child_cell(cbody);
+						if (cbc && !is_seq_op(sva_op(cbc)))
+							log_error("sva2check: multi-clock property element only supported as the direct consequent of |->/|=> in v1 (%s).\n", log_id(cc));
+						// delimit the start to the outer edges where it
+						// holds, persisted across the rest of the outer
+						// cycle (global-clock FFs: unaffected by
+						// clk2fflogic, which only rewrites clocked FFs)
+						SigSpec oclk = clk;
+						bool opos = clk_pos;
+						Wire *pastw = wn("mcpastclk");
+						mod->addFf(NEW_ID, oclk, pastw);
+						SigSpec edge_now = opos ? oclk : mod->Not(NEW_ID, oclk);
+						SigSpec edge_prev = opos ? mod->Not(NEW_ID, SigSpec(pastw)) : SigSpec(pastw);
+						SigSpec oedge = mod->And(NEW_ID, edge_now, edge_prev);
+						Wire *holdw = wn("mchold");
+						mod->addFf(NEW_ID, mod->Mux(NEW_ID, holdw, c_start, oedge), holdw);
+						SigSpec s_level = mod->And(NEW_ID, c_start,
+								mod->Or(NEW_ID, oedge, holdw));
+						// deliver as a single inner-tick pulse at the
+						// first inner edge that sees the level
+						SigSpec saved_clk = clk;
+						bool saved_pos = clk_pos;
+						clk = iclk[0];
+						clk_pos = ipos;
+						multiclock = true;
+						SigSpec ss = reg(s_level, "mcstart");
+						SigSpec pss = reg(ss, "mcstart");
+						SigSpec pulse = mod->And(NEW_ID, ss, mod->Not(NEW_ID, pss));
+						SigSpec r;
+						if (cbc)
+							r = strong_seq_fail(cbc, pulse);
+						else
+							r = andN({pulse,
+									mod->Not(NEW_ID, reduce1(resolve(cbody)))});
+						clk = saved_clk;
+						clk_pos = saved_pos;
+						return r;
+					}
+				}
+			}
 			if (!slots_mode || !shift)
 				return prop_dispatch(port(1), child(1), c_start);
 			// the consequent is one tick further along the same attempt
@@ -2382,8 +2530,11 @@ struct SvaCompiler {
 		if (op == "true" || op == "inside" || op == "weq" || op == "wne")
 			return 1;
 		if (op == "##") {
+			// two-port ##: leading-delay form `@(c) ##k body` (see seq_end)
+			bool lead2 = GetSize(ports) == 2;
+			int ti = lead2 ? 1 : 2;
 			int lo, hi = -1;
-			SigSpec cyc = n->getPort(ports[1]);
+			SigSpec cyc = n->getPort(ports[lead2 ? 0 : 1]);
 			Cell *cc = child_cell(cyc);
 			if (cc && sva_op(cc) == "bounds") {
 				auto bp = ports_of(cc);
@@ -2395,9 +2546,9 @@ struct SvaCompiler {
 				if (!const_int(cyc, lo)) return -1;
 				hi = lo;
 			}
-			Cell *lhs = child(0);
+			Cell *lhs = lead2 ? nullptr : child(0);
 			int ll = lhs ? seq_min_len(lhs) : 1;
-			Cell *tail = child(2);
+			Cell *tail = child(ti);
 			int tl = tail ? seq_min_len(tail) : 1;
 			if (ll < 0 || tl < 0) return -1;
 			(void)hi;
@@ -2459,8 +2610,11 @@ struct SvaCompiler {
 		if (op == "true" || op == "inside" || op == "weq" || op == "wne")
 			return 1;
 		if (op == "##") {
+			// two-port ##: leading-delay form `@(c) ##k body` (see seq_end)
+			bool lead2 = GetSize(ports) == 2;
+			int ti = lead2 ? 1 : 2;
 			int lo, hi = -1;
-			SigSpec cyc = n->getPort(ports[1]);
+			SigSpec cyc = n->getPort(ports[lead2 ? 0 : 1]);
 			Cell *cc = child_cell(cyc);
 			if (cc && sva_op(cc) == "bounds") {
 				auto bp = ports_of(cc);
@@ -2472,10 +2626,10 @@ struct SvaCompiler {
 				if (!const_int(cyc, lo)) return -1;
 				hi = lo;
 			}
-			Cell *lhs = child(0);
-			int ll = lhs ? seq_max_len(lhs) : clen(0);
-			Cell *tail = child(2);
-			int tl = tail ? seq_max_len(tail) : clen(2);
+			Cell *lhs = lead2 ? nullptr : child(0);
+			int ll = lhs ? seq_max_len(lhs) : (lead2 ? 1 : clen(0));
+			Cell *tail = child(ti);
+			int tl = tail ? seq_max_len(tail) : clen(ti);
 			if (ll < 0) return -1;
 			// ticks: lhs spans ll (its last tick abuts the delay), the delay
 			// adds hi, the tail adds its own length minus the shared tick
@@ -2616,8 +2770,11 @@ struct Sva2CheckPass : public Pass {
 		log("ranges, repetitions, |->/|=>, boolean property operators, always/\n");
 		log("nexttime bounds, until, abort operators), then lower each $check to\n");
 		log("EN=1'b1, A = disable || !fail with \\CLK and \\CLK_POLARITY attributes.\n");
-		log("Unsupported operators abort with an error (multi-clock, liveness\n");
-		log("operators, local variables, named instances, within, matches).\n");
+		log("v1 multi-clock: a |->/|=> consequent `clocked` on a different clock\n");
+		log("compiles as its own island on that clock; such $check cells keep\n");
+		log("EN=1'b1 and carry no \\CLK attributes.  Other multi-clock elements\n");
+		log("abort with an error, as do liveness operators, local variables,\n");
+		log("within, and matches.\n");
 		log("\n");
 		log("With -expose_bad, additionally create a module output port per\n");
 		log("converted check named bad_<check> driven by EN && !A, for AIGER\n");
@@ -2881,8 +3038,19 @@ struct Sva2CheckPass : public Pass {
 
 				cell->setPort(ID(EN), SigSpec(State::S1));
 				cell->setPort(ID(A), new_a);
-				cell->attributes[ID(CLK)] = Const(clksig[0].wire->name.str());
-				cell->attributes[ID(CLK_POLARITY)] = Const(comp.clk_pos ? 1 : 0, 1);
+				if (!comp.multiclock) {
+					cell->attributes[ID(CLK)] = Const(clksig[0].wire->name.str());
+					cell->attributes[ID(CLK_POLARITY)] = Const(comp.clk_pos ? 1 : 0, 1);
+				} else {
+					// the property monitors on more than one clock, so
+					// there is no single sampling clock to name: keep
+					// EN=1'b1 (A = !fail is checked at every formal step;
+					// the monitor FFs of both islands only move on real
+					// clock edges, so fail can only change on one) and
+					// omit the clock attributes, which would otherwise
+					// misleadingly pin the outer clock
+					log("sva2check: %s: multi-clock property; $check left unclocked (checked at every step).\n", log_id(cell));
+				}
 				cell->attributes[ID(sva2check)] = Const(1, 1);
 
 				if (expose_bad) {

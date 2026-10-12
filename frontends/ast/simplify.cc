@@ -7697,8 +7697,17 @@ skip_memory_write:;
 
 				auto node_filename = children[0]->clone();
 				while (node_filename->simplify(true, stage, width_hint, sign_hint)) { }
-				if (node_filename->type != AST_CONSTANT)
-					input_error("Failed to evaluate system function `%s' with non-constant 1st argument.\n", str);
+				if (node_filename->type != AST_CONSTANT) {
+					// Runtime-variable filename (e.g. chosen by plusargs):
+					// yosys only supports compile-time $readmem. Elide the
+					// call instead of aborting the parse -- the file cannot
+					// be resolved statically, and the memory keeps its
+					// (possibly undriven) state, same as simulation before
+					// the initial block runs.
+					log_warning("Failed to evaluate system function `%s' with non-constant 1st argument; eliding the call (runtime $readmem is not supported).\n", str);
+					newNode = std::make_unique<AstNode>(location, AST_BLOCK);
+					goto apply_newNode;
+				}
 
 				auto node_memory = children[1]->clone();
 				while (node_memory->simplify(true, stage, width_hint, sign_hint)) { }

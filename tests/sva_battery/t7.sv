@@ -1,4 +1,7 @@
 module t7 (input logic clk);
+  // IC3-BMC: 300  (ctr-wrap CEXes sit at depth 256/259; the bounded
+  // reachability pre-pass finds them in ~300 cheap solves instead of
+  // ~256 IC3 frames)
   logic [7:0] ctr;
   always_ff @(posedge clk) ctr <= ctr + 8'd1;
   logic lvl, p3;

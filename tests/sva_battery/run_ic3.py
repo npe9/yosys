@@ -38,13 +38,13 @@ async2sync
 opt_clean
 memory
 opt_clean
-{extra_mem}ic3 -check-cells -init-zero
+{extra_mem}ic3 -check-cells -init-zero{bmc}
 """
 
 
 def prep_extras(path):
     """Per-file opt-in prep passes from pragma comments (multiclock etc.)."""
-    a2s = mem = ""
+    a2s = mem = bmc = ""
     for line in open(path):
         m = re.match(r'\s*//\s*PREP-EXTRA-AFTER-ASYNC2SYNC:\s*(.+)', line)
         if m:
@@ -52,7 +52,13 @@ def prep_extras(path):
         m = re.match(r'\s*//\s*PREP-EXTRA-AFTER-MEMORY:\s*(.+)', line)
         if m:
             mem = m.group(1).strip() + "\n"
-    return a2s, mem
+        # bounded-reachability pre-pass depth (deep CEXes that would
+        # otherwise need one IC3 frame per counterexample step, e.g.
+        # t7's ctr-wrap CEXes at depth 256/259)
+        m = re.match(r'\s*//\s*IC3-BMC:\s*(\d+)', line)
+        if m:
+            bmc = " -bmc " + m.group(1)
+    return a2s, mem, bmc
 
 
 def run(cmd, **kw):
@@ -63,10 +69,10 @@ def check_one(yosys, path, top, inc_dirs, timeout):
     label = os.path.basename(path) if isinstance(path, str) else os.path.basename(path[0])
     files = path if isinstance(path, list) else [path]
     inc = " ".join("-I" + d for d in inc_dirs)
-    extra_a2s, extra_mem = prep_extras(files[0])
+    extra_a2s, extra_mem, bmc = prep_extras(files[0])
     script = PREP.format(inc=inc, files=" ".join(files),
                          top=" -top " + top if top else "",
-                         extra_a2s=extra_a2s, extra_mem=extra_mem)
+                         extra_a2s=extra_a2s, extra_mem=extra_mem, bmc=bmc)
     ys = os.path.join(tempfile.gettempdir(), f"ic3_{os.getpid()}.ys")
     with open(ys, "w") as fh:
         fh.write(script)

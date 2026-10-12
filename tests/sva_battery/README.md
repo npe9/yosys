@@ -60,8 +60,14 @@ comments at the top of the file:
 
 Files without pragmas keep the standard single-clock prep exactly.
 
+A third pragma opts the file into the ic3 bounded-reachability pre-pass:
+
+    // IC3-BMC: <depth>                        (passed as `ic3 -bmc <depth>`)
+
+Deep counterexamples that would need one IC3 frame per step (t7's
+ctr-wrap CEXes at depth 256/259) are found in <depth> cheap unrolled
+solves instead; a miss falls through to k-induction and IC3 as usual.
+
 ## Known edges (fail by design, do not "fix" without a plan entry)
 
 - `t30a.sv` — unsupported syntax (aborts in the parser).
-- `t7.sv` — ic3 timeout (strong-windowed consequent scalability; see
-  PLAN.md "ic3 pass scalability").

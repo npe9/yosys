@@ -3,10 +3,10 @@
 and checks per-property expectations (// PROVED / // DIS @N comments).
 
 N = ctr value = BMC step = ic3 frame - 1.  Exit 0 iff the green leg is
-clean.  Known edges (t30a prep-fail, t7 ic3 timeout, t40*/tfix_* sim
-testbenches with no properties) are asserted, not skipped silently.
-x-prefixed stress files (xlive*, xfifo_dist, xmcloc1) need per-file
-timeouts and manual verdict reading; they are listed but not gated here.
+clean.  Known edges (t30a prep-fail, t40*/tfix_* sim testbenches with no
+properties) are asserted, not skipped silently.  x-prefixed stress files
+(xlive*, xfifo_dist, xmcloc1) need per-file timeouts and manual verdict
+reading; they are listed but not gated here.
 """
 
 import glob
@@ -119,7 +119,6 @@ def check_bmc(path, exp):
 # line from the ic3 leg (they never reach property verdicts).
 KNOWN_EDGES = {
     "t30a.sv": lambda l: "prep-failed" in l,
-    "t7.sv": lambda l: "timed out" in l,
     "t40_case1.sv": lambda l: "no summary" in l,
     "t40_tb.sv": lambda l: "no summary" in l,
     "t41_case1.sv": lambda l: "no summary" in l,

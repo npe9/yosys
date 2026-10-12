@@ -177,6 +177,11 @@ struct Ic3Solver
 	// k-induction depth tried before the IC3 loop (0 = disabled)
 	int kind_max;
 
+	// bounded reachability depth tried before everything else (0 = off);
+	// finds deep counterexamples (t7-class CEXes near the ctr-wrap
+	// boundary) in d cheap solves instead of d IC3 frames
+	int bmc_max;
+
 	// CTG-guided generalization recursion depth (0 = disabled)
 	int ctg_depth_max;
 
@@ -187,6 +192,7 @@ struct Ic3Solver
 	Ic3Solver(RTLIL::Module *module, bool init_zero, int max_frames) :
 			module(module), sigmap(module), ez(), satgen(&ez, &sigmap),
 			init_zero(init_zero), max_frames(max_frames), kind_max(0),
+			bmc_max(0),
 			ctg_depth_max(0),
 			nsolves(0),
 			n_bad(0), n_blockq(0), n_gen(0), n_init(0), n_ctg(0),
@@ -612,7 +618,12 @@ struct Ic3Solver
 			push_assum(assumptions, -init_act);
 			assumptions.push_back(badv.at(d));
 			std::vector<bool> model;
-			if (solve_model(assumptions, states.at(d), model)) {
+			bool sat = solve_model(assumptions, states.at(d), model);
+			if (getenv("IC3_BMC_DEBUG"))
+				fprintf(stderr, "kind-debug: d=%d sat=%d badlit=%d initlit=%d nstates=%d clauses=%d vars=%d\n",
+						d, (int)sat, badv.at(d), init_act, (int)states.at(d).size(),
+						ez.numCnfClauses(), ez.numCnfVariables());
+			if (sat) {
 				depth = d - 1;
 				return 1;
 			}
@@ -690,10 +701,53 @@ struct Ic3Solver
 		}
 	}
 
+	// Bounded reachability pre-pass on a throwaway encoding: unroll the
+	// design bmc_max+1 timeframes and ask bad@t for t = 1..bmc_max (the
+	// transition CNF is shared, so each step is one cheap solve). A hit
+	// is an exact counterexample at depth t (the IC3 loop would need t
+	// frames to find it -- t7-class deep CEXes at the ctr-wrap boundary);
+	// a miss is inconclusive and falls through.  2 = not run / no hit.
+	int bmc_prepass(RTLIL::Cell *prop, int &depth)
+	{
+		if (bmc_max <= 0)
+			return 2;
+		Ic3Solver bs(module, init_zero, max_frames);
+		bs.assume_cells = assume_cells;
+		bs.encode(prop, bmc_max + 1);
+		for (int t = 1; t <= bmc_max; t++) {
+			std::vector<int> assumptions;
+			// every id below lives in bs.ez: push_assum/solve_model must
+			// be qualified with bs, otherwise this->ez (still empty here)
+			// allocates the NOT(init) expression and the assumption is
+			// garbage in bs's id namespace -- spurious SAT
+			bs.push_assum(assumptions, -bs.init_act);
+			assumptions.push_back(bs.badv[t]);
+			std::vector<bool> model;
+			bool sat = bs.solve_model(assumptions, bs.states.at(t), model);
+			if (getenv("IC3_BMC_DEBUG"))
+				fprintf(stderr, "bmc-debug: %s t=%d sat=%d badlit=%d initlit=%d nstates=%d clauses=%d vars=%d\n",
+						log_id(prop), t, (int)sat, bs.badv[t], bs.init_act, (int)bs.states.at(t).size(),
+						bs.ez.numCnfClauses(), bs.ez.numCnfVariables());
+			if (sat) {
+				if (getenv("IC3_BMC_DEBUG") && t <= 2) {
+					std::string m;
+					for (bool b : model) m += b ? '1' : '0';
+					fprintf(stderr, "bmc-model: %s t=%d state1=%s\n", log_id(prop), t, m.c_str());
+				}
+				depth = t - 1;
+				return 1;
+			}
+		}
+		return 2;
+	}
+
 	// 0 = proved, 1 = disproved (depth set), 2 = undecided (depth set)
 	int prove(RTLIL::Cell *prop, int &depth)
 	{
-		int r = kind_prepass(prop, depth);
+		int r = bmc_prepass(prop, depth);
+		if (r != 2)
+			return r;
+		r = kind_prepass(prop, depth);
 		if (r != 2)
 			return r;
 		return prove_core(prop, depth);
@@ -1017,6 +1071,12 @@ struct Ic3Pass : Pass
 		log("        try k-induction up to depth k before the IC3 loop\n");
 		log("        (default: 8; 0 disables)\n");
 		log("\n");
+		log("    -bmc <depth>\n");
+		log("        bounded-model-checking pre-pass: ask bad@t for t = 1..depth\n");
+		log("        on a throwaway solver before k-induction and IC3; on a hit\n");
+		log("        the property is disproved without building frames\n");
+		log("        (default: 0 = disabled)\n");
+		log("\n");
 		log("    -ctg <depth>\n");
 		log("        CTG-guided generalization recursion depth, abc-pdr style\n");
 		log("        (default: 0 = disabled; experimental, can multiply\n");
@@ -1041,6 +1101,7 @@ struct Ic3Pass : Pass
 		bool verbose = false;
 		int max_frames = 1000;
 		int kind_max = 8;
+		int bmc_max = 0;
 		int ctg_depth_max = 0;
 
 		log_header(design, "Executing IC3 pass (safety and liveness model checking).\n");
@@ -1069,6 +1130,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-ctg") {
 				ctg_depth_max = atoi(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-bmc") {
+				bmc_max = atoi(args[++argidx].c_str());
 				continue;
 			}
 			if (args[argidx] == "-cex") {
@@ -1147,6 +1212,7 @@ struct Ic3Pass : Pass
 			Ic3Solver solver(module, init_zero, max_frames);
 			solver.assume_cells = assumes;
 			solver.kind_max = kind_max;
+			solver.bmc_max = bmc_max;
 			solver.ctg_depth_max = ctg_depth_max;
 
 			int depth = 0;
@@ -1189,6 +1255,7 @@ struct Ic3Pass : Pass
 			Ic3Solver solver(module, init_zero, max_frames);
 			solver.assume_cells = assumes;
 			solver.kind_max = kind_max;
+			solver.bmc_max = bmc_max;
 			solver.ctg_depth_max = ctg_depth_max;
 
 			int depth = 0;

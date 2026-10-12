@@ -2636,6 +2636,16 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 	}
 
+	// IEEE 1800-2009 17.2: a checker declaration is a template. Its body is
+	// cloned and elaborated per instantiation (below), so the declaration
+	// itself must not be simplified in place -- doing so would flatten the
+	// body into the module and leave the template empty.
+	if (type == AST_SVA && str == "checker_decl") {
+		basic_prep = true;
+		recursion_counter--;
+		return false;
+	}
+
 	// IEEE 1800-2009 6.19.5: enum.next / enum.prev walk the declaration order and wrap.
 	// first, last, and num are properties of the type, including a typedef name.
 	std::string enum_method, enum_prefix;
@@ -3748,6 +3758,346 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 							child->children[0]->type == AST_IDENTIFIER && child->children[0]->str == "\\$global_clock")
 						current_always_clocked = true;
 				}
+		}
+	}
+
+	// IEEE 1800-2009 17.3: a checker instantiation is expanded inline at the
+	// AST level, the way sva2check's inline_decl inlines named sequence/
+	// property instances at the RTLIL level: the actual argument expression
+	// textually replaces the formal everywhere in the cloned body. AST-level
+	// inlining is used (instead of an RTLIL route) so checker-local
+	// declarations can be renamed per instance and the body composes with
+	// generate blocks like any other module items.
+	if (type == AST_CELL && GetSize(children) >= 1 && children[0]->type == AST_CELLTYPE && !children[0]->str.empty()) {
+		AstNode *decl = nullptr;
+		auto find_checker = [&](AstNode *scope) {
+			if (!scope || decl)
+				return;
+			for (auto &ch : scope->children) {
+				if (!ch)
+					continue;
+				if (ch->type == AST_SVA && ch->str == "checker_decl" && GetSize(ch->children) >= 2 &&
+						ch->children[0]->type == AST_CELLTYPE && ch->children[0]->str == children[0]->str)
+					decl = ch.get();
+				if (ch->type == AST_PACKAGE) {
+					for (auto &inner : ch->children)
+						if (inner->type == AST_SVA && inner->str == "checker_decl" && GetSize(inner->children) >= 2 &&
+								inner->children[0]->type == AST_CELLTYPE && inner->children[0]->str == children[0]->str)
+							decl = inner.get();
+				}
+			}
+		};
+		find_checker(current_ast_mod);
+		find_checker(current_ast);
+
+		if (!decl) {
+			// A cell that came out of a checker body may only instantiate
+			// another checker; anything else is a module instance, which
+			// IEEE 1800-2009 17.2 does not allow there.
+			if (get_bool_attribute(ID(sv_in_checker)))
+				input_error("Checker instantiation of `%s' not found (module instantiations are not allowed inside checker bodies).\n",
+						children[0]->str.c_str());
+		} else {
+			int inline_depth = attributes.count(ID(checker_inline_depth)) ? attributes[ID(checker_inline_depth)]->integer : 0;
+			if (inline_depth >= 64)
+				log_error("Recursive checker instantiation involving `%s' (depth limit 64).\n", children[0]->str.c_str());
+			AstNode *decl_body = decl->children[1].get();
+			log_assert(decl_body->type == AST_GENBLOCK);
+
+			// checker formals are the AST_IDENTIFIER children after the
+			// body; an optional default expression is their first child.
+			// The trailing AST_SVA markers carry the checker's effective
+			// default clocking / disable iff.
+			std::vector<AstNode *> formals;
+			AstNode *defclock = nullptr, *defdisable = nullptr;
+			for (size_t i = 2; i < decl->children.size(); i++) {
+				AstNode *c = decl->children[i].get();
+				if (c->type == AST_IDENTIFIER)
+					formals.push_back(c);
+				else if (c->type == AST_SVA && c->str == "checker_default_clock" && GetSize(c->children) == 1)
+					defclock = c->children[0].get();
+				else if (c->type == AST_SVA && c->str == "checker_default_disable" && GetSize(c->children) == 1)
+					defdisable = c->children[0].get();
+			}
+
+			// Bind actuals: positional arguments fill formals in order,
+			// named arguments by name, `.*` picks up the same-named signal
+			// from the instantiation scope, and remaining formals fall back
+			// to their default expression.
+			dict<std::string, AstNode *> actuals;
+			std::vector<AstNode *> positional;
+			for (size_t i = 1; i < children.size(); i++) {
+				AstNode *c = children[i].get();
+				if (c->type == AST_PARASET)
+					input_error("Checker instance `%s' of `%s' takes no parameters (checkers are not parametric).\n",
+							str.c_str(), children[0]->str.c_str());
+				if (c->type != AST_ARGUMENT)
+					continue;
+				if (c->str.empty()) {
+					if (c->children.empty())
+						input_error("Checker instance `%s' has an empty positional port connection.\n", str.c_str());
+					positional.push_back(c->children[0].get());
+				} else {
+					AstNode *match = nullptr;
+					for (auto f : formals)
+						if (f->str == c->str)
+							match = f;
+					if (!match)
+						input_error("Checker instance `%s' connects unknown port `%s'.\n", str.c_str(), c->str.c_str());
+					// an explicitly empty named connection `.x()' leaves
+					// the port to its default, like an omitted port
+					if (!c->children.empty())
+						actuals[match->str] = c->children[0].get();
+				}
+			}
+			std::vector<std::unique_ptr<AstNode>> owned_actuals;
+			size_t posi = 0;
+			for (auto f : formals) {
+				if (actuals.count(f->str))
+					continue;
+				if (posi < positional.size()) {
+					actuals[f->str] = positional[posi++];
+					continue;
+				}
+				if (get_bool_attribute(ID::wildcard_port_conns) && current_scope.count(f->str)) {
+					auto id = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+					id->str = f->str;
+					owned_actuals.push_back(std::move(id));
+					actuals[f->str] = owned_actuals.back().get();
+					continue;
+				}
+				if (!f->children.empty()) {
+					actuals[f->str] = f->children[0].get();
+					continue;
+				}
+				input_error("Checker port `%s' of `%s' is not connected and has no default.\n",
+						f->str.c_str() + 1, children[0]->str.c_str() + 1);
+			}
+
+			auto body = decl_body->clone();
+			std::string pfx = str + "$";
+
+			// Pass 1: collect the checker's local declaration names (data
+			// objects, functions, sequence/property/let/nested checker
+			// declarations, named genblocks) so the clone can be renamed
+			// without colliding across instances of the same checker.
+			dict<std::string, std::string> rename;
+			std::function<void(AstNode *)> collect_names = [&](AstNode *node) {
+				for (auto &ch : node->children) {
+					AstNode *c = ch.get();
+					if (!c)
+						continue;
+					switch (c->type) {
+					case AST_WIRE:
+					case AST_MEMORY:
+					case AST_PARAMETER:
+					case AST_LOCALPARAM:
+					case AST_TYPEDEF:
+					case AST_FUNCTION:
+					case AST_TASK:
+					case AST_GENVAR:
+					case AST_GENBLOCK:
+						if (!c->str.empty())
+							rename[c->str] = pfx + (c->str.front() == '\\' ? c->str.substr(1) : c->str);
+						break;
+					case AST_ENUM:
+						if (!c->str.empty())
+							rename[c->str] = pfx + (c->str.front() == '\\' ? c->str.substr(1) : c->str);
+						for (auto &item : c->children)
+							if (item->type == AST_ENUM_ITEM && !item->str.empty())
+								rename[item->str] = pfx + (item->str.front() == '\\' ? item->str.substr(1) : item->str);
+						break;
+					case AST_SVA:
+						if ((c->str == "sequence_decl" || c->str == "property_decl" || c->str == "let_decl" ||
+									c->str == "checker_decl") && GetSize(c->children) >= 1 && !c->children[0]->str.empty())
+							rename[c->children[0]->str] = pfx + (c->children[0]->str.front() == '\\' ? c->children[0]->str.substr(1) : c->children[0]->str);
+						break;
+					default:
+						break;
+					}
+					collect_names(c);
+				}
+			};
+			collect_names(body.get());
+
+			// Pass 2: rename declarations and their references in the
+			// clone. Actual argument expressions are spliced in pass 3, so
+			// they are never touched by this renaming and keep resolving in
+			// the instantiation scope (the inline_decl semantics).
+			std::function<void(AstNode *)> rename_node = [&](AstNode *node) {
+				for (auto &ch : node->children) {
+					AstNode *c = ch.get();
+					if (!c)
+						continue;
+					switch (c->type) {
+					case AST_WIRE:
+					case AST_MEMORY:
+					case AST_PARAMETER:
+					case AST_LOCALPARAM:
+					case AST_TYPEDEF:
+					case AST_TASK:
+					case AST_GENVAR:
+					case AST_GENBLOCK:
+						if (rename.count(c->str))
+							c->str = rename.at(c->str);
+						break;
+					case AST_FUNCTION:
+						if (rename.count(c->str)) {
+							std::string old = c->str;
+							c->str = rename.at(c->str);
+							c->replace_result_wire_name_in_function(old, c->str);
+						}
+						break;
+					case AST_ENUM:
+						if (rename.count(c->str))
+							c->str = rename.at(c->str);
+						for (auto &item : c->children)
+							if (item->type == AST_ENUM_ITEM && rename.count(item->str))
+								item->str = rename.at(item->str);
+						break;
+					case AST_IDENTIFIER:
+					case AST_FCALL:
+					case AST_TCALL:
+					case AST_WIRETYPE:
+						if (rename.count(c->str))
+							c->str = rename.at(c->str);
+						break;
+					case AST_SVA:
+						if ((c->str == "sequence_decl" || c->str == "property_decl" || c->str == "let_decl" ||
+									c->str == "checker_decl") && GetSize(c->children) >= 1 && rename.count(c->children[0]->str))
+							c->children[0]->str = rename.at(c->children[0]->str);
+						break;
+					case AST_CELL:
+						// nested checker instance: unique instance name for
+						// the next expansion round, and its type must follow
+						// a renamed nested checker declaration. Instance names
+						// are not in the rename map, so prefix them directly.
+						if (!c->str.empty()) {
+							if (rename.count(c->str))
+								c->str = rename.at(c->str);
+							else
+								c->str = pfx + (c->str.front() == '\\' ? c->str.substr(1) : c->str);
+						}
+						if (GetSize(c->children) >= 1 && c->children[0]->type == AST_CELLTYPE && rename.count(c->children[0]->str))
+							c->children[0]->str = rename.at(c->children[0]->str);
+						c->set_attribute(ID(checker_inline_depth), AstNode::mkconst_int(c->location, inline_depth + 1, false));
+						break;
+					case AST_ASSERT:
+					case AST_ASSUME:
+					case AST_LIVE:
+					case AST_FAIR:
+					case AST_COVER:
+						// Labels keep their source name so property verdicts
+						// stay keyed by the label the user wrote; genrtlil's
+						// duplicate-name fallback uniquifies later instances.
+						break;
+					default:
+						break;
+					}
+					rename_node(c);
+				}
+			};
+			rename_node(body.get());
+
+			// Pass 3: substitute the formals with the actual expressions.
+			// Identifiers renamed in pass 2 are checker-local references
+			// and never formal references, so plain name matching is enough.
+			std::function<void(AstNode *)> subst_formals = [&](AstNode *node) {
+				for (auto &ch : node->children) {
+					AstNode *c = ch.get();
+					if (!c)
+						continue;
+					if (c->type == AST_IDENTIFIER && actuals.count(c->str)) {
+						actuals.at(c->str)->clone()->cloneInto(*c);
+						continue;
+					}
+					subst_formals(c);
+				}
+			};
+			subst_formals(body.get());
+			fixup_hierarchy_flags();
+
+			// Pass 4: the checker's own `default clocking` / `default
+			// disable iff` applies to concurrent assertions without an
+			// explicit clocking event (assertions parsed before the
+			// declaration were not covered by the parser state).
+			if (defclock || defdisable) {
+				std::function<void(AstNode *)> apply_clock = [&](AstNode *node) {
+					for (auto &ch : node->children) {
+						AstNode *c = ch.get();
+						if (!c)
+							continue;
+						if ((c->type == AST_ASSERT || c->type == AST_ASSUME || c->type == AST_COVER ||
+								c->type == AST_LIVE || c->type == AST_FAIR) &&
+								GetSize(c->children) >= 1 && c->get_bool_attribute(ID(sv_concurrent))) {
+							AstNode *spec = c->children[0].get();
+							if (spec->type == AST_SVA && spec->str == "spec") {
+								if (defclock && GetSize(spec->children) >= 1 && spec->children[0]->type == AST_SVA &&
+										spec->children[0]->str == "no_clock")
+									defclock->clone()->cloneInto(*(spec->children[0]));
+								if (defdisable && GetSize(spec->children) >= 2 && spec->children[1]->type == AST_SVA &&
+										spec->children[1]->str == "no_disable")
+									defdisable->clone()->cloneInto(*(spec->children[1]));
+							} else {
+								// no spec node at all: wrap the body in one
+								auto wrapped = std::make_unique<AstNode>(location, AST_SVA);
+								wrapped->str = "spec";
+								wrapped->children.push_back(defclock ? defclock->clone() : std::make_unique<AstNode>(location, AST_SVA));
+								if (!defclock)
+									wrapped->children[0]->str = "no_clock";
+								wrapped->children.push_back(defdisable ? defdisable->clone() : std::make_unique<AstNode>(location, AST_SVA));
+								if (!defdisable)
+									wrapped->children[1]->str = "no_disable";
+								wrapped->children.push_back(c->children[0]->clone());
+								wrapped->cloneInto(*(c->children[0]));
+							}
+						}
+						apply_clock(c);
+					}
+				};
+				apply_clock(body.get());
+			}
+
+			// Flatten the elaborated body into the enclosing module, like
+			// the unconditional-generate-block case does, and consume the
+			// instance cell. The body's own declarations are registered in
+			// the scope as they are flattened: the module's registration
+			// pass only runs at the start of a simplify call, so a sibling
+			// (e.g. an assertion calling a checker-local function) would
+			// otherwise miss them within this round.
+			for (auto &ch : body->children) {
+				if (!ch)
+					continue;
+				switch (ch->type) {
+				case AST_WIRE:
+				case AST_MEMORY:
+				case AST_PARAMETER:
+				case AST_LOCALPARAM:
+				case AST_FUNCTION:
+				case AST_TASK:
+				case AST_TYPEDEF:
+				case AST_GENVAR:
+					current_scope[ch->str] = ch.get();
+					break;
+				case AST_ENUM:
+					current_scope[ch->str] = ch.get();
+					for (auto &item : ch->children)
+						if (item->type == AST_ENUM_ITEM)
+							current_scope[item->str] = item.get();
+					break;
+				default:
+					break;
+				}
+				ch->simplify(const_fold, stage, -1, false);
+				current_ast_mod->children.push_back(std::move(ch));
+			}
+			body->children.clear();
+
+			auto none = std::make_unique<AstNode>(location, AST_NONE);
+			none->cloneInto(*this);
+			fixup_hierarchy_flags();
+			recursion_counter--;
+			return true;
 		}
 	}
 

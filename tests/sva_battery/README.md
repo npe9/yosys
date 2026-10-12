@@ -32,6 +32,13 @@ expression proves the engine honors the assumption).
 ## File classes
 
 - `t*.sv` — the green battery. Run all: `for f in t*.sv; do ...`.
+- `tchk*.sv` — checker blocks (IEEE 1800-2009 17): checkers as reusable
+  property containers (ports, nested instantiation, checker-local
+  variables renamed per instance, `default clocking` inside a checker).
+  Instances are inlined at the AST during simplify, so verdicts keep the
+  assertion labels from the checker body; a checker instantiated more
+  than once reports the first instance's copies under the bare labels and
+  later ones under genrtlil's auto-suffixed duplicates.
 - `xlive*.sv` — liveness (`s_eventually` of a plain expression), handled
   by ic3's native two-phase gfp engine, not by BMC (`run_bmc.py` does not
   support liveness). Expectations are `// PROVED` / `// DIS` with no `@N`

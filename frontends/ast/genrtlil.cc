@@ -2567,6 +2567,11 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 	// boolean net is returned so assert/assume/cover can still build a $check.
 	// It is not a temporal evaluator: plain booleans stay ordinary expressions.
 	case AST_SVA:
+		// A checker declaration is a template: instantiations were inlined
+		// during simplify, and an uninstantiated checker compiles to
+		// nothing.
+		if (str == "checker_decl")
+			break;
 		{
 			static bool warned = false;
 			if (!warned && str != "sequence_decl" && str != "property_decl" && str != "let_decl") {

@@ -92,6 +92,16 @@
 			// IEEE 1800-2009 default clocking / default disable iff (clause 16).
 			std::unique_ptr<AstNode> sva_default_clock;
 			std::unique_ptr<AstNode> sva_default_disable;
+			// IEEE 1800-2009 17.2: checker formal ports (identifier with an
+			// optional default-expression child) collected while parsing a
+			// checker header, plus the enclosing default clocking/disable
+			// restored at endchecker.
+			std::vector<std::unique_ptr<AstNode>> checker_formals;
+			std::unique_ptr<AstNode> checker_clk_backup;
+			std::unique_ptr<AstNode> checker_dis_backup;
+			// Nonzero while parsing a checker body: assertions get tagged
+			// so checker expansion can apply the checker's default clocking.
+			int in_checker = 0;
 			// Condition of the immediate assertion whose else-statement is being parsed.
 			std::unique_ptr<AstNode> pending_assert_cond;
 			bool collecting_let_ports = false;
@@ -564,6 +574,76 @@
 		extra->saveChild(std::move(wire));
 	}
 
+	// IEEE 1800-2009 17.2: a checker body holds assertion, declaration, and
+	// generate items only. The body is parsed via module_body, so items that
+	// are legal in modules but not in checkers are rejected here with a
+	// pointed message instead of being silently mis-elaborated. Checker
+	// instantiations are tagged so that simplify can tell an unresolved
+	// checker name apart from an illegal module instance.
+	// An AST_INITIAL whose block holds only assignment statements is a
+	// variable initializer from `logic x = e;`, not procedural modeling
+	// code; those elaborate like a module-level initial value.
+	static bool checker_is_var_init(AstNode *n)
+	{
+		if (n->type != AST_INITIAL || n->children.size() != 1 ||
+				n->children[0]->type != AST_BLOCK)
+			return false;
+		for (auto &stmt : n->children[0]->children)
+			if (stmt->type != AST_ASSIGN_LE && stmt->type != AST_ASSIGN_EQ)
+				return false;
+		return true;
+	}
+
+	static void checker_body_check(AstNode *node)
+	{
+		for (auto &child : node->children) {
+			AstNode *n = child.get();
+			if (!n)
+				continue;
+			switch (n->type) {
+			case AST_ALWAYS:
+				err_at_loc(n->location, "Procedural modeling code (always/initial/final) in a checker is not supported.");
+				break;
+			case AST_INITIAL:
+				if (checker_is_var_init(n))
+					break;
+				err_at_loc(n->location, "Procedural modeling code (always/initial/final) in a checker is not supported.");
+				break;
+			case AST_ASSIGN:
+				err_at_loc(n->location, "Continuous assignments in a checker are not supported.");
+				break;
+			case AST_PRIMITIVE:
+				err_at_loc(n->location, "Primitive instances in a checker are not supported.");
+				break;
+			case AST_DEFPARAM:
+				err_at_loc(n->location, "defparam in a checker is not supported.");
+				break;
+			case AST_TASK:
+				err_at_loc(n->location, "Task declarations in a checker are not supported (functions are allowed).");
+				break;
+			case AST_CLASS:
+				err_at_loc(n->location, "Class declarations in a checker are not supported.");
+				break;
+			case AST_CELLARRAY:
+				err_at_loc(n->location, "Checker instance arrays are not supported.");
+				break;
+			case AST_CELL:
+				// module instantiations inside checkers are rejected in
+				// simplify once the name turns out not to be a checker
+				n->set_attribute(ID(sv_in_checker), AstNode::mkconst_int(n->location, 1, false));
+				break;
+			case AST_GENBLOCK:
+			case AST_GENIF:
+			case AST_GENFOR:
+			case AST_GENCASE:
+				checker_body_check(n);
+				break;
+			default:
+				break;
+			}
+		}
+	}
+
 	void frontend_verilog_yy::parser::error(const frontend_verilog_yy::parser::location_type& loc, const std::string& msg)
 	{
 		err_at_loc(loc, "%s", msg);
@@ -721,6 +801,7 @@
 %type <ast_t> sva_until sva_iff sva_or sva_and sva_not sva_intersect sva_within sva_throughout
 %type <ast_t> sva_concat sva_delay_tail sva_repeat sva_bool sva_bexpr sva_primary sva_cycle sva_bounds sva_bounds_tail sva_msg sva_msg_args sva_action
 %type <ast_t> sva_case_items sva_matches sva_inside_items
+%type <ast_t> checker_port_default
 
 %type <specify_target_ptr_t> specify_target
 %type <specify_triple_ptr_t> specify_triple specify_opt_triple
@@ -1940,11 +2021,79 @@ module_body_stmt:
 	sva_sequence_decl | sva_property_decl | sva_let_decl | clocking_decl | import_stmt | sva_default_disable |
 	dpi_export_decl | bind_stmt | class_decl;
 
+checker_port_default:
+	TOK_EQ expr {
+		$$ = std::move($2);
+	} |
+	%empty {
+		$$ = nullptr;
+	};
+
+checker_port_tok:
+	TOK_UNTYPED | TOK_SEQUENCE | TOK_PROPERTY | TOK_INTEGER | TOK_INT |
+	TOK_LOGIC | TOK_REG |
+	%empty;
+
+checker_port_item:
+	checker_port_tok TOK_ID checker_port_default {
+		// IEEE 1800-2009 17.2: the formal's type (property/sequence/untyped)
+		// does not affect the synchronous compiled semantics; expansion is a
+		// textual substitution of the actual for the formal (like named
+		// property/sequence instances), so only the name and the optional
+		// default expression are kept.
+		auto formal = std::make_unique<AstNode>(@2, AST_IDENTIFIER);
+		formal->str = *$2;
+		if ($3)
+			formal->children.push_back(std::move($3));
+		extra->checker_formals.push_back(std::move(formal));
+	};
+
+checker_port_list:
+	checker_port_item |
+	checker_port_list TOK_COMMA checker_port_item;
+
+checker_ports_opt:
+	%empty |
+	TOK_LPAREN checker_port_list optional_comma TOK_RPAREN;
+
 checker_decl:
-	TOK_CHECKER TOK_ID TOK_SEMICOL {
-		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_GENBLOCK));
-		node->str = *$2;
-	} module_body TOK_ENDCHECKER {
+	TOK_CHECKER TOK_ID {
+		extra->checker_formals.clear();
+	} checker_ports_opt TOK_SEMICOL {
+		auto id = std::make_unique<AstNode>(@2, AST_CELLTYPE);
+		id->str = *$2;
+		auto node = mk_sva(location_range(@1, @5), "checker_decl");
+		node->children.push_back(std::move(id));
+		// children[1]: body container the module_body items parse into
+		AstNode *n = extra->pushChild(std::move(node));
+		(void)n;
+		(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_GENBLOCK));
+		// A checker's own default clocking/disable applies to assertions
+		// inside it and is restored at endchecker; a checker without one
+		// inherits the enclosing scope's via the parser state.
+		extra->checker_clk_backup = std::move(extra->sva_default_clock);
+		extra->checker_dis_backup = std::move(extra->sva_default_disable);
+		extra->in_checker++;
+	} module_body TOK_ENDCHECKER opt_label {
+		checkLabelsMatch(@8, "Checker label", $2.get(), $9.get());
+		extra->ast_stack.pop_back();
+		AstNode *node = extra->ast_stack.back();
+		log_assert(node->type == AST_SVA && node->str == "checker_decl");
+		for (auto &formal : extra->checker_formals)
+			node->children.push_back(std::move(formal));
+		extra->checker_formals.clear();
+		// Record the effective default clocking/disable (own or inherited)
+		// so expansion can retrofit assertions parsed before the
+		// `default clocking` declaration.
+		if (extra->sva_default_clock)
+			node->children.push_back(sva_add(mk_sva(@$, "checker_default_clock"), extra->sva_default_clock->clone()));
+		if (extra->sva_default_disable)
+			node->children.push_back(sva_add(mk_sva(@$, "checker_default_disable"), extra->sva_default_disable->clone()));
+		extra->sva_default_clock = std::move(extra->checker_clk_backup);
+		extra->sva_default_disable = std::move(extra->checker_dis_backup);
+		log_assert(GetSize(node->children) >= 2 && node->children[1]->type == AST_GENBLOCK);
+		checker_body_check(node->children[1].get());
+		extra->in_checker--;
 		extra->ast_stack.pop_back();
 	};
 
@@ -4136,6 +4285,12 @@ sva_concurrent:
 			SET_AST_NODE_LOC(node.get(), ($1 != nullptr ? @1 : @2), @6);
 			if ($1 != nullptr)
 				node->str = *$1;
+			// Checker expansion retrofits the checker's own `default
+			// clocking` onto clock-less concurrent assertions; the tag
+			// distinguishes them from plain immediate assertions, which
+			// take no clocking event.
+			if (extra->in_checker)
+				node->set_attribute(ID(sv_concurrent), AstNode::mkconst_int(@2, 1, false));
 			extra->saveChild(std::move(node));
 		}
 	} |

@@ -1,0 +1,1 @@
+module tfix_b_tb; logic clk=0; logic [3:0] tag=0; wire [7:0] y; tfix_b dut(clk,tag,y); always #5 clk=~clk; initial begin #12 tag=4'b0001; #10 tag=4'b0000; #10 $display("tag0 y=%02x (expect 66)",y); $finish; end always @(negedge clk) $display("y=%02x tag=%b",y,tag); endmodule

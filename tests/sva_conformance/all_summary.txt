@@ -1,0 +1,19 @@
+Conformance sweep 2026-10-12 (RTL scope: files with SVA keywords, dv/tb/uvm/sim components filtered)
+Harness: conformance/prim_assert.sv complete lowRISC macro set + run_corpus.py fragment prelude
+opentitan-rtl 345/345
+ibex-rtl      142/142
+cva6           61/61  (hpdcache submodule initialized; its own 14 SVA files also 14/14)
+core-v-verif   17/17
+axi4-fvip      15/15
+caliptra-rtl   88/88
+TOTAL         668/668
+Zero frontend changes were needed for this sweep: every failure class was
+harness-side (missing macro definitions, assertion-fragment files without
+their include) or environment (uninitialized submodule). Constructs
+verified parsing along the way: package constant functions with
+negative-size arrays, empty macro arguments with defaults, hierarchical
+references into child instances inside property expressions, sec_cm
+security-countermeasure property shapes, PRIM_FLOP_SPARSE_FSM hooks.
+Known out-of-scope (recorded in PLAN gap register): TB-land randomize-
+with constraints and UVM class code (dv components), liveness operators
+beyond s_eventually, mid-sequence clock switches.

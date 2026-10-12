@@ -38,6 +38,10 @@ expression proves the engine honors the assumption).
   (v1 disproofs report depth 0; lasso-witness export is out of scope).
   Read the verdict lines manually -- files with a `DIS` expectation exit
   nonzero from `run_ic3.py` by design.
+- `tmcloc1.sv` — multiclock local-variable scoreboard (8-bit data,
+  strong `##[2:3]`, DIS pair). Ic3-stress: the slot/island state space
+  grinds generalization (t7 class); use `--timeout 500`. `tmcloc2.sv`
+  is the green 1-bit sibling (in the `t*.sv` glob).
 - `xfifo_dist.sv` — stress case, outside the `t*.sv` glob on purpose:
   pointer-distance invariants of a two-clock async FIFO that are ic3-hard
   (CTI explosion near stale-flag boundaries) and k-induction-hard

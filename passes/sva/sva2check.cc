@@ -117,6 +117,14 @@ struct SvaCompiler {
 	int nslots = 0;
 	SigSpec age;
 	SigSpec phase;   // runtime tick counter mod nslots (slot ring address base)
+	// multi-clock consequent island (v1): reads-only bridge for locals.
+	// Every local known at the handoff gets a shift chain on the consequent
+	// clock; stage 0 loads the outer ring's value (combinatorial at the
+	// handoff tick, stable for the rest of the outer cycle) under the
+	// island-start pulse, stage k shifts once per consequent tick.  Island
+	// reads select the stage by the island age vector; writes are rejected.
+	bool island_mode = false;
+	dict<Wire *, std::vector<Wire *>> island_chains;
 	// raw (un-spliced) gate expression set by `throughout`: re-spliced at
 	// the compile-time age current at each gate consumption point, so a
 	// gate referencing local variables reads the slot of the tick it
@@ -1018,6 +1026,22 @@ struct SvaCompiler {
 	{
 		if (read_cache.count(xw) && read_cache[xw].first == slot_epoch)
 			return read_cache[xw].second;
+		if (island_mode) {
+			// multi-clock consequent island: the value crossed the clock
+			// boundary in a shift chain (stage 0 = value at the handoff
+			// pulse, stage k = k consequent ticks later); reads select the
+			// stage by the island age vector -- the ring and phase are not
+			// reachable from the consequent clock
+			auto it = island_chains.find(xw);
+			if (it == island_chains.end())
+				log_error("sva2check: internal: island read of unknown local %s.\n", log_id(xw));
+			auto &chain = it->second;
+			SigSpec v = Const(0, chain[0]->width);
+			for (int k = (int)chain.size() - 1; k >= 0; k--)
+				v = mod->Mux(NEW_ID, v, chain[k], age[k]);
+			read_cache[xw] = {slot_epoch, v};
+			return v;
+		}
 		SlotFile &sf = slotfiles[xw];
 		if (sf.q.empty()) {
 			// read before any write: materialize an undriven slot file so
@@ -1067,6 +1091,8 @@ struct SvaCompiler {
 		auto ap = ports_of(a);
 		if (GetSize(ap) < 2)
 			return;
+		if (island_mode)
+			log_error("sva2check: local variable assignments in a multi-clock consequent are not supported in v1 (%s).\n", log_id(a));
 		SigSpec xs = a->getPort(ap[0]);
 		// the target names the body-declared local; inside an instance its
 		// slot file is keyed by the fresh lmap wire
@@ -2177,8 +2203,6 @@ struct SvaCompiler {
 							(iclk[0] != clk[0] || ipos != clk_pos)) {
 						if (clone_scope)
 							log_error("sva2check: multi-clock consequent inside an instantiated property/sequence is not supported in v1 (%s).\n", log_id(n));
-						if (slots_mode)
-							log_error("sva2check: local variables with a multi-clock consequent are not supported in v1 (%s).\n", log_id(n));
 						SigSpec cbody = cc->getPort(ID(B));
 						Cell *cbc = child_cell(cbody);
 						if (cbc && !is_seq_op(sva_op(cbc)))
@@ -2191,6 +2215,13 @@ struct SvaCompiler {
 						bool opos = clk_pos;
 						Wire *pastw = wn("mcpastclk");
 						mod->addFf(NEW_ID, oclk, pastw);
+						// init so edge_prev is false at the init step:
+						// with pastw=0 a clock starting high at step 0
+						// false-triggers oedge while no wr-domain state
+						// ticks there, handing the island a match whose
+						// captured data does not exist yet (tmcloc1 data
+						// cex).  Matches clk2fflogic's own past-clk init.
+						pastw->attributes[ID::init] = RTLIL::Const(opos ? State::S1 : State::S0, 1);
 						SigSpec edge_now = opos ? oclk : mod->Not(NEW_ID, oclk);
 						SigSpec edge_prev = opos ? mod->Not(NEW_ID, SigSpec(pastw)) : SigSpec(pastw);
 						SigSpec oedge = mod->And(NEW_ID, edge_now, edge_prev);
@@ -2208,12 +2239,61 @@ struct SvaCompiler {
 						SigSpec ss = reg(s_level, "mcstart");
 						SigSpec pss = reg(ss, "mcstart");
 						SigSpec pulse = mod->And(NEW_ID, ss, mod->Not(NEW_ID, pss));
+						// locals: carry every known local across the
+						// handoff in a shift chain on the consequent
+						// clock.  stage 0 loads the outer ring's value
+						// (combinatorial at the handoff tick; the ring,
+						// phase and age are stable for the rest of the
+						// outer cycle, and s_level guarantees the pulse
+						// fires inside it); stage k shifts once per
+						// consequent tick.  Reads inside the island
+						// select the stage by the island age vector.
+						// Writes in the island are rejected (v1).
+						if (slots_mode) {
+							int span = cbc ? seq_max_len(cbc) : 0;
+							int L = std::min(nslots, span + 1);
+							for (auto &kv : slotfiles) {
+								Wire *xw = kv.first;
+								SigSpec ov = local_read(xw);
+								std::vector<Wire *> chain(L);
+								for (int k = 0; k < L; k++) {
+									chain[k] = wn("mcslot", ov.size());
+									// stage 0 is gated by s_level (not the
+									// registered pulse): it must sample ov
+									// AT the first inner edge of the
+									// handoff so its Q is valid during the
+									// island's tick-0 window; a pulse-based
+									// enable lands one inner tick late and
+									// shifts the whole chain off by one
+									SigSpec d = k == 0
+											? mod->Mux(NEW_ID, SigSpec(chain[0]), ov, s_level)
+											: SigSpec(chain[k - 1]);
+									mod->addDff(NEW_ID, iclk[0], d, chain[k], ipos);
+								}
+								island_chains[xw] = chain;
+							}
+						}
+						SigSpec saved_age = age;
+						if (slots_mode) {
+							island_mode = true;
+							age = Const(0, nslots);
+							age = sigset(age, 0, pulse);
+							slot_epoch++;
+						}
 						SigSpec r;
 						if (cbc)
 							r = strong_seq_fail(cbc, pulse);
-						else
+						else {
+							static std::vector<Wire *> no_formals;
 							r = andN({pulse,
-									mod->Not(NEW_ID, reduce1(resolve(cbody)))});
+									mod->Not(NEW_ID, reduce1(splice_expr(cbody, no_formals, false)))});
+						}
+						if (slots_mode) {
+							island_mode = false;
+							island_chains.clear();
+							age = saved_age;
+							slot_epoch++;
+						}
 						clk = saved_clk;
 						clk_pos = saved_pos;
 						return r;
@@ -3104,7 +3184,11 @@ struct Sva2CheckPass : public Pass {
 				std::vector<Cell *> drop;
 				pool<Cell *> seen;
 				auto enqueue = [&](Cell *c) {
-					if (c && !seen.count(c) && !decl_bodies.count(c)) {
+					// a cell already removed during compilation (cloned
+					// trees, sampled-value lowering) must not be dropped
+					// again: module->remove() deletes the object
+					if (c && c->module == mod && mod->cell(c->name) == c &&
+							!seen.count(c) && !decl_bodies.count(c)) {
 						seen.insert(c);
 						drop.push_back(c);
 					}

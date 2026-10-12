@@ -699,6 +699,93 @@ struct Ic3Solver
 		return prove_core(prop, depth);
 	}
 
+	// Write a Yosys witness (.yw) for a safety disproof at `depth`: walk
+	// init -> s_1 -> ... -> s_depth (bad) through the shared encoding,
+	// recording the input valuation at each step.  Mirrors smtbmc's yw
+	// (input signals per step, LSB at the highest string index); the
+	// replay design re-derives register states itself, so it must be
+	// prepped EXACTLY like the ic3 run (same setundef -init -zero when
+	// -init-zero was used).
+	void export_cex(const std::string &file, int depth)
+	{
+		if (state1.empty()) {
+			log_warning("ic3: cex export needs a state vector; skipped.\n");
+			return;
+		}
+		std::vector<Wire *> inports;
+		std::vector<int> inwidth;
+		std::vector<std::vector<int>> inlit;
+		size_t total_bits = 0;
+		for (auto w : module->wires())
+			if (w->port_input) {
+				inports.push_back(w);
+				inlit.push_back(satgen.importSigSpec(w, 1));
+				inwidth.push_back(GetSize(inlit.back()));
+				total_bits += inwidth.back();
+			}
+		// model vector: state2 (successor state) then all input bits
+		std::vector<int> mvec = state2;
+		for (auto &l : inlit)
+			mvec.insert(mvec.end(), l.begin(), l.end());
+
+		std::vector<std::string> steps;
+		std::vector<int> curcube(state1.size(), 0);
+		int nsteps = std::max(depth, 1);
+		for (int i = 0; i < nsteps; i++) {
+			std::vector<int> assumptions;
+			if (i == 0)
+				push_assum(assumptions, -init_act);
+			else
+				push_cube(assumptions, curcube, state1);
+			std::vector<bool> model;
+			if (!solve_model(assumptions, mvec, model)) {
+				log_error("ic3: cex replay walk broke at step %d -- internal error.\n", i);
+				return;
+			}
+			std::string bits(total_bits, '0');
+			size_t off = 0;
+			for (size_t p = 0; p < inports.size(); p++) {
+				for (int b = 0; b < inwidth[p]; b++) {
+					if (model[GetSize(state2) + off + b])
+						bits[total_bits - 1 - (off + b)] = '1';
+				}
+				off += inwidth[p];
+			}
+			steps.push_back(bits);
+			for (int j = 0; j < GetSize(state1); j++)
+				curcube[j] = model[j] ? state1[j] : -state1[j];
+		}
+		// the final state must violate the property
+		{
+			std::vector<int> assumptions;
+			push_cube(assumptions, curcube, state1);
+			assumptions.push_back(bad1);
+			if (!solve_assum(assumptions))
+				log_warning("ic3: cex final state does not satisfy bad -- depth mismatch?\n");
+		}
+
+		FILE *f = fopen(file.c_str(), "w");
+		if (!f) {
+			log_error("ic3: cannot open %s for writing.\n", file.c_str());
+			return;
+		}
+		fprintf(f, "{\n  \"format\": \"Yosys Witness Trace\",\n  \"generator\": \"yosys-ic3\",\n  \"clocks\": [],\n  \"signals\": [\n");
+		for (size_t p = 0; p < inports.size(); p++) {
+			std::string esc;
+			for (char ch : inports[p]->name.str())
+				esc += ch == '\\' ? "\\\\" : std::string(1, ch);
+			fprintf(f, "    {\"path\": [\"%s\"], \"width\": %d, \"offset\": 0, \"init_only\": false}%s\n",
+					esc.c_str(), inwidth[p], p + 1 == inports.size() ? "" : ",");
+		}
+		fprintf(f, "  ],\n  \"steps\": [\n");
+		for (size_t i = 0; i < steps.size(); i++)
+			fprintf(f, "    {\"bits\": \"%s\"}%s\n", steps[i].c_str(), i + 1 == steps.size() ? "" : ",");
+		fprintf(f, "  ]\n}\n");
+		fclose(f);
+		log("ic3: counterexample witness written to %s (%d steps)\n", file.c_str(), GetSize(steps));
+		log("ic3: replay: same prep, then `sim -r %s -vcd trace.vcd -n %d`\n", file.c_str(), GetSize(steps));
+	}
+
 	// --- liveness (v1) ----------------------------------------------------
 	// F p ("assert property (s_eventually p)", lowered by sva2check to a
 	// FLAVOR "liveness" $check with A = p) is FALSE iff there is a
@@ -886,7 +973,8 @@ struct Ic3Pass : Pass
 	void help() override
 	{
 		log("\n");
-		log("    ic3 [-top <name>] [-check-cells] [-init-zero] [-max <frames>] [-kind <k>] [-v]\n");
+		log("    ic3 [-top <name>] [-check-cells] [-init-zero] [-max <frames>] [-kind <k>]\n");
+		log("        [-ctg <depth>] [-cex <prefix>] [-v]\n");
 		log("\n");
 		log("Proves (or disproves) the safety properties given as $assert cells and\n");
 		log("$check cells with FLAVOR \"assert\" in the selected module, using the\n");
@@ -904,6 +992,12 @@ struct Ic3Pass : Pass
 		log("have a free (nondeterministic) initial state unless -init-zero is\n");
 		log("given, which forces all registers to start at zero. Disproofs are\n");
 		log("reported with the frame at which a bad state was found.\n");
+		log("\n");
+		log("With -cex <prefix>, each disproved safety property additionally writes a\n");
+		log("Yosys witness <prefix><property>.yw of the counterexample (input\n");
+		log("valuations per step; replay with the SAME prep and\n");
+		log("`sim -r <file>.yw -vcd trace.vcd`). Liveness disproofs do not export\n");
+		log("witnesses in v1.\n");
 		log("\n");
 		log("    -top <name>\n");
 		log("        module to process (default: top module)\n");
@@ -928,6 +1022,11 @@ struct Ic3Pass : Pass
 		log("        (default: 0 = disabled; experimental, can multiply\n");
 		log("        obligations on easy properties)\n");
 		log("\n");
+		log("    -cex <prefix>\n");
+		log("        write a Yosys witness (.yw) per disproved safety property;\n");
+		log("        replay with the same prep and\n");
+		log("        `sim -r <prefix><property>.yw -vcd trace.vcd`\n");
+		log("\n");
 		log("    -v\n");
 		log("        print per-property solve statistics\n");
 		log("\n");
@@ -936,6 +1035,7 @@ struct Ic3Pass : Pass
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		std::string top_name;
+		std::string cex_prefix;
 		bool check_cells = false;
 		bool init_zero = false;
 		bool verbose = false;
@@ -969,6 +1069,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-ctg") {
 				ctg_depth_max = atoi(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-cex") {
+				cex_prefix = args[++argidx];
 				continue;
 			}
 			if (args[argidx] == "-v") {
@@ -1054,6 +1158,13 @@ struct Ic3Pass : Pass
 			} else if (result == 1) {
 				log("ic3: %s: disproved (depth %d)\n", name.c_str(), depth);
 				n_disproved++;
+				if (!cex_prefix.empty()) {
+					std::string safe = name;
+					for (auto &ch : safe)
+						if (!isalnum((unsigned char)ch) && ch != '_' && ch != '-')
+							ch = '_';
+					solver.export_cex(stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), depth);
+				}
 			} else {
 				log("ic3: %s: undecided\n", name.c_str());
 				n_undecided++;

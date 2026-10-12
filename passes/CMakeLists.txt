@@ -1,4 +1,6 @@
 add_subdirectory(cmds)
+add_subdirectory(ic3)
+add_subdirectory(sva)
 add_subdirectory(equiv)
 add_subdirectory(fsm)
 add_subdirectory(hierarchy)

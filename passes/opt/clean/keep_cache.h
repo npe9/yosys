@@ -154,6 +154,9 @@ private:
 		if (cell->type == ID($print) || cell->type == ID($check))
 			return true;
 
+		if (cell->type.in(ID($finish), ID($stop)))
+			return true;
+
 		if (cell->has_keep_attr())
 			return true;
 

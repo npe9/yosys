@@ -31,6 +31,7 @@
 #include "frontends/verilog/verilog_location.h"
 #include <stdint.h>
 #include <set>
+#include <unordered_map>
 
 YOSYS_NAMESPACE_BEGIN
 
@@ -161,7 +162,14 @@ namespace AST
 		AST_TYPEDEF,
 		AST_STRUCT,
 		AST_UNION,
-		AST_STRUCT_ITEM
+		AST_STRUCT_ITEM,
+
+		// IEEE 1800-2009 sequence/property operators. str names the operator.
+		AST_SVA,
+
+		// SystemVerilog class declaration (simulation-only; parsed for
+		// completeness, bodies are not elaborated)
+		AST_CLASS
 	};
 
 	using AstSrcLocType = Location;
@@ -232,7 +240,9 @@ namespace AST
 		// creating and deleting nodes
 		AstNode(AstSrcLocType loc, AstNodeType type = AST_NONE, std::unique_ptr<AstNode> child1 = nullptr, std::unique_ptr<AstNode> child2 = nullptr, std::unique_ptr<AstNode> child3 = nullptr, std::unique_ptr<AstNode> child4 = nullptr);
 		std::unique_ptr<AstNode> clone() const;
+	std::unique_ptr<AstNode> clone_rebased() const;
 		void cloneInto(AstNode &other) const;
+	void cloneInto(AstNode &other, std::unordered_map<const AstNode *, AstNode *> *clonemap) const;
 		void delete_children();
 		~AstNode();
 
@@ -407,6 +417,10 @@ namespace AST
 	// extern std::string current_filename;
 	// also set by the language frontend to control some AST processing
 	extern bool sv_mode_but_global_and_used_for_literally_one_condition;
+	// Set by the Verilog frontend. Synthesis drops $sva cells; -formal keeps them.
+	extern bool keep_sva_cells;
+	// 0 when -sv selected no year. Otherwise the IEEE 1800 year from -std=.
+	extern int sv_std_year;
 
 	// for stats
 	unsigned long long astnode_count();
@@ -447,6 +461,7 @@ namespace AST_INTERNAL
 	extern AST::AstNode *current_always, *current_top_block, *current_block, *current_block_child;
 	extern RTLIL::Module *current_module;
 	extern bool current_always_clocked;
+	extern bool current_sva_context;
 	extern dict<std::string, int> current_memwr_count;
 	extern dict<std::string, pool<int>> current_memwr_visible;
 	struct LookaheadRewriter;

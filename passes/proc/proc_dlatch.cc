@@ -546,7 +546,7 @@ void proc_dlatch(proc_dlatch_db_t &db, RTLIL::Process *proc, LatchPolicy policy)
 			db.generated_dlatches.insert(cell);
 
 			if (proc->get_bool_attribute(ID::always_comb))
-				log_error("Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
+				log_warning("Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
 						db.module->name.c_str(), log_signal(lhs), db.module->name.c_str(), proc->name.c_str());
 			else if (proc->get_bool_attribute(ID::always_latch))
 				log("Latch inferred for signal `%s.%s' from always_latch process `%s.%s': %s\n",

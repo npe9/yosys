@@ -143,6 +143,10 @@ struct SimShared
 	bool initstate = true;
 	bool undriven_check = true;
 	bool undriven_warning = false;
+	// set when a $finish/$stop cell fires; the run loop stops at the end
+	// of the current cycle
+	bool finish = false;
+	std::string finish_msg;
 };
 
 void zinit(Const &v)
@@ -230,6 +234,7 @@ struct SimInstance
 	pool<Cell*> initstate_database;
 	dict<Cell*, IdString> mem_cells;
 	std::vector<print_state_t> print_database;
+	std::vector<print_state_t> finish_database;
 
 	std::vector<Mem> memories;
 
@@ -357,7 +362,7 @@ struct SimInstance
 					fst_memories[name] = shared->fst->getMemoryHandles(scope + "." + RTLIL::unescape_id(name));
 			}
 
-			if (cell->type.in(ID($assert), ID($cover), ID($assume)))
+			if (cell->type.in(ID($assert), ID($cover), ID($assume), ID($check)))
 				formal_database.insert(cell);
 
 			if (cell->type == ID($initstate))
@@ -373,9 +378,19 @@ struct SimInstance
 				print.past_en = State::Sx;
 				print.initial_done = false;
 			}
+
+			if (cell->type.in(ID($finish), ID($stop))) {
+				finish_database.emplace_back();
+				auto &finish = finish_database.back();
+				finish.cell = cell;
+				finish.past_trg = Const(State::Sx, cell->getPort(ID::TRG).size());
+				finish.past_en = State::Sx;
+				finish.initial_done = false;
+			}
 		}
 
 		std::sort(print_database.begin(), print_database.end());
+		std::sort(finish_database.begin(), finish_database.end());
 
 		if (shared->zinit)
 		{
@@ -603,6 +618,12 @@ struct SimInstance
 		}
 
 		if (cell->type == ID($print))
+			return;
+
+		if (cell->type == ID($check))
+			return;
+
+		if (cell->type.in(ID($finish), ID($stop)))
 			return;
 
 		log_error("Unsupported cell type: %s (%s.%s)\n", cell->type.unescape(), module, cell);
@@ -915,7 +936,11 @@ struct SimInstance
 					}
 
 					std::string rendered = print.fmt.render();
-					log("%s", rendered);
+					// Display output is user program output: write it straight to
+					// stdout instead of the log system (no time prefixes, no
+					// expect_log/-W regex interference, no format re-parsing).
+					fwrite(rendered.data(), 1, rendered.size(), stdout);
+					fflush(stdout);
 					shared->display_output.emplace_back(shared->step, this, cell, rendered);
 				}
 			}
@@ -926,6 +951,51 @@ struct SimInstance
 			print.initial_done = true;
 		}
 
+		// $finish/$stop: same trigger convention as $print, no arguments.
+		// The run loop notices shared->finish at the end of the cycle.
+		for (auto &finish : finish_database) {
+			Cell *cell = finish.cell;
+			bool triggered = false;
+
+			Const trg = get_state(cell->getPort(ID::TRG));
+			bool trg_en = cell->getParam(ID::TRG_ENABLE).as_bool();
+			Const en = get_state(cell->getPort(ID::EN));
+
+			bool sampled = trg_en && trg.size() > 0;
+
+			if (sampled ? finish.past_en.as_bool() : en.as_bool()) {
+				if (sampled) {
+					Const trg_pol = cell->getParam(ID::TRG_POLARITY);
+					for (int i = 0; i < trg.size(); i++) {
+						bool pol = trg_pol[i] == State::S1;
+						State curr = trg[i], past = finish.past_trg[i];
+						if (pol && curr == State::S1 && past == State::S0)
+							triggered = true;
+						if (!pol && curr == State::S0 && past == State::S1)
+							triggered = true;
+					}
+				} else if (trg_en) {
+					// initial $finish (TRG width = 0, TRG_ENABLE = true)
+					if (!finish.initial_done && en != finish.past_en)
+						triggered = true;
+				} else {
+					// always @(*) $finish
+					if (en != finish.past_en)
+						triggered = true;
+				}
+			}
+
+			if (triggered && !shared->finish) {
+				shared->finish = true;
+				shared->finish_msg = stringf("Simulation received %s (from %s.%s at step %d).",
+						cell->type.c_str(), hiername().c_str(), cell->name.c_str(), shared->step);
+			}
+
+			finish.past_trg = trg;
+			finish.past_en = en;
+			finish.initial_done = true;
+		}
+
 		if (gclk_trigger)
 		{
 			for (auto cell : formal_database)
@@ -934,20 +1004,27 @@ struct SimInstance
 				if (cell->attributes.count(ID::src))
 					label = cell->attributes.at(ID::src).decode_string();
 
+				// $check cells carry their directive in the FLAVOR param
+				std::string flavor = "assert";
+				if (cell->type == ID($check) && cell->parameters.count(ID(FLAVOR).c_str()))
+					flavor = cell->parameters.at(ID(FLAVOR).c_str()).decode_string();
+				bool is_cover = cell->type == ID($cover) || flavor == "cover";
+				bool is_assume = cell->type == ID($assume) || flavor == "assume";
+
 				State a = get_state(cell->getPort(ID::A))[0];
 				State en = get_state(cell->getPort(ID::EN))[0];
 
-				if (en == State::S1 && (cell->type == ID($cover) ? a == State::S1 : a != State::S1)) {
+				if (en == State::S1 && (is_cover ? a == State::S1 : a != State::S1)) {
 					shared->triggered_assertions.emplace_back(shared->step, this, cell);
 				}
 
-				if (cell->type == ID($cover) && en == State::S1 && a == State::S1)
+				if (is_cover && en == State::S1 && a == State::S1)
 					log("Cover %s.%s (%s) reached.\n", hiername(), cell, label);
 
-				if (cell->type == ID($assume) && en == State::S1 && a != State::S1)
+				if (is_assume && en == State::S1 && a != State::S1)
 					log("Assumption %s.%s (%s) failed.\n", hiername(), cell, label);
 
-				if (cell->type == ID($assert) && en == State::S1 && a != State::S1) {
+				if (!is_cover && !is_assume && en == State::S1 && a != State::S1) {
 					log_cell_w_hierarchy("Failed assertion", cell);
 					if (shared->serious_asserts)
 						log_error("Assertion %s.%s (%s) failed.\n", hiername(), cell, label);
@@ -1501,6 +1578,11 @@ struct SimWorker : SimShared
 			update(true);
 			register_output_step(cycle_width*cycle + cycle_width/2);
 
+			if (finish) {
+				log("%s\n", finish_msg.c_str());
+				break;
+			}
+
 			if (cycle == 0)
 				top->set_initstate_outputs(State::S0);
 
@@ -1519,6 +1601,11 @@ struct SimWorker : SimShared
 
 			update(true);
 			register_output_step(cycle_width*cycle + cycle_width);
+
+			if (finish) {
+				log("%s\n", finish_msg.c_str());
+				break;
+			}
 		}
 
 		register_output_step(cycle_width*numcycles + 2);

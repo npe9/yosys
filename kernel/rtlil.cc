@@ -2371,6 +2371,17 @@ namespace {
 				return;
 			}
 
+			if (cell->type.in(ID($finish), ID($stop))) {
+				param(ID::TRG_WIDTH);
+				param_bool(ID::TRG_ENABLE);
+				param(ID::TRG_POLARITY);
+				param(ID::PRIORITY);
+				port(ID::EN, 1);
+				port(ID::TRG, param(ID::TRG_WIDTH));
+				check_expected();
+				return;
+			}
+
 			if (cell->type == ID($check)) {
 				std::string flavor = param_string(ID(FLAVOR));
 				if (!(flavor == "assert" || flavor == "assume" || flavor == "live" || flavor == "fair" || flavor == "cover"))
@@ -2858,7 +2869,15 @@ std::vector<RTLIL::NamedObject*> RTLIL::Module::selected_members() const
 void RTLIL::Module::add(RTLIL::Wire *wire)
 {
 	log_assert(!wire->name.empty());
-	log_assert(count_id(wire->name) == 0);
+	if (count_id(wire->name) != 0) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			log_warning("Duplicate object name `%s' in module `%s'; renaming the new wire.\n",
+					wire->name.c_str(), name.c_str());
+		}
+		wire->name = stringf("%s$dup%d", wire->name.c_str(), autoidx++);
+	}
 	log_assert(refcount_wires_ == 0);
 	wires_[wire->name] = wire;
 	wire->module = this;

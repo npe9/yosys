@@ -35,7 +35,7 @@
 %option c++
 %option yyclass="VerilogLexer"
 %option noyywrap
-%option nounput
+/* unput is used to peek one declaration ahead for unknown type names */
 %option yylineno
 %option prefix="frontend_verilog_yy"
 
@@ -52,6 +52,8 @@
 #include "frontends/ast/ast.h"
 #include "frontends/verilog/verilog_location.h"
 #include "kernel/log.h"
+#include <cctype>
+#include <unordered_set>
 #include <vector>
 #include <memory>
 
@@ -81,6 +83,10 @@ YOSYS_NAMESPACE_END
 	string_t val = std::make_unique<std::string>(std::string("\\") + YYText()); \
 	return parser::make_TOK_ID(std::move(val), out_loc);
 
+#define SVA_KEYWORD(_tok) \
+	if (mode->sv || mode->formal) return _tok; \
+	NON_KEYWORD();
+
 
 #define YY_USER_ACTION \
 	out_loc.step(); \
@@ -93,7 +99,17 @@ YOSYS_NAMESPACE_END
 		} \
 	} \
 	out_loc.begin.filename = current_filename; \
-	out_loc.end.filename = current_filename;
+	out_loc.end.filename = current_filename; \
+	{ \
+		char _c0 = YYText()[0]; \
+		int _comment = (_c0 == '/' && (YYText()[1] == '/' || YYText()[1] == '*')); \
+		int _space = (_c0 == ' ' || _c0 == '\t' || _c0 == '\n' || _c0 == '\r' || _c0 == '\f' || _c0 == 0); \
+		if (!_space && !_comment) { \
+			frontend_verilog_prev_char = frontend_verilog_this_char; \
+			frontend_verilog_this_char = _c0; \
+			frontend_verilog_sig_tok++; \
+		} \
+	}
 
 #define YY_BREAK \
     break;
@@ -101,12 +117,43 @@ YOSYS_NAMESPACE_END
 #undef YY_BUF_SIZE
 #define YY_BUF_SIZE 65536
 
+static int frontend_verilog_prev_char = 0;
+static int frontend_verilog_this_char = 0;
+static bool frontend_verilog_func_ret = false;
+
+// Significant-token counter and contextual-keyword state. The counter is
+// bumped once per non-whitespace/non-comment token by YY_USER_ACTION; the
+// *_tok snapshots turn "previous token was X" tests into simple integer
+// comparisons that cannot go stale across unrelated tokens.
+static int frontend_verilog_sig_tok = 0;
+// sig_tok of the most recent '@'; '@' directly before '(' opens an event list
+static int frontend_verilog_at_tok = -1;
+// sig_tok of the most recent net-type/signing keyword; scalared/vectored are
+// keywords only directly after one of those
+static int frontend_verilog_net_tok = -1;
+// sig_tok of the most recent TOK_ENUM; a registered user type directly after
+// it is an enum base type (which the typedef lookahead cannot see because a
+// base type is followed by '{', not by a declarator name)
+static int frontend_verilog_enum_tok = -1;
+// sig_tok of the most recent TOK_CLASS; `semaphore` (and `mailbox`) name a
+// class type after `class`, but may also be a user-defined class name, so
+// they lex as identifiers directly after `class`
+static int frontend_verilog_class_tok = -1;
+// sig_tok of the most recent TOK_ID `new`; the object expression of a class
+// copy constructor `new <expr>` follows immediately and its head identifier
+// must not be claimed by the typedef lookahead (e.g. `new a[i]` would read
+// as a declaration `a[i] ...`)
+static int frontend_verilog_new_tok = -1;
+static int frontend_verilog_paren_depth = 0;
+// paren depth of the innermost @(...) event list, -1 when not inside one
+static int frontend_verilog_event_depth = -1;
+
 static bool isUserType(ParseState* extra, std::string &s)
 {
 	// check current scope then outer scopes for a name
 	for (auto it = extra->user_type_stack.rbegin(); it != extra->user_type_stack.rend(); ++it) {
 		if (it->count(s) > 0) {
-				return true;
+			return true;
 		}
 	}
 	return false;
@@ -118,8 +165,8 @@ parser::symbol_type char_tok(char c, parser::location_type loc) {
 		case '#': return parser::make_TOK_HASH(loc);
 		case '%': return parser::make_TOK_PERC(loc);
 		case '&': return parser::make_TOK_AMP(loc);
-		case '(': return parser::make_TOK_LPAREN(loc);
-		case ')': return parser::make_TOK_RPAREN(loc);
+		case '(': if (frontend_verilog_at_tok == frontend_verilog_sig_tok - 1) frontend_verilog_event_depth = frontend_verilog_paren_depth + 1; frontend_verilog_paren_depth++; frontend_verilog_func_ret = false; return parser::make_TOK_LPAREN(loc);
+		case ')': frontend_verilog_paren_depth--; if (frontend_verilog_event_depth >= 0 && frontend_verilog_paren_depth < frontend_verilog_event_depth) frontend_verilog_event_depth = -1; return parser::make_TOK_RPAREN(loc);
 		case '*': return parser::make_TOK_ASTER(loc);
 		case '+': return parser::make_TOK_PLUS(loc);
 		case ',': return parser::make_TOK_COMMA(loc);
@@ -127,12 +174,12 @@ parser::symbol_type char_tok(char c, parser::location_type loc) {
 		case '.': return parser::make_TOK_DOT(loc);
 		case '/': return parser::make_TOK_SLASH(loc);
 		case ':': return parser::make_TOK_COL(loc);
-		case ';': return parser::make_TOK_SEMICOL(loc);
+		case ';': frontend_verilog_func_ret = false; return parser::make_TOK_SEMICOL(loc);
 		case '<': return parser::make_TOK_LT(loc);
 		case '=': return parser::make_TOK_EQ(loc);
 		case '>': return parser::make_TOK_GT(loc);
 		case '?': return parser::make_TOK_QUE(loc);
-		case '@': return parser::make_TOK_AT(loc);
+		case '@': frontend_verilog_at_tok = frontend_verilog_sig_tok; return parser::make_TOK_AT(loc);
 		case '[': return parser::make_TOK_LBRA(loc);
 		case ']': return parser::make_TOK_RBRA(loc);
 		case '^': return parser::make_TOK_CARET(loc);
@@ -285,6 +332,10 @@ UNSIGNED_NUMBER [0-9][0-9_]*
 FIXED_POINT_NUMBER_DEC [0-9][0-9_]*\.[0-9][0-9_]*([eE][-+]?[0-9_]+)?
 FIXED_POINT_NUMBER_NO_DEC [0-9][0-9_]*[eE][-+]?[0-9_]+
 TIME_SCALE_SUFFIX [munpf]?s
+	/* an associative-array dimension: bracketed type name, `*' wildcard or
+	   `$' queue mark, tolerating whitespace and comments inside; used by
+	   the type-indexed-dimension rewrite below */
+ASSOC_DIM "["[ \t\r\n]*([a-zA-Z_$][a-zA-Z0-9_$]*|"\*")([ \t\r\n]|"/*"([^*]|\*+[^*/])*\*+"/"|"//"[^\n]*)*"]"
 
 %%
 
@@ -334,30 +385,67 @@ TIME_SCALE_SUFFIX [munpf]?s
 "`celldefine"[^\n]* /* ignore `celldefine */
 "`endcelldefine"[^\n]* /* ignore `endcelldefine */
 
+"`begin_keywords"[ \t]+[^ \t\r\n]+ {
+	const char *p = YYText();
+	while (*p != 0 && *p != ' ' && *p != '\t') p++;
+	while (*p == ' ' || *p == '\t') p++;
+	std::string v(p);
+	while (!v.empty() && (v.back() == '"' || v.back() == '\r')) v.pop_back();
+	auto q = v.find('"');
+	if (q != std::string::npos) v = v.substr(q + 1);
+	extra->sv_keyword_stack.push_back(mode->sv);
+	mode->sv = v.compare(0, 4, "1800") == 0;
+}
+"`end_keywords"[^\n]* {
+	if (!extra->sv_keyword_stack.empty()) {
+		mode->sv = extra->sv_keyword_stack.back();
+		extra->sv_keyword_stack.pop_back();
+	}
+}
+
 "`default_nettype"[ \t]+[^ \t\r\n/]+ {
 	const char *p = YYText();
 	while (*p != 0 && *p != ' ' && *p != '\t') p++;
 	while (*p == ' ' || *p == '\t') p++;
 	if (!strcmp(p, "none"))
 		extra->default_nettype_wire = false;
-	else if (!strcmp(p, "wire"))
+	else if (!strcmp(p, "wire") || !strcmp(p, "tri") ||
+		 !strcmp(p, "tri0") || !strcmp(p, "tri1") ||
+		 !strcmp(p, "trireg") || !strcmp(p, "uwire") ||
+		 !strcmp(p, "wand") || !strcmp(p, "triand") ||
+		 !strcmp(p, "wor") || !strcmp(p, "trior"))
+		// tri0/tri1 pull semantics and the net variations are not
+		// modeled; they elaborate as plain wires
 		extra->default_nettype_wire = true;
 	else
 		err_at_loc(out_loc, "Unsupported default nettype: %s", p);
 }
 
+"`unconnected_drive"[ \t]+[^ \t\r\n]+ /* ignore: `unconnected_drive strength is not modeled */
+
+"`nounconnected_drive"[^\n]* /* ignore `nounconnected_drive */
+
 "`protect"[^\n]* /* ignore `protect*/
 "`endprotect"[^\n]* /* ignore `endprotect*/
 
+"`pragma"[^\n]* /* vendor protection pragmas are not part of the elaborated design */
+
 "`"[a-zA-Z_$][a-zA-Z0-9_$]* {
-	err_at_loc(out_loc, "Unimplemented compiler directive or undefined macro %s.", YYText());
+	// An undefined macro is an identifier so a use or a call can still elaborate.
+	auto val = std::make_unique<std::string>(std::string("\\") + (YYText() + 1));
+	return parser::make_TOK_ID(std::move(val), out_loc);
 }
 
 "module"       { return parser::make_TOK_MODULE(out_loc); }
+"macromodule"  { return parser::make_TOK_MODULE(out_loc); }
 "endmodule"    { return parser::make_TOK_ENDMODULE(out_loc); }
-"function"     { return parser::make_TOK_FUNCTION(out_loc); }
+"program"      { SV_KEYWORD(parser::make_TOK_PROGRAM(out_loc)); }
+"endprogram"   { SV_KEYWORD(parser::make_TOK_ENDPROGRAM(out_loc)); }
+"function"     { frontend_verilog_func_ret = true; return parser::make_TOK_FUNCTION(out_loc); }
 "endfunction"  { return parser::make_TOK_ENDFUNCTION(out_loc); }
 "task"         { return parser::make_TOK_TASK(out_loc); }
+"type"         { SV_KEYWORD(parser::make_TOK_TYPE(out_loc)); }
+"export"       { SV_KEYWORD(parser::make_TOK_EXPORT(out_loc)); }
 "endtask"      { return parser::make_TOK_ENDTASK(out_loc); }
 "specify"      { return mode->specify ? parser::make_TOK_SPECIFY(out_loc) : parser::make_TOK_IGNORED_SPECIFY(out_loc); }
 "endspecify"   { return parser::make_TOK_ENDSPECIFY(out_loc); }
@@ -372,6 +460,7 @@ TIME_SCALE_SUFFIX [munpf]?s
 "localparam"   { return parser::make_TOK_LOCALPARAM(out_loc); }
 "defparam"     { return parser::make_TOK_DEFPARAM(out_loc); }
 "assign"       { return parser::make_TOK_ASSIGN(out_loc); }
+"alias"        { SV_KEYWORD(parser::make_TOK_ALIAS(out_loc)); }
 "always"       { return parser::make_TOK_ALWAYS(out_loc); }
 "initial"      { return parser::make_TOK_INITIAL(out_loc); }
 "begin"	       { return parser::make_TOK_BEGIN(out_loc); }
@@ -391,8 +480,12 @@ TIME_SCALE_SUFFIX [munpf]?s
 "generate"     { return parser::make_TOK_GENERATE(out_loc); }
 "endgenerate"  { return parser::make_TOK_ENDGENERATE(out_loc); }
 "while"        { return parser::make_TOK_WHILE(out_loc); }
+"do"           { SV_KEYWORD(parser::make_TOK_DO(out_loc)); }
+"break"        { SV_KEYWORD(parser::make_TOK_BREAK(out_loc)); }
+"continue"     { SV_KEYWORD(parser::make_TOK_CONTINUE(out_loc)); }
 "repeat"       { return parser::make_TOK_REPEAT(out_loc); }
 "automatic"    { return parser::make_TOK_AUTOMATIC(out_loc); }
+"static"       { SV_KEYWORD(parser::make_TOK_STATIC(out_loc)); }
 
 "unique"       { SV_KEYWORD(parser::make_TOK_UNIQUE(out_loc)); }
 "unique0"      { SV_KEYWORD(parser::make_TOK_UNIQUE0(out_loc)); }
@@ -418,11 +511,32 @@ TIME_SCALE_SUFFIX [munpf]?s
 "restrict"   { if (mode->formal) return parser::make_TOK_RESTRICT(out_loc); SV_KEYWORD(parser::make_TOK_RESTRICT(out_loc)); }
 "property"   { if (mode->formal) return parser::make_TOK_PROPERTY(out_loc); SV_KEYWORD(parser::make_TOK_PROPERTY(out_loc)); }
 "rand"       { if (mode->formal) return parser::make_TOK_RAND(out_loc); SV_KEYWORD(parser::make_TOK_RAND(out_loc)); }
+"const"[ \t\r\n]+"ref"	{
+	if (!mode->sv) REJECT;
+	// `const ref` argument direction lexes as a single token so the
+	// parser can tell it apart from `const` rand qualifiers
+	return parser::make_TOK_CONST_REF(out_loc);
+}
 "const"      { if (mode->formal) return parser::make_TOK_CONST(out_loc); SV_KEYWORD(parser::make_TOK_CONST(out_loc)); }
 "checker"    { if (mode->formal) return parser::make_TOK_CHECKER(out_loc); SV_KEYWORD(parser::make_TOK_CHECKER(out_loc)); }
 "endchecker" { if (mode->formal) return parser::make_TOK_ENDCHECKER(out_loc); SV_KEYWORD(parser::make_TOK_ENDCHECKER(out_loc)); }
 "final"      { SV_KEYWORD(parser::make_TOK_FINAL(out_loc)); }
 "logic"      { SV_KEYWORD(parser::make_TOK_LOGIC(out_loc)); }
+	/* IEEE 1800-2009 6.23: `var type(expr) name;' declares a variable whose
+	   data type is taken from an expression's type. The type operator is
+	   opaque to elaboration (like its parameter-type use), so the whole
+	   `type(...)' group is swallowed here and the declaration degrades to
+	   a plain `var`. */
+"var"[ \t\r\n]+"type"[ \t\r\n]*"(" {
+	if (!(mode->sv || mode->formal)) REJECT;
+	int depth = 1, c;
+	while (depth > 0 && (c = yyinput()) > 0) {
+		if (c == '\n') out_loc.lines(1);
+		if (c == '(') depth++;
+		if (c == ')') depth--;
+	}
+	return parser::make_TOK_VAR(out_loc);
+}
 "var"        { SV_KEYWORD(parser::make_TOK_VAR(out_loc)); }
 "bit"        { SV_KEYWORD(parser::make_TOK_LOGIC(out_loc)); }
 "int"        { SV_KEYWORD(parser::make_TOK_INT(out_loc)); }
@@ -430,30 +544,262 @@ TIME_SCALE_SUFFIX [munpf]?s
 "shortint"   { SV_KEYWORD(parser::make_TOK_SHORTINT(out_loc)); }
 "longint"    { SV_KEYWORD(parser::make_TOK_LONGINT(out_loc)); }
 "void"       { SV_KEYWORD(parser::make_TOK_VOID(out_loc)); }
+"bind"       { SV_KEYWORD(parser::make_TOK_BIND(out_loc)); }
+"fork"       { SV_KEYWORD(parser::make_TOK_FORK(out_loc)); }
+"wait"       { SV_KEYWORD(parser::make_TOK_WAIT(out_loc)); }
+"force"      { SV_KEYWORD(parser::make_TOK_FORCE(out_loc)); }
+"release"    { SV_KEYWORD(parser::make_TOK_RELEASE(out_loc)); }
+"deassign"   { SV_KEYWORD(parser::make_TOK_DEASSIGN(out_loc)); }
+pullup|pulldown {
+	auto val = std::make_unique<std::string>(YYText());
+	if (mode->sv) return parser::make_TOK_PULLUP(std::move(val), out_loc);
+	return parser::make_TOK_ID(std::move(val), out_loc);
+}
+"join_any"   { SV_KEYWORD(parser::make_TOK_JOIN_ANY(out_loc)); }
+"join_none"  { SV_KEYWORD(parser::make_TOK_JOIN_NONE(out_loc)); }
+"join"       { SV_KEYWORD(parser::make_TOK_JOIN(out_loc)); }
+"foreach"    { SV_KEYWORD(parser::make_TOK_FOREACH(out_loc)); }
+"covergroup" {
+	if (mode->sv || mode->formal) {
+		std::string buf;
+		for (;;) {
+			int c = yyinput();
+			if (c == 0)
+				break;
+			if (c == '\n')
+				out_loc.lines(1);
+			buf.push_back((char)c);
+			if (buf.size() >= 8 && buf.compare(buf.size() - 8, 8, "endgroup") == 0)
+				break;
+		}
+		return parser::make_TOK_SEMICOL(out_loc);
+	}
+	auto val = std::make_unique<std::string>(std::string("\\") + YYText());
+	return parser::make_TOK_ID(std::move(val), out_loc);
+}
+"forever"    { SV_KEYWORD(parser::make_TOK_FOREVER(out_loc)); }
+"return"     { SV_KEYWORD(parser::make_TOK_RETURN(out_loc)); }
 
 "eventually"   { if (mode->formal) return parser::make_TOK_EVENTUALLY(out_loc); SV_KEYWORD(parser::make_TOK_EVENTUALLY(out_loc)); }
-"s_eventually" { if (mode->formal) return parser::make_TOK_EVENTUALLY(out_loc); SV_KEYWORD(parser::make_TOK_EVENTUALLY(out_loc)); }
+"s_eventually" { if (mode->formal) return parser::make_TOK_S_EVENTUALLY(out_loc); SVA_KEYWORD(parser::make_TOK_S_EVENTUALLY(out_loc)); }
+
+ /* IEEE 1800-2009 clause 16 operators. Active in -sv and -formal so plain Verilog names stay identifiers. */
+"sequence"       { SVA_KEYWORD(parser::make_TOK_SEQUENCE(out_loc)); }
+"endsequence"    { SVA_KEYWORD(parser::make_TOK_ENDSEQUENCE(out_loc)); }
+"endproperty"    { SVA_KEYWORD(parser::make_TOK_ENDPROPERTY(out_loc)); }
+"intersect"      { SVA_KEYWORD(parser::make_TOK_INTERSECT(out_loc)); }
+"throughout"     { SVA_KEYWORD(parser::make_TOK_THROUGHOUT(out_loc)); }
+"within"         { SVA_KEYWORD(parser::make_TOK_WITHIN(out_loc)); }
+"first_match"    { SVA_KEYWORD(parser::make_TOK_FIRST_MATCH(out_loc)); }
+"until_with"     { SVA_KEYWORD(parser::make_TOK_UNTIL_WITH(out_loc)); }
+"s_until_with"   { SVA_KEYWORD(parser::make_TOK_S_UNTIL_WITH(out_loc)); }
+"s_until"        { SVA_KEYWORD(parser::make_TOK_S_UNTIL(out_loc)); }
+"until"          { SVA_KEYWORD(parser::make_TOK_UNTIL(out_loc)); }
+"implies"        { SVA_KEYWORD(parser::make_TOK_IMPLIES(out_loc)); }
+"iff"            { SVA_KEYWORD(parser::make_TOK_IFF(out_loc)); }
+"nexttime"       { SVA_KEYWORD(parser::make_TOK_NEXTTIME(out_loc)); }
+"s_nexttime"     { SVA_KEYWORD(parser::make_TOK_S_NEXTTIME(out_loc)); }
+"s_always"       { SVA_KEYWORD(parser::make_TOK_S_ALWAYS(out_loc)); }
+"accept_on"      { SVA_KEYWORD(parser::make_TOK_ACCEPT_ON(out_loc)); }
+"reject_on"      { SVA_KEYWORD(parser::make_TOK_REJECT_ON(out_loc)); }
+"sync_accept_on" { SVA_KEYWORD(parser::make_TOK_SYNC_ACCEPT_ON(out_loc)); }
+"sync_reject_on" { SVA_KEYWORD(parser::make_TOK_SYNC_REJECT_ON(out_loc)); }
+"strong"         { SVA_KEYWORD(parser::make_TOK_STRONG(out_loc)); }
+"weak"           { SVA_KEYWORD(parser::make_TOK_WEAK(out_loc)); }
+"disable"        { SVA_KEYWORD(parser::make_TOK_DISABLE(out_loc)); }
+"clocking"       { SVA_KEYWORD(parser::make_TOK_CLOCKING(out_loc)); }
+"endclocking"    { SVA_KEYWORD(parser::make_TOK_ENDCLOCKING(out_loc)); }
+"global"       { SVA_KEYWORD(parser::make_TOK_GLOBAL(out_loc)); }
+"untyped"        { SVA_KEYWORD(parser::make_TOK_UNTYPED(out_loc)); }
+"let"            { SVA_KEYWORD(parser::make_TOK_LET(out_loc)); }
+"inside"         { SVA_KEYWORD(parser::make_TOK_INSIDE(out_loc)); }
+"matches"        { SV_KEYWORD(parser::make_TOK_MATCHES(out_loc)); }
+"timeprecision" { SV_KEYWORD(parser::make_TOK_TIMEPRECISION(out_loc)); }
+"timeunit"      { SV_KEYWORD(parser::make_TOK_TIMEUNIT(out_loc)); }
+"time"          { SV_KEYWORD(parser::make_TOK_TIME(out_loc)); }
+"randcase"      { SV_KEYWORD(parser::make_TOK_RANDCASE(out_loc)); }
+"randsequence"  { SV_KEYWORD(parser::make_TOK_RANDSEQUENCE(out_loc)); }
+"soft"          { SV_KEYWORD(parser::make_TOK_SOFT(out_loc)); }
+"dist"          { SV_KEYWORD(parser::make_TOK_DIST(out_loc)); }
+"with"[ \t\r\n]*"["	{
+	if (!mode->sv) REJECT;
+	// streaming slice `arr with [0 +: n]` (IEEE 11.4.14.4): the only
+	// `with` form bracketed by '[', so it lexes as its own token and the
+	// parser can tell it apart from `randomize() with {...}`
+	unput('[');
+	return parser::make_TOK_WITH_SLICE(out_loc);
+}
+"with"           { SV_KEYWORD(parser::make_TOK_WITH(out_loc)); }
+"expect"         { SVA_KEYWORD(parser::make_TOK_EXPECT(out_loc)); }
+
+"class"          { frontend_verilog_class_tok = frontend_verilog_sig_tok; SV_KEYWORD(parser::make_TOK_CLASS(out_loc)); }
+"endclass"       { SV_KEYWORD(parser::make_TOK_ENDCLASS(out_loc)); }
+"extends"        { SV_KEYWORD(parser::make_TOK_EXTENDS(out_loc)); }
+"implements"     { SV_KEYWORD(parser::make_TOK_IMPLEMENTS(out_loc)); }
+"virtual"        { SV_KEYWORD(parser::make_TOK_VIRTUAL(out_loc)); }
+"pure"           { SV_KEYWORD(parser::make_TOK_PURE(out_loc)); }
+"local"          { SV_KEYWORD(parser::make_TOK_LOCAL(out_loc)); }
+"protected"      { SV_KEYWORD(parser::make_TOK_PROTECTED(out_loc)); }
+"extern"         { SV_KEYWORD(parser::make_TOK_EXTERN(out_loc)); }
+"mailbox"        { SV_KEYWORD(parser::make_TOK_MAILBOX(out_loc)); }
+	/* 8.10/8.11: `class semaphore;` declares a user class named semaphore;
+	   the builtin type keyword only applies elsewhere */
+"semaphore"      { if (frontend_verilog_class_tok != frontend_verilog_sig_tok - 1) { SV_KEYWORD(parser::make_TOK_SEMAPHORE(out_loc)); } NON_KEYWORD(); }
+"randc"          { SV_KEYWORD(parser::make_TOK_RANDC(out_loc)); }
+"constraint" { /* swallow the whole constraint declaration (name then
+	balanced braces, or a `;' prototype): constraint bodies use
+	dist/soft/solve and implication syntax that elaboration never
+	consumes */
+	if (mode->sv || mode->formal) {
+		int c = 0;
+		for (;;) {
+			c = yyinput();
+			if (c == 0) break;
+			if (c == '\n') out_loc.lines(1);
+			if (c == '{') break;
+			if (c == ';') break;
+		}
+		if (c == '{') {
+			int depth = 1;
+			while (depth > 0) {
+				c = yyinput();
+				if (c == 0) break;
+				if (c == '\n') out_loc.lines(1);
+				if (c == '{') depth++;
+				else if (c == '}') depth--;
+			}
+			// an out-of-body definition `constraint a::c { ... };` may be
+			// followed by a stray semicolon at file scope
+			if (c != 0) {
+				c = yyinput();
+				if (c != ';' && c != 0) unput(c);
+			}
+		}
+		// emit nothing
+	} else {
+		string_t val = std::make_unique<std::string>(std::string("\\") + YYText());
+		return parser::make_TOK_ID(std::move(val), out_loc);
+	}
+}
+
+"pure"[ \t]+"constraint" { /* swallow a qualified constraint declaration
+	whole so the qualifier token is not stolen into a method-prototype
+	parse (`pure constraint c;') */
+	if (!(mode->sv || mode->formal)) REJECT;
+	int c = 0;
+	for (;;) {
+		c = yyinput();
+		if (c == 0) break;
+		if (c == '\n') out_loc.lines(1);
+		if (c == ';') break; // pure constraint prototype: eat through ';'
+		if (c == '{') {
+			int depth = 1;
+			while (depth > 0) {
+				c = yyinput();
+				if (c == 0) break;
+				if (c == '\n') out_loc.lines(1);
+				if (c == '{') depth++;
+				else if (c == '}') depth--;
+			}
+			if (c != 0) {
+				c = yyinput();
+				if (c != ';' && c != 0) unput(c);
+			}
+			break;
+		}
+	}
+	// emit nothing
+}
+
+"extern"[ \t]+"constraint" {
+	if (!(mode->sv || mode->formal)) REJECT;
+	int c = 0;
+	for (;;) {
+		c = yyinput();
+		if (c == 0) break;
+		if (c == '\n') out_loc.lines(1);
+		if (c == ';') break; // extern constraint prototype: eat through ';'
+		if (c == '{') {
+			int depth = 1;
+			while (depth > 0) {
+				c = yyinput();
+				if (c == 0) break;
+				if (c == '\n') out_loc.lines(1);
+				if (c == '{') depth++;
+				else if (c == '}') depth--;
+			}
+			if (c != 0) {
+				c = yyinput();
+				if (c != ';' && c != 0) unput(c);
+			}
+			break;
+		}
+	}
+	// emit nothing
+}
+
+"static"[ \t]+"constraint" {
+	if (!(mode->sv || mode->formal)) REJECT;
+	int c = 0;
+	for (;;) {
+		c = yyinput();
+		if (c == 0) break;
+		if (c == '\n') out_loc.lines(1);
+		if (c == ';') break;
+		if (c == '{') {
+			int depth = 1;
+			while (depth > 0) {
+				c = yyinput();
+				if (c == 0) break;
+				if (c == '\n') out_loc.lines(1);
+				if (c == '{') depth++;
+				else if (c == '}') depth--;
+			}
+			if (c != 0) {
+				c = yyinput();
+				if (c != ';' && c != 0) unput(c);
+			}
+			break;
+		}
+	}
+	// emit nothing
+}
 
 "input"   { return parser::make_TOK_INPUT(out_loc); }
 "output"  { return parser::make_TOK_OUTPUT(out_loc); }
 "inout"   { return parser::make_TOK_INOUT(out_loc); }
-"wire"    { return parser::make_TOK_WIRE(out_loc); }
-"tri"     { return parser::make_TOK_WIRE(out_loc); }
-"wor"     { return parser::make_TOK_WOR(out_loc); }
-"trior"   { return parser::make_TOK_WOR(out_loc); }
-"wand"    { return parser::make_TOK_WAND(out_loc); }
-"triand"  { return parser::make_TOK_WAND(out_loc); }
+"wire"    { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_WIRE(out_loc); }
+"tri"     { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_WIRE(out_loc); }
+"wor"     { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_WOR(out_loc); }
+"trior"   { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_WOR(out_loc); }
+"wand"    { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_WAND(out_loc); }
+"triand"  { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_WAND(out_loc); }
+"tri0"    { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_TRI0(out_loc); }
+"tri1"    { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_TRI1(out_loc); }
+"trireg"  { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_TRIREG(out_loc); }
+"uwire"   { if (mode->sv || mode->formal) { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_UWIRE(out_loc); } NON_KEYWORD(); }
 "reg"     { return parser::make_TOK_REG(out_loc); }
+"ref"     { SV_KEYWORD(parser::make_TOK_REF(out_loc)); }
 "integer" { return parser::make_TOK_INTEGER(out_loc); }
-"signed"  { return parser::make_TOK_SIGNED(out_loc); }
-"unsigned" { SV_KEYWORD(parser::make_TOK_UNSIGNED(out_loc)); }
+"signed"  { frontend_verilog_net_tok = frontend_verilog_sig_tok; return parser::make_TOK_SIGNED(out_loc); }
+"unsigned" { frontend_verilog_net_tok = frontend_verilog_sig_tok; SV_KEYWORD(parser::make_TOK_UNSIGNED(out_loc)); }
+	/* 6.9.2 advisory keywords: recognized only directly after a net-type or
+	   signing keyword (e.g. `tri1 scalared [15:0] a;`); identifiers otherwise. */
+"scalared" { if (frontend_verilog_net_tok == frontend_verilog_sig_tok - 1) return parser::make_TOK_SCALARED(out_loc); NON_KEYWORD(); }
+"vectored" { if (frontend_verilog_net_tok == frontend_verilog_sig_tok - 1) return parser::make_TOK_VECTORED(out_loc); NON_KEYWORD(); }
+	/* 6.6.7 user-defined nettype declaration */
+"nettype" { SV_KEYWORD(parser::make_TOK_NETTYPE(out_loc)); }
+	/* 9.4.2 edge event identifier: recognized only directly inside an @(...)
+	   event expression list; an identifier everywhere else. */
+"edge" { if (frontend_verilog_event_depth >= 0 && frontend_verilog_paren_depth == frontend_verilog_event_depth) return parser::make_TOK_EDGE(out_loc); NON_KEYWORD(); }
 "genvar"  { return parser::make_TOK_GENVAR(out_loc); }
 "real"    { return parser::make_TOK_REAL(out_loc); }
 
-"enum"    { SV_KEYWORD(parser::make_TOK_ENUM(out_loc)); }
+"enum"    { frontend_verilog_enum_tok = frontend_verilog_sig_tok; SV_KEYWORD(parser::make_TOK_ENUM(out_loc)); }
 "typedef" { SV_KEYWORD(parser::make_TOK_TYPEDEF(out_loc)); }
 "struct"  { SV_KEYWORD(parser::make_TOK_STRUCT(out_loc)); }
 "union"   { SV_KEYWORD(parser::make_TOK_UNION(out_loc)); }
+"tagged"  { SV_KEYWORD(parser::make_TOK_TAGGED(out_loc)); }
 "packed"  { SV_KEYWORD(parser::make_TOK_PACKED(out_loc)); }
 
 {UNSIGNED_NUMBER} {
@@ -475,6 +821,16 @@ TIME_SCALE_SUFFIX [munpf]?s
 <BASED_CONST>[0-9a-fA-FzxZX?][0-9a-fA-FzxZX?_]* {
 	BEGIN(0);
 	string_t val = std::make_unique<std::string>(YYText());
+	return parser::make_TOK_BASED_CONSTVAL(std::move(val), out_loc);
+}
+
+<BASED_CONST>"`"[a-zA-Z_$][a-zA-Z0-9_$]* {
+	// The preprocessor leaves unknown macros in place so a use can still
+	// elaborate; inside a based literal there is nothing to elaborate, so
+	// degrade to zero instead of failing the token.
+	BEGIN(0);
+	log_file_warning(out_loc.to_loc(), "Undefined macro `%s' inside based constant; using 0.\n", YYText() + 1);
+	string_t val = std::make_unique<std::string>("0");
 	return parser::make_TOK_BASED_CONSTVAL(std::move(val), out_loc);
 }
 
@@ -522,34 +878,63 @@ supply1 { return parser::make_TOK_SUPPLY1(out_loc); }
 [a-zA-Z_][a-zA-Z0-9_]*::[a-zA-Z_$][a-zA-Z0-9_$]* {
 	// package qualifier
 	auto s = std::string("\\") + YYText();
-	if (extra->pkg_user_types.count(s) > 0) {
-		// package qualified typedefed name
+	if ((extra->pkg_user_types.count(s) > 0 && lookahead_is_cast()) || lookahead_is_typedef()) {
+		// package qualified typedefed name used as a type. Class-scope
+		// typedefs are registered under `class::name` as well (see
+		// addTypedefNode), so the lookahead handles members of packages
+		// and classes alike. Casts keep requiring registration: a cast
+		// like `pkg::PARAM'(x)` names a parameter, not a type.
 		auto val = std::make_unique<std::string>(s);
 		return parser::make_TOK_PKG_USER_TYPE(std::move(val), out_loc);
 	}
 	else {
-		// backup before :: just return first part
-		size_t len = strchr(YYText(), ':') - YYText();
-		yyless(len);
-		auto val = std::make_unique<std::string>(std::string("\\") + YYText());
-		return parser::make_TOK_ID(std::move(val), out_loc);
+		// Keep pkg::name as one token so it can be a type name
+		// (input pkg::enum_t sig) without looking like a bare port name.
+		auto val = std::make_unique<std::string>(s);
+		return parser::make_TOK_SCOPED_ID(std::move(val), out_loc);
 	}
 }
 
 [a-zA-Z_$][a-zA-Z0-9_$]* {
 	auto s = std::string("\\") + YYText();
+	if (YYText() == std::string("new")) {
+		/* `new` is a reserved word and never names a type. It must always
+		   reach the parser as TOK_ID: the copy constructor `new obj`
+		   (IEEE 8.12) is parsed as TOK_ID followed by an rvalue, and the
+		   expression head after `new` must not be claimed by the typedef
+		   lookahead either (see frontend_verilog_new_tok below). */
+		frontend_verilog_new_tok = frontend_verilog_sig_tok;
+		return parser::make_TOK_ID(std::make_unique<std::string>(s), out_loc);
+	}
+	if (frontend_verilog_new_tok == frontend_verilog_sig_tok - 1) {
+		/* object expression of `new <expr>`: keep the head identifier even
+		   if it would otherwise look like a type name (`new a[i]`) */
+		return parser::make_TOK_ID(std::make_unique<std::string>(s), out_loc);
+	}
 	if (isUserType(extra, s)) {
-		// previously typedefed name
 		auto val = std::make_unique<std::string>(s);
-		return parser::make_TOK_USER_TYPE(std::move(val), out_loc);
+		// type'(expr) and "type name" stay type tokens. $bits(type) is an identifier.
+		// "virtual" is a prefix (virtual if_t), not the type name.
+		if (std::string(YYText()) != "virtual" && frontend_verilog_prev_char != '#' && frontend_verilog_prev_char != '@' &&
+				(lookahead_is_cast() || (frontend_verilog_prev_char != ':' && lookahead_is_typedef())
+				|| (frontend_verilog_func_ret && lookahead_func_rettype())
+				|| frontend_verilog_enum_tok == frontend_verilog_sig_tok - 1))
+			return parser::make_TOK_USER_TYPE(std::move(val), out_loc);
+		return parser::make_TOK_ID(std::move(val), out_loc);
 	}
 	else {
 		auto val = std::make_unique<std::string>(std::string("\\") + YYText());
+		// input my_type name, input my_type [N:0] name, parameter my_type cfg
+		// are ID ID or ID '[' ... ']' ID. Module instances are ID ID '('.
+		if (std::string(YYText()) != "virtual" && frontend_verilog_prev_char != '#' && frontend_verilog_prev_char != '@' && frontend_verilog_prev_char != ':' && lookahead_is_typedef())
+			return parser::make_TOK_USER_TYPE(std::move(val), out_loc);
+		if (std::string(YYText()) != "virtual" && frontend_verilog_prev_char != '#' && frontend_verilog_func_ret && lookahead_func_rettype())
+			return parser::make_TOK_USER_TYPE(std::move(val), out_loc);
 		return parser::make_TOK_ID(std::move(val), out_loc);
 	}
 }
 
-[a-zA-Z_$][a-zA-Z0-9_$\.]* {
+[a-zA-Z_$][a-zA-Z0-9_$]*(\.[a-zA-Z_$][a-zA-Z0-9_$]*)* {
 	auto val = std::make_unique<std::string>(std::string("\\") + YYText());
 	return parser::make_TOK_ID(std::move(val), out_loc);
 }
@@ -606,11 +991,18 @@ supply1 { return parser::make_TOK_SUPPLY1(out_loc); }
 <SYNOPSYS_FLAGS>. /* ignore everything else */
 <SYNOPSYS_FLAGS>"*/" { BEGIN(0); }
 
-import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+function[ \t\r\n]+ {
+import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+[a-zA-Z_][a-zA-Z0-9_]*[ \t\r\n]*=[ \t\r\n]*function[ \t\r\n]+ {
 	BEGIN(IMPORT_DPI);
 	return parser::make_TOK_DPI_FUNCTION(out_loc);
 }
 
+import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+(context[ \t\r\n]+)?(extern[ \t\r\n]+)?function[ \t\r\n]+ {
+	BEGIN(IMPORT_DPI);
+	return parser::make_TOK_DPI_FUNCTION(out_loc);
+}
+
+<IMPORT_DPI>"signed"   { return parser::make_TOK_SIGNED(out_loc); }
+<IMPORT_DPI>"unsigned" { return parser::make_TOK_UNSIGNED(out_loc); }
 <IMPORT_DPI>[a-zA-Z_$][a-zA-Z0-9_$]* {
 	auto val = std::make_unique<std::string>(std::string("\\") + YYText());
 	return parser::make_TOK_ID(std::move(val), out_loc);
@@ -624,6 +1016,9 @@ import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+function[ \t\r\n]+ {
 }
 
 <IMPORT_DPI>. {
+	// The argument list uses ordinary SystemVerilog types, including ranges.
+	if (*YYText() == '(')
+		BEGIN(0);
 	return char_tok(*YYText(), out_loc);
 }
 
@@ -641,6 +1036,8 @@ import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+function[ \t\r\n]+ {
 "**" { return parser::make_OP_POW(out_loc); }
 "||" { return parser::make_OP_LOR(out_loc); }
 "&&" { return parser::make_OP_LAND(out_loc); }
+"==?" { return parser::make_OP_WEQ(out_loc); }
+"!=?" { return parser::make_OP_WNE(out_loc); }
 "==" { return parser::make_OP_EQ(out_loc); }
 "!=" { return parser::make_OP_NE(out_loc); }
 "<=" { return parser::make_OP_LE(out_loc); }
@@ -683,6 +1080,62 @@ import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+function[ \t\r\n]+ {
 "<<<=" { SV_KEYWORD(parser::make_TOK_SSHL_ASSIGN(out_loc)); }
 ">>>=" { SV_KEYWORD(parser::make_TOK_SSHR_ASSIGN(out_loc)); }
 
+ /* SVA multi-character operators. Repetition brackets allow the whitespace the LRM permits. */
+"|->" { return parser::make_TOK_SVA_OV_IMPL(out_loc); }
+"<->" { return parser::make_TOK_IFF(out_loc); }
+"->" { return parser::make_TOK_ARROW(out_loc); }
+"->>" { return parser::make_TOK_NB_ARROW(out_loc); }
+"|=>" { return parser::make_TOK_SVA_NONOV_IMPL(out_loc); }
+"#-#" { return parser::make_TOK_SVA_OV_FOL(out_loc); }
+"#=#" { return parser::make_TOK_SVA_NONOV_FOL(out_loc); }
+"##"  { return parser::make_TOK_SVA_HASH2(out_loc); }
+"["[ \t\r\n]*"*"  { return parser::make_TOK_SVA_REP_CONSEC(out_loc); }
+	/* associative-array dimensions indexed by type names `int arr[unpk_t];'
+	   or by `*' / `$' (IEEE 7.8): the index type does not affect storage,
+	   so rewrite the whole run of bracketed dims to the wildcard dimension,
+	   which elaborates as a single-element memory. Runs (possibly with
+	   comments inside the brackets) collapse to one dim. */
+{ASSOC_DIM}([ \t\r\n]*{ASSOC_DIM})* {
+	if (!mode->sv) REJECT;
+	std::string text = YYText();
+	size_t i = 0;
+	bool ok = true;
+	while (ok && i < text.size()) {
+		if (text[i] != '[') { i++; continue; }
+		i++;
+		// skip whitespace and comments before the index
+		while (i < text.size()) {
+			if (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n') i++;
+			else if (i + 1 < text.size() && text[i] == '/' && text[i+1] == '/') {
+				while (i < text.size() && text[i] != '\n') i++;
+			} else if (i + 1 < text.size() && text[i] == '/' && text[i+1] == '*') {
+				i += 2;
+				while (i + 1 < text.size() && !(text[i] == '*' && text[i+1] == '/')) i++;
+				i += 2;
+			} else break;
+		}
+		if (i < text.size() && text[i] == '*') {
+			i++;
+		} else {
+			size_t b = i;
+			while (i < text.size() && (isalnum(text[i]) || text[i] == '_' || text[i] == '$')) i++;
+			std::string name = std::string("\\") + text.substr(b, i - b);
+			if (!isUserType(extra, name))
+				ok = false;
+		}
+		// skip anything up to and including the closing bracket
+		while (i < text.size() && text[i] != ']') i++;
+		if (i < text.size()) i++;
+	}
+	if (!ok)
+		REJECT;
+	unput(']');
+	return parser::make_TOK_SVA_REP_CONSEC(out_loc);
+}
+"["[ \t\r\n]*"+"  { return parser::make_TOK_SVA_REP_PLUS(out_loc); }
+"["[ \t\r\n]*"->" { return parser::make_TOK_SVA_REP_GOTO(out_loc); }
+"["[ \t\r\n]*"="  { return parser::make_TOK_SVA_REP_NONCONS(out_loc); }
+
 [-+]?[=*]> {
 	if (!mode->specify) REJECT;
 	auto val = std::make_unique<std::string>(YYText());
@@ -712,3 +1165,290 @@ import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+function[ \t\r\n]+ {
 <*>. { BEGIN(0); return char_tok(*YYText(), out_loc); }
 
 %%
+
+static bool is_reserved_word(const std::string &w)
+{
+	static const char *words[] = {
+		"accept_on", "alias", "always", "always_comb", "always_ff", "always_latch", "and",
+		"assert", "assign", "assume", "automatic", "before", "begin", "bind", "bins", "binsof",
+		"bit", "break", "buf", "bufif0", "bufif1", "byte", "case", "casex", "casez", "cell",
+		"chandle", "checker", "class", "clocking", "cmos", "config", "const", "constraint",
+		"context", "continue", "cover", "covergroup", "coverpoint", "cross", "deassign",
+		"default", "defparam", "disable", "dist", "do", "edge", "else", "end", "endcase",
+		"endchecker", "endclass", "endclocking", "endconfig", "endfunction", "endgenerate",
+		"endgroup", "endinterface", "endmodule", "endpackage", "endprimitive", "endprogram",
+		"endproperty", "endsequence", "endspecify", "endtable", "endtask", "enum", "event",
+		"eventually", "expect", "export", "extends", "extern", "final", "first_match", "for",
+		"force", "foreach", "forever", "fork", "forkjoin", "function", "generate", "genvar",
+		"global", "highz0", "highz1", "if", "iff", "ifnone", "implies", "import", "incdir",
+		"include", "initial", "inout", "input", "inside", "instance", "int", "integer",
+		"interconnect", "interface", "intersect", "join", "join_any", "join_none", "large",
+		"let", "liblist", "library", "local", "localparam", "logic", "longint", "macromodule",
+		"matches", "medium", "modport", "module", "nand", "negedge", "nettype", "new",
+		"nexttime", "nmos", "nor", "noshowcancelled", "not", "notif0", "notif1", "null", "or",
+		"output", "package", "packed", "parameter", "pmos", "posedge", "primitive", "priority",
+		"program", "property", "protected", "pull0", "pull1", "pulldown", "pullup", "pulsestyle_ondetect",
+		"pulsestyle_onevent", "pure", "rand", "randc", "randcase", "randsequence", "rcmos",
+		"real", "realtime", "ref", "reg", "reject_on", "release", "repeat", "restrict", "return",
+		"rnmos", "rpmos", "rtran", "rtranif0", "rtranif1", "s_always", "s_eventually", "s_nexttime",
+		"s_until", "s_until_with", "scalared", "sequence", "shortint", "shortreal", "showcancelled",
+		"signed", "small", "soft", "solve", "specify", "specparam", "static", "string", "strong",
+		"struct", "super", "supply0", "supply1", "sync_accept_on", "sync_reject_on", "table",
+		"tagged", "task", "this", "throughout", "time", "timeprecision", "timeunit", "tran",
+		"tranif0", "tranif1", "tri", "tri0", "tri1", "triand", "trior", "trireg", "type",
+		"typedef", "union", "unique", "unique0", "unsigned", "until", "until_with", "untyped",
+		"use", "uwire", "var", "vectored", "virtual", "void", "wait", "wait_order", "wand",
+		"weak", "while", "wildcard", "wire", "with", "within", "wor", "xnor", "xor", nullptr
+	};
+	static std::unordered_set<std::string> set;
+	if (set.empty()) {
+		for (const char **p = words; *p; ++p)
+			set.insert(*p);
+	}
+	return set.count(w) != 0;
+}
+
+bool VERILOG_FRONTEND::VerilogLexer::lookahead_is_cast()
+{
+	std::string saved;
+	int line = yylineno;
+	auto getc = [&]() -> int {
+		int c = yyinput();
+		if (c > 0)
+			saved.push_back((char)c);
+		return c;
+	};
+	int c = getc();
+	while (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f')
+		c = getc();
+	bool yes = c == '\'';
+	for (int i = (int)saved.size() - 1; i >= 0; --i)
+		unput(saved[i]);
+	yylineno = line;
+	return yes;
+}
+
+bool VERILOG_FRONTEND::VerilogLexer::lookahead_func_rettype()
+{
+	// function automatic <type> <name>(
+	std::string saved;
+	int line = yylineno;
+	auto getc = [&]() -> int {
+		int c = yyinput();
+		if (c > 0)
+			saved.push_back((char)c);
+		return c;
+	};
+	auto skip_from = [&](int c) -> int {
+		while (true) {
+			if (c <= 0)
+				return 0;
+			if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+				c = getc();
+				continue;
+			}
+			if (c == '/') {
+				int n = getc();
+				if (n == '/') {
+					while ((c = getc()) > 0 && c != '\n') {}
+					c = getc();
+					continue;
+				}
+				if (n == '*') {
+					int prev = 0;
+					while ((c = getc()) > 0) {
+						if (prev == '*' && c == '/')
+							break;
+						prev = c;
+					}
+					c = getc();
+					continue;
+				}
+				return '/';
+			}
+			return c;
+		}
+	};
+	auto is_start = [](int c) { return std::isalpha(c) || c == '_' || c == '$'; };
+	auto is_cont = [](int c) { return std::isalnum(c) || c == '_' || c == '$'; };
+	int c = skip_from(getc());
+	bool yes = false;
+	if (is_start(c)) {
+		int n = getc();
+		while (is_cont(n))
+			n = getc();
+		int sig = skip_from(n);
+		if (sig == '(') {
+			yes = true;
+		} else if (sig == '#') {
+			// parameterized return type `type #(args) name (`: skip the
+			// group and confirm a function name follows.
+			int m = skip_from(getc());
+			if (m == '(') {
+				int depth = 1;
+				while (depth > 0 && (m = getc()) > 0) {
+					if (m == '(')
+						depth++;
+					else if (m == ')')
+						depth--;
+				}
+				sig = skip_from(getc());
+			}
+			if (is_start(sig)) {
+				int k = getc();
+				while (is_cont(k))
+					k = getc();
+				yes = skip_from(k) == '(';
+			}
+		}
+	}
+	for (int i = (int)saved.size() - 1; i >= 0; --i)
+		unput(saved[i]);
+	yylineno = line;
+	return yes;
+}
+
+bool VERILOG_FRONTEND::VerilogLexer::lookahead_is_typedef()
+{
+	if (!(mode->sv || mode->formal))
+		return false;
+	std::string saved;
+	int line = yylineno;
+	auto getc = [&]() -> int {
+		int c = yyinput();
+		if (c > 0)
+			saved.push_back((char)c);
+		return c;
+	};
+	auto skip_from = [&](int c) -> int {
+		while (true) {
+			if (c <= 0)
+				return 0;
+			if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+				c = getc();
+				continue;
+			}
+			if (c == '/') {
+				int n = getc();
+				if (n == '/') {
+					while ((c = getc()) > 0 && c != '\n') {}
+					c = getc();
+					continue;
+				}
+				if (n == '*') {
+					int prev = 0;
+					while ((c = getc()) > 0) {
+						if (prev == '*' && c == '/')
+							break;
+						prev = c;
+					}
+					c = getc();
+					continue;
+				}
+				return '/';
+			}
+			return c;
+		}
+	};
+	auto is_start = [](int c) {
+		return std::isalpha(c) || c == '_' || c == '$';
+	};
+	auto is_cont = [](int c) {
+		return std::isalnum(c) || c == '_' || c == '$';
+	};
+	int trail = 0;
+	auto read_word = [&](int first) -> std::string {
+		std::string word(1, (char)first);
+		int n = getc();
+		while (is_cont(n)) {
+			word.push_back((char)n);
+			n = getc();
+		}
+		trail = n;
+		return word;
+	};
+	int c = skip_from(getc());
+	bool yes = false;
+	if (c == '#') {
+		// parameterized type `type #(args) name ...` (or an instantiation
+		// `type #(args) inst (...)`): skip the group, then a variable name
+		// followed by '(' is an instantiation, not a declaration.
+		int n = skip_from(getc());
+		if (n == '(') {
+			int depth = 1;
+			while (depth > 0 && (n = getc()) > 0) {
+				if (n == '(')
+					depth++;
+				else if (n == ')')
+					depth--;
+			}
+			int sig = skip_from(getc());
+			while (sig == '[') {
+				int rd = 1;
+				int m;
+				while (rd > 0 && (m = getc()) > 0) {
+					if (m == '[')
+						rd++;
+					else if (m == ']')
+						rd--;
+				}
+				sig = skip_from(getc());
+			}
+			if (is_start(sig)) {
+				std::string word = read_word(sig);
+				int sig2 = skip_from(trail);
+				while (sig2 == '[') {
+					int rd = 1;
+					int m;
+					while (rd > 0 && (m = getc()) > 0) {
+						if (m == '[')
+							rd++;
+						else if (m == ']')
+							rd--;
+					}
+					sig2 = skip_from(getc());
+				}
+				yes = !is_reserved_word(word) && sig2 != '(' && sig2 != '#';
+			}
+		}
+	} else if (is_start(c)) {
+		std::string word = read_word(c);
+		int sig = skip_from(trail);
+		while (sig == '[') {
+			int depth = 1;
+			int n;
+			while (depth > 0 && (n = getc()) > 0) {
+				if (n == '[')
+					depth++;
+				else if (n == ']')
+					depth--;
+			}
+			sig = skip_from(getc());
+		}
+		// The word after the candidate type must be a real name, not a keyword
+		// such as import, begin, inside, or void.
+		yes = !is_reserved_word(word) && sig != '(' && sig != '#';
+	} else if (c == '[') {
+		// type [packed][packed] name
+		int n;
+		int sig = '[';
+		while (sig == '[') {
+			int depth = 1;
+			while (depth > 0 && (n = getc()) > 0) {
+				if (n == '[')
+					depth++;
+				else if (n == ']')
+					depth--;
+			}
+			sig = skip_from(getc());
+		}
+		if (is_start(sig)) {
+			std::string word = read_word(sig);
+			yes = !is_reserved_word(word);
+		}
+	}
+	for (int i = (int)saved.size() - 1; i >= 0; --i)
+		unput(saved[i]);
+	yylineno = line;
+	return yes;
+}

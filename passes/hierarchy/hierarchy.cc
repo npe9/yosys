@@ -193,6 +193,7 @@ struct IFExpander
 
 	bool                                    has_interfaces_not_found;
 	std::vector<RTLIL::IdString>            connections_to_remove;
+	std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> positional_renames;
 	std::vector<RTLIL::IdString>            connections_to_add_name;
 	std::vector<RTLIL::SigSpec>             connections_to_add_signal;
 	dict<RTLIL::IdString, RTLIL::Module*>   interfaces_to_add_to_submodule;
@@ -203,6 +204,7 @@ struct IFExpander
 	{
 		has_interfaces_not_found = false;
 		connections_to_remove.clear();
+		positional_renames.clear();
 		connections_to_add_name.clear();
 		connections_to_add_signal.clear();
 		interfaces_to_add_to_submodule.clear();
@@ -232,8 +234,11 @@ struct IFExpander
 	// Handle an interface connection from the module
 	void on_interface(RTLIL::Module        &submodule,
 	                  RTLIL::IdString       conn_name,
-	                  const RTLIL::SigSpec &conn_signals)
+	                  const RTLIL::SigSpec &conn_signals,
+	                  RTLIL::IdString       port_name = {})
 	{
+		if (port_name.empty())
+			port_name = conn_name;
 		// Check if the connected wire is a potential interface in the parent module
 		std::string interface_name_str = conn_signals[0].wire->name.str();
 		// Strip the prefix '$dummywireforinterface' from the dummy wire to get the name
@@ -269,7 +274,7 @@ struct IFExpander
 
 		// Go over all wires in interface, and add replacements to lists.
 		for (auto mod_wire : mod_replace_ports->wires()) {
-			std::string signal_name1 = conn_name.str() + "." + mod_wire->name.unescape();
+			std::string signal_name1 = port_name.str() + "." + mod_wire->name.unescape();
 			std::string signal_name2 = interface_name.str() + "." + mod_wire->name.unescape();
 			connections_to_add_name.push_back(RTLIL::IdString(signal_name1));
 			if(module.wire(signal_name2) == nullptr) {
@@ -282,14 +287,14 @@ struct IFExpander
 			}
 		}
 		connections_to_remove.push_back(conn_name);
-		interfaces_to_add_to_submodule[conn_name] = interfaces_in_module.at(interface_name2);
+		interfaces_to_add_to_submodule[port_name] = interfaces_in_module.at(interface_name2);
 
 		// Find if the sub-module has set a modport for the current interface
 		// connection. Add any modports to a dict which will be passed to
 		// AstModule::derive
-		string modport_name = submodule.wire(conn_name)->get_string_attribute(ID::interface_modport);
+		string modport_name = submodule.wire(port_name)->get_string_attribute(ID::interface_modport);
 		if (!modport_name.empty()) {
-			modports_used_in_submodule[conn_name] = "\\" + modport_name;
+			modports_used_in_submodule[port_name] = "\\" + modport_name;
 		}
 	}
 
@@ -299,34 +304,58 @@ struct IFExpander
 	                   RTLIL::IdString       conn_name,
 	                   const RTLIL::SigSpec &conn_signals)
 	{
+		int id = 0;
+		bool positional = read_id_num(conn_name, &id);
+		bool looks_like_iface =
+			conn_signals.size() == 1 &&
+			conn_signals[0].wire != nullptr &&
+			conn_signals[0].wire->get_bool_attribute(ID::is_interface) &&
+			conn_signals[0].wire->name.str().find("$dummywireforinterface") == 0;
+		if (positional && !looks_like_iface) {
+			bool sub_has_iface = false;
+			for (auto wire : submodule.wires())
+				if (wire->port_id && wire->get_bool_attribute(ID::is_interface))
+					sub_has_iface = true;
+			if (sub_has_iface) {
+				for (auto wire : submodule.wires()) {
+					if (wire->port_id == id && !wire->get_bool_attribute(ID::is_interface)) {
+						positional_renames.push_back({conn_name, wire->name});
+						return;
+					}
+				}
+			}
+		}
+
 		// Does the connection look like an interface
-		if (
-			conn_signals.size() != 1 ||
-			conn_signals[0].wire == nullptr ||
-			conn_signals[0].wire->get_bool_attribute(ID::is_interface) == false ||
-			conn_signals[0].wire->name.str().find("$dummywireforinterface") != 0
-		)
+		if (!looks_like_iface)
 			return;
 
 		// Check if the connection is present as an interface in the sub-module's port list
-		int id;
-		if (read_id_num(conn_name, &id)) {
-			/* Interface expansion is incompatible with positional arguments
-			 * during expansion, the port list gets each interface signal
-			 * inserted after the interface itself which means that the argument
-			 * positions in the parent module no longer match.
-			 *
-			 * Supporting this would require expanding the interfaces in the
-			 * parent module, renumbering the arguments to match, and then
-			 * iterating over the ports list to find the matching interface
-			 * (refactoring on_interface to accept different conn_names on the
-			 * parent and child).
-			 */
-			log_error("Unable to connect `%s' to submodule `%s' with positional interface argument `%s'!\n",
-				module.name,
-				submodule.name,
-				conn_signals[0].wire->name.str().substr(23)
-			);
+		if (positional) {
+			// IEEE 1800-2009 23.3.2: a positional port is the port at that index.
+			// Resolve it before expansion so the interface is connected by name.
+			RTLIL::IdString iface_port;
+			for (auto wire : submodule.wires()) {
+				if (wire->port_id == id && wire->get_bool_attribute(ID::is_interface)) {
+					iface_port = wire->name;
+					break;
+				}
+			}
+			if (iface_port.empty()) {
+				for (auto wire : submodule.wires()) {
+					if (wire->port_id == id) {
+						positional_renames.push_back({conn_name, wire->name});
+						return;
+					}
+				}
+				log_error("Unable to connect `%s' to submodule `%s' with positional interface argument `%s'!\n",
+					module.name,
+					submodule.name,
+					conn_signals[0].wire->name.str().substr(23)
+				);
+			}
+			on_interface(submodule, conn_name, conn_signals, iface_port);
+			return;
 		} else {
 			// Lookup connection by name
 			const RTLIL::Wire *wire = submodule.wire(conn_name);
@@ -358,6 +387,14 @@ struct IFExpander
 		for(unsigned int i=0;i<connections_to_remove.size();i++) {
 			cell.connections_.erase(connections_to_remove[i]);
 		}
+		// Other positional ports keep their names when the interface port expands.
+		for (auto &ren : positional_renames) {
+			auto it = cell.connections_.find(ren.first);
+			if (it == cell.connections_.end())
+				continue;
+			cell.connections_[ren.second] = it->second;
+			cell.connections_.erase(it);
+		}
 	}
 };
 
@@ -385,9 +422,11 @@ RTLIL::Module *get_module(RTLIL::Design                  &design,
 	}
 
 	// Internal cell types have no module to load. With check set they
-	// must at least be known cell types.
-	if (cell_type[0] == '$') {
-		if (check && !yosys_celltypes.cell_known(cell.type))
+	// must at least be known cell types.  Frontend-emitted escaped forms
+	// ("\$sva" property-tree cells) are pseudo-internal too: they are
+	// validated by sva2check, not by module port checking.
+	if (cell_type[0] == '$' || (cell_type.size() > 1 && cell_type[0] == '\\' && cell_type[1] == '$')) {
+		if (cell_type[0] == '$' && check && !yosys_celltypes.cell_known(cell.type))
 			log_error("Cell type `%s' referenced in module `%s' in cell `%s' is neither a known internal cell type nor part of the design.\n",
 			          cell_type.c_str(), parent.name.c_str(), cell.name.c_str());
 		return nullptr;
@@ -415,12 +454,37 @@ RTLIL::Module *get_module(RTLIL::Design                  &design,
 		}
 	}
 
-	// We couldn't find the module anywhere. Complain if check is set.
+	// We couldn't find the module anywhere. A single translation unit often
+	// instantiates primitives that live in another file. Keep the parent so
+	// its own logic still synthesizes.
 	if (check)
-		log_error("Module `%s' referenced in module `%s' in cell `%s' is not part of the design.\n",
-		          cell_type.c_str(), parent.name.c_str(), cell.name.c_str());
+		log_warning("Module `%s' referenced in module `%s' is not part of the design; treating it as a black box.\n",
+		            cell_type.c_str(), parent.name.c_str());
 
-	return nullptr;
+	RTLIL::Module *bb = design.addModule(cell.type);
+	bb->set_bool_attribute(ID::blackbox);
+	bb->set_bool_attribute(IdString("\\sv_missing_blackbox"));
+	int array_num = 1;
+	if (cell.attributes.count(IdString("\\sv_array_count")))
+		array_num = cell.attributes.at(IdString("\\sv_array_count")).as_int();
+	if (array_num < 1)
+		array_num = 1;
+	int port_id = 1;
+	for (auto &conn : cell.connections()) {
+		if (bb->wire(conn.first))
+			continue;
+		int width = GetSize(conn.second);
+		if (array_num > 1 && width % array_num == 0)
+			width /= array_num;
+		if (width < 1)
+			width = 1;
+		RTLIL::Wire *wire = bb->addWire(conn.first, width);
+		wire->port_id = port_id++;
+		wire->port_input = true;
+		wire->port_output = true;
+	}
+	bb->fixup_ports();
+	return bb;
 }
 
 // Check that the connections on the cell match those that are defined
@@ -450,6 +514,8 @@ void check_cell_connections(const RTLIL::Module &module, RTLIL::Cell &cell, RTLI
 			          conn.first.unescape());
 		}
 	}
+	if (mod.get_bool_attribute(IdString("\\sv_missing_blackbox")))
+		return;
 	for (auto &param : cell.parameters) {
 		if (read_id_num(param.first, &id)) {
 			if (id <= 0 || id > GetSize(mod.avail_parameters))
@@ -504,6 +570,7 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 			int idx = atoi(cell->type.substr(pos_idx + 1, pos_num).c_str());
 			int num = atoi(cell->type.substr(pos_num + 1, pos_type).c_str());
 			array_cells[cell] = std::pair<int, int>(idx, num);
+			cell->attributes[IdString("\\sv_array_count")] = RTLIL::Const(num);
 			cell->type = cell->type.substr(pos_type + 1);
 		}
 

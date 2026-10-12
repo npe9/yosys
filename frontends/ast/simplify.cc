@@ -198,13 +198,38 @@ void AstNode::annotateTypedEnums(AstNode *template_node)
 		AstNode *enum_item0 = enum_node->children[0].get();
 		log_assert(enum_item0->type == AST_ENUM_ITEM);
 		int width;
-		if (!enum_item0->range_valid)
-			width = 1;
+		bool base_signed = false;
+		if (!enum_item0->range_valid) {
+			// Typed enums (typedef enum base_t {...}) inherit the packed
+			// base type's range; each item carries the base type as an
+			// AST_WIRETYPE child instead of an explicit range node.
+			width = -1;
+			for (auto &ch : enum_item0->children) {
+				if (ch->type != AST_WIRETYPE)
+					continue;
+				AstNode *tdef = current_scope.count(ch->str) ? current_scope.at(ch->str) : nullptr;
+				AstNode *twire = tdef;
+				if (twire && twire->type == AST_TYPEDEF && !twire->children.empty())
+					twire = twire->children[0].get();
+				if (twire && twire->type == AST_WIRE) {
+					base_signed = twire->is_signed;
+					if (twire->range_valid)
+						width = std::max(twire->range_left, twire->range_right) -
+							std::min(twire->range_left, twire->range_right) + 1;
+					else if (!twire->children.empty() && twire->children[0]->type == AST_RANGE &&
+							twire->children[0]->range_valid)
+						width = twire->children[0]->range_left - twire->children[0]->range_right + 1;
+				}
+			}
+			if (width < 1)
+				width = 1;
+		}
 		else if (enum_item0->range_swapped)
 			width = enum_item0->range_right - enum_item0->range_left + 1;
 		else
 			width = enum_item0->range_left - enum_item0->range_right + 1;
-		log_assert(width > 0);
+		if (width <= 0)
+			width = 1;
 		//add declared enum items:
 		for (auto& enum_item : enum_node->children){
 			log_assert(enum_item->type == AST_ENUM_ITEM);
@@ -213,8 +238,14 @@ void AstNode::annotateTypedEnums(AstNode *template_node)
 			if (enum_item->children.size() == 1){
 				is_signed = false;
 			} else if (enum_item->children.size() == 2){
-				log_assert(enum_item->children[1]->type == AST_RANGE);
-				is_signed = enum_item->children[1]->is_signed;
+				if (enum_item->children[1]->type == AST_WIRETYPE) {
+					// typed enum: signedness inherited from the packed base
+					// type (resolved while computing the width above)
+					is_signed = base_signed;
+				} else {
+					log_assert(enum_item->children[1]->type == AST_RANGE);
+					is_signed = enum_item->children[1]->is_signed;
+				}
 			} else {
 				log_error("enum_item children size==%zu, expected 1 or 2 for %s (%s)\n",
 						  (size_t) enum_item->children.size(),
@@ -251,11 +282,438 @@ static std::unique_ptr<AstNode> make_range(AstSrcLocType loc, int left, int righ
 	return range;
 }
 
+// An identifier from a package that was never compiled resolves to the
+// implicit 1-bit wire created for it. Such an identifier cannot decide a
+// range bound; find it so the bound can be replaced by a constant, like
+// other missing-package degradations in this frontend.
+static AstNode *find_missing_autowire(AstNode *node, int depth = 0)
+{
+	if (node->type == AST_IDENTIFIER && node->id2ast) {
+		if (node->id2ast->type == AST_AUTOWIRE)
+			return node;
+		if (depth < 8 && (node->id2ast->type == AST_PARAMETER || node->id2ast->type == AST_LOCALPARAM))
+			for (auto &child : node->id2ast->children)
+				if (child) {
+					AstNode *found = find_missing_autowire(child.get(), depth + 1);
+					if (found)
+						return found;
+				}
+	}
+	if (depth >= 8)
+		return nullptr;
+	for (auto &child : node->children)
+		if (child) {
+			AstNode *found = find_missing_autowire(child.get(), depth + 1);
+			if (found)
+				return found;
+		}
+	return nullptr;
+}
+
+// Rewrite references to a flattened unpacked-array port: the leading index
+// select becomes a part-select on the wide wire (word width w).
+static AstNode *resolve_wiretype_struct(AstNode *decl_node);
+
+static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, int w, AstNode *port_node)
+{
+	if (!node)
+		return;
+	// Element member select on a flattened struct-array port:
+	// W[idx].member -> W[idx][member_bits] so the identifier branch below
+	// can turn it into a part-select on the wide wire.
+	if (node->type == AST_PREFIX && node->str == name && port_node &&
+			node->children.size() == 2 && node->children[1]->type == AST_IDENTIFIER) {
+		AstNode *stype = resolve_wiretype_struct(port_node);
+		if (stype && stype->range_valid) {
+			std::string mname = node->children[1]->str;
+			if (!mname.empty() && mname[0] == '\\')
+				mname = mname.substr(1);
+			AstNode *item = nullptr;
+			for (auto &cand : stype->children) {
+				std::string cname = cand->str;
+				if (!cname.empty() && cname[0] == '\\')
+					cname = cname.substr(1);
+				if (cname == mname) {
+					item = cand.get();
+					break;
+				}
+			}
+			if (item && item->range_valid) {
+				auto loc = node->location;
+				auto mr = std::make_unique<AstNode>(loc, AST_MULTIRANGE);
+				mr->children.push_back(std::make_unique<AstNode>(loc, AST_RANGE, node->children[0]->clone()));
+				mr->children.push_back(std::make_unique<AstNode>(loc, AST_RANGE,
+						AstNode::mkconst_int(loc, item->range_left, true),
+						AstNode::mkconst_int(loc, item->range_right, true)));
+				node->children.clear();
+				node->children.push_back(std::move(mr));
+				node->type = AST_IDENTIFIER;
+			}
+		}
+	}
+	if (node->type == AST_IDENTIFIER && node->str == name && !node->children.empty() &&
+			node->children[0]->type == AST_RANGE) {
+		AstNode *idx = node->children[0].get();
+		// A stage-1 member-select rewrite may already have produced
+		// W[idx][part] as a single MULTIRANGE child; split it into the
+		// two-range shape this branch works on.
+		if (node->children.size() == 1 && idx->children.size() == 2 &&
+				idx->children[0]->type == AST_RANGE && idx->children[1]->type == AST_RANGE) {
+			node->children.insert(node->children.begin(), std::move(node->children[0]->children[1]));
+			node->children.insert(node->children.begin(), std::move(node->children[0]->children[0]));
+			idx = node->children[0].get();
+		}
+		auto loc = idx->location;
+		std::unique_ptr<AstNode> off;
+		if (idx->range_valid) {
+			off = AstNode::mkconst_int(loc, idx->range_left * w, true);
+		} else {
+			// Unwrap the index expression from its single-child range node and
+			// fold constant indices now: downstream width detection recurses
+			// into these bounds, and a bare RANGE inside an expression (or
+			// non-const bounds shaped like one) trips it up.
+			AstNode *ix = idx->children.size() == 1 ? idx->children[0].get() : nullptr;
+			if (ix && ix->type == AST_CONSTANT)
+				off = AstNode::mkconst_int(loc, ix->integer * w, true);
+			if (!off) {
+				if (!ix)
+					ix = idx;
+				off = std::make_unique<AstNode>(loc, AST_MUL, ix->clone(), AstNode::mkconst_int(loc, w, true));
+			}
+		}
+		node->children.erase(node->children.begin());
+		std::unique_ptr<AstNode> left, right;
+		if (!node->children.empty() && node->children[0]->type == AST_RANGE && node->children[0]->range_valid) {
+			// word select plus packed sub-select [a:b]
+			int a = node->children[0]->range_left, b = node->children[0]->range_right;
+			node->children.erase(node->children.begin());
+			if (a == w - 1 && b == 0) {
+				left = off->clone();
+				right = std::move(off);
+			} else if (off->type == AST_CONSTANT) {
+				left = AstNode::mkconst_int(loc, off->integer + a, true);
+				right = AstNode::mkconst_int(loc, off->integer + b, true);
+			} else {
+				left = std::make_unique<AstNode>(loc, AST_ADD, off->clone(), AstNode::mkconst_int(loc, a, true));
+				right = std::move(off);
+				if (b != 0)
+					right = std::make_unique<AstNode>(loc, AST_ADD, std::move(right), AstNode::mkconst_int(loc, b, true));
+			}
+		} else {
+			if (off->type == AST_CONSTANT) {
+				left = AstNode::mkconst_int(loc, off->integer + w - 1, true);
+				right = std::move(off);
+			} else {
+				left = std::make_unique<AstNode>(loc, AST_ADD, off->clone(), AstNode::mkconst_int(loc, w - 1, true));
+				right = std::move(off);
+			}
+		}
+		node->children.insert(node->children.begin(),
+				std::make_unique<AstNode>(loc, AST_RANGE, std::move(left), std::move(right)));
+		node->integer = 0;
+		node->basic_prep = false;
+	}
+	for (auto &child : node->children)
+		rewrite_unpacked_port_refs(child.get(), name, w, port_node);
+	for (auto &attr : node->attributes)
+		rewrite_unpacked_port_refs(attr.second.get(), name, w, port_node);
+}
+
+// Information about a plain 1-D unpacked memory (packed range + exactly one
+// unpacked range, not a typed/struct array). Bounds are resolved on demand;
+// returns false for any other shape (multidim, unresolved, struct).
+// Whole-array rewrites are limited to small memories; larger ones are left
+// to the legacy memory path (direct whole-memory assignments still work
+// there, while a concatenation of their elements would exceed the
+// expression width implementation limit).
+static const int64_t whole_array_rewrite_max_bits = 65536;
+
+// `<seq>.triggered` / `<seq>.matched` (IEEE 1800-2009 16.14.6): the parser
+// sees the sequence method as a hierarchical identifier, so elaboration
+// reaches the implicit-declaration diagnostic for the underlying wire.
+// sva2check later drives such wires with the sequence's end pulse; here we
+// only recognize the form so it does not warn/error when the stem names a
+// sequence declared in this module.
+static bool is_sequence_method_ref(const std::string &str)
+{
+	if (!current_ast_mod)
+		return false;
+	for (int m = 0; m < 2; m++) {
+		const char *suf = m ? ".matched" : ".triggered";
+		size_t sl = strlen(suf);
+		if (str.size() <= sl || str.compare(str.size() - sl, sl, suf) != 0)
+			continue;
+		std::string stem = str.substr(0, str.size() - sl);
+		if (!stem.empty() && stem[0] == '\\')
+			stem = stem.substr(1);
+		for (auto &child : current_ast_mod->children) {
+			if (child->type != AST_SVA || child->str != "sequence_decl" ||
+					child->children.empty())
+				continue;
+			if (child->children[0]->str == stem)
+				return true;
+		}
+	}
+	return false;
+}
+
+static bool get_1d_unpacked_mem_info(AstNode *mem, int &elem_width, int &lo, int &hi, bool *struct_array = nullptr){
+	log_assert(mem->type == AST_MEMORY);
+	if (mem->children.size() != 2)
+		return false;
+	AstNode *prange = mem->children[0].get();
+	AstNode *urange = mem->children[1].get();
+	if (!prange || !urange || prange->type != AST_RANGE || urange->type != AST_RANGE)
+		return false;
+	// Struct/union-typed arrays get element reads/connections rewritten
+	// positionally (each element is one packed word); whole-array ASSIGN
+	// splits must stay away because '{...} patterns have their own
+	// positioning machinery (is_whole_array_assign rejects via this flag).
+	if (struct_array)
+		*struct_array = mem->attributes.count(ID::wiretype) && resolve_wiretype_struct(mem);
+	while (!prange->range_valid && prange->simplify(true, 1, -1, false)) { }
+	while (!urange->range_valid && urange->simplify(true, 1, -1, false)) { }
+	if (!prange->range_valid || !urange->range_valid)
+		return false;
+	elem_width = std::abs(prange->range_left - prange->range_right) + 1;
+	lo = std::min(urange->range_left, urange->range_right);
+	hi = std::max(urange->range_left, urange->range_right);
+	if ((int64_t)(hi - lo + 1) * elem_width > whole_array_rewrite_max_bits)
+		return false;
+	return true;
+}
+
+// Element reference mimicking parser output for `mem[idx]` on a 1-D unpacked
+// memory: single AST_RANGE index child, integer = number of indexed dims.
+static std::unique_ptr<AstNode> make_mem_elem_ref(Location loc, AstNode *mem, int index)
+{
+	auto elem = std::make_unique<AstNode>(loc, AST_IDENTIFIER,
+			std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, index, true)));
+	elem->str = mem->str;
+	elem->id2ast = mem;
+	elem->integer = 1;
+	elem->basic_prep = false;
+	return elem;
+}
+
+// Rewrite whole-array accesses to plain 1-D unpacked memories into indexed
+// element form, before child simplification: reads and cell connection
+// arguments become a concatenation {mem[hi], ..., mem[lo]} so the element at
+// the lowest index lands in the LSBs (matching the flattened unpacked-port
+// convention in rewrite_unpacked_port_refs and packed multidim arrays), and
+// assignments to a whole array split into per-element assignments driven
+// through a temporary vector wire (keeping the source expression's width
+// padding/truncation semantics). Any memory referenced this way is marked
+// with the mem2reg attribute so the element wires referenced by the rewrite
+// always exist; stock yosys rejected whole-array accesses to memories
+// ("Invalid array access"). References inside system function/task calls and
+// nested in an assignment lvalue concatenation are left alone.
+static bool is_whole_array_assign(AstNode *node, AstNode *&mem, int &elem_width, int &lo, int &hi)
+{
+	if (!(node->type == AST_ASSIGN || node->type == AST_ASSIGN_EQ || node->type == AST_ASSIGN_LE))
+		return false;
+	if (node->children.size() < 2 || !node->children[0] ||
+			node->children[0]->type != AST_IDENTIFIER || !node->children[0]->children.empty())
+		return false;
+	AstNode *lhs = node->children[0].get();
+	if (!lhs->id2ast || lhs->id2ast->type != AST_MEMORY)
+		return false;
+	bool struct_array = false;
+	if (!get_1d_unpacked_mem_info(lhs->id2ast, elem_width, lo, hi, &struct_array) || struct_array)
+		return false;
+	mem = lhs->id2ast;
+	return true;
+}
+
+// Detect a multi-word slice write `mem[sel_hi:sel_lo] = expr` on a plain
+// 1-D unpacked memory with constant in-bounds bounds.
+static bool is_slice_array_assign(AstNode *node, AstNode *&mem, int &elem_width, int &lo, int &hi)
+{
+	if (!(node->type == AST_ASSIGN || node->type == AST_ASSIGN_EQ || node->type == AST_ASSIGN_LE))
+		return false;
+	if (node->children.size() < 2 || !node->children[0] ||
+			node->children[0]->type != AST_IDENTIFIER)
+		return false;
+	AstNode *lhs = node->children[0].get();
+	if (!lhs->id2ast || lhs->id2ast->type != AST_MEMORY)
+		return false;
+	if (lhs->children.size() != 1 || !lhs->children[0] || lhs->children[0]->type != AST_RANGE)
+		return false;
+	AstNode *range = lhs->children[0].get();
+	if (!range->range_valid || range->range_left == range->range_right)
+		return false;
+	int dim_lo, dim_hi;
+	if (!get_1d_unpacked_mem_info(lhs->id2ast, elem_width, dim_lo, dim_hi))
+		return false;
+	lo = std::min(range->range_left, range->range_right);
+	hi = std::max(range->range_left, range->range_right);
+	if (lo < dim_lo || hi > dim_hi)
+		return false;
+	mem = lhs->id2ast;
+	return true;
+}
+
+// Expand `mem = expr` into a temporary vector wire driven by expr plus one
+// assignment per element. The temporary keeps the source expression's width
+// padding/truncation semantics. In procedural context (always/initial block,
+// function/task body) the temporary is a module-level reg sampled by a
+// blocking assignment at the statement position, so non-blocking whole-array
+// writes keep their evaluate-now/update-later semantics; a continuous
+// assignment would be rejected by proc there.
+static std::vector<std::unique_ptr<AstNode>> expand_whole_array_assign(AstNode *node, AstNode *mem, int elem_width, int lo, int hi, bool procedural)
+{
+	auto loc = node->location;
+
+	std::string tmpname = stringf("$wholeassign$%d", autoidx++);
+	auto tmp_wire = std::make_unique<AstNode>(loc, AST_WIRE,
+			make_range(loc, (hi - lo + 1) * elem_width - 1, 0));
+	tmp_wire->str = tmpname;
+	tmp_wire->is_logic = true;
+	tmp_wire->is_reg = procedural;
+	AstNode *tmp_wire_p = tmp_wire.get();
+	while (tmp_wire_p->simplify(true, 1, -1, false)) { }
+	current_scope[tmpname] = tmp_wire_p;
+	current_ast_mod->children.push_back(std::move(tmp_wire));
+
+	auto driver = std::make_unique<AstNode>(loc, procedural ? AST_ASSIGN_EQ : AST_ASSIGN);
+	driver->children.push_back(std::make_unique<AstNode>(loc, AST_IDENTIFIER));
+	driver->children[0]->str = tmpname;
+	driver->children[0]->id2ast = tmp_wire_p;
+	driver->children.push_back(std::move(node->children[1]));
+	driver->was_checked = true;
+
+	std::vector<std::unique_ptr<AstNode>> expanded;
+	expanded.push_back(std::move(driver));
+	for (int i = hi; i >= lo; i--) {
+		auto assign = std::make_unique<AstNode>(loc, node->type);
+		assign->children.push_back(make_mem_elem_ref(loc, mem, i));
+		auto rhs = std::make_unique<AstNode>(loc, AST_IDENTIFIER,
+				make_range(loc, (i - lo + 1) * elem_width - 1, (i - lo) * elem_width));
+		rhs->str = tmpname;
+		rhs->id2ast = tmp_wire_p;
+		assign->children.push_back(std::move(rhs));
+		expanded.push_back(std::move(assign));
+	}
+	return expanded;
+}
+
+static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool in_procedural = false)
+{
+	if (!node)
+		return;
+
+	bool node_is_assign = node->type == AST_ASSIGN || node->type == AST_ASSIGN_EQ || node->type == AST_ASSIGN_LE;
+	bool procedural = in_procedural || node->type == AST_ALWAYS || node->type == AST_INITIAL;
+
+	for (size_t i = 0; i < node->children.size(); i++) {
+		AstNode *child = node->children[i].get();
+
+		// split `mem = expr` into per-element assignments, spliced into this
+		// node's children list
+		AstNode *mem = nullptr;
+		int elem_width = 0, lo = 0, hi = -1;
+		if (is_whole_array_assign(child, mem, elem_width, lo, hi)) {
+			auto expanded = expand_whole_array_assign(child, mem, elem_width, lo, hi, procedural);
+			mem->set_attribute(ID::mem2reg, AstNode::mkconst_int(node->location, 1, false));
+			// the driver expression may itself contain whole-array reads
+			for (auto &it : expanded)
+				rewrite_whole_array_refs(it.get(), false);
+			node->children.erase(node->children.begin() + i);
+			for (auto &it : expanded) {
+				node->children.insert(node->children.begin() + i, std::move(it));
+				i++;
+			}
+			i--;
+			continue;
+		}
+
+		// split a multi-word slice write `mem[hi:lo] = expr` into per-element
+		// assignments driven through a temporary, same shape as whole-array
+		if (is_slice_array_assign(child, mem, elem_width, lo, hi)) {
+			auto expanded = expand_whole_array_assign(child, mem, elem_width, lo, hi, procedural);
+			mem->set_attribute(ID::mem2reg, AstNode::mkconst_int(node->location, 1, false));
+			for (auto &it : expanded)
+				rewrite_whole_array_refs(it.get(), false);
+			node->children.erase(node->children.begin() + i);
+			for (auto &it : expanded) {
+				node->children.insert(node->children.begin() + i, std::move(it));
+				i++;
+			}
+			i--;
+			continue;
+		}
+
+		// multi-word slice read: replace `mem[hi:lo]` with a concatenation of
+		// element references, lowest index in the LSBs (same convention as the
+		// whole-array read below); out-of-bounds or oversized slices are left
+		// for the generic memory-read path
+		if (child->type == AST_IDENTIFIER && !in_lvalue && !(node_is_assign && i == 0) && child->id2ast &&
+				child->id2ast->type == AST_MEMORY && !(node->type == AST_FCALL || node->type == AST_TCALL) &&
+				child->children.size() == 1 && child->children[0] && child->children[0]->type == AST_RANGE &&
+				child->children[0]->range_valid && child->children[0]->range_left != child->children[0]->range_right &&
+				get_1d_unpacked_mem_info(child->id2ast, elem_width, lo, hi)) {
+			AstNode *sel_range = child->children[0].get();
+			int sel_lo = std::min(sel_range->range_left, sel_range->range_right);
+			int sel_hi = std::max(sel_range->range_left, sel_range->range_right);
+			if (sel_lo >= lo && sel_hi <= hi) {
+				AstNode *smem = child->id2ast;
+				auto loc = child->location;
+				child->type = AST_CONCAT;
+				child->str.clear();
+				child->id2ast = nullptr;
+				child->is_signed = false;
+				child->children.clear();
+				for (int j = sel_lo; j <= sel_hi; j++)
+					child->children.push_back(make_mem_elem_ref(loc, smem, j));
+				smem->set_attribute(ID::mem2reg, AstNode::mkconst_int(loc, 1, false));
+				// element references are terminal; no recursion needed
+				continue;
+			}
+		}
+
+		// whole-array read: replace the bare identifier with a concatenation
+		// of element references, lowest index in the LSBs (AST_CONCAT
+		// children: first child = low bits)
+		if (child->type == AST_IDENTIFIER && !in_lvalue && !(node_is_assign && i == 0) && child->children.empty() && child->id2ast &&
+				child->id2ast->type == AST_MEMORY && !(node->type == AST_FCALL || node->type == AST_TCALL) &&
+				get_1d_unpacked_mem_info(child->id2ast, elem_width, lo, hi)) {
+			AstNode *mem = child->id2ast;
+			auto loc = child->location;
+			child->type = AST_CONCAT;
+			child->str.clear();
+			child->id2ast = nullptr;
+			child->is_signed = false;
+			for (int j = lo; j <= hi; j++)
+				child->children.push_back(make_mem_elem_ref(loc, mem, j));
+			mem->set_attribute(ID::mem2reg, AstNode::mkconst_int(loc, 1, false));
+			// element references are terminal; no recursion needed
+			continue;
+		}
+
+		rewrite_whole_array_refs(child, node_is_assign && i == 0, procedural);
+	}
+	for (auto &attr : node->attributes)
+		rewrite_whole_array_refs(attr.second.get(), false);
+}
+
+
 static int range_width(AstNode *node, AstNode *rnode)
 {
 	log_assert(rnode->type==AST_RANGE);
 	if (!rnode->range_valid) {
-		node->input_error("Non-constant range in declaration of %s\n", node->str);
+		// A freshly cloned range (e.g. a struct type template handed to a
+		// later declaration via the wiretype attribute, or the $sv_unit /
+		// verilog_globals duplication of compilation-unit decls) can carry
+		// constant children before any simplify pass sets range_valid.
+		if (rnode->children.size() == 2 &&
+				rnode->children[0]->type == AST_CONSTANT &&
+				rnode->children[1]->type == AST_CONSTANT) {
+			rnode->range_left = rnode->children[0]->integer;
+			rnode->range_right = rnode->children[1]->integer;
+			rnode->range_valid = true;
+		} else {
+			node->input_error("Non-constant range in declaration of %s\n", node->str);
+		}
 	}
 	// note: range swapping has already been checked for
 	return rnode->range_left - rnode->range_right + 1;
@@ -320,6 +778,7 @@ static bool arrays_have_compatible_dims_from(AstNode *mem_a, int first_dim, AstN
 
 // Convert per-dimension element positions to declared index values.
 // Position 0 is the first declared element for each unpacked dimension.
+
 static std::vector<int> array_indices_from_position(AstNode *mem, const std::vector<int> &position)
 {
 	int num_dims = mem->unpacked_dimensions;
@@ -378,10 +837,44 @@ static int size_packed_struct(AstNode *snode, int base_offset)
 	// examine members from last to first
 	for (auto it = snode->children.rbegin(); it != snode->children.rend(); ++it) {
 		auto node = it->get();
+		if (node->attributes.count(ID::sv_void_member)) {
+			// tagged-union void member: tag-only, contributes no bits and
+			// is exempt from the packed-union same-size check
+			node->range_right = base_offset + offset;
+			node->range_left = base_offset + offset - 1;
+			node->range_valid = true;
+			node->dimensions.push_back({ 0, 0, false });
+			continue;
+		}
 		int width;
 		if (node->type == AST_STRUCT || node->type == AST_UNION) {
 			// embedded struct or union
 			width = size_packed_struct(node, base_offset + offset);
+		}
+		else if (node->type == AST_MEMORY || node->type == AST_WIRE) {
+			// member declared through a user-defined type: resolving the
+			// member's WIRETYPE rewrites the STRUCT_ITEM into the typedef's
+			// wire or memory node before the struct is sized. Pack the
+			// dimensions the same way as the unpacked-array extension below.
+			log_assert(!node->children.empty() && node->children[0]->type == AST_RANGE);
+			node->dimensions.clear();
+			width = add_dimension(node, node->children[0].get());
+			if (node->type == AST_MEMORY) {
+				if (node->children.size() != 2 || node->children[1]->type != AST_RANGE)
+					struct_array_packing_error(node);
+				auto rnode = node->children[1].get();
+				if (rnode->children.size() == 1) {
+					// C-style array size, e.g. typedef bit [63:0] t [4]; t a;
+					node->dimensions.push_back({ 0, rnode->range_left, true });
+					width *= rnode->range_left;
+				} else {
+					width *= add_dimension(node, rnode);
+				}
+			}
+			// range nodes are now redundant
+			node->children.clear();
+			// keep the member a struct item for downstream consumers
+			node->type = AST_STRUCT_ITEM;
 		}
 		else {
 			log_assert(node->type == AST_STRUCT_ITEM);
@@ -450,10 +943,16 @@ static int size_packed_struct(AstNode *snode, int base_offset)
 			node->range_valid = true;
 		}
 		if (is_union) {
-			// check that all members have the same size
+			// check that all members have the same size. Tagged and
+			// unpacked unions (IEEE 1800-2017 7.3.2) may have
+			// differently-sized members; the union is sized to the
+			// widest member plus the tag bits.
 			if (packed_width == -1) {
 				// first member
 				packed_width = width;
+			}
+			else if (snode->attributes.count(ID::sv_tagged) || snode->attributes.count(ID(sv_unpacked))) {
+				packed_width = std::max(packed_width, width);
 			}
 			else {
 				if (packed_width != width)
@@ -466,6 +965,19 @@ static int size_packed_struct(AstNode *snode, int base_offset)
 	}
 
 	int width = is_union ? packed_width : offset;
+
+	// tagged unions (IEEE 1800-2017 7.3.2) carry an implicit tag encoding
+	// the active member, stored ahead of the member bits
+	if (snode->attributes.count(ID::sv_tagged)) {
+		int nmembers = 0;
+		for (auto &child : snode->children)
+			if (child && child->type == AST_STRUCT_ITEM)
+				nmembers++;
+		int tag_bits = 1;
+		while ((1 << tag_bits) < nmembers)
+			tag_bits++;
+		width += tag_bits;
+	}
 
 	snode->range_right = base_offset;
 	snode->range_left = base_offset + width - 1;
@@ -622,6 +1134,42 @@ static void add_members_to_scope(AstNode *snode, std::string name)
 	}
 }
 
+// Resolve the struct/union template behind a wire or memory declared
+// through a (possibly chained) user-defined type. The wiretype attribute
+// holds either the struct node itself (packed-struct wires, memories of
+// packed structs) or the typedef name as a string; the typedef target may
+// in turn be an array-of-struct memory carrying the struct in its own
+// wiretype attribute.
+static AstNode *resolve_wiretype_struct(AstNode *decl_node)
+{
+	if (!decl_node->attributes.count(ID::wiretype))
+		return nullptr;
+	AstNode *wt = decl_node->attributes.at(ID::wiretype).get();
+	if (wt->type == AST_STRUCT || wt->type == AST_UNION)
+		return wt;
+	if (wt->type != AST_CONSTANT)
+		return nullptr;
+	std::string tname = wt->str.c_str();
+	AstNode *td = current_scope.count(tname) ? current_scope.at(tname) : nullptr;
+	if (!td && current_ast)
+		for (auto &node : current_ast->children) {
+			if (!node)
+				continue;
+			if (node->type == AST_TYPEDEF && node->str == tname)
+				td = node.get();
+			if (node->type == AST_PACKAGE)
+				for (auto &inner : node->children)
+					if (inner && inner->type == AST_TYPEDEF && inner->str == tname)
+						td = inner.get();
+		}
+	AstNode *t = (td && td->type == AST_TYPEDEF && !td->children.empty()) ? td->children[0].get() : nullptr;
+	if (t && (t->type == AST_STRUCT || t->type == AST_UNION))
+		return t;
+	if (t && (t->type == AST_WIRE || t->type == AST_MEMORY))
+		return resolve_wiretype_struct(t);
+	return nullptr;
+}
+
 std::unique_ptr<AstNode> make_packed_struct(AstNode *template_node, std::string &name, decltype(AstNode::attributes) &attributes)
 {
 	// create a wire for the packed struct
@@ -683,12 +1231,28 @@ static bool node_contains_assignment_to(const AstNode* node, const AstNode* var)
 
 static std::string prefix_id(const std::string &prefix, const std::string &str)
 {
+	// An empty (or unescaped) identifier can never resolve; return it
+	// unchanged instead of asserting. Error-recovery and class/method
+	// parsing can leave such nodes in the tree (e.g. dropped member
+	// attributes), and they are discarded before RTLIL generation.
+	if (str.empty() || (str.front() != '$' && str.front() != '\\'))
+		return str;
 	log_assert(!prefix.empty() && (prefix.front() == '$' || prefix.front() == '\\'));
 	log_assert(!str.empty() && (str.front() == '$' || str.front() == '\\'));
 	log_assert(prefix.back() == '.');
 	if (str.front() == '\\')
 		return prefix + str.substr(1);
 	return prefix + str;
+}
+
+// Identifier references that miss current_scope inside an inlined function
+// body (the expansion prefix carries "$func$") are resolved by the
+// function-inlining machinery (names carry the "$func$" prefix), not by
+// module-scope scanning — which would walk every module child per reference
+// and emit dead autowires.
+static bool prefix_is_function_inline(const std::string &prefix)
+{
+	return prefix.find("$func$") != std::string::npos;
 }
 
 // direct access to this global should be limited to the following two functions
@@ -704,6 +1268,69 @@ void AST::set_simplify_design_context(const RTLIL::Design *design)
 static const RTLIL::Module* lookup_module(const std::string &name)
 {
 	return simplify_design_context->module(name);
+}
+
+// True when a parameter value is plain arithmetic over constants and
+// (possibly qualified) identifiers - safe to force-fold early when a
+// referencing module runs before the defining package's own fold pass.
+static bool expr_is_plain_arith(AstNode *n, int depth = 0)
+{
+	if (!n || depth > 32)
+		return false;
+	switch (n->type) {
+	case AST_CONSTANT:
+		return true;
+	case AST_IDENTIFIER: {
+		// An identifier that would resolve to an implicit (autowire) net
+		// must not be force-folded: the missing-package degradation paths
+		// handle those, and folding them early produces stale state.
+		AstNode *pt = n->id2ast;
+		if ((!pt || (pt->type != AST_PARAMETER && pt->type != AST_LOCALPARAM &&
+				pt->type != AST_ENUM_ITEM && pt->type != AST_CONSTANT)) &&
+				current_scope.count(n->str))
+			pt = current_scope[n->str];
+		if ((!pt || (pt->type != AST_PARAMETER && pt->type != AST_LOCALPARAM &&
+				pt->type != AST_ENUM_ITEM && pt->type != AST_CONSTANT)) &&
+				simplify_design_context) {
+			// resolves later via a design package member (possibly
+			// package-qualified basename match)
+			for (auto &pn : simplify_design_context->verilog_packages) {
+				if (!pn)
+					continue;
+				for (auto &mem : pn->children) {
+					if (!mem)
+						continue;
+					const std::string &ms = mem->str;
+					size_t pos = ms.rfind("::");
+					std::string base = pos == std::string::npos ? ms : ms.substr(pos + 2);
+					if (base == n->str || ms == n->str) {
+						pt = mem.get();
+						break;
+					}
+				}
+				if (pt)
+					break;
+			}
+		}
+		if (!pt)
+			return false;
+		if (pt->type != AST_PARAMETER && pt->type != AST_LOCALPARAM &&
+				pt->type != AST_ENUM_ITEM && pt->type != AST_CONSTANT)
+			return false;
+		return true;
+	}
+	case AST_ADD: case AST_SUB: case AST_MUL: case AST_DIV: case AST_MOD:
+	case AST_POW: case AST_SHIFT_LEFT: case AST_SHIFT_RIGHT: case AST_SHIFT_SLEFT: case AST_SHIFT_SRIGHT:
+	case AST_BIT_AND: case AST_BIT_OR: case AST_BIT_XOR: case AST_BIT_XNOR:
+	case AST_BIT_NOT:
+		break;
+	default:
+		return false;
+	}
+	for (auto &ch : n->children)
+		if (!expr_is_plain_arith(ch.get(), depth + 1))
+			return false;
+	return true;
 }
 
 const RTLIL::Module* AstNode::lookup_cell_module()
@@ -935,6 +1562,585 @@ static void mark_auto_nosync(AstNode *block, const AstNode *wire)
 	block->set_attribute(auto_nosync_prefix + wire->str, AstNode::mkconst_int(block->location, 1, false));
 }
 
+// IEEE 1800-2009 12.8: break/continue in a constant iteration stop or skip it.
+// 1 = break, 2 = continue, 0 = neither. The control statement and everything
+// after it in this list are removed.
+static int trim_uncond_loop_exit(std::vector<std::unique_ptr<AstNode>> &stmts)
+{
+	for (size_t i = 0; i < stmts.size(); i++) {
+		AstNode *stmt = stmts[i].get();
+		if (!stmt)
+			continue;
+		int direct = 0;
+		if (stmt->type == AST_TCALL && stmt->str == "\\break")
+			direct = 1;
+		else if (stmt->type == AST_TCALL && stmt->str == "\\continue")
+			direct = 2;
+		if (direct) {
+			stmts.erase(stmts.begin() + i, stmts.end());
+			return direct;
+		}
+		int nested = 0;
+		if (stmt->type == AST_BLOCK)
+			nested = trim_uncond_loop_exit(stmt->children);
+		else if (stmt->type == AST_CASE && !stmt->children.empty() && stmt->children[0]->type == AST_CONSTANT) {
+			AstNode *arm = nullptr;
+			int arms = 0;
+			for (size_t c = 1; c < stmt->children.size(); c++) {
+				if (stmt->children[c] && stmt->children[c]->type == AST_COND) {
+					arm = stmt->children[c].get();
+					arms++;
+				}
+			}
+			if (arms == 1 && arm) {
+				for (auto &ch : arm->children) {
+					if (ch && ch->type == AST_BLOCK)
+						nested = trim_uncond_loop_exit(ch->children);
+				}
+			}
+		}
+		if (!nested)
+			continue;
+		stmts.erase(stmts.begin() + i + 1, stmts.end());
+		return nested;
+	}
+	return 0;
+}
+
+// IEEE 1800-2009 9.6.2: an unconditional disable ends the named block there.
+// The block name may already carry an outer prefix (\blk.inner) while the
+// disable statement still names the local block (\inner).
+static bool disable_names_match(const std::string &block, const std::string &target)
+{
+	if (block == target)
+		return true;
+	size_t dot = block.rfind('.');
+	if (dot == std::string::npos)
+		return false;
+	std::string local = block.substr(dot + 1);
+	if (!target.empty() && target[0] == '\\')
+		return target.substr(1) == local;
+	return target == local;
+}
+
+static void subst_known_reads(AstNode *node, const dict<std::string, int> &known, bool lvalue)
+{
+	if (!node)
+		return;
+	if (!lvalue && node->type == AST_IDENTIFIER && node->children.empty() && known.count(node->str)) {
+		AstNode::mkconst_int(node->location, known.at(node->str), true)->cloneInto(*node);
+		return;
+	}
+	for (size_t i = 0; i < node->children.size(); i++) {
+		bool child_lv = (node->type == AST_ASSIGN || node->type == AST_ASSIGN_EQ || node->type == AST_ASSIGN_LE) && i == 0;
+		subst_known_reads(node->children[i].get(), known, child_lv);
+	}
+}
+
+static bool eval_known_int(AstNode *expr, const dict<std::string, int> &known, int &out)
+{
+	if (!expr)
+		return false;
+	auto copy = expr->clone();
+	subst_known_reads(copy.get(), known, false);
+	while (copy->simplify(true, 1, -1, false)) { }
+	if (copy->type != AST_CONSTANT)
+		return false;
+	out = copy->asInt(true);
+	return true;
+}
+
+// Same as eval_known_int, but also requires the result to be fully defined:
+// x/z bits would silently read back as 0 through asInt and could make a case
+// arm look (un)matched when it is not.
+static bool eval_known_int_def(AstNode *expr, const dict<std::string, int> &known, int &out)
+{
+	if (!expr)
+		return false;
+	auto copy = expr->clone();
+	subst_known_reads(copy.get(), known, false);
+	while (copy->simplify(true, 1, -1, false)) { }
+	if (copy->type != AST_CONSTANT || !copy->bits_only_01())
+		return false;
+	out = copy->asInt(true);
+	return true;
+}
+
+static bool erase_uncond_disable(std::vector<std::unique_ptr<AstNode>> &stmts, const std::string &name, dict<std::string, int> &known)
+{
+	for (size_t i = 0; i < stmts.size(); i++) {
+		AstNode *stmt = stmts[i].get();
+		if (!stmt)
+			continue;
+		if (stmt->type == AST_SVA && stmt->str == "disable" && !stmt->children.empty() &&
+				stmt->children[0]->type == AST_IDENTIFIER && disable_names_match(name, stmt->children[0]->str)) {
+			stmts.erase(stmts.begin() + i, stmts.end());
+			return true;
+		}
+		if ((stmt->type == AST_ASSIGN_EQ || stmt->type == AST_ASSIGN_LE || stmt->type == AST_ASSIGN) &&
+				stmt->children.size() >= 2 && stmt->children[0]->type == AST_IDENTIFIER && stmt->children[0]->children.empty()) {
+			int val = 0;
+			if (eval_known_int(stmt->children[1].get(), known, val))
+				known[stmt->children[0]->str] = val;
+			else
+				known.erase(stmt->children[0]->str);
+		}
+		if (stmt->type == AST_BLOCK && erase_uncond_disable(stmt->children, name, known)) {
+			stmts.erase(stmts.begin() + i + 1, stmts.end());
+			return true;
+		}
+		if (stmt->type == AST_CASE && !stmt->children.empty()) {
+			// case matches compares each pattern with a boolean, not with the dummy selector.
+			if (stmt->str == "\\matches")
+				continue;
+			int sel = 0;
+			if (!eval_known_int_def(stmt->children[0].get(), known, sel))
+				continue;
+			// Resolving which arm runs is only sound when every non-default
+			// compare is a fully defined constant; in `case (1'b1) ...` style
+			// reverse-cases the compares are dynamic and the default arm is
+			// not necessarily the one that executes.
+			bool resolvable = true;
+			for (size_t c = 1; c < stmt->children.size(); c++) {
+				AstNode *arm = stmt->children[c].get();
+				if (!arm || arm->type != AST_COND) {
+					resolvable = false;
+					break;
+				}
+				for (auto &ch : arm->children) {
+					if (!ch || ch->type == AST_BLOCK || ch->type == AST_DEFAULT)
+						continue;
+					int cmp = 0;
+					if (!eval_known_int_def(ch.get(), known, cmp)) {
+						resolvable = false;
+						break;
+					}
+				}
+				if (!resolvable)
+					break;
+			}
+			if (!resolvable)
+				continue;
+			AstNode *taken = nullptr;
+			AstNode *fallback = nullptr;
+			bool matched = false;
+			for (size_t c = 1; c < stmt->children.size(); c++) {
+				AstNode *arm = stmt->children[c].get();
+				if (!arm || arm->type != AST_COND)
+					continue;
+				AstNode *blk = nullptr;
+				bool is_default = false;
+				bool arm_match = false;
+				for (auto &ch : arm->children) {
+					if (!ch)
+						continue;
+					if (ch->type == AST_BLOCK)
+						blk = ch.get();
+					else if (ch->type == AST_DEFAULT)
+						is_default = true;
+					else {
+						int cmp = 0;
+						if (eval_known_int_def(ch.get(), known, cmp) && cmp == sel)
+							arm_match = true;
+					}
+				}
+				if (is_default)
+					fallback = blk;
+				else if (arm_match) {
+					taken = blk;
+					matched = true;
+					break;
+				}
+			}
+			if (!matched)
+				taken = fallback;
+			if (taken && erase_uncond_disable(taken->children, name, known)) {
+				stmts.erase(stmts.begin() + i + 1, stmts.end());
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static bool contains_function_return(const AstNode *node)
+{
+	if (!node)
+		return false;
+	if (node->type == AST_TCALL && node->str == "\\return")
+		return true;
+	for (auto &child : node->children)
+		if (contains_function_return(child.get()))
+			return true;
+	return false;
+}
+
+static void strip_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
+{
+	for (size_t i = 0; i < stmts.size();) {
+		AstNode *stmt = stmts[i].get();
+		if (stmt && stmt->type == AST_TCALL && stmt->str == "\\return") {
+			stmts.erase(stmts.begin() + i);
+			continue;
+		}
+		// A return inside a loop is decided when the loop is unrolled.
+		if (stmt && stmt->type != AST_FOR && stmt->type != AST_WHILE && stmt->type != AST_REPEAT)
+			strip_function_return(stmt->children);
+		i++;
+	}
+}
+
+static std::unique_ptr<AstNode> return_if(AstNode *cond, std::unique_ptr<AstNode> taken, std::vector<std::unique_ptr<AstNode>> &else_stmts)
+{
+	auto cas = std::make_unique<AstNode>(cond->location, AST_CASE);
+	cas->children.push_back(std::make_unique<AstNode>(cond->location, AST_REDUCE_BOOL, cond->clone()));
+	auto then_blk = std::move(taken);
+	then_blk->children.push_back(std::make_unique<AstNode>(cond->location, AST_TCALL));
+	then_blk->children.back()->str = "\\return";
+	auto then_arm = std::make_unique<AstNode>(cond->location, AST_COND, AstNode::mkconst_int(cond->location, 1, false), std::move(then_blk));
+	auto else_blk = std::make_unique<AstNode>(cond->location, AST_BLOCK);
+	for (auto &stmt : else_stmts)
+		else_blk->children.push_back(std::move(stmt));
+	else_stmts.clear();
+	auto else_arm = std::make_unique<AstNode>(cond->location, AST_COND, std::make_unique<AstNode>(cond->location, AST_DEFAULT), std::move(else_blk));
+	cas->children.push_back(std::move(then_arm));
+	cas->children.push_back(std::move(else_arm));
+	return cas;
+}
+
+// Replace a case whose selector is constant with the taken arm. A constant 0
+// if around a later live return otherwise hides that return from proc.
+static bool unwrap_const_case(std::vector<std::unique_ptr<AstNode>> &stmts)
+{
+	bool did = false;
+	for (size_t i = 0; i < stmts.size();) {
+		AstNode *stmt = stmts[i].get();
+		if (!stmt) {
+			i++;
+			continue;
+		}
+		if (stmt->type == AST_BLOCK) {
+			if (unwrap_const_case(stmt->children))
+				did = true;
+			i++;
+			continue;
+		}
+		if (stmt->type != AST_CASE || stmt->children.empty() || !stmt->children[0]) {
+			i++;
+			continue;
+		}
+		for (size_t c = 1; c < stmt->children.size(); c++) {
+			AstNode *arm = stmt->children[c].get();
+			if (!arm)
+				continue;
+			for (auto &ch : arm->children)
+				if (ch && ch->type == AST_BLOCK && unwrap_const_case(ch->children))
+					did = true;
+		}
+		auto sel = stmt->children[0]->clone();
+		while (sel->simplify(true, 1, -1, false)) { }
+		if (sel->type != AST_CONSTANT || !sel->bits_only_01()) {
+			i++;
+			continue;
+		}
+		int sel_v = sel->asInt(true);
+		// Only unwrap when every arm is provably decided by the constant
+		// selector: a `case (1'b1) tag[0]: ...` reverse-case has a constant
+		// selector but dynamic compares, and folding it to the default arm
+		// would drop the conditional logic.
+		bool resolvable = true;
+		for (size_t c = 1; c < stmt->children.size(); c++) {
+			AstNode *arm = stmt->children[c].get();
+			if (!arm || arm->type != AST_COND) {
+				resolvable = false;
+				break;
+			}
+			for (auto &ch : arm->children) {
+				if (!ch || ch->type == AST_BLOCK || ch->type == AST_DEFAULT)
+					continue;
+				if (ch->type != AST_CONSTANT || !ch->bits_only_01()) {
+					resolvable = false;
+					break;
+				}
+			}
+			if (!resolvable)
+				break;
+		}
+		if (!resolvable) {
+			i++;
+			continue;
+		}
+		AstNode *taken = nullptr;
+		AstNode *fallback = nullptr;
+		for (size_t c = 1; c < stmt->children.size(); c++) {
+			AstNode *arm = stmt->children[c].get();
+			if (!arm)
+				continue;
+			AstNode *blk = nullptr;
+			bool is_default = false;
+			bool matched = false;
+			for (auto &ch : arm->children) {
+				if (!ch)
+					continue;
+				if (ch->type == AST_BLOCK)
+					blk = ch.get();
+				else if (ch->type == AST_DEFAULT)
+					is_default = true;
+				else if (ch->type == AST_CONSTANT && ch->asInt(true) == sel_v)
+					matched = true;
+			}
+			if (is_default)
+				fallback = blk;
+			else if (matched)
+				taken = blk;
+		}
+		if (!taken)
+			taken = fallback;
+		if (!taken) {
+			i++;
+			continue;
+		}
+		std::vector<std::unique_ptr<AstNode>> body;
+		for (auto &ch : taken->children)
+			body.push_back(std::move(ch));
+		stmts.erase(stmts.begin() + i);
+		stmts.insert(stmts.begin() + i, std::make_move_iterator(body.begin()), std::make_move_iterator(body.end()));
+		did = true;
+	}
+	return did;
+}
+
+// IEEE 1800-2009 13.4.1: return leaves the function. Statements after it run
+// only on paths that do not return. Returns true when every path returns.
+static bool absorb_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
+{
+	auto is_return = [](const AstNode *n) {
+		return n && n->type == AST_TCALL && n->str == "\\return";
+	};
+	auto arm_body = [](AstNode *arm) -> std::vector<std::unique_ptr<AstNode>>* {
+		if (!arm)
+			return nullptr;
+		for (int i = GetSize(arm->children) - 1; i >= 0; i--) {
+			if (arm->children[i] && arm->children[i]->type == AST_BLOCK)
+				return &arm->children[i]->children;
+		}
+		return nullptr;
+	};
+	for (size_t i = 0; i < stmts.size(); i++) {
+		AstNode *stmt = stmts[i].get();
+		if (!stmt)
+			continue;
+		if (is_return(stmt)) {
+			stmts.erase(stmts.begin() + i, stmts.end());
+			return true;
+		}
+		if (stmt->type == AST_FOR || stmt->type == AST_WHILE || stmt->type == AST_REPEAT) {
+			if (stmt->type == AST_FOR) {
+				while (GetSize(stmt->children) > 1 && stmt->children[0] && stmt->children[1] &&
+						stmt->children[0]->type == AST_ASSIGN_EQ && stmt->children[1]->type == AST_ASSIGN_EQ)
+					stmt->children.erase(stmt->children.begin() + 1);
+				while (GetSize(stmt->children) > 4 && stmt->children[3] &&
+						stmt->children[3]->type != AST_BLOCK && stmt->children[3]->type != AST_GENBLOCK)
+					stmt->children.erase(stmt->children.begin() + 3);
+			}
+			int body_at = stmt->type == AST_FOR ? 3 : 1;
+			int cond_at = stmt->type == AST_FOR ? 1 : 0;
+			if (body_at < GetSize(stmt->children) && stmt->children[body_at] && stmt->children[body_at]->type == AST_BLOCK &&
+					absorb_function_return(stmt->children[body_at]->children)) {
+				bool always_once = stmt->type == AST_WHILE && stmt->get_bool_attribute(ID(sv_do));
+				auto body = std::move(stmt->children[body_at]);
+				if (always_once) {
+					std::vector<std::unique_ptr<AstNode>> body_stmts = std::move(body->children);
+					stmts.erase(stmts.begin() + i, stmts.end());
+					stmts.insert(stmts.begin() + i, std::make_move_iterator(body_stmts.begin()), std::make_move_iterator(body_stmts.end()));
+					return true;
+				}
+				auto cond = stmt->children[cond_at]->clone();
+				std::unique_ptr<AstNode> init;
+				if (stmt->type == AST_FOR && stmt->children[0])
+					init = std::move(stmt->children[0]);
+				std::vector<std::unique_ptr<AstNode>> rest;
+				for (size_t r = i + 1; r < stmts.size(); r++)
+					rest.push_back(std::move(stmts[r]));
+				stmts.erase(stmts.begin() + i, stmts.end());
+				if (init)
+					stmts.push_back(std::move(init));
+				stmts.push_back(return_if(cond.get(), std::move(body), rest));
+				continue;
+			}
+		}
+		if (stmt->type == AST_BLOCK) {
+			if (absorb_function_return(stmt->children)) {
+				stmts.erase(stmts.begin() + i + 1, stmts.end());
+				return true;
+			}
+			// A loop inside this block does not see the statements after the block.
+			// Bring those statements in, then fold them onto the paths that fall through.
+			if (contains_function_return(stmt) && i + 1 < stmts.size()) {
+				stmt->set_attribute(ID(sv_noexpand), AstNode::mkconst_int(stmt->location, 1, false));
+				for (size_t r = i + 1; r < stmts.size(); r++)
+					stmt->children.push_back(std::move(stmts[r]));
+				stmts.erase(stmts.begin() + i + 1, stmts.end());
+				absorb_function_return(stmt->children);
+			}
+			continue;
+		}
+		if (stmt->type == AST_CASE) {
+			bool saw_arm = false;
+			bool any_return = false;
+			bool all_return = true;
+			bool has_default = false;
+			std::vector<std::vector<std::unique_ptr<AstNode>>*> open_arms;
+			std::vector<std::vector<std::unique_ptr<AstNode>>*> returned_arms;
+			for (size_t c = 1; c < stmt->children.size(); c++) {
+				AstNode *arm = stmt->children[c].get();
+				if (arm) {
+					for (auto &ch : arm->children)
+						if (ch && ch->type == AST_DEFAULT)
+							has_default = true;
+				}
+				auto *body = arm_body(arm);
+				if (!body && arm) {
+					auto blk = std::make_unique<AstNode>(arm->location, AST_BLOCK);
+					std::vector<std::unique_ptr<AstNode>> head;
+					bool took_cmp = false;
+					for (auto &ch : arm->children) {
+						bool stmt = ch && (ch->type == AST_ASSIGN_EQ || ch->type == AST_ASSIGN || ch->type == AST_ASSIGN_LE ||
+								ch->type == AST_TCALL || ch->type == AST_CASE || ch->type == AST_FOR || ch->type == AST_WHILE ||
+								ch->type == AST_REPEAT || ch->type == AST_BLOCK);
+						if (!took_cmp && ch && ch->type != AST_DEFAULT && !stmt) {
+							head.push_back(std::move(ch));
+							took_cmp = true;
+							continue;
+						}
+						if (ch && ch->type == AST_DEFAULT) {
+							head.push_back(std::move(ch));
+							continue;
+						}
+						if (ch)
+							blk->children.push_back(std::move(ch));
+					}
+					if (!blk->children.empty()) {
+						head.push_back(std::move(blk));
+						arm->children.clear();
+						for (auto &ch : head)
+							if (ch)
+								arm->children.push_back(std::move(ch));
+					}
+					body = arm_body(arm);
+				}
+				if (!body)
+					continue;
+				saw_arm = true;
+				if (absorb_function_return(*body)) {
+					any_return = true;
+					returned_arms.push_back(body);
+					continue;
+				}
+				all_return = false;
+				open_arms.push_back(body);
+			}
+			// No default means an unselected case falls through.
+			if (!has_default)
+				all_return = false;
+			if (saw_arm && all_return) {
+				stmts.erase(stmts.begin() + i + 1, stmts.end());
+				return true;
+			}
+			if (any_return && i + 1 < stmts.size()) {
+				std::vector<std::unique_ptr<AstNode>> rest;
+				for (size_t r = i + 1; r < stmts.size(); r++)
+					rest.push_back(std::move(stmts[r]));
+				stmts.erase(stmts.begin() + i + 1, stmts.end());
+				for (auto *body : open_arms) {
+					for (auto &extra : rest)
+						body->push_back(extra->clone());
+					absorb_function_return(*body);
+				}
+				if (!has_default) {
+					auto blk = std::make_unique<AstNode>(stmt->location, AST_BLOCK);
+					for (auto &extra : rest)
+						blk->children.push_back(extra->clone());
+					auto cond = std::make_unique<AstNode>(stmt->location, AST_COND);
+					cond->children.push_back(std::make_unique<AstNode>(stmt->location, AST_DEFAULT));
+					cond->children.push_back(std::move(blk));
+					stmt->children.push_back(std::move(cond));
+				}
+			}
+			// The return was consumed while folding this arm. Keep it when this
+			// case itself can fall through, so a loop around it still stops there.
+			if (any_return && !all_return) {
+				for (auto *body : returned_arms) {
+					bool has_return = false;
+					for (auto &ch : *body)
+						if (ch && ch->type == AST_TCALL && ch->str == "\\return")
+							has_return = true;
+					if (has_return)
+						continue;
+					auto stop = std::make_unique<AstNode>(stmt->location, AST_TCALL);
+					stop->str = "\\return";
+					body->push_back(std::move(stop));
+				}
+			}
+		}
+	}
+	return false;
+}
+
+// Fold returns in statements inserted for one loop, plus whatever follows the
+// loop in the same block. The loop node itself stays owned by that block.
+static void absorb_loop_tail(AstNode *block, AstNode *self, size_t from)
+{
+	if (!block || from > block->children.size())
+		return;
+	std::vector<std::unique_ptr<AstNode>> head, suffix, held;
+	for (size_t k = 0; k < block->children.size(); k++) {
+		if (block->children[k].get() == self)
+			held.push_back(std::move(block->children[k]));
+		else if (k < from)
+			head.push_back(std::move(block->children[k]));
+		else
+			suffix.push_back(std::move(block->children[k]));
+	}
+	block->children.clear();
+	absorb_function_return(suffix);
+	for (int pass = 0; pass < 6; pass++) {
+		bool opened = unwrap_const_case(suffix);
+		absorb_function_return(suffix);
+		if (!opened)
+			break;
+	}
+	strip_function_return(suffix);
+	for (auto &stmt : head)
+		block->children.push_back(std::move(stmt));
+	for (auto &stmt : suffix)
+		block->children.push_back(std::move(stmt));
+	for (auto &stmt : held)
+		block->children.push_back(std::move(stmt));
+}
+
+// A net driven by one constant continuous assignment has that constant value.
+static AstNode *constant_cont_driver(AstNode *mod, const std::string &name)
+{
+	AstNode *found = nullptr;
+	if (!mod)
+		return nullptr;
+	for (auto &ch : mod->children) {
+		if (!ch || ch->children.size() < 2 || !ch->children[0] || !ch->children[1])
+			continue;
+		if (ch->children[0]->type != AST_IDENTIFIER || ch->children[0]->str != name || !ch->children[0]->children.empty())
+			continue;
+		if (ch->type == AST_ASSIGN_EQ || ch->type == AST_ASSIGN_LE)
+			return nullptr;
+		if (ch->type != AST_ASSIGN)
+			continue;
+		if (ch->children[1]->type != AST_CONSTANT || found)
+			return nullptr;
+		found = ch->children[1].get();
+	}
+	return found;
+}
+
 // block names can be prefixed with an explicit scope during elaboration
 static bool is_autonamed_block(const std::string &str) {
 	size_t last_dot = str.rfind('.');
@@ -1002,7 +2208,9 @@ public:
 		}
 	}
 
-	void import(std::map<std::string, AstNode*>& scope, AstNode* to_import) const {
+	void import(std::map<std::string, AstNode*>& scope, AstNode* to_import, std::set<std::string> *wildcard_names = nullptr) const {
+		if (!to_import)
+			return;
 		// Check if this is a specific import and if this item should be imported
 		if (!is_wildcard && import_items.count(to_import->str) == 0)
 			return;
@@ -1014,6 +2222,8 @@ public:
 			if (is_wildcard && scope.count(to_import->str) > 0)
 				return;
 			scope[to_import->str] = to_import;
+			if (is_wildcard && wildcard_names)
+				wildcard_names->insert(to_import->str);
 		}
 		if (to_import->type == AST_ENUM) {
 			for (auto& enode : to_import->children) {
@@ -1028,10 +2238,37 @@ public:
 					scope[enode->str] = enode.get();
 				else
 					node->input_error("enum item %s already exists in current scope\n", enode->str);
+				if (is_wildcard && wildcard_names)
+					wildcard_names->insert(enode->str);
 			}
 		}
 	}
 };
+
+// IEEE 1800-2009 11.4.13: inside compares with ==, or with ==? when the
+// set element is an integral value that contains x or z.
+static std::unique_ptr<AstNode> inside_eq(AstSrcLocType loc, AstNode *lhs, std::unique_ptr<AstNode> item, bool x_wild = true)
+{
+	bool wild = false;
+	if (item->type == AST_CONSTANT) {
+		for (auto bit : item->bits)
+			if ((x_wild && bit == RTLIL::State::Sx) || bit == RTLIL::State::Sz || bit == RTLIL::State::Sa)
+				wild = true;
+	}
+	if (!wild)
+		return std::make_unique<AstNode>(loc, AST_EQ, lhs->clone(), std::move(item));
+
+	std::vector<RTLIL::State> mask, value;
+	mask.reserve(item->bits.size());
+	value.reserve(item->bits.size());
+	for (auto bit : item->bits) {
+		bool dont_care = (x_wild && bit == RTLIL::State::Sx) || bit == RTLIL::State::Sz || bit == RTLIL::State::Sa;
+		mask.push_back(dont_care ? RTLIL::State::S0 : RTLIL::State::S1);
+		value.push_back(dont_care ? RTLIL::State::S0 : bit);
+	}
+	auto masked = std::make_unique<AstNode>(loc, AST_BIT_AND, lhs->clone(), AstNode::mkconst_bits(loc, mask, false));
+	return std::make_unique<AstNode>(loc, AST_EQ, std::move(masked), AstNode::mkconst_bits(loc, value, false));
+}
 
 // convert the AST into a simpler AST that has all parameters substituted by their
 // values, unrolled for-loops, expanded generate blocks, etc. when this function
@@ -1039,20 +2276,908 @@ public:
 //
 // this function also does all name resolving and sets the id2ast member of all
 // nodes that link to a different node using names and lexical scoping.
+// IEEE 1800-2009 10.6: force/assign holds a variable until release/deassign.
+// cond is null when the variable is not held. A non-constant if makes the
+// hold conditional on that branch.
+struct ForceHold {
+	std::unique_ptr<AstNode> cond;
+	std::unique_ptr<AstNode> value;
+};
+
+static bool is_const_bool(const AstNode *n, bool &bit)
+{
+	if (!n || n->type != AST_CONSTANT)
+		return false;
+	bit = n->asBool();
+	return true;
+}
+
+static dict<std::string, ForceHold> clone_holds(const dict<std::string, ForceHold> &held)
+{
+	dict<std::string, ForceHold> copy;
+	for (auto &kv : held) {
+		ForceHold h;
+		if (kv.second.cond)
+			h.cond = kv.second.cond->clone();
+		if (kv.second.value)
+			h.value = kv.second.value->clone();
+		copy[kv.first] = std::move(h);
+	}
+	return copy;
+}
+
+static void apply_force_override(std::vector<std::unique_ptr<AstNode>> &stmts, dict<std::string, ForceHold> &held, dict<std::string, int> &known)
+{
+	auto note_value = [&](AstNode *stmt) {
+		if ((stmt->type != AST_ASSIGN_EQ && stmt->type != AST_ASSIGN_LE && stmt->type != AST_ASSIGN) ||
+				stmt->children.size() < 2 || stmt->children[0]->type != AST_IDENTIFIER || !stmt->children[0]->children.empty())
+			return;
+		int val = 0;
+		if (eval_known_int(stmt->children[1].get(), known, val))
+			known[stmt->children[0]->str] = val;
+		else
+			known.erase(stmt->children[0]->str);
+	};
+	for (size_t i = 0; i < stmts.size();) {
+		AstNode *stmt = stmts[i].get();
+		if (!stmt) {
+			i++;
+			continue;
+		}
+		if (stmt->type == AST_BLOCK) {
+			apply_force_override(stmt->children, held, known);
+			i++;
+			continue;
+		}
+		if (stmt->type == AST_CASE && !stmt->children.empty()) {
+			if (stmt->str == "\\matches") {
+				i++;
+				continue;
+			}
+			int sel = 0;
+			if (!eval_known_int_def(stmt->children[0].get(), known, sel)) {
+				AstNode *then_blk = nullptr;
+				AstNode *else_blk = nullptr;
+				for (size_t c = 1; c < stmt->children.size(); c++) {
+					AstNode *arm = stmt->children[c].get();
+					if (!arm || arm->type != AST_COND)
+						continue;
+					AstNode *blk = nullptr;
+					bool is_default = false;
+					for (auto &ch : arm->children) {
+						if (!ch)
+							continue;
+						if (ch->type == AST_BLOCK)
+							blk = ch.get();
+						else if (ch->type == AST_DEFAULT)
+							is_default = true;
+					}
+					if (is_default)
+						else_blk = blk;
+					else if (!then_blk)
+						then_blk = blk;
+				}
+				auto then_held = clone_holds(held);
+				auto else_held = clone_holds(held);
+				auto then_known = known;
+				auto else_known = known;
+				if (then_blk)
+					apply_force_override(then_blk->children, then_held, then_known);
+				if (else_blk)
+					apply_force_override(else_blk->children, else_held, else_known);
+				pool<std::string> names;
+				for (auto &kv : held)
+					names.insert(kv.first);
+				for (auto &kv : then_held)
+					names.insert(kv.first);
+				for (auto &kv : else_held)
+					names.insert(kv.first);
+				dict<std::string, ForceHold> merged;
+				for (auto &name : names) {
+					auto take = [](dict<std::string, ForceHold> &src, const std::string &name) {
+						ForceHold h;
+						if (src.count(name) && src.at(name).cond) {
+							h.cond = src.at(name).cond->clone();
+							if (src.at(name).value)
+								h.value = src.at(name).value->clone();
+						}
+						return h;
+					};
+					ForceHold th = take(then_held, name);
+					ForceHold eh = take(else_held, name);
+					if (!th.cond && !eh.cond)
+						continue;
+					if (!th.cond)
+						th.cond = AstNode::mkconst_int(stmt->location, 0, false);
+					if (!eh.cond)
+						eh.cond = AstNode::mkconst_int(stmt->location, 0, false);
+					if (!th.value)
+						th.value = AstNode::mkconst_int(stmt->location, 0, false);
+					if (!eh.value)
+						eh.value = AstNode::mkconst_int(stmt->location, 0, false);
+					ForceHold h;
+					bool tb, eb;
+					if (is_const_bool(th.cond.get(), tb) && is_const_bool(eh.cond.get(), eb) && tb == eb) {
+						if (!tb)
+							continue;
+						h.cond = AstNode::mkconst_int(stmt->location, 1, false);
+						h.value = std::make_unique<AstNode>(stmt->location, AST_TERNARY, stmt->children[0]->clone(),
+								std::move(th.value), std::move(eh.value));
+					} else {
+						h.cond = std::make_unique<AstNode>(stmt->location, AST_TERNARY, stmt->children[0]->clone(),
+								std::move(th.cond), std::move(eh.cond));
+						h.value = std::make_unique<AstNode>(stmt->location, AST_TERNARY, stmt->children[0]->clone(),
+								std::move(th.value), std::move(eh.value));
+					}
+					merged[name] = std::move(h);
+				}
+				held = std::move(merged);
+				known.clear();
+				i++;
+				continue;
+			}
+			// The selector is a fully defined constant, so this case can be
+			// resolved to a single arm. That is only sound when every non-default
+			// compare is a fully defined constant too: in `case (1'b1) tag[0]: ...`
+			// style reverse-case statements the compares are dynamic, and erasing
+			// all arms but the default would drop live logic.
+			AstNode *taken = nullptr;
+			AstNode *fallback = nullptr;
+			size_t taken_at = 0;
+			size_t fallback_at = 0;
+			bool matched = false;
+			bool resolvable = true;
+			for (size_t c = 1; c < stmt->children.size(); c++) {
+				AstNode *arm = stmt->children[c].get();
+				if (!arm || arm->type != AST_COND) {
+					// casex/casez arms (AST_CONDX/AST_CONDZ) match with
+					// wildcard semantics that a plain compare cannot prove.
+					resolvable = false;
+					break;
+				}
+				AstNode *blk = nullptr;
+				bool is_default = false;
+				bool arm_match = false;
+				for (auto &ch : arm->children) {
+					if (!ch)
+						continue;
+					if (ch->type == AST_BLOCK)
+						blk = ch.get();
+					else if (ch->type == AST_DEFAULT)
+						is_default = true;
+					else {
+						int cmp = 0;
+						if (!eval_known_int_def(ch.get(), known, cmp)) {
+							resolvable = false;
+							break;
+						}
+						if (cmp == sel)
+							arm_match = true;
+					}
+				}
+				if (!resolvable)
+					break;
+				if (is_default) {
+					fallback = blk;
+					fallback_at = c;
+				} else if (arm_match && !matched) {
+					taken = blk;
+					taken_at = c;
+					matched = true;
+				}
+			}
+			if (!resolvable) {
+				i++;
+				continue;
+			}
+			if (!matched) {
+				taken = fallback;
+				taken_at = fallback_at;
+			}
+			for (size_t c = stmt->children.size(); c > 1; c--)
+				if (!taken || c - 1 != taken_at)
+					stmt->children.erase(stmt->children.begin() + (c - 1));
+			if (taken)
+				apply_force_override(taken->children, held, known);
+			i++;
+			continue;
+		}
+		if (stmt->type == AST_TCALL && (stmt->str == "\\release" || stmt->str == "\\deassign")) {
+			if (!stmt->children.empty() && stmt->children[0]->type == AST_IDENTIFIER && stmt->children[0]->children.empty()) {
+				held.erase(stmt->children[0]->str);
+				known.erase(stmt->children[0]->str);
+			}
+			stmts.erase(stmts.begin() + i);
+			continue;
+		}
+		if ((stmt->type == AST_ASSIGN_EQ || stmt->type == AST_ASSIGN_LE) && stmt->children.size() >= 2 &&
+				stmt->children[0]->type == AST_IDENTIFIER && stmt->children[0]->children.empty()) {
+			const std::string &name = stmt->children[0]->str;
+			if (stmt->get_bool_attribute(ID(sv_force))) {
+				ForceHold h;
+				h.cond = AstNode::mkconst_int(stmt->location, 1, false);
+				h.value = stmt->children[1]->clone();
+				held.erase(name);
+				held[name] = std::move(h);
+				stmt->attributes.erase(ID(sv_force));
+				note_value(stmt);
+				i++;
+				continue;
+			}
+			if (held.count(name) && held.at(name).cond) {
+				bool on = false;
+				if (is_const_bool(held.at(name).cond.get(), on) && on) {
+					stmts.erase(stmts.begin() + i);
+					continue;
+				}
+				auto rhs = std::move(stmt->children[1]);
+				stmt->children[1] = std::make_unique<AstNode>(stmt->location, AST_TERNARY,
+						held.at(name).cond->clone(), held.at(name).value->clone(), std::move(rhs));
+				known.erase(name);
+				i++;
+				continue;
+			}
+			note_value(stmt);
+		}
+		i++;
+	}
+}
+
 bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hint)
 {
+	{
+		// Clang assumes `this` is non-null and would otherwise delete this test.
+		uintptr_t raw = reinterpret_cast<uintptr_t>(this);
+		asm volatile("" : "+r"(raw));
+		if (raw < 4096)
+			return false;
+	}
 	static int recursion_counter = 0;
 	static bool deep_recursion_warning = false;
 
-	if (recursion_counter++ == 1000 && deep_recursion_warning) {
-		log_warning("Deep recursion in AST simplifier.\nDoes this design contain overly long or deeply nested expressions, or excessive recursion?\n");
-		deep_recursion_warning = false;
+	if (recursion_counter >= 1000) {
+		static bool warned = false;
+		if (!warned) {
+			log_warning("Deep recursion in AST simplifier.\nDoes this design contain overly long or deeply nested expressions, or excessive recursion?\n");
+			warned = true;
+		}
+		return false;
+	}
+	recursion_counter++;
+
+
+	// Class declarations are simulation-only: keep the parsed AST (for
+	// completeness) but never elaborate the body.
+	if (type == AST_CLASS) {
+		basic_prep = true;
+		recursion_counter--;
+		return false;
+	}
+
+	// Out-of-block class method definitions (parsed at package scope) are
+	// simulation-only as well: their bodies reference class members and
+	// constructs (this/super) that only make sense in class context.
+	if ((type == AST_FUNCTION || type == AST_TASK) &&
+			attributes.count(ID(sv_class_method_def)) != 0) {
+		basic_prep = true;
+		recursion_counter--;
+		return false;
 	}
 
 	static bool unevaluated_tern_branch = false;
 
+	// IEEE 1800-2009 11.12: a let is a textual macro. Substitute before the
+	// assertion-instance guard, which would otherwise leave the call intact.
+	if (type == AST_FCALL && !str.empty() && (str.size() < 2 || str[1] != '$')) {
+		AstNode *let = nullptr;
+		auto find_let = [&](AstNode *scope) {
+			if (!scope)
+				return;
+			for (auto &ch : scope->children) {
+				if (ch && ch->type == AST_SVA && ch->str == "let_decl" && !ch->children.empty() &&
+						ch->children[0]->str == str)
+					let = ch.get();
+				if (ch && ch->type == AST_PACKAGE) {
+					for (auto &inner : ch->children) {
+						if (inner->type == AST_SVA && inner->str == "let_decl" && !inner->children.empty() &&
+								inner->children[0]->str == str)
+							let = inner.get();
+					}
+				}
+			}
+		};
+		find_let(current_ast_mod);
+		find_let(current_ast);
+		if (let && let->children.size() >= 2) {
+			for (auto &child : children)
+				while (child && child->simplify(true, stage, -1, false)) { }
+			auto body = let->children[1]->clone();
+			std::function<void(AstNode *)> subst = [&](AstNode *node) {
+				for (size_t pi = 2; pi < let->children.size() && pi - 2 < children.size(); pi++) {
+					if (node->type == AST_IDENTIFIER && node->str == let->children[pi]->str) {
+						children[pi - 2]->clone()->cloneInto(*node);
+						return;
+					}
+				}
+				for (auto &ch : node->children)
+					if (ch)
+						subst(ch.get());
+			};
+			subst(body.get());
+			while (body->simplify(true, stage, width_hint, sign_hint)) { }
+			body->cloneInto(*this);
+			fixup_hierarchy_flags();
+			recursion_counter--;
+			return true;
+		}
+	}
+
+	// A let with no ports is an expression name, not a call: `let seven = 7; y = seven`.
+	if (type == AST_IDENTIFIER && !in_lvalue && children.empty() && !str.empty()) {
+		AstNode *let = nullptr;
+		auto find_let_id = [&](AstNode *scope) {
+			if (!scope)
+				return;
+			for (auto &ch : scope->children) {
+				if (ch && ch->type == AST_SVA && ch->str == "let_decl" && ch->children.size() == 2 &&
+						ch->children[0]->str == str)
+					let = ch.get();
+			}
+		};
+		find_let_id(current_ast_mod);
+		find_let_id(current_ast);
+		if (let) {
+			auto body = let->children[1]->clone();
+			while (body->simplify(true, stage, width_hint, sign_hint)) { }
+			body->cloneInto(*this);
+			fixup_hierarchy_flags();
+			recursion_counter--;
+			return true;
+		}
+	}
+
+	// IEEE 1800-2009 6.19.5: enum.next / enum.prev walk the declaration order and wrap.
+	// first, last, and num are properties of the type, including a typedef name.
+	std::string enum_method, enum_prefix;
+	if (type == AST_FCALL) {
+		auto ends = [&](const char *suf) {
+			size_t n = strlen(suf);
+			return str.size() >= n && str.compare(str.size() - n, n, suf) == 0;
+		};
+		if (ends(".next")) { enum_method = "next"; enum_prefix = str.substr(0, str.size() - 5); }
+		else if (ends(".prev")) { enum_method = "prev"; enum_prefix = str.substr(0, str.size() - 5); }
+		else if (ends(".first")) { enum_method = "first"; enum_prefix = str.substr(0, str.size() - 6); }
+		else if (ends(".last")) { enum_method = "last"; enum_prefix = str.substr(0, str.size() - 5); }
+		else if (ends(".num")) { enum_method = "num"; enum_prefix = str.substr(0, str.size() - 4); }
+		else if (ends(".name")) { enum_method = "name"; enum_prefix = str.substr(0, str.size() - 5); }
+	}
+	if (!enum_method.empty()) {
+		bool prev = enum_method == "prev";
+		std::string prefix = enum_prefix;
+		bool on_expr = !str.empty() && str[0] == '.';
+		AstNode *enum_node = nullptr;
+		std::unique_ptr<AstNode> base;
+		auto scan_enum = [&](AstNode *scope) {
+			if (!scope || enum_node)
+				return;
+			for (auto &ch : scope->children) {
+				if (!ch)
+					continue;
+				if (ch->type == AST_ENUM) {
+					for (auto &item : ch->children) {
+						if (item && item->str == prefix) {
+							enum_node = ch.get();
+							if (!item->children.empty())
+								base = item->children[0]->clone();
+						}
+					}
+				}
+				if (ch->type == AST_TYPEDEF && ch->str == prefix && !ch->children.empty() &&
+						ch->children[0]->attributes.count(ID::enum_type)) {
+					std::string ename = ch->children[0]->attributes.at(ID::enum_type)->str.c_str();
+					for (auto &sib : scope->children) {
+						if (sib && sib->type == AST_ENUM && sib->str == ename)
+							enum_node = sib.get();
+					}
+				}
+				if ((ch->type == AST_WIRE || ch->type == AST_MEMORY) && ch->str == prefix && ch->attributes.count(ID::enum_type)) {
+					std::string ename = ch->attributes.at(ID::enum_type)->str.c_str();
+					for (auto &sib : scope->children) {
+						if (sib && sib->type == AST_ENUM && sib->str == ename)
+							enum_node = sib.get();
+					}
+					if (!base) {
+						base = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+						base->str = prefix;
+					}
+				}
+			}
+		};
+		scan_enum(current_ast_mod);
+		scan_enum(current_ast);
+		// expr.method(): the receiver is the first argument, not a name prefix.
+		if (prefix.empty() && !children.empty()) {
+			AstNode *recv = children[0].get();
+			if (recv && recv->type == AST_IDENTIFIER) {
+				prefix = recv->str;
+				base = recv->clone();
+				enum_node = nullptr;
+				scan_enum(current_ast_mod);
+				scan_enum(current_ast);
+			} else if (recv && recv->type == AST_CAST_SIZE && recv->children.size() >= 2) {
+				std::function<void(AstNode *)> find_ty = [&](AstNode *n) {
+					if (!n || !prefix.empty())
+						return;
+					if (n->type == AST_WIRETYPE)
+						prefix = n->str;
+					for (auto &ch : n->children)
+						find_ty(ch.get());
+				};
+				find_ty(recv->children[0].get());
+				base = recv->children[1]->clone();
+				enum_node = nullptr;
+				scan_enum(current_ast_mod);
+				scan_enum(current_ast);
+			}
+		}
+		if (enum_node && (base || enum_method == "first" || enum_method == "last" || enum_method == "num")) {
+			enum_node->allocateDefaultEnumValues();
+			std::vector<int> values;
+			std::vector<std::string> names;
+			for (auto &item : enum_node->children) {
+				if (item && item->type == AST_ENUM_ITEM && !item->children.empty() &&
+						item->children[0]->type == AST_CONSTANT) {
+					values.push_back(item->children[0]->integer);
+					std::string nm = item->str;
+					if (!nm.empty() && nm[0] == '\\')
+						nm = nm.substr(1);
+					names.push_back(nm);
+				}
+			}
+			if (enum_method == "name" && base) {
+				while (base->simplify(true, stage, -1, false)) { }
+				if (base->type == AST_IDENTIFIER && current_ast_mod) {
+					for (auto &ch : current_ast_mod->children) {
+						if (!ch || ch->type != AST_ASSIGN || ch->children.size() < 2)
+							continue;
+						if (ch->children[0]->type != AST_IDENTIFIER || ch->children[0]->str != base->str ||
+								!ch->children[0]->children.empty())
+							continue;
+						auto rhs = ch->children[1]->clone();
+						while (rhs->simplify(true, stage, -1, false)) { }
+						if (rhs->type == AST_CONSTANT) {
+							rhs->cloneInto(*base);
+							break;
+						}
+					}
+				}
+				if (base->type == AST_CONSTANT) {
+					std::string picked;
+					for (size_t i = 0; i < values.size(); i++) {
+						if (values[i] == base->integer) {
+							picked = names[i];
+							break;
+						}
+					}
+					auto result = AstNode::mkconst_str(location, picked);
+					result->cloneInto(*this);
+					fixup_hierarchy_flags();
+					recursion_counter--;
+					return true;
+				}
+				std::unique_ptr<AstNode> sel = AstNode::mkconst_str(location, "");
+				for (int i = (int)values.size() - 1; i >= 0; i--) {
+					auto eq = std::make_unique<AstNode>(location, AST_EQ, base->clone(),
+							AstNode::mkconst_int(location, values[i], true));
+					sel = std::make_unique<AstNode>(location, AST_TERNARY, std::move(eq),
+							AstNode::mkconst_str(location, names[i]), std::move(sel));
+				}
+				sel->cloneInto(*this);
+				fixup_hierarchy_flags();
+				recursion_counter--;
+				return true;
+			}
+			if (enum_method == "name") {
+				recursion_counter--;
+				return false;
+			}
+			if (!values.empty() && (enum_method == "first" || enum_method == "last" || enum_method == "num")) {
+				int picked = enum_method == "first" ? values.front() : enum_method == "last" ? values.back() : (int)values.size();
+				auto result = AstNode::mkconst_int(location, picked, true);
+				result->cloneInto(*this);
+				fixup_hierarchy_flags();
+				recursion_counter--;
+				return true;
+			}
+			int step = 1;
+			AstNode *step_node = nullptr;
+			if (on_expr) {
+				if (children.size() >= 2)
+					step_node = children[1].get();
+			} else if (!children.empty()) {
+				step_node = children[0].get();
+			}
+			if (step_node) {
+				while (step_node->simplify(true, stage, -1, false)) { }
+				if (step_node->type == AST_CONSTANT)
+					step = step_node->integer;
+			}
+			while (base->simplify(true, stage, -1, false)) { }
+			auto result = std::make_unique<AstNode>(location, AST_CONSTANT);
+			if (!values.empty() && base->type == AST_CONSTANT) {
+				int idx = 0;
+				bool found = false;
+				for (size_t i = 0; i < values.size(); i++) {
+					if (values[i] == base->integer) {
+						idx = (int)i;
+						found = true;
+						break;
+					}
+				}
+				int n = (int)values.size();
+				int pos = found ? idx : 0;
+				if (found) {
+					int delta = prev ? -step : step;
+					pos = ((pos + delta) % n + n) % n;
+				}
+				result = AstNode::mkconst_int(location, values[pos], true);
+			} else if (!values.empty()) {
+				int n = (int)values.size();
+				std::unique_ptr<AstNode> sel = AstNode::mkconst_int(location, values[0], true);
+				for (int i = n - 1; i >= 0; i--) {
+					int delta = prev ? -step : step;
+					int pos = ((i + delta) % n + n) % n;
+					auto eq = std::make_unique<AstNode>(location, AST_EQ, base->clone(),
+							AstNode::mkconst_int(location, values[i], true));
+					sel = std::make_unique<AstNode>(location, AST_TERNARY, std::move(eq),
+							AstNode::mkconst_int(location, values[pos], true), std::move(sel));
+				}
+				result = std::move(sel);
+			}
+			if (!values.empty()) {
+				result->cloneInto(*this);
+				fixup_hierarchy_flags();
+				recursion_counter--;
+				return true;
+			}
+		}
+	}
+
+	// Assertion trees keep calls intact: sampled-value functions and
+	// sequence/property instances are not user functions.
+	bool sva_instance = false;
+	if (type == AST_FCALL) {
+		auto scan_scope = [&](AstNode *scope) {
+			if (!scope)
+				return;
+			for (auto &decl : scope->children) {
+				AstNode *look = decl.get();
+				if (look->type == AST_PACKAGE) {
+					for (auto &inner : look->children) {
+						if (inner->type == AST_SVA && (inner->str == "property_decl" || inner->str == "sequence_decl") &&
+								!inner->children.empty() && inner->children[0]->str == str)
+							sva_instance = true;
+					}
+				}
+				if (look->type == AST_SVA && (look->str == "property_decl" || look->str == "sequence_decl") &&
+						!look->children.empty() && look->children[0]->str == str)
+					sva_instance = true;
+			}
+		};
+		scan_scope(current_ast_mod);
+		scan_scope(current_ast);
+	}
+	if (type == AST_FCALL && (current_sva_context || sva_instance)) {
+		// Assertion trees keep calls intact: sampled-value functions and
+		// sequence/property instances are not user functions.  Genuine user
+		// functions (e.g. in local-variable assignment expressions) still
+		// inline normally.
+		std::string fname = str;
+		bool is_user_function = false;
+		auto scan_fns = [&](AstNode *scope) {
+			if (!scope || is_user_function)
+				return;
+			for (auto &decl : scope->children)
+				if (decl && decl->type == AST_FUNCTION && decl->str == fname)
+					is_user_function = true;
+		};
+		scan_fns(current_scope.count(fname) ? current_scope[fname] : nullptr);
+		scan_fns(current_ast_mod);
+		scan_fns(current_ast);
+		if (!is_user_function && current_scope.count(fname) && current_scope[fname]->type == AST_FUNCTION)
+			is_user_function = true;
+		if (!is_user_function) {
+			for (auto &child : children)
+				while (child && child->simplify(const_fold, stage, -1, false)) { }
+			recursion_counter--;
+			return false;
+		}
+	}
 	std::unique_ptr<AstNode> newNode = nullptr;
 	bool did_something = false;
+
+	// IEEE 1800-2009 11.4.6: x and z in the right operand are wildcards.
+	if (type == AST_SVA && (str == "weq" || str == "wne" || str == "meq") && children.size() >= 2) {
+		auto lhs = children[0]->clone();
+		auto rhs = children[1]->clone();
+		while (lhs->simplify(true, stage, -1, false)) { }
+		while (rhs->simplify(true, stage, -1, false)) { }
+		if (lhs->type == AST_IDENTIFIER && lhs->children.empty()) {
+			AstNode *drv = constant_cont_driver(current_ast_mod, lhs->str);
+			if (drv)
+				lhs = drv->clone();
+		}
+		// case matches: ? and z are don't-cares. ==? also treats x as one.
+		auto eq = inside_eq(location, lhs.get(), std::move(rhs), str != "meq");
+		if (str == "wne")
+			eq = std::make_unique<AstNode>(location, AST_LOGIC_NOT, std::move(eq));
+		eq->location = location;
+		eq->cloneInto(*this);
+		fixup_hierarchy_flags();
+		recursion_counter--;
+		return true;
+	}
+
+	// IEEE 1800-2009 12.7 / 18.5.8: foreach walks declared dimensions left to right.
+	if (type == AST_SVA && str == "foreach" && children.size() >= 3 && children.back() && children.back()->type == AST_BLOCK) {
+		auto arr = children[0]->clone();
+		while (arr->simplify(true, stage, -1, false)) { }
+		AstNode *mem = arr->id2ast;
+		int nvars = GetSize(children) - 2;
+		if (mem && (mem->type == AST_WIRE || mem->type == AST_MEMORY) && nvars <= GetSize(mem->dimensions) && nvars > 0) {
+			// An empty slot does not iterate that dimension.
+			struct Slot { int child; int left, right, step, cur; };
+			std::vector<Slot> slots;
+			bool ready = true;
+			for (int d = 0; d < nvars; d++) {
+				AstNode *var = children[d + 1].get();
+				if (!var || var->type != AST_IDENTIFIER || var->str.empty())
+					continue;
+				auto &dim = mem->dimensions[d];
+				if (dim.range_width <= 0) {
+					ready = false;
+					break;
+				}
+				int lo = dim.range_right;
+				int hi = lo + dim.range_width - 1;
+				Slot s;
+				s.child = d + 1;
+				s.left = dim.range_swapped ? lo : hi;
+				s.right = dim.range_swapped ? hi : lo;
+				s.step = s.left <= s.right ? 1 : -1;
+				s.cur = s.left;
+				slots.push_back(s);
+			}
+			if (ready && !slots.empty()) {
+				auto block = std::make_unique<AstNode>(location, AST_BLOCK);
+				auto done = [&]() {
+					for (auto &s : slots)
+						if (s.cur != s.right)
+							return false;
+					return true;
+				};
+				while (true) {
+					dict<std::string, int> known;
+					for (auto &s : slots)
+						known[children[s.child]->str] = s.cur;
+					auto body = children.back()->clone();
+					subst_known_reads(body.get(), known, false);
+					block->children.push_back(std::move(body));
+					if (done())
+						break;
+					for (int d = GetSize(slots) - 1; d >= 0; d--) {
+						slots[d].cur += slots[d].step;
+						if (slots[d].cur != slots[d].right + slots[d].step)
+							break;
+						slots[d].cur = slots[d].left;
+					}
+				}
+				block->cloneInto(*this);
+				fixup_hierarchy_flags();
+				recursion_counter--;
+				return true;
+			}
+		}
+	}
+
+	// IEEE 1800-2009 10.11: alias joins nets, including a constant part-select.
+	// A bare port name stays the canonical net.
+	if (type == AST_SVA && str == "alias") {
+		auto select_bounds = [](AstNode *id, bool &whole, int &hi, int &lo) {
+			whole = false;
+			if (!id || id->type != AST_IDENTIFIER)
+				return false;
+			if (id->children.empty()) {
+				whole = true;
+				return true;
+			}
+			if (id->children.size() != 1 || id->children[0]->type != AST_RANGE)
+				return false;
+			auto &bounds = id->children[0]->children;
+			if (bounds.size() == 1 && bounds[0]->type == AST_CONSTANT) {
+				hi = lo = bounds[0]->asInt(true);
+				return true;
+			}
+			if (bounds.size() == 2 && bounds[0]->type == AST_CONSTANT && bounds[1]->type == AST_CONSTANT) {
+				hi = bounds[0]->asInt(true);
+				lo = bounds[1]->asInt(true);
+				return true;
+			}
+			return false;
+		};
+		auto same_net = [&](AstNode *a, AstNode *b) {
+			bool aw, bw;
+			int ah, al, bh, bl;
+			if (!select_bounds(a, aw, ah, al) || !select_bounds(b, bw, bh, bl))
+				return false;
+			if (a->str != b->str || aw != bw)
+				return false;
+			return aw || (ah == bh && al == bl);
+		};
+		bool shaped = children.size() >= 2;
+		for (auto &ch : children) {
+			if (ch && ch->type == AST_IDENTIFIER) {
+				for (auto &sel : ch->children)
+					while (sel && sel->simplify(true, stage, -1, false)) { }
+			}
+			bool whole;
+			int hi, lo;
+			if (!select_bounds(ch.get(), whole, hi, lo))
+				shaped = false;
+		}
+		if (shaped && current_ast_mod) {
+			auto is_port = [&](AstNode *id) {
+				if (!id->children.empty())
+					return false;
+				for (auto &ch : current_ast_mod->children)
+					if (ch && ch->str == id->str && ch->port_id != 0 &&
+							(ch->type == AST_WIRE || ch->type == AST_MEMORY))
+						return true;
+				return false;
+			};
+			size_t canon_i = 0;
+			for (size_t i = 1; i < children.size(); i++)
+				if (is_port(children[i].get()) && !is_port(children[canon_i].get()))
+					canon_i = i;
+			AstNode *canon = children[canon_i].get();
+			std::function<void(AstNode *)> repl = [&](AstNode *node) {
+				if (!node || node == this)
+					return;
+				if (node->type == AST_IDENTIFIER && !same_net(node, canon)) {
+					for (size_t i = 0; i < children.size(); i++) {
+						if (i == canon_i || !same_net(node, children[i].get()))
+							continue;
+						bool lvalue = node->in_lvalue;
+						canon->clone()->cloneInto(*node);
+						node->in_lvalue = lvalue;
+						return;
+					}
+				}
+				for (auto &ch : node->children)
+					repl(ch.get());
+			};
+			repl(current_ast_mod);
+		} else if (children.size() >= 2) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				log_warning("Alias of a non-constant select is ignored.\n");
+			}
+		}
+		type = AST_BLOCK;
+		str.clear();
+		children.clear();
+		fixup_hierarchy_flags();
+		recursion_counter--;
+		return true;
+	}
+
+	// A disable that simplify did not use as a block exit must not become an $sva cell.
+	if (type == AST_SVA && str == "disable") {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			log_warning("disable that is not an unconditional exit of its named block is ignored.\n");
+		}
+		type = AST_BLOCK;
+		str.clear();
+		children.clear();
+		fixup_hierarchy_flags();
+		recursion_counter--;
+		return true;
+	}
+
+	// IEEE 1800-2009 16.9.3: $sampled(e) is the current sampled value, not a delay.
+	if (type == AST_FCALL && str == "\\$sampled" && !children.empty()) {
+		children[0]->clone()->cloneInto(*this);
+		fixup_hierarchy_flags();
+		recursion_counter--;
+		return true;
+	}
+
+	// IEEE 1800-2009 11.4.14: {<<slice{expr}} reverses slice-sized blocks.
+	if (type == AST_SVA && str == "stream_l" && children.size() >= 2) {
+		while (children[0]->simplify(true, stage, -1, false)) { }
+		while (children[1]->simplify(true, stage, -1, false)) { }
+		int slice = 1;
+		if (children[0]->type == AST_CONSTANT && children[0]->asInt(false) > 0)
+			slice = children[0]->asInt(false);
+		AstNode *payload = children[1].get();
+		int width = -1;
+		bool sgn = false;
+		payload->detectSignWidth(width, sgn);
+		if (width > 0 && current_ast_mod) {
+			std::vector<std::pair<int, int>> blocks;
+			for (int pos = width; pos > 0; ) {
+				int sz = std::min(slice, pos);
+				blocks.push_back({pos - 1, pos - sz});
+				pos -= sz;
+			}
+			std::reverse(blocks.begin(), blocks.end());
+			std::string name;
+			if (payload->type == AST_IDENTIFIER && payload->children.empty()) {
+				name = payload->str;
+			} else {
+				auto tmp = mktemp_logic(location, "$stream$", current_ast_mod, true, width - 1, 0, false);
+				auto asg = std::make_unique<AstNode>(location, AST_ASSIGN, tmp->clone(), payload->clone());
+				current_ast_mod->children.push_back(std::move(asg));
+				name = tmp->str;
+			}
+			auto cat = std::make_unique<AstNode>(location, AST_CONCAT);
+			for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
+				auto bit = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+				bit->str = name;
+				auto range = std::make_unique<AstNode>(location, AST_RANGE);
+				range->children.push_back(mkconst_int(location, it->first, true));
+				range->children.push_back(mkconst_int(location, it->second, true));
+				bit->children.push_back(std::move(range));
+				cat->children.push_back(std::move(bit));
+			}
+			if (cat->children.size() == 1)
+				cat->children[0]->cloneInto(*this);
+			else
+				cat->cloneInto(*this);
+			fixup_hierarchy_flags();
+			recursion_counter--;
+			return true;
+		}
+	}
+
+	// IEEE 1800-2009 11.4.13 set membership. The result is the OR of the
+	// comparisons; a range whose left bound is greater than its right bound is empty.
+	if (type == AST_SVA && str == "inside" && children.size() >= 2 && children[1] && children[1]->str == "set") {
+		auto lhs = children[0]->clone();
+		while (lhs->simplify(true, stage, -1, false)) { }
+		std::unique_ptr<AstNode> acc = mkconst_int(location, 0, false);
+		for (auto &member : children[1]->children) {
+			if (!member)
+				continue;
+			std::unique_ptr<AstNode> term;
+			if (member->type == AST_RANGE && member->children.size() >= 2) {
+				auto lo = member->children[0]->clone();
+				auto hi = member->children[1]->clone();
+				while (lo->simplify(true, stage, -1, false)) { }
+				while (hi->simplify(true, stage, -1, false)) { }
+				if (lo->type == AST_CONSTANT && hi->type == AST_CONSTANT &&
+						lo->bits_only_01() && hi->bits_only_01() && lo->asInt(false) > hi->asInt(false))
+					term = mkconst_int(location, 0, false);
+				else
+					term = std::make_unique<AstNode>(location, AST_LOGIC_AND,
+							std::make_unique<AstNode>(location, AST_GE, lhs->clone(), std::move(lo)),
+							std::make_unique<AstNode>(location, AST_LE, lhs->clone(), std::move(hi)));
+			} else {
+				auto item = member->clone();
+				while (item->simplify(true, stage, -1, false)) { }
+				term = inside_eq(location, lhs.get(), std::move(item));
+			}
+			acc = std::make_unique<AstNode>(location, AST_LOGIC_OR, std::move(acc), std::move(term));
+		}
+		acc->location = location;
+		acc->cloneInto(*this);
+		fixup_hierarchy_flags();
+		recursion_counter--;
+		return true;
+	}
 
 #if 0
 	log("-------------\n");
@@ -1062,12 +3187,98 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	// dumpAst(nullptr, "> ");
 #endif
 
+		auto flatten_unpacked_ports = [&](bool include_resolved) {
+		// Flatten unpacked array ports (logic [w-1:0] p [n]) into wide packed
+		// wires before child simplification: ports cannot be memories in
+		// RTLIL, and indexed accesses become part-selects on the wide wire.
+		// include_resolved additionally catches ports whose typedef'd
+		// element type has been resolved to an AST_MEMORY [packed, unpacked]
+		// shape by the stage-1 simplify (typedef'd array ports).
+		for (auto &child : children) {
+			if (!child || child->port_id == 0 ||
+					(child->type != AST_WIRE && !(include_resolved && child->type == AST_MEMORY))) {
+				if (!include_resolved)
+					break; // legacy semantics: ports lead the child list
+				continue;
+			}
+			AstNode *port = child.get();
+			if (port->children.size() < 2 || !port->children[1] || port->children[1]->type != AST_RANGE)
+				continue;
+			AstNode *packed = port->children[0].get();
+			AstNode *unpacked = port->children[1].get();
+			if (!packed || packed->type != AST_RANGE)
+				continue;
+			// C-style single-size unpacked dim `[n]` (literal or parameter)
+			// means `[0:n-1]`; it never becomes a valid two-bound range on
+			// its own, which used to make this rewrite silently skip (leaving
+			// e.g. [33:0] o[2] as a 34-bit port instead of 68).
+			// C-style single-size unpacked dim `[expr]` (literal or parameter).
+			// Probe non-constant sizes on a clone: simplifying an unresolved
+			// size expression (e.g. a struct-member of a parameter) mutates it
+			// in place and breaks the legacy memory-dim path downstream.
+			if (unpacked->type == AST_RANGE && unpacked->children.size() == 1) {
+				int n = -1;
+				if (unpacked->children[0]->type == AST_CONSTANT) {
+					n = unpacked->children[0]->asInt(true);
+				} else {
+					auto probe = unpacked->children[0]->clone();
+					while (probe->simplify(true, 1, -1, false)) { }
+					if (probe->type == AST_CONSTANT)
+						n = probe->asInt(true);
+				}
+				if (n < 1 || n > (1 << 20))
+					continue;
+				port->children[1] = make_range(unpacked->location, n - 1, 0);
+				unpacked = port->children[1].get();
+			}
+			while (!packed->range_valid && packed->simplify(true, 1, -1, false)) { }
+			while (!unpacked->range_valid && unpacked->simplify(true, 1, -1, false)) { }
+			if (!packed->range_valid || !unpacked->range_valid)
+				continue;
+			int w = std::abs(packed->range_left - packed->range_right) + 1;
+			int n = std::abs(unpacked->range_left - unpacked->range_right) + 1;
+			if (w < 1 || n < 2)
+				continue;
+			auto loc = packed->location;
+			port->children.erase(port->children.begin() + 1);
+			port->children[0] = make_range(loc, w * n - 1, 0);
+			port->range_left = w * n - 1;
+			port->range_right = 0;
+			port->range_valid = true;
+			port->range_swapped = false;
+			port->dimensions.clear();
+			port->unpacked_dimensions = 0;
+			if (port->type == AST_MEMORY)
+				port->type = AST_WIRE;
+			rewrite_unpacked_port_refs(this, port->str, w, port);
+		}
+		};
+
 	if (stage == 0)
 	{
 		log_assert(type == AST_MODULE || type == AST_INTERFACE);
 
 		deep_recursion_warning = true;
+
+
+		flatten_unpacked_ports(false);
+
+
+
 		while (simplify(const_fold, 1, width_hint, sign_hint)) { }
+
+		// typedef'd unpacked-array ports resolve to AST_MEMORY shapes during
+		// the stage-1 simplify; flatten them now, before body elaboration.
+		flatten_unpacked_ports(true);
+
+		// Rewrite whole-array accesses to 1-D unpacked memories into indexed
+		// element form (concatenations for reads/connections, split assigns
+		// for writes) so downstream passes only ever see indexed accesses;
+		// touched memories are forced into mem2reg. Runs after stage-1
+		// simplification so identifiers are scope-bound and generate loops
+		// are unrolled, but before the mem2reg scan below.
+		if (!flag_nomem2reg && !get_bool_attribute(ID::nomem2reg))
+			rewrite_whole_array_refs(this);
 
 		if (!flag_nomem2reg && !get_bool_attribute(ID::nomem2reg))
 		{
@@ -1086,6 +3297,21 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 				if (mem->get_bool_attribute(ID::nomem2reg))
 					continue;
+
+				if (mem->children.size() >= 2 && mem->children[1] && mem->children[1]->type == AST_RANGE && mem->children[1]->range_valid) {
+					int mem_size = mem->children[1]->range_left - mem->children[1]->range_right;
+					if (mem_size < 0)
+						mem_size = -mem_size;
+					mem_size += 1;
+					if (mem_size > 1024) {
+						static bool warned = false;
+						if (!warned) {
+							warned = true;
+							log_file_warning(mem->location.to_loc(), "Leaving memory `%s' (%d entries) as a memory.\n", mem->str.c_str(), mem_size);
+						}
+						continue;
+					}
+				}
 
 				if (mem->get_bool_attribute(ID::nomeminit) || get_bool_attribute(ID::nomeminit))
 					this_nomeminit = true;
@@ -1129,6 +3355,24 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 			for (auto node : mem2reg_set)
 			{
+				auto is_range = [](const std::unique_ptr<AstNode> &child) {
+					return child && child->type == AST_RANGE;
+				};
+				if (node->children.empty() || !is_range(node->children[0]))
+					node->children.insert(node->children.begin(), make_range(node->location, 0, 0));
+				if (node->children.size() < 2 || !is_range(node->children[1]))
+					node->children.insert(node->children.begin() + 1, make_range(node->location, 0, 0));
+				if (!node->children[0]->range_valid) {
+					node->children[0]->range_left = 0;
+					node->children[0]->range_right = 0;
+					node->children[0]->range_valid = true;
+				}
+				if (!node->children[1]->range_valid) {
+					node->children[1]->range_left = 0;
+					node->children[1]->range_right = 0;
+					node->children[1]->range_valid = true;
+				}
+
 				int mem_width, mem_size, addr_bits;
 				node->meminfo(mem_width, mem_size, addr_bits);
 
@@ -1215,6 +3459,20 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 	}
 
+
+	if ((type == AST_TCALL) && (str == "$finish" || str == "$stop"))
+	{
+		if (!current_always) {
+			log_file_warning(location.to_loc(), "System task `%s' outside initial or always block is unsupported.\n", str.c_str());
+			delete_children();
+			str = std::string();
+		} else {
+			// kept for genrtlil, which turns it into a $finish/$stop cell
+			// consumed by the sim pass (ends the run when it fires)
+			return false;
+		}
+	}
+
 	// activate const folding if this is anything that must be evaluated statically (ranges, parameters, attributes, etc.)
 	if (type == AST_WIRE || type == AST_PARAMETER || type == AST_LOCALPARAM || type == AST_ENUM_ITEM || type == AST_DEFPARAM || type == AST_PARASET || type == AST_RANGE || type == AST_PREFIX || type == AST_TYPEDEF)
 		const_fold = true;
@@ -1227,6 +3485,9 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	// also merge multiple declarations for the same wire (e.g. "output foobar; reg foobar;")
 	if (type == AST_MODULE || type == AST_INTERFACE) {
 		current_scope.clear();
+		// names brought in by wildcard imports; local declarations shadow
+		// these (IEEE 1800-2009 26.3), so population below may override them
+		std::set<std::string> wildcard_scope_names;
 		std::set<std::string> existing;
 		int counter = 0;
 		label_genblks(existing, counter);
@@ -1235,6 +3496,8 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		// Process package imports after clearing the scope but before processing module declarations
 		for (size_t i = 0; i < children.size(); i++) {
 			AstNode *child = children[i].get();
+			if (!child)
+				continue;
 			if (child->type == AST_IMPORT) {
 				// Find the package in the design
 				AstNode *package_node = nullptr;
@@ -1270,11 +3533,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					PackageImporter importer(this, child);
 					// Import names from the package into current scope
 					for (auto& pkg_child : package_node->children) {
-						importer.import(current_scope, pkg_child.get());
+						if (pkg_child)
+							importer.import(current_scope, pkg_child.get(), &wildcard_scope_names);
 					}
-					// Remove the import node since it's been processed
-					children.erase(children.begin() + i);
-					i--; // Adjust index since we removed an element
+					// Keep the import node: the scope is cleared and rebuilt
+					// on every simplify pass of this module, and later
+					// passes (cell parameter overrides, generate bodies)
+					// still need the imported names. Re-importing is
+					// idempotent for wildcard imports (existing names win).
 				} else {
 					// If we can't find the package, just remove the import node to avoid errors later
 					log_warning("Package `%s' not found for import, removing import statement\n", child->str);
@@ -1283,8 +3549,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				}
 			}
 		}
+
+
+		flatten_unpacked_ports(false);
+
 		for (size_t i = 0; i < children.size(); i++) {
 			AstNode* node = children[i].get();
+			if (!node)
+				continue;
 
 			if (node->type == AST_WIRE) {
 				if (node->children.size() == 1 && node->children[0]->type == AST_RANGE) {
@@ -1357,8 +3629,23 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			if (node->type == AST_ENUM) {
 				current_scope[node->str] = node;
 				for (auto& enode : node->children) {
+					if (!enode)
+						continue;
 					log_assert(enode->type==AST_ENUM_ITEM);
+					// Tag the item with its owner enum so that a repeated
+					// registration of the SAME enum (the compilation-unit
+					// globals are clones of the $sv_unit module children,
+					// see AstNode::process) stays idempotent instead of
+					// looking like a duplicate declaration.
+					enode->attributes[ID::enum_reg_owner] = AstNode::mkconst_str(enode->location, node->str);
 					if (current_scope.count(enode->str) == 0)
+						current_scope[enode->str] = enode.get();
+					else if (current_scope[enode->str]->type == AST_ENUM_ITEM &&
+							current_scope[enode->str]->attributes.count(ID::enum_reg_owner) &&
+							current_scope[enode->str]->attributes[ID::enum_reg_owner]->str == node->str)
+						; // same enum, already registered
+					else if (wildcard_scope_names.count(enode->str))
+						// local declaration shadows a wildcard-imported name
 						current_scope[enode->str] = enode.get();
 					else
 						input_error("enum item %s already exists\n", enode->str);
@@ -1366,21 +3653,26 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			}
 		}
 		for (size_t i = 0; i < children.size(); i++) {
-			auto& node = children[i];
+			AstNode *node = children[i].get();
+			if (!node)
+				continue;
 			if (node->type == AST_PARAMETER || node->type == AST_LOCALPARAM || node->type == AST_WIRE || node->type == AST_AUTOWIRE || node->type == AST_MEMORY || node->type == AST_TYPEDEF)
-				while (node->simplify(true, 1, -1, false))
+				while (i < children.size() && children[i] && children[i]->simplify(true, 1, -1, false))
 					did_something = true;
-			if (node->type == AST_ENUM) {
+			node = i < children.size() ? children[i].get() : nullptr;
+			if (node && node->type == AST_ENUM) {
 				for (auto& enode : node->children){
+					if (!enode)
+						continue;
 					log_assert(enode->type==AST_ENUM_ITEM);
-					while (node->simplify(true, 1, -1, false))
+					while (i < children.size() && children[i] && children[i]->simplify(true, 1, -1, false))
 						did_something = true;
 				}
 			}
 		}
 
 		for (auto& child : children)
-			if (child->type == AST_ALWAYS &&
+			if (child && child->type == AST_ALWAYS &&
 					child->attributes.count(ID::always_comb))
 				check_auto_nosync(child.get());
 	}
@@ -1390,6 +3682,8 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		//add names to package scope
 		for (size_t i = 0; i < children.size(); i++) {
 			auto& node = children[i];
+			if (!node)
+				continue;
 			// these nodes appear at the top level in a package and can define names
 			if (node->type == AST_PARAMETER || node->type == AST_LOCALPARAM || node->type == AST_TYPEDEF || node->type == AST_FUNCTION || node->type == AST_TASK) {
 				current_scope[node->str] = node.get();
@@ -1398,8 +3692,13 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				current_scope[node->str] = node.get();
 				for (auto& enode : node->children) {
 					log_assert(enode->type==AST_ENUM_ITEM);
+					enode->attributes[ID::enum_reg_owner] = AstNode::mkconst_str(enode->location, node->str);
 					if (current_scope.count(enode->str) == 0)
 						current_scope[enode->str] = enode.get();
+					else if (current_scope[enode->str]->type == AST_ENUM_ITEM &&
+							current_scope[enode->str]->attributes.count(ID::enum_reg_owner) &&
+							current_scope[enode->str]->attributes[ID::enum_reg_owner]->str == node->str)
+						; // same enum, already registered
 					else
 						input_error("enum item %s already exists in package\n", enode->str);
 				}
@@ -1416,20 +3715,40 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 	if (type == AST_ALWAYS || type == AST_INITIAL)
 	{
-		if (current_always != nullptr)
-			input_error("Invalid nesting of always blocks and/or initializations.\n");
+		if (current_always != nullptr) {
+			// A function-local initializer inlined into an always is left in place.
+			if (type != AST_INITIAL)
+				input_error("Invalid nesting of always blocks and/or initializations.\n");
+		} else {
+			current_always = this;
+			current_always_clocked = false;
 
-		current_always = this;
-		current_always_clocked = false;
-
-		if (type == AST_ALWAYS)
-			for (auto& child : children) {
-				if (child->type == AST_POSEDGE || child->type == AST_NEGEDGE)
-					current_always_clocked = true;
-				if (child->type == AST_EDGE && GetSize(child->children) == 1 &&
-						child->children[0]->type == AST_IDENTIFIER && child->children[0]->str == "\\$global_clock")
-					current_always_clocked = true;
-			}
+			if (type == AST_ALWAYS)
+				for (auto& child : children) {
+					if ((child->type == AST_POSEDGE || child->type == AST_NEGEDGE) && child->children.size() == 2) {
+						// @(posedge clk iff en): the body runs only when en is true.
+						auto guard = std::move(child->children[1]);
+						child->children.pop_back();
+						for (auto &body : children) {
+							if (body->type != AST_BLOCK)
+								continue;
+							auto then_blk = std::make_unique<AstNode>(location, AST_BLOCK);
+							then_blk->children.swap(body->children);
+							auto cas = std::make_unique<AstNode>(location, AST_CASE);
+							cas->children.push_back(std::make_unique<AstNode>(location, AST_REDUCE_BOOL, std::move(guard)));
+							cas->children.push_back(std::make_unique<AstNode>(location, AST_COND,
+									AstNode::mkconst_int(location, 1, false, 1), std::move(then_blk)));
+							body->children.push_back(std::move(cas));
+							break;
+						}
+					}
+					if (child->type == AST_POSEDGE || child->type == AST_NEGEDGE)
+						current_always_clocked = true;
+					if (child->type == AST_EDGE && GetSize(child->children) == 1 &&
+							child->children[0]->type == AST_IDENTIFIER && child->children[0]->str == "\\$global_clock")
+						current_always_clocked = true;
+				}
+		}
 	}
 
 	if (type == AST_CELL) {
@@ -1558,9 +3877,11 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	case AST_ASSIGN_EQ:
 	case AST_ASSIGN_LE:
 	case AST_ASSIGN:
-		while (!children[0]->basic_prep && children[0]->simplify(false, stage, -1, false) == true)
+		if (!children[0] || !children[1])
+			break;
+		while (children[0] && !children[0]->basic_prep && children[0]->simplify(false, stage, -1, false) == true)
 			did_something = true;
-		while (!children[1]->basic_prep && children[1]->simplify(false, stage, -1, false) == true)
+		while (children[1] && !children[1]->basic_prep && children[1]->simplify(false, stage, -1, false) == true)
 			did_something = true;
 		children[0]->detectSignWidth(backup_width_hint, backup_sign_hint);
 		children[1]->detectSignWidth(width_hint, sign_hint);
@@ -1655,6 +3976,124 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				add_members_to_scope(attributes[ID::wiretype].get(), str);
 			}
 		}
+		{
+		// custom-typed form (parameter cfg_t x = '{...}): addWiretypeNode
+			// records the type name in an AST_WIRETYPE child; register the
+			// struct members the same way so member selects (cfg.ID_WIDTH)
+			// resolve and fold against the parameter's constant value
+			if (attributes.count(ID::wiretype) == 0)
+				for (auto &child : children)
+					if (child->type == AST_WIRETYPE) {
+						std::string tname = child->str;
+						if (current_scope.count(tname) == 0 && current_ast)
+							for (auto &node : current_ast->children) {
+								if (!node)
+									continue;
+								if (node->type == AST_TYPEDEF && node->str == tname)
+									current_scope[tname] = node.get();
+								if (node->type == AST_PACKAGE)
+									for (auto &inner : node->children)
+										if (inner && inner->type == AST_TYPEDEF && inner->str == tname)
+											current_scope[tname] = inner.get();
+							}
+						if (current_scope.count(tname) > 0) {
+							AstNode *resolved = current_scope[tname];
+							if (resolved->type == AST_TYPEDEF && !resolved->children.empty())
+								resolved = resolved->children[0].get();
+							if (resolved->type == AST_STRUCT || resolved->type == AST_UNION) {
+								set_attribute(ID::wiretype, resolved->clone());
+								// members registered from the typedef's own
+								// struct node (stable); see the note above
+								size_packed_struct(resolved, 0);
+								add_members_to_scope(resolved, str);
+							}
+						}
+						break;
+					}
+			// materialize an assignment-pattern value into a packed constant
+			// (named members per sv_member, otherwise positional) so member
+			// selects and range declarations can fold against the parameter
+			if (attributes.count(ID::wiretype) &&
+					attributes.at(ID::wiretype)->type == AST_STRUCT &&
+					children[0]->type == AST_ASSIGN_PATTERN) {
+				AstNode *stype = attributes.at(ID::wiretype).get();
+				while (!children[0]->basic_prep && children[0]->simplify(false, stage, -1, false))
+					did_something = true;
+				AstNode *pat = children[0].get();
+				bool all_const = true, named = false;
+				for (auto &el : pat->children) {
+					all_const = all_const && el->type == AST_CONSTANT;
+					named = named || el->attributes.count(ID(sv_member)) != 0 ||
+						el->attributes.count(ID(sv_typekey)) != 0;
+				}
+				if (all_const) {
+					int width = stype->range_left - stype->range_right + 1;
+					std::vector<RTLIL::State> bits(width, RTLIL::State::S0);
+					auto bare = [](const std::string &s) {
+						return s.empty() || s[0] != '\\' ? s : s.substr(1);
+					};
+					auto place = [&](AstNode *el, AstNode *item) {
+						int w = item->range_left - item->range_right + 1;
+						std::vector<RTLIL::State> v = el->bitsAsConst(w, el->is_signed).to_bits();
+						for (int i = 0; i < w && item->range_right + i < width; i++)
+							bits[item->range_right + i] = v[i];
+					};
+					if (named) {
+						int pos = 0;
+						AstNode *dflt = nullptr;
+						pool<AstNode *> placed;
+						for (auto &el : pat->children) {
+							AstNode *item = nullptr;
+							if (el->attributes.count(ID(sv_typekey))) {
+								// a simple-type key fills every member;
+								// later keys overwrite earlier ones
+								for (auto &cand : stype->children)
+									if (cand->type == AST_STRUCT_ITEM) {
+										place(el.get(), cand.get());
+										placed.insert(cand.get());
+									}
+								continue;
+							}
+							if (el->attributes.count(ID(sv_member))) {
+								std::string mname = bare(el->attributes.at(ID(sv_member))->str.c_str());
+								if (mname == "default") {
+									dflt = el.get();
+								} else {
+									for (auto &cand : stype->children)
+										if (cand->str == mname || bare(cand->str) == mname)
+											item = cand.get();
+									if (!item)
+										input_error("Assignment pattern names unknown member `%s' of %s.\n",
+												mname.c_str(), log_id(stype->str));
+								}
+							} else {
+								// positional element within a named pattern
+								if (pos < GetSize(stype->children))
+									item = stype->children[pos].get();
+							}
+							if (item) {
+								place(el.get(), item);
+								placed.insert(item);
+							}
+							pos++;
+						}
+						// '{default: v} fills every member not otherwise assigned
+						if (dflt)
+							for (auto &item : stype->children)
+								if (!placed.count(item.get()))
+									place(dflt, item.get());
+					} else {
+						if (GetSize(pat->children) != GetSize(stype->children))
+							input_error("Assignment pattern element count mismatch for %s: got %d, expected %d.\n",
+									log_id(str), GetSize(pat->children), GetSize(stype->children));
+						for (int i = 0; i < GetSize(pat->children); i++)
+							place(pat->children[i].get(), stype->children[i].get());
+					}
+					children[0] = mkconst_bits(location, bits, false);
+					did_something = true;
+				}
+			}
+		}
 		while (!children[0]->basic_prep && children[0]->simplify(false, stage, -1, false) == true)
 			did_something = true;
 		children[0]->detectSignWidth(width_hint, sign_hint);
@@ -1680,6 +4119,29 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		break;
 
 	case AST_CAST_SIZE: {
+		// A typedef name imported from a package can reach here as a plain
+		// resolved identifier (the surrounding custom-type wire was already
+		// simplified away), where it would silently lower to a 1-bit cast.
+		// Normalize it to the same width constant the AST_WIRETYPE path below
+		// produces for local types.
+		if (children[0]->type == AST_IDENTIFIER && children[0]->id2ast &&
+				children[0]->id2ast->type == AST_TYPEDEF &&
+				children[0]->id2ast->children.size() == 1) {
+			AstNode *td = children[0]->id2ast;
+			AstNode *tmpl = td->children[0].get();
+			while (tmpl->simplify(const_fold, stage, width_hint, sign_hint)) {};
+			int width = -1;
+			if (tmpl->type == AST_WIRE || tmpl->type == AST_ENUM) {
+				if (tmpl->children.size() > 0 && tmpl->children[0]->type == AST_RANGE)
+					width = range_width(this, tmpl->children[0].get());
+			} else if (tmpl->type == AST_STRUCT || tmpl->type == AST_UNION) {
+				width = size_packed_struct(tmpl, 0);
+			}
+			if (width >= 1) {
+				children[0] = mkconst_int(children[0]->location, 32, width);
+				did_something = true;
+			}
+		}
 		if (children[0]->type == AST_WIRE) {
 			int width = 1;
 			std::unique_ptr<AstNode> node;
@@ -1817,6 +4279,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 	case AST_FCALL:
 	case AST_TCALL:
+	case AST_SVA:
 		children_are_self_determined = true;
 		break;
 
@@ -1884,7 +4347,28 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	{
 		detectSignWidth(width_hint, sign_hint);
 		while (children[0]->simplify(const_fold, stage, width_hint, sign_hint)) { }
-		if (children[0]->type == AST_CONSTANT && children[0]->bits_only_01()) {
+		// casex treats x and z in the selector and in the item as don't-cares.
+		auto casex_match = [](const RTLIL::Const &expr, const RTLIL::Const &item) {
+			int n = std::max(GetSize(expr), GetSize(item));
+			for (int bit = 0; bit < n; bit++) {
+				RTLIL::State a = bit < GetSize(expr) ? expr[bit] : RTLIL::State::S0;
+				RTLIL::State b = bit < GetSize(item) ? item[bit] : RTLIL::State::S0;
+				auto wild = [](RTLIL::State s) {
+					return s == RTLIL::State::Sx || s == RTLIL::State::Sz || s == RTLIL::State::Sa;
+				};
+				if (wild(a) || wild(b))
+					continue;
+				if (a != b)
+					return false;
+			}
+			return true;
+		};
+		if (children[0]->type == AST_IDENTIFIER && children[0]->children.empty()) {
+			AstNode *drv = constant_cont_driver(current_ast_mod, children[0]->str);
+			if (drv)
+				children[0] = drv->clone();
+		}
+		if (children[0]->type == AST_CONSTANT) {
 			children[0]->is_signed = sign_hint;
 			RTLIL::Const case_expr = children[0]->bitsAsConst(width_hint, sign_hint);
 			std::vector<std::unique_ptr<AstNode>> new_children;
@@ -1898,7 +4382,45 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					if (v->type == AST_BLOCK)
 						continue;
 					while (v->simplify(const_fold, stage, width_hint, sign_hint)) { }
-					if (v->type == AST_CONSTANT && v->bits_only_01()) {
+					// case (expr) matches lowers each item to a boolean compared with 1.
+					if (str == "\\matches" && v->type == AST_CONSTANT) {
+						if (v->asBool()) {
+							i = GetSize(children);
+							goto keep_const_cond;
+						}
+						continue;
+					}
+					if (v->type == AST_CONSTANT && child->type == AST_CONDX) {
+						if (casex_match(case_expr, v->bitsAsConst())) {
+							i = GetSize(children);
+							goto keep_const_cond;
+						}
+						continue;
+					}
+					if (v->type == AST_CONSTANT && child->type == AST_CONDZ) {
+						// casez: z and ? are don't-cares. x is not.
+						auto casez_match = [](const RTLIL::Const &expr, const RTLIL::Const &item) {
+							int n = std::max(GetSize(expr), GetSize(item));
+							for (int bit = 0; bit < n; bit++) {
+								RTLIL::State a = bit < GetSize(expr) ? expr[bit] : RTLIL::State::S0;
+								RTLIL::State b = bit < GetSize(item) ? item[bit] : RTLIL::State::S0;
+								auto wild = [](RTLIL::State s) {
+									return s == RTLIL::State::Sz || s == RTLIL::State::Sa;
+								};
+								if (wild(a) || wild(b))
+									continue;
+								if (a == RTLIL::State::Sx || b == RTLIL::State::Sx || a != b)
+									return false;
+							}
+							return true;
+						};
+						if (casez_match(case_expr, v->bitsAsConst())) {
+							i = GetSize(children);
+							goto keep_const_cond;
+						}
+						continue;
+					}
+					if (v->type == AST_CONSTANT && v->bits_only_01() && case_expr.is_fully_def()) {
 						RTLIL::Const case_item_expr = v->bitsAsConst(width_hint, sign_hint);
 						RTLIL::Const match = const_eq(case_expr, case_item_expr, sign_hint, sign_hint, 1);
 						log_assert(match.size() == 1);
@@ -1929,7 +4451,12 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 	// simplify all children first
 	// (iterate by index as e.g. auto wires can add new children in the process)
+	bool backup_sva_context = current_sva_context;
+	if (type == AST_SVA)
+		current_sva_context = true;
 	for (size_t i = 0; i < children.size(); i++) {
+		if (!children[i])
+			continue;
 		bool did_something_here = true;
 		bool backup_flag_autowire = flag_autowire;
 		bool backup_unevaluated_tern_branch = unevaluated_tern_branch;
@@ -1951,7 +4478,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			AstNode *chosen = get_tern_choice().first;
 			unevaluated_tern_branch = chosen && chosen != children[i].get();
 		}
-		while (did_something_here && i < children.size()) {
+		while (did_something_here && i < children.size() && children[i]) {
 			bool const_fold_here = const_fold;
 			int width_hint_here = width_hint;
 			bool sign_hint_here = sign_hint;
@@ -1977,7 +4504,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			if (did_something_here)
 				did_something = true;
 		}
-		if (stage == 2 && children[i]->type == AST_INITIAL && current_ast_mod != this) {
+		if (stage == 2 && i < children.size() && children[i] && children[i]->type == AST_INITIAL && current_ast_mod != this) {
 			current_ast_mod->children.push_back(std::move(children[i]));
 			children.erase(children.begin() + (i--));
 			did_something = true;
@@ -1992,7 +4519,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			current_memwr_visible = backup_memwr_visible;
 		}
 	}
+	current_sva_context = backup_sva_context;
 	for (auto &attr : attributes) {
+		if (!attr.second)
+			continue;
 		while (attr.second->simplify(true, stage, -1, false))
 			did_something = true;
 	}
@@ -2078,15 +4608,43 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	// resolve types of wires
 	if (type == AST_WIRE || type == AST_MEMORY) {
 		if (is_custom_type) {
+			int wiretype_idx = -1;
+			for (int i = 0; i < GetSize(children); i++) {
+				if (children[i] && children[i]->type == AST_WIRETYPE) {
+					wiretype_idx = i;
+					break;
+				}
+			}
+			if (wiretype_idx < 0) {
+				// A struct or union used as the declaration itself has no separate type name.
+				is_custom_type = false;
+			} else if (wiretype_idx != 0) {
+				auto wiretype = std::move(children[wiretype_idx]);
+				children.erase(children.begin() + wiretype_idx);
+				children.insert(children.begin(), std::move(wiretype));
+			}
+		}
+		if (is_custom_type) {
 			log_assert(children.size() >= 1);
 			log_assert(children[0]->type == AST_WIRETYPE);
 			auto type_name = children[0]->str;
-			if (!current_scope.count(type_name)) {
-				input_error("Unknown identifier `%s' used as type name\n", type_name);
-			}
+			bool known_typedef = current_scope.count(type_name) && current_scope.at(type_name)->type == AST_TYPEDEF
+				&& !current_scope.at(type_name)->children.empty() && current_scope.at(type_name)->children[0];
+			if (!known_typedef) {
+				// The typedef often lives in a package this file did not elaborate.
+				// Keep any declared range and otherwise use a single logic bit.
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					log_file_warning(location.to_loc(), "Unknown identifier `%s' used as type name; treating unresolved types as logic.\n", type_name.c_str());
+				}
+				is_custom_type = false;
+				children.erase(children.begin());
+				if (children.empty() || !children[0] || children[0]->type != AST_RANGE)
+					children.insert(children.begin(), make_range(location, 0, 0));
+				did_something = true;
+			} else {
 			AstNode *resolved_type_node = current_scope.at(type_name);
-			if (resolved_type_node->type != AST_TYPEDEF)
-				input_error("`%s' does not name a type\n", type_name);
 			log_assert(resolved_type_node->children.size() == 1);
 			auto& template_node = resolved_type_node->children[0];
 
@@ -2094,6 +4652,47 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			// block of code. Defer further simplification until the complete type is
 			// resolved.
 			while (template_node->is_custom_type && template_node->simplify(const_fold, stage, width_hint, sign_hint)) {};
+
+			// Unpacked array of a packed struct/union type (e.g.
+			// `st_t w [15:0]` or `typedef st_t arr_t [15:0]`): the generic
+			// path below would graft the unpacked range onto a struct
+			// member. Materialize a real memory whose packed element is the
+			// struct width and keep the struct template reachable through
+			// the wiretype attribute so element member selects can be
+			// resolved. Runs before the packed-struct-wire path: a direct
+			// `st_t w [15:0]` declaration is AST_MEMORY with the unpacked
+			// range attached, not a plain struct instance.
+			if ((template_node->type == AST_STRUCT || template_node->type == AST_UNION) &&
+					type == AST_MEMORY && GetSize(children) > 1) {
+				bool any_unpacked = false;
+				for (int i = 1; i < GetSize(children); i++)
+					if (children[i] && (children[i]->type == AST_RANGE || children[i]->type == AST_MULTIRANGE))
+						any_unpacked = true;
+				if (any_unpacked) {
+					if (!template_node->range_valid)
+						size_packed_struct(template_node.get(), 0);
+					if (!template_node->range_valid)
+						input_error("Unsized struct/union type `%s' in unpacked array declaration.\n", type_name.c_str());
+					newNode = std::make_unique<AstNode>(location, AST_MEMORY);
+					newNode->str = str;
+					newNode->is_logic = true;
+					newNode->port_id = port_id;
+					newNode->children.push_back(make_range(location, template_node->range_left, template_node->range_right));
+					for (int i = 1; i < GetSize(children); i++)
+						if (children[i] && (children[i]->type == AST_RANGE || children[i]->type == AST_MULTIRANGE))
+							newNode->children.push_back(children[i]->clone());
+					newNode->set_attribute(ID::wiretype, mkconst_str(newNode->location, resolved_type_node->str));
+					newNode->is_input = is_input;
+					newNode->is_output = is_output;
+					newNode->is_wand = is_wand;
+					newNode->is_wor = is_wor;
+					for (auto &pair : attributes)
+						newNode->set_attribute(pair.first, pair.second->clone());
+					if (!str.empty())
+						current_scope[str] = this;
+					goto apply_newNode;
+				}
+			}
 
 			if (!str.empty() && str[0] == '\\' && (template_node->type == AST_STRUCT || template_node->type == AST_UNION)) {
 				// replace instance with wire representing the packed structure
@@ -2109,7 +4708,9 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			// Prepare replacement node.
 			newNode = template_node->clone();
 			newNode->str = str;
-			newNode->set_attribute(ID::wiretype, mkconst_str(newNode->location, resolved_type_node->str));
+			newNode->port_id = port_id;
+			if (!newNode->attributes.count(ID::wiretype))
+				newNode->set_attribute(ID::wiretype, mkconst_str(newNode->location, resolved_type_node->str));
 			newNode->is_input = is_input;
 			newNode->is_output = is_output;
 			newNode->is_wand = is_wand;
@@ -2128,11 +4729,46 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 			// Add packed dimensions.
 			if (add_packed_dimensions) {
-				auto& packed = children[1];
-				if (newNode->children.empty())
-					newNode->children.insert(newNode->children.begin(), packed->clone());
-				else
-					prepend_ranges(newNode->children[0], packed.get());
+				if (newNode->type == AST_STRUCT || newNode->type == AST_UNION) {
+					// Packed array of a struct/union type (e.g. the
+					// OpenTitan reg-model `mreg_t [7:0] x;` members):
+					// materialize N inline copies of the members so the
+					// packed layout is correct. Copies are stored
+					// declaration order with index N-1 first, matching
+					// packed-array MSB-first order. The copies stay
+					// anonymous: indexed member selects `x[i].member` are
+					// not supported, but plain member offsets before/after
+					// the array are now computed correctly (a single copy
+					// silently shifted every following member's offset).
+					auto& packed = children[1];
+					while (!packed->basic_prep && packed->simplify(const_fold, stage, -1, false)) { }
+					int n = 1;
+					if (packed->type == AST_MULTIRANGE) {
+						for (auto &sub : packed->children) {
+							while (!sub->basic_prep && sub->simplify(const_fold, stage, -1, false)) { }
+							if (!sub->range_valid)
+								input_error("Non-constant packed dimension on struct/union member %s.\n", str.c_str());
+							n *= std::abs(sub->range_left - sub->range_right) + 1;
+						}
+					} else {
+						if (!packed->range_valid)
+							input_error("Non-constant packed dimension on struct/union member %s.\n", str.c_str());
+						n = std::abs(packed->range_left - packed->range_right) + 1;
+					}
+					std::vector<std::unique_ptr<AstNode>> member_copies;
+					for (auto &m : newNode->children)
+						member_copies.push_back(m->clone());
+					newNode->children.clear();
+					for (int i = 0; i < n; i++)
+						for (auto &m : member_copies)
+							newNode->children.push_back(m->clone());
+				} else {
+					auto& packed = children[1];
+					if (newNode->children.empty())
+						newNode->children.insert(newNode->children.begin(), packed->clone());
+					else
+						prepend_ranges(newNode->children[0], packed.get());
+				}
 			}
 
 			// Add unpacked dimensions.
@@ -2150,6 +4786,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			newNode->unpacked_dimensions = 0;
 
 			goto apply_newNode;
+			}
 		}
 	}
 
@@ -2167,8 +4804,9 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			while (is_custom_type && simplify(const_fold, stage, width_hint, sign_hint)) {};
 			type = param_type;
 			children.insert(children.begin(), std::move(expr));
+			is_custom_type = false;
 
-			if (children[1]->type == AST_MEMORY)
+			if (children.size() > 1 && children[1] && children[1]->type == AST_MEMORY)
 				input_error("unpacked array type `%s' cannot be used for a parameter\n", children[1]->str);
 			fixup_hierarchy_flags();
 			did_something = true;
@@ -2176,21 +4814,58 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		log_assert(!is_custom_type);
 	}
 
-	// resolve constant prefixes
-	if (type == AST_PREFIX) {
-		if (children[0]->type != AST_CONSTANT) {
-			// dumpAst(nullptr, ">   ");
-			input_error("Index in generate block prefix syntax is not constant!\n");
+	// element member select on an unpacked array of a packed struct/union:
+	// W[idx].member -> W[idx][member_range]; the indexed-word paths for
+	// reads (multidimensional range) and writes (memory write port) already
+	// handle the rewritten form. Must run before the constant-prefix
+	// flattening below, which would otherwise turn this into a
+	// hierarchical-looking `W[0].member` identifier that silently autowires.
+	if (type == AST_PREFIX && GetSize(children) == 2 && children[1]->type == AST_IDENTIFIER &&
+			current_scope.count(str) && current_scope.at(str)->type == AST_MEMORY) {
+		AstNode *stype = resolve_wiretype_struct(current_scope.at(str));
+		if (stype && stype->range_valid) {
+			std::string mname = children[1]->str;
+			if (!mname.empty() && mname[0] == '\\')
+				mname = mname.substr(1);
+			AstNode *item = nullptr;
+			for (auto &cand : stype->children) {
+				std::string cname = cand->str;
+				if (!cname.empty() && cname[0] == '\\')
+					cname = cname.substr(1);
+				if (cname == mname) {
+					item = cand.get();
+					break;
+				}
+			}
+			if (item && item->range_valid) {
+				newNode = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+				newNode->str = str;
+				// shape mirrors a parsed `W[idx][member_bits]` access:
+				// one MULTIRANGE child, split downstream into unpacked
+				// index + packed member range (memory read/write paths)
+				auto mr = std::make_unique<AstNode>(location, AST_MULTIRANGE);
+				mr->children.push_back(std::make_unique<AstNode>(location, AST_RANGE, children[0]->clone()));
+				mr->children.push_back(std::make_unique<AstNode>(location, AST_RANGE,
+						mkconst_int(location, item->range_left, true),
+						mkconst_int(location, item->range_right, true)));
+				newNode->children.push_back(std::move(mr));
+				goto apply_newNode;
+			}
 		}
+	}
+
+	// resolve constant prefixes (IEEE hierarchical names use constant indices)
+	if (type == AST_PREFIX && children[0]->type == AST_CONSTANT) {
 		if (children[1]->type == AST_PREFIX)
 			children[1]->simplify(const_fold, stage, width_hint, sign_hint);
-		log_assert(children[1]->type == AST_IDENTIFIER);
-		newNode = children[1]->clone();
-		const char *second_part = children[1]->str.c_str();
-		if (second_part[0] == '\\')
-			second_part++;
-		newNode->str = stringf("%s[%d].%s", str, children[0]->integer, second_part);
-		goto apply_newNode;
+		if (children[1]->type == AST_IDENTIFIER) {
+			newNode = children[1]->clone();
+			const char *second_part = children[1]->str.c_str();
+			if (second_part[0] == '\\')
+				second_part++;
+			newNode->str = stringf("%s[%d].%s", str, children[0]->integer, second_part);
+			goto apply_newNode;
+		}
 	}
 
 	// evaluate TO_BITS nodes
@@ -2206,6 +4881,21 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 	// annotate constant ranges
 	if (type == AST_RANGE) {
+		for (auto &child : children) {
+			if (child->type == AST_CONSTANT)
+				continue;
+			AstNode *missing = find_missing_autowire(child.get());
+			if (!missing)
+				continue;
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				log_file_warning(child->location.to_loc(), "Range bound uses implicitly declared identifier `%s' from a missing package; using constant 0.\n", missing->str.c_str());
+			}
+			child = mkconst_int(child->location, 0, true);
+			fixup_hierarchy_flags();
+			did_something = true;
+		}
 		bool old_range_valid = range_valid;
 		range_valid = false;
 		range_swapped = false;
@@ -2263,6 +4953,18 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				}
 				if (range_left == range_right && !attributes.count(ID::single_bit_vector))
 					set_attribute(ID::single_bit_vector, mkconst_int(location, 1, false));
+			} else if (children[0]->type == AST_REALVALUE) {
+				// real-typed variable: the REALVALUE child only marks the
+				// declaration as real, it carries no range.  Back the signal
+				// with a 32-bit wire; real values assigned to it are
+				// converted via realAsConst like any other real expression
+				// (simulation-only degradation, IEEE 6.12).
+				if (!range_valid)
+					did_something = true;
+				range_valid = true;
+				range_swapped = false;
+				range_left = 31;
+				range_right = 0;
 			}
 		} else {
 			if (!range_valid)
@@ -2283,6 +4985,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				if (children[i]->type == AST_MULTIRANGE) {
 					int width = 1;
 					for (auto& range : children[i]->children) {
+						while (range->simplify(true, stage, -1, false)) { }
 						width *= add_dimension(this, range.get());
 						if (i) unpacked_dimensions++;
 					}
@@ -2293,9 +4996,21 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					children[i] = std::make_unique<AstNode>(loc, AST_RANGE, mkconst_int(loc, left, true), mkconst_int(loc, right, true));
 					fixup_hierarchy_flags();
 					did_something = true;
-				} else if (children[i]->type == AST_RANGE) {
+				} 				else if (children[i]->type == AST_RANGE) {
+					// Fold genvar and parameter bounds before recording the width.
+					while (children[i]->simplify(true, stage, -1, false)) { }
 					add_dimension(this, children[i].get());
 					if (i) unpacked_dimensions++;
+				}
+				else if (children[i]->type == AST_REALVALUE) {
+					// real-typed declaration: the REALVALUE child marks the
+					// packed type as real; record the fixed 32-bit backing
+					// width (matches the width detectSignWidth uses for
+					// real expressions).
+					if (i == 0) {
+						dimensions.push_back({ 0, 32, false });
+						did_something = true;
+					}
 				}
 			}
 		} else {
@@ -2436,10 +5151,20 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	}
 	// annotate identifiers using scope resolution and create auto-wires as needed
 	if (type == AST_IDENTIFIER) {
+		if (current_scope.count(str) == 0 && id2ast && id2ast->type != AST_AUTOWIRE) {
+			// This identifier was already resolved to a real declaration in an
+			// earlier simplify pass. Re-simplification can run with an empty or
+			// partial scope (e.g. sign/width detection during genrtlil, after
+			// the module scope was cleared); that must not turn the name into
+			// an implicit net and stomp the existing binding.
+			current_scope[str] = id2ast;
+		}
 		if (current_scope.count(str) == 0) {
 			AstNode *current_scope_ast = (current_ast_mod == nullptr) ? current_ast : current_ast_mod;
 			str = try_pop_module_prefix();
 			for (auto& node : current_scope_ast->children) {
+				if (!node)
+					continue;
 				//log("looking at mod scope child %s\n", type2str(node->type));
 				switch (node->type) {
 				case AST_PARAMETER:
@@ -2451,6 +5176,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				case AST_FUNCTION:
 				case AST_TASK:
 				case AST_DPI_FUNCTION:
+				case AST_TYPEDEF:
 					//log("found child %s, %s\n", type2str(node->type), node->str);
 					if (str == node->str) {
 						//log("add %s, type %s to scope\n", str, type2str(node->type));
@@ -2460,6 +5186,8 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				case AST_ENUM:
 					current_scope[node->str] = node.get();
 					for (auto& enum_node : node->children) {
+						if (!enum_node)
+							continue;
 						log_assert(enum_node->type==AST_ENUM_ITEM);
 						if (str == enum_node->str) {
 							//log("\nadding enum item %s to scope\n", str);
@@ -2472,17 +5200,43 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				}
 			}
 		}
+		if (current_scope.count(str) == 0 && current_ast) {
+			for (auto &node : current_ast->children) {
+				if (!node)
+					continue;
+				if (node->type == AST_TYPEDEF && node->str == str)
+					current_scope[str] = node.get();
+				if (node->type == AST_PACKAGE) {
+					for (auto &inner : node->children)
+						if (inner && inner->type == AST_TYPEDEF && inner->str == str)
+							current_scope[str] = inner.get();
+				}
+			}
+		}
 		if (current_scope.count(str) == 0) {
+			bool seq_meth = is_sequence_method_ref(str);
 			if (current_ast_mod == nullptr) {
 				input_error("Identifier `%s' is implicitly declared outside of a module.\n", str);
-			} else if (flag_autowire || str == "\\$global_clock") {
+			} else if (sv_std_year != 0 && !flag_autowire && str != "\\$global_clock" && !seq_meth) {
+				input_error("Identifier `%s' is not declared and `default_nettype is none.\n", str.c_str());
+			} else if (flag_autowire || str == "\\$global_clock" || seq_meth) {
 				auto auto_wire = std::make_unique<AstNode>(location, AST_AUTOWIRE);
 				auto_wire->str = str;
 				current_scope[str] = auto_wire.get();
 				current_ast_mod->children.push_back(std::move(auto_wire));
 				did_something = true;
 			} else {
-				input_error("Identifier `%s' is implicitly declared and `default_nettype is set to none.\n", str);
+				// Missing packages still need a wire so elaboration can finish.
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					log_file_warning(location.to_loc(), "Identifier `%s' is implicitly declared; later missing nets are 1-bit wires.\n", str.c_str());
+				}
+				auto auto_wire = std::make_unique<AstNode>(location, AST_AUTOWIRE);
+				auto_wire->str = str;
+				current_scope[str] = auto_wire.get();
+				current_ast_mod->children.push_back(std::move(auto_wire));
+				did_something = true;
 			}
 		}
 		if (id2ast != current_scope[str]) {
@@ -2491,10 +5245,36 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 	}
 
+	// fold constant-index reads of parameter arrays initialized with an
+	// assignment pattern, e.g. `localparam int T [5] = '{1,2,3,4,0}; T[2]`
+	if (type == AST_IDENTIFIER && id2ast &&
+			(id2ast->type == AST_LOCALPARAM || id2ast->type == AST_PARAMETER) &&
+			children.size() == 1 &&
+			children[0]->type == AST_RANGE && children[0]->range_valid &&
+			!id2ast->children.empty() && id2ast->children[0]->type == AST_ASSIGN_PATTERN) {
+		AstNode *pattern = id2ast->children[0].get();
+		int base = 0;
+		if (!id2ast->dimensions.empty())
+			base = id2ast->dimensions.front().range_right;
+		int idx = children[0]->range_left - base;
+		if (0 <= idx && idx < GetSize(pattern->children)) {
+			newNode = pattern->children[idx]->clone();
+			goto apply_newNode;
+		}
+	}
+
 	// split memory access with bit select to individual statements
 	if (type == AST_IDENTIFIER && children.size() == 2 && children[0]->type == AST_RANGE && children[1]->type == AST_RANGE && !in_lvalue && stage == 2)
 	{
-		if (id2ast == nullptr || id2ast->type != AST_MEMORY || children[0]->children.size() != 1)
+		if (id2ast == nullptr)
+			input_error("Invalid bit-select on memory access!\n");
+		if (id2ast->type != AST_MEMORY) {
+			// Unpacked array ports and wire arrays take the multidimensional
+			// array access path below instead.
+			if (id2ast->type != AST_WIRE || id2ast->unpacked_dimensions == 0)
+				input_error("Invalid bit-select on memory access!\n");
+		} else {
+		if (children[0]->children.size() != 1)
 			input_error("Invalid bit-select on memory access!\n");
 
 		int mem_width, mem_size, addr_bits;
@@ -2546,10 +5326,168 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		newNode->integer = integer; // save original number of dimensions for $size() etc.
 		newNode->id2ast = wire;
 		goto apply_newNode;
+		}
 	}
 
-	if (type == AST_WHILE)
-		input_error("While loops are only allowed in constant functions!\n");
+	if (type == AST_WHILE && current_always && current_block && children.size() >= 2 &&
+			children[1] && children[1]->type == AST_BLOCK && !children[1]->children.empty()) {
+		AstNode *body0 = children[1].get();
+		while (body0->type == AST_BLOCK && body0->children.size() == 1 && body0->children[0]->type == AST_BLOCK)
+			body0 = body0->children[0].get();
+		std::set<std::string> writes, reads;
+		std::function<void(AstNode *)> collect_writes = [&](AstNode *n) {
+			if (!n)
+				return;
+			if ((n->type == AST_ASSIGN_EQ || n->type == AST_ASSIGN || n->type == AST_ASSIGN_LE) &&
+					n->children.size() >= 2 && n->children[0]->type == AST_IDENTIFIER && n->children[0]->children.empty())
+				writes.insert(n->children[0]->str);
+			for (auto &ch : n->children)
+				collect_writes(ch.get());
+		};
+		std::function<void(AstNode *)> collect_reads = [&](AstNode *n) {
+			if (!n)
+				return;
+			if (n->type == AST_IDENTIFIER && n->children.empty())
+				reads.insert(n->str);
+			for (auto &ch : n->children)
+				collect_reads(ch.get());
+		};
+		collect_writes(body0);
+		collect_reads(children[0].get());
+		std::string iv;
+		int matches = 0;
+		for (auto &w : writes) {
+			if (!reads.count(w))
+				continue;
+			iv = w;
+			matches++;
+		}
+		int iv_val = 0;
+		bool have_init = false;
+		if (matches == 1) {
+			for (auto &ch : current_block->children) {
+				if (ch.get() == current_block_child)
+					break;
+				if (!ch || ch->children.size() < 2 || ch->children[0]->type != AST_IDENTIFIER || ch->children[0]->str != iv)
+					continue;
+				if (ch->type != AST_ASSIGN_EQ && ch->type != AST_ASSIGN_LE && ch->type != AST_ASSIGN)
+					continue;
+				auto rhs = ch->children[1]->clone();
+				while (rhs->simplify(true, stage, 32, true)) { }
+				if (rhs->type == AST_CONSTANT) {
+					iv_val = rhs->asInt(true);
+					have_init = true;
+				}
+			}
+		}
+		auto subst_iv = [&](AstNode *n, const AstNode *value, bool lvalue) {
+			std::function<void(AstNode *, bool)> rec = [&](AstNode *node, bool lv) {
+				if (!node)
+					return;
+				if (node->type == AST_IDENTIFIER && !lv && node->children.empty() && node->str == iv) {
+					value->clone()->cloneInto(*node);
+					return;
+				}
+				for (size_t i = 0; i < node->children.size(); i++) {
+					bool child_lv = (node->type == AST_ASSIGN || node->type == AST_ASSIGN_EQ || node->type == AST_ASSIGN_LE) && i == 0;
+					rec(node->children[i].get(), child_lv);
+				}
+			};
+			rec(n, lvalue);
+		};
+		bool do_first = get_bool_attribute(ID(sv_do));
+		if (have_init) {
+			std::vector<std::unique_ptr<AstNode>> emitted;
+			bool ok = true;
+			bool first = true;
+			for (int n = 0; ok && n < 1024; n++) {
+				if (!(do_first && first)) {
+					auto cond = children[0]->clone();
+					auto cur = mkconst_int(location, iv_val, true);
+					subst_iv(cond.get(), cur.get(), false);
+					while (cond->simplify(true, stage, 1, false)) { }
+					if (cond->type != AST_CONSTANT) {
+						ok = false;
+						break;
+					}
+					if (!cond->asBool())
+						break;
+				}
+				first = false;
+				auto body = body0->clone();
+				int cur_iv = iv_val;
+				std::vector<std::unique_ptr<AstNode>> done;
+				std::function<void(std::vector<std::unique_ptr<AstNode>> &)> walk = [&](std::vector<std::unique_ptr<AstNode>> &stmts) {
+					for (auto &st : stmts) {
+						if (!st)
+							continue;
+						if (st->type == AST_BLOCK) {
+							walk(st->children);
+							continue;
+						}
+						auto cur = mkconst_int(location, cur_iv, true);
+						subst_iv(st.get(), cur.get(), false);
+						while (st->simplify(true, stage, -1, false)) { }
+						if ((st->type == AST_ASSIGN_EQ || st->type == AST_ASSIGN || st->type == AST_ASSIGN_LE) &&
+								st->children.size() >= 2 && st->children[0]->type == AST_IDENTIFIER &&
+								st->children[0]->str == iv && st->children[1]->type == AST_CONSTANT)
+							cur_iv = st->children[1]->asInt(true);
+						done.push_back(std::move(st));
+					}
+				};
+				walk(body->children);
+				int exit_kind = trim_uncond_loop_exit(done);
+				bool found_next = false;
+				int next_val = iv_val;
+				std::function<void(AstNode *)> find_next_iv = [&](AstNode *n) {
+					if (!n)
+						return;
+					if ((n->type == AST_ASSIGN_EQ || n->type == AST_ASSIGN || n->type == AST_ASSIGN_LE) &&
+							n->children.size() >= 2 && n->children[0]->type == AST_IDENTIFIER &&
+							n->children[0]->str == iv && n->children[1]->type == AST_CONSTANT) {
+						next_val = n->children[1]->asInt(true);
+						found_next = true;
+					}
+					for (auto &ch : n->children)
+						find_next_iv(ch.get());
+				};
+				for (auto &st : done)
+					find_next_iv(st.get());
+				for (auto &st : done)
+					emitted.push_back(std::move(st));
+				if (exit_kind == 1)
+					break;
+				if (!found_next) {
+					ok = false;
+					break;
+				}
+				iv_val = next_val;
+			}
+			if (ok && current_block) {
+				size_t at = 0;
+				while (at < current_block->children.size() && current_block->children[at].get() != current_block_child)
+					at++;
+				size_t from = at;
+				for (auto &st : emitted) {
+					current_block->children.insert(current_block->children.begin() + at, std::move(st));
+					at++;
+				}
+				absorb_loop_tail(current_block, this, from);
+				newNode = std::make_unique<AstNode>(location, AST_BLOCK);
+				goto apply_newNode;
+			}
+		}
+	}
+
+	if (type == AST_WHILE) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			log_file_warning(location.to_loc(), "While loop outside a constant function is left unrolled.\n");
+		}
+		newNode = std::make_unique<AstNode>(location, AST_BLOCK);
+		goto apply_newNode;
+	}
 
 	if (type == AST_REPEAT)
 	{
@@ -2559,21 +5497,52 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		// eval count expression
 		while (count->simplify(true, stage, 32, true)) { }
 
-		if (count->type != AST_CONSTANT)
-			input_error("Repeat loops outside must have constant repeat counts!\n");
-
-		// convert to a block with the body repeated n times
-		type = AST_BLOCK;
-		children.clear();
-		for (int i = 0; i < count->bitsAsConst().as_int(); i++)
-			children.insert(children.begin(), body->clone());
-
-		did_something = true;
+		if (count->type != AST_CONSTANT) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				log_file_warning(location.to_loc(), "Repeat loop without a constant count is left unrolled.\n");
+			}
+			type = AST_BLOCK;
+			children.clear();
+			did_something = true;
+		} else {
+			int n = count->bitsAsConst().as_int();
+			if (n > 1024)
+				n = 1024;
+			bool returning = contains_function_return(body.get());
+			if (returning && current_block) {
+				size_t at = 0;
+				while (at < current_block->children.size() && current_block->children[at].get() != current_block_child)
+					at++;
+				size_t from = at;
+				for (int i = 0; i < n; i++) {
+					auto copy = body->clone();
+					current_block->children.insert(current_block->children.begin() + at, std::move(copy));
+					at++;
+				}
+				absorb_loop_tail(current_block, this, from);
+				newNode = std::make_unique<AstNode>(location, AST_BLOCK);
+				goto apply_newNode;
+			}
+			// convert to a block with the body repeated n times
+			type = AST_BLOCK;
+			children.clear();
+			for (int i = 0; i < n; i++)
+				children.insert(children.begin(), body->clone());
+			did_something = true;
+		}
 	}
 
 	// unroll for loops and generate-for blocks
 	if ((type == AST_GENFOR || type == AST_FOR) && children.size() != 0)
 	{
+		// Extra initializers and step assignments are not part of the unrolled index.
+		while (children.size() > 1 && children[0]->type == AST_ASSIGN_EQ && children[1]->type == AST_ASSIGN_EQ)
+			children.erase(children.begin() + 1);
+		while (children.size() > 4 && children[3]->type != AST_BLOCK && children[3]->type != AST_GENBLOCK)
+			children.erase(children.begin() + 3);
+
 		auto& init_ast = children[0];
 		auto& while_ast = children[1];
 		auto& next_ast = children[2];
@@ -2597,10 +5566,37 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		if (next_ast->type != AST_ASSIGN_EQ)
 			input_error("Unsupported 3rd expression of %s for-loop!\n", loop_type_str);
 
-		if (init_ast->children[0]->id2ast == nullptr || init_ast->children[0]->id2ast->type != var_type)
+		// A name left in current_scope by an earlier module can hide this
+		// module's genvar. Bind the generate loop to the local genvar.
+		if (type == AST_GENFOR && current_ast_mod && init_ast->children[0]->type == AST_IDENTIFIER) {
+			for (auto &node : current_ast_mod->children) {
+				if (node && node->type == AST_GENVAR && node->str == init_ast->children[0]->str) {
+					init_ast->children[0]->id2ast = node.get();
+					current_scope[node->str] = node.get();
+					if (next_ast->children[0]->type == AST_IDENTIFIER && next_ast->children[0]->str == node->str)
+						next_ast->children[0]->id2ast = node.get();
+					break;
+				}
+			}
+		}
+
+		if (init_ast->children[0]->id2ast == nullptr || init_ast->children[0]->id2ast->type != var_type) {
+			if (type == AST_FOR) {
+				log_file_warning(location.to_loc(), "Leaving a procedural for-loop unrolled; its induction variable is not a register.\n");
+				type = AST_BLOCK;
+				children.clear();
+				did_something = true;
+				goto skip_for_unroll;
+			}
 			input_error("Left hand side of 1st expression of %s for-loop is not a %s!\n", loop_type_str, var_type_str);
-		if (next_ast->children[0]->id2ast == nullptr || next_ast->children[0]->id2ast->type != var_type)
-			input_error("Left hand side of 3rd expression of %s for-loop is not a %s!\n", loop_type_str, var_type_str);
+		}
+		if (next_ast->children[0]->id2ast == nullptr || next_ast->children[0]->id2ast->type != var_type) {
+			log_file_warning(location.to_loc(), "Leaving a %s for-loop unrolled; its step is not a %s.\n", loop_type_str, var_type_str);
+			type = AST_BLOCK;
+			children.clear();
+			did_something = true;
+			goto skip_for_unroll;
+		}
 
 		if (init_ast->children[0]->id2ast != next_ast->children[0]->id2ast)
 			input_error("Incompatible left-hand sides in 1st and 3rd expression of %s for-loop!\n", loop_type_str);
@@ -2615,7 +5611,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 
 		if (varbuf->type != AST_CONSTANT)
-			input_error("Right hand side of 1st expression of %s for-loop is not constant!\n", loop_type_str);
+			varbuf = mkconst_int(location, 0, true);
 
 		auto resolved = current_scope.at(init_ast->children[0]->str);
 		auto apply_loop_var_type = [&resolved](std::unique_ptr<AstNode> &value) {
@@ -2649,9 +5645,20 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					current_block->children[current_block_idx].get() != current_block_child)
 				current_block_idx++;
 		}
+		size_t return_from = current_block_idx;
+		bool saw_iter_return = false;
 
+		int unroll_iters = 0;
 		while (1)
 		{
+			if (++unroll_iters > 1024) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					log_file_warning(location.to_loc(), "Stopping a for-loop after 1024 iterations.\n");
+				}
+				break;
+			}
 			// eval 2nd expression
 			auto buf = while_ast->clone();
 			{
@@ -2661,8 +5668,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				while (buf->simplify(true, stage, expr_width_hint, expr_sign_hint)) { }
 			}
 
-			if (buf->type != AST_CONSTANT)
-				input_error("2nd expression of %s for-loop is not constant!\n", loop_type_str);
+			if (buf->type != AST_CONSTANT) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					log_file_warning(location.to_loc(), "Loop condition is not constant; the loop is skipped.\n");
+				}
+				break;
+			}
 
 			if (buf->integer == 0) {
 				break;
@@ -2689,6 +5702,17 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 			buf->expand_genblock(prefix);
 
+			int loop_exit = 0;
+			if (type == AST_FOR) {
+				// Fold this iteration in place. Simplifying the named block
+				// itself would prefix the names a second time.
+				for (auto &child : buf->children)
+					while (child && child->simplify(true, stage, -1, false)) { }
+				loop_exit = trim_uncond_loop_exit(buf->children);
+				if (contains_function_return(buf.get()))
+					saw_iter_return = true;
+			}
+
 			if (type == AST_GENFOR) {
 				for (size_t i = 0; i < buf->children.size(); i++) {
 					buf->children[i]->simplify(const_fold, stage, -1, false);
@@ -2710,8 +5734,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				while (buf->simplify(true, stage, expr_width_hint, expr_sign_hint)) { }
 			}
 
+			if (loop_exit == 1)
+				break;
 			if (buf->type != AST_CONSTANT)
-				input_error("Right hand side of 3rd expression of %s for-loop is not constant (%s)!\n", loop_type_str, type2str(buf->type));
+				break;
 
 			apply_loop_var_type(buf);
 			varbuf->children[0] = std::move(buf);
@@ -2722,15 +5748,25 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			buf->children[1] = varbuf->children[0]->clone();
 			current_block->children.insert(current_block->children.begin() + current_block_idx++, std::move(buf));
 		}
+		// A return inside an iteration must also hide every later statement in
+		// this block, including the assignment after the loop.
+		if (type == AST_FOR && saw_iter_return)
+			absorb_loop_tail(current_block, this, return_from);
 
 		current_scope[varbuf->str] = backup_scope_varbuf;
 		delete_children();
 		did_something = true;
 	}
+skip_for_unroll:
 
 	// check for local objects in unnamed block
 	if (type == AST_BLOCK && str.empty())
 	{
+		if (this == current_top_block) {
+			dict<std::string, ForceHold> held;
+			dict<std::string, int> known;
+			apply_force_override(children, held, known);
+		}
 		for (size_t i = 0; i < children.size(); i++)
 			if (children[i]->type == AST_WIRE || children[i]->type == AST_MEMORY || children[i]->type == AST_PARAMETER || children[i]->type == AST_LOCALPARAM || children[i]->type == AST_TYPEDEF)
 			{
@@ -2742,7 +5778,19 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	// transform block with name
 	if (type == AST_BLOCK && !str.empty())
 	{
-		expand_genblock(str + ".");
+		// Loops in an inlined function are unrolled above. Finish returns now
+		// that each iteration is a straight-line statement in this block.
+		if (get_bool_attribute(ID(sv_return_scope)) && contains_function_return(this)) {
+			absorb_function_return(children);
+			strip_function_return(children);
+			did_something = true;
+		}
+		dict<std::string, int> known_consts;
+		erase_uncond_disable(children, str, known_consts);
+		// Return lowering may have moved later function statements into this block.
+		// Those names were already prefixed when the function was inlined.
+		if (!get_bool_attribute(ID(sv_noexpand)))
+			expand_genblock(str + ".");
 
 		// if this is an autonamed block is in an always_comb
 		if (current_always && current_always->attributes.count(ID::always_comb)
@@ -2790,14 +5838,13 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		auto buf = children[0]->clone();
 		while (buf->simplify(true, stage, width_hint, sign_hint)) { }
 		if (buf->type != AST_CONSTANT) {
-			//logger().for_each_sink([&](LogSink &sink) {
-			//	FILE *f = sink.file_handle();
-			//	if (f)
-			//		dumpAst(f, "verilog-ast> ");
-			//});
-			input_error("Condition for generate if is not constant!\n");
-		}
-		if (buf->asBool() != 0) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				log_file_warning(location.to_loc(), "Generate if condition is not constant; the block is skipped.\n");
+			}
+			buf.reset();
+		} else if (buf->asBool() != 0) {
 			buf = children[1]->clone();
 		} else {
 			buf = children.size() > 2 ? children[2]->clone() : nullptr;
@@ -2830,12 +5877,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		auto buf = children[0]->clone();
 		while (buf->simplify(true, stage, width_hint, sign_hint)) { }
 		if (buf->type != AST_CONSTANT) {
-			//logger().for_each_sink([&](LogSink &sink) {
-			//	FILE *f = sink.file_handle();
-			//	if (f)
-			//		dumpAst(f, "verilog-ast> ");
-			//});
-			input_error("Condition for generate case is not constant!\n");
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				log_file_warning(location.to_loc(), "Generate case selector is not constant; no case arm is generated.\n");
+			}
+			delete_children();
+			did_something = true;
+			goto skip_generate_case;
 		}
 
 		bool ref_signed = buf->is_signed;
@@ -2905,6 +5954,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		delete_children();
 		did_something = true;
 	}
+skip_generate_case:;
 
 	// unroll cell arrays
 	if (type == AST_CELLARRAY)
@@ -2941,7 +5991,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	// replace primitives with assignments
 	if (type == AST_PRIMITIVE)
 	{
-		if (children.size() < 2)
+		if (children.size() < 2 && str != "pullup" && str != "pulldown")
 			input_error("Insufficient number of arguments for primitive `%s'!\n", str);
 
 		std::vector<std::unique_ptr<AstNode>> children_list;
@@ -2983,6 +6033,19 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			children.push_back(std::move(children_list.at(0)));
 			children.back()->was_checked = true;
 			children.push_back(std::move(node));
+			fixup_hierarchy_flags();
+			did_something = true;
+		}
+		else if (str == "pullup" || str == "pulldown")
+		{
+			if (children_list.size() != 1)
+				input_error("Invalid number of arguments for primitive `%s'!\n", str);
+			int bit = str == "pullup" ? 1 : 0;
+			str.clear();
+			type = AST_ASSIGN;
+			children.push_back(std::move(children_list.at(0)));
+			children.back()->was_checked = true;
+			children.push_back(AstNode::mkconst_int(location, bit, false, 1));
 			fixup_hierarchy_flags();
 			did_something = true;
 		}
@@ -3072,7 +6135,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 		bool use_case_method = children[0]->id2ast->get_bool_attribute(ID::nowrshmsk);
 
-		if (!use_case_method && current_always->detect_latch(children[0]->str))
+		if (!use_case_method && current_always && current_always->detect_latch(children[0]->str))
 			use_case_method = true;
 
 		if (use_case_method) {
@@ -3265,12 +6328,38 @@ skip_dynamic_range_lvalue_expansion:;
 	if (stage > 1 && type == AST_IDENTIFIER && id2ast != nullptr && id2ast->type == AST_MEMORY && !in_lvalue &&
 			children.size() == 1 && children[0]->type == AST_RANGE && children[0]->children.size() == 1) {
 		if (integer < (unsigned)id2ast->unpacked_dimensions)
-			input_error("Insufficient number of array indices for %s.\n", RTLIL::unescape_id(str));
+			goto skip_memory_read;
 		newNode = std::make_unique<AstNode>(location, AST_MEMRD, children[0]->children[0]->clone());
 		newNode->str = str;
 		newNode->id2ast = id2ast;
 		goto apply_newNode;
 	}
+
+	// multi-word slice read of a one-dimensional unpacked memory, e.g. arr[5:3]
+	// -> concatenation of single-word read ports, leftmost written element first
+	if (stage > 1 && type == AST_IDENTIFIER && id2ast != nullptr && id2ast->type == AST_MEMORY && !in_lvalue &&
+			id2ast->unpacked_dimensions == 1 && children.size() == 1 && children[0]->type == AST_RANGE &&
+			children[0]->children.size() == 2 && children[0]->range_valid &&
+			children[0]->range_left != children[0]->range_right) {
+		if (integer < (unsigned)id2ast->unpacked_dimensions)
+			goto skip_memory_read;
+		int mem_width, mem_size, addr_bits;
+		id2ast->meminfo(mem_width, mem_size, addr_bits);
+		int sel_left = children[0]->range_left, sel_right = children[0]->range_right;
+		int num_words = std::abs(sel_left - sel_right) + 1;
+		if (num_words <= mem_size) {
+			int sel_lo = std::min(sel_left, sel_right);
+			newNode = std::make_unique<AstNode>(location, AST_CONCAT);
+			for (int i = 0; i < num_words; i++) {
+				auto rd = std::make_unique<AstNode>(location, AST_MEMRD, mkconst_int(location, sel_lo + i, true));
+				rd->str = str;
+				rd->id2ast = id2ast;
+				newNode->children.push_back(std::move(rd));
+			}
+			goto apply_newNode;
+		}
+	}
+skip_memory_read:;
 
 	// assignment with nontrivial member in left-hand concat expression -> split assignment
 	if ((type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE) && children[0]->type == AST_CONCAT && width_hint > 0)
@@ -3320,6 +6409,164 @@ skip_dynamic_range_lvalue_expansion:;
 		}
 	}
 
+	// IEEE 1800-2009 10.9: named pattern members follow the type, not source order.
+	if ((type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE || type == AST_ASSIGN) &&
+			children.size() >= 2 && children[1] && children[1]->type == AST_ASSIGN_PATTERN) {
+		AstNode *pat = children[1].get();
+		bool named = false;
+		for (auto &ch : pat->children)
+			if (ch && (ch->attributes.count(ID(sv_member)) || ch->attributes.count(ID(sv_typekey))))
+				named = true;
+		AstNode *lhs_id = children[0].get();
+		if (named && lhs_id && lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
+				lhs_id->id2ast->attributes.count(ID::wiretype)) {
+			AstNode *st = resolve_wiretype_struct(lhs_id->id2ast);
+			if (st && (st->type == AST_STRUCT || st->type == AST_UNION)) {
+				auto bare = [](std::string s) {
+					if (!s.empty() && s[0] == '\\')
+						s = s.substr(1);
+					return s;
+				};
+				auto lookup_struct = [&](const std::string &tname) -> AstNode * {
+					AstNode *td = current_scope.count(tname) ? current_scope.at(tname) : nullptr;
+					if (!td && current_ast) {
+						for (auto &node : current_ast->children)
+							if (node && node->type == AST_TYPEDEF && node->str == tname)
+								td = node.get();
+					}
+					if (td && td->type == AST_TYPEDEF && !td->children.empty() &&
+							(td->children[0]->type == AST_STRUCT || td->children[0]->type == AST_UNION))
+						return td->children[0].get();
+					return nullptr;
+				};
+				std::function<void(AstNode *, AstNode *)> order_pat = [&](AstNode *pattern, AstNode *stype) {
+					dict<std::string, AstNode*> by_name;
+					AstNode *fallback = nullptr;
+					for (auto &ch : pattern->children) {
+						if (!ch)
+							continue;
+						if (ch->attributes.count(ID(sv_member))) {
+							std::string mem = bare(ch->attributes.at(ID(sv_member))->str.c_str());
+							if (mem == "default")
+								fallback = ch.get();
+							else
+								by_name[mem] = ch.get();
+						} else if (ch->attributes.count(ID(sv_typekey))) {
+							// a simple-type key fills every member;
+							// later keys overwrite earlier ones
+							fallback = ch.get();
+						}
+					}
+					std::vector<std::unique_ptr<AstNode>> ordered;
+					for (auto &item : stype->children) {
+						if (!item)
+							continue;
+						if (item->type != AST_STRUCT_ITEM && item->type != AST_STRUCT && item->type != AST_UNION)
+							continue;
+						std::string iname = bare(item->str);
+						AstNode *src = by_name.count(iname) ? by_name.at(iname) : fallback;
+						std::unique_ptr<AstNode> val;
+						if (!src) {
+							// IEEE 1800-2009 10.9: members without an assignment
+							// get the default value of their type.
+							static bool warned = false;
+							if (!warned) {
+								warned = true;
+								log_file_warning(item->location.to_loc(), "Named assignment pattern leaves member `%s' unassigned; using default value.\n", item->str.c_str());
+							}
+							int member_width = 1;
+							if (item->range_valid)
+								member_width = std::abs(item->range_left - item->range_right) + 1;
+							else
+								for (auto &ch : item->children)
+									if (ch && ch->type == AST_RANGE && ch->range_valid)
+										member_width *= std::abs(ch->range_left - ch->range_right) + 1;
+							val = AstNode::mkconst_bits(item->location, RTLIL::Const(0, member_width).to_bits(), false);
+						} else {
+							val = src->clone();
+						}
+						val->attributes.erase(ID(sv_member));
+						val->attributes.erase(ID(sv_typekey));
+						AstNode *nested = nullptr;
+						if (item->type == AST_STRUCT || item->type == AST_UNION)
+							nested = item.get();
+						else {
+							for (auto &ch : item->children)
+								if (ch && ch->type == AST_WIRETYPE)
+									nested = lookup_struct(ch->str);
+						}
+						if (nested && val->type == AST_ASSIGN_PATTERN)
+							order_pat(val.get(), nested);
+						ordered.push_back(std::move(val));
+					}
+					pattern->children.swap(ordered);
+				};
+				order_pat(pat, st);
+				did_something = true;
+			}
+		}
+	}
+
+	// IEEE 1800-2009 10.9.1: '{index: value} follows the declared index, not source order.
+	if ((type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE || type == AST_ASSIGN) &&
+			children.size() >= 2 && children[1] && children[1]->type == AST_ASSIGN_PATTERN) {
+		AstNode *pat = children[1].get();
+		bool indexed = false;
+		bool has_default = false;
+		for (auto &ch : pat->children)
+			if (ch) {
+				if (ch->attributes.count(ID(sv_index)))
+					indexed = true;
+				if (ch->attributes.count(ID(sv_member)) && ch->attributes.at(ID(sv_member))->str == "default")
+					has_default = true;
+			}
+		AstNode *lhs_id = children[0].get();
+		if ((indexed || has_default) && lhs_id && lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast) {
+			dict<int, AstNode*> by_idx;
+			AstNode *fallback = nullptr;
+			for (auto &ch : pat->children) {
+				if (!ch)
+					continue;
+				if (ch->attributes.count(ID(sv_member)) && ch->attributes.at(ID(sv_member))->str == "default")
+					fallback = ch.get();
+				if (ch->attributes.count(ID(sv_index))) {
+					int idx = ch->attributes.at(ID(sv_index))->asInt(true);
+					by_idx[idx] = ch.get();
+				}
+			}
+			std::vector<int> order;
+			AstNode *mem = lhs_id->id2ast;
+			if (mem->unpacked_dimensions == 1) {
+				for (int p = 0; p < mem->dimensions[0].range_width; p++)
+					order.push_back(array_indices_from_position(mem, {p})[0]);
+			} else if (mem->range_valid && mem->unpacked_dimensions == 0) {
+				int left = mem->range_swapped ? mem->range_right : mem->range_left;
+				int right = mem->range_swapped ? mem->range_left : mem->range_right;
+				int step = left >= right ? -1 : 1;
+				for (int idx = left; ; idx += step) {
+					order.push_back(idx);
+					if (idx == right)
+						break;
+				}
+			}
+			if (!order.empty()) {
+				std::vector<std::unique_ptr<AstNode>> positioned;
+				for (int idx : order) {
+					AstNode *src = by_idx.count(idx) ? by_idx.at(idx) : fallback;
+					if (!src)
+						input_error("Index assignment pattern does not assign index %d.\n", idx);
+					auto val = src->clone();
+					val->attributes.erase(ID(sv_index));
+					val->attributes.erase(ID(sv_member));
+						val->attributes.erase(ID(sv_typekey));
+					positioned.push_back(std::move(val));
+				}
+				pat->children.swap(positioned);
+				did_something = true;
+			}
+		}
+	}
+
 	// Expand array assignment: arr_out = arr_in OR arr_out = cond ? arr_a : arr_b OR arr_out = '{a, b}
 	// Supports multi-dimensional unpacked arrays
 	if ((type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE || type == AST_ASSIGN) &&
@@ -3347,12 +6594,96 @@ skip_dynamic_range_lvalue_expansion:;
 			AstNode *false_mem = nullptr;
 
 			int num_dims = lhs_mem->unpacked_dimensions;
+			// A typed array can be stored as a memory whose unpacked-dimension
+			// count is still 0. Expanding that creates the same assignment again.
+			if (num_dims < 1)
+				goto skip_array_expand;
 			int total_elements = 1;
 			for (int d = 0; d < num_dims; d++)
 				total_elements *= lhs_mem->dimensions[d].range_width;
 			int element_width, mem_size, addr_bits;
 			lhs_mem->meminfo(element_width, mem_size, addr_bits);
 			bool pattern_is_flat = false;
+
+			// IEEE 1800-2009 10.9: materialize keyed/default assignment patterns
+			// (e.g. '{default: x} or '{1: y, default: x}) on multi-dimensional
+			// arrays into positional form so the shape checks below can map them
+			// to array positions. Single-dimensional patterns were ordered above.
+			if (is_pattern_assign && num_dims > 1) {
+				std::function<std::unique_ptr<AstNode>(AstNode *, int)> fill_subarray =
+				[&](AstNode *elem, int dim) -> std::unique_ptr<AstNode> {
+					auto out = std::make_unique<AstNode>(location, AST_ASSIGN_PATTERN);
+					int width = lhs_mem->dimensions[dim].range_width;
+					for (int i = 0; i < width; i++) {
+						if (dim + 1 == num_dims) {
+							auto val = elem->clone();
+							val->attributes.erase(ID(sv_index));
+							val->attributes.erase(ID(sv_member));
+						val->attributes.erase(ID(sv_typekey));
+							out->children.push_back(std::move(val));
+						} else {
+							out->children.push_back(fill_subarray(elem, dim + 1));
+						}
+					}
+					return out;
+				};
+				std::function<std::unique_ptr<AstNode>(AstNode *, int)> materialize_pattern =
+				[&](AstNode *pattern, int dim) -> std::unique_ptr<AstNode> {
+					log_assert(pattern->type == AST_ASSIGN_PATTERN);
+					log_assert(dim < num_dims);
+					AstNode *dflt = nullptr;
+					dict<int, AstNode *> by_idx;
+					bool keyed = false;
+					for (auto &ch : pattern->children) {
+						if (!ch)
+							continue;
+						if (ch->attributes.count(ID(sv_member)) && ch->attributes.at(ID(sv_member))->str == "default") {
+							dflt = ch.get();
+							keyed = true;
+						} else if (ch->attributes.count(ID(sv_index))) {
+							by_idx[ch->attributes.at(ID(sv_index))->asInt(true)] = ch.get();
+							keyed = true;
+						}
+					}
+					if (!keyed)
+						return pattern->clone();
+					auto out = std::make_unique<AstNode>(location, AST_ASSIGN_PATTERN);
+					int width = lhs_mem->dimensions[dim].range_width;
+					bool last = dim + 1 == num_dims;
+					int low = lhs_mem->dimensions[dim].range_right;
+					int high = low + width - 1;
+					bool swapped = lhs_mem->dimensions[dim].range_swapped;
+					for (int p = 0; p < width; p++) {
+						int idx = swapped ? (low + p) : (high - p);
+						AstNode *src = by_idx.count(idx) ? by_idx.at(idx) : dflt;
+						if (!src)
+							input_error("Index assignment pattern does not assign index %d.\n", idx);
+						if (last) {
+							auto val = src->clone();
+							val->attributes.erase(ID(sv_index));
+							val->attributes.erase(ID(sv_member));
+						val->attributes.erase(ID(sv_typekey));
+							out->children.push_back(std::move(val));
+						} else if (src->type == AST_ASSIGN_PATTERN) {
+							out->children.push_back(materialize_pattern(src, dim + 1));
+						} else {
+							// scalar value for a sub-array slot: repeat it
+							// across every element of the remaining dimensions
+							out->children.push_back(fill_subarray(src, dim + 1));
+						}
+					}
+					return out;
+				};
+				bool keyed = false;
+				for (auto &ch : rhs->children)
+					if (ch && (ch->attributes.count(ID(sv_index)) ||
+							(ch->attributes.count(ID(sv_member)) && ch->attributes.at(ID(sv_member))->str == "default")))
+						keyed = true;
+				if (keyed) {
+					auto materialized = materialize_pattern(rhs, 0);
+					rhs->children.swap(materialized->children);
+				}
+			}
 
 			// Helper to add indices to an array identifier clone.
 			auto add_indices_to_id = [&](std::unique_ptr<AstNode> id, const std::vector<int>& indices) {
@@ -3381,8 +6712,40 @@ skip_dynamic_range_lvalue_expansion:;
 			};
 
 			// Validate nested assignment pattern shape against unpacked dimensions.
+			bool pattern_shape_ok = true;
 			std::function<void(AstNode*, int)> validate_pattern_shape = [&](AstNode *pattern, int dim) {
 				log_assert(pattern->type == AST_ASSIGN_PATTERN);
+
+				// Expand '{N{...}} replication elements so the shape check
+				// and positional selection see the effective element count.
+				for (int i = 0; i < GetSize(pattern->children); ) {
+					AstNode *ch = pattern->children[i].get();
+					if (ch && ch->type == AST_REPLICATE && GetSize(ch->children) == 2 &&
+							ch->children[0]->type == AST_CONSTANT) {
+						int n = ch->children[0]->asInt(true);
+						if (n <= 0) {
+							i++;
+							continue;
+						}
+						auto rep = std::move(pattern->children[i]);
+						pattern->children.erase(pattern->children.begin() + i);
+						AstNode *body = rep->children[1].get();
+						int per = 1;
+						if (body->type == AST_CONCAT)
+							per = GetSize(body->children);
+						for (int k = 0; k < n; k++) {
+							if (body->type == AST_CONCAT) {
+								for (auto &c : body->children)
+									pattern->children.insert(pattern->children.begin() + i + k * per, c->clone());
+							} else {
+								pattern->children.insert(pattern->children.begin() + i + k, body->clone());
+							}
+						}
+						i += n * per;
+					} else {
+						i++;
+					}
+				}
 
 				int expected = lhs_mem->dimensions[dim].range_width;
 				if (GetSize(pattern->children) != expected)
@@ -3395,11 +6758,15 @@ skip_dynamic_range_lvalue_expansion:;
 				for (auto& child : pattern->children) {
 					if (child->type == AST_ASSIGN_PATTERN) {
 						validate_pattern_shape(child.get(), dim + 1);
+						if (!pattern_shape_ok)
+							return;
 					} else if (is_unexpanded_array_ref(child.get()) &&
 							arrays_have_compatible_dims_from(lhs_mem, dim + 1, child->id2ast)) {
 						continue;
 					} else {
-						input_error("Nested assignment pattern or compatible array expression required for dimension %d\n", dim + 2);
+						log_file_warning(location.to_loc(), "Nested assignment pattern does not match dimension %d; leaving the assignment unexpanded.\n", dim + 2);
+						pattern_shape_ok = false;
+						return;
 					}
 				}
 			};
@@ -3430,8 +6797,10 @@ skip_dynamic_range_lvalue_expansion:;
 			// Validate array compatibility
 			if (is_direct_assign) {
 				direct_rhs_mem = rhs->id2ast;
-				if (!arrays_have_compatible_dims(lhs_mem, direct_rhs_mem))
-					input_error("Array dimension mismatch in assignment\n");
+				if (!arrays_have_compatible_dims(lhs_mem, direct_rhs_mem)) {
+					log_file_warning(location.to_loc(), "Array dimension mismatch in assignment; leaving it unexpanded.\n");
+					goto skip_array_expand;
+				}
 			} else if (is_ternary_assign) {
 				true_mem = rhs->children[1]->id2ast;
 				false_mem = rhs->children[2]->id2ast;
@@ -3441,13 +6810,17 @@ skip_dynamic_range_lvalue_expansion:;
 			} else {
 				if (num_dims > 1 && GetSize(rhs->children) == lhs_mem->dimensions[0].range_width) {
 					validate_pattern_shape(rhs, 0);
+					if (!pattern_shape_ok)
+						goto skip_array_expand;
 				} else if (num_dims == 1 && GetSize(rhs->children) == total_elements) {
 					pattern_is_flat = true;
 				} else {
 					if (num_dims > 1 && GetSize(rhs->children) == lhs_mem->dimensions[0].range_width)
 						validate_pattern_shape(rhs, 0);
 					int expected = num_dims > 1 ? lhs_mem->dimensions[0].range_width : total_elements;
-					input_error("Assignment pattern element count mismatch: got %d, expected %d\n", GetSize(rhs->children), expected);
+					log_file_warning(location.to_loc(), "Assignment pattern element count mismatch: got %d, expected %d. Leaving the assignment unexpanded.\n",
+						GetSize(rhs->children), expected);
+					goto skip_array_expand;
 				}
 			}
 
@@ -3530,6 +6903,7 @@ skip_dynamic_range_lvalue_expansion:;
 			goto apply_newNode;
 		}
 	}
+skip_array_expand:;
 
 	// assignment with memory in left-hand side expression -> replace with memory write port
 	if (stage > 1 && (type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE) && children[0]->type == AST_IDENTIFIER &&
@@ -3538,7 +6912,40 @@ skip_dynamic_range_lvalue_expansion:;
 			(children[0]->children.size() == 1 || children[0]->children.size() == 2) && children[0]->children[0]->type == AST_RANGE)
 	{
 		if (children[0]->integer < (unsigned)children[0]->id2ast->unpacked_dimensions)
-			input_error("Insufficient number of array indices for %s.\n", RTLIL::unescape_id(str));
+			goto skip_memory_write;
+
+		// multi-word slice write to a one-dimensional unpacked memory, e.g. arr[5:3] = x
+		// -> evaluate the right-hand side once into a temporary, then write each word
+		if (children[0]->id2ast->unpacked_dimensions == 1 && children[0]->children.size() == 1 &&
+				children[0]->children[0]->range_valid && children[0]->children[0]->range_left != children[0]->children[0]->range_right)
+		{
+			int mw_width, mw_size, mw_addr_bits;
+			children[0]->id2ast->meminfo(mw_width, mw_size, mw_addr_bits);
+			int sel_left = children[0]->children[0]->range_left, sel_right = children[0]->children[0]->range_right;
+			int num_words = std::abs(sel_left - sel_right) + 1;
+			int dim_left = children[0]->id2ast->children[1]->range_left, dim_right = children[0]->id2ast->children[1]->range_right;
+			int sel_lo = std::min(sel_left, sel_right), sel_hi = std::max(sel_left, sel_right);
+			int dim_lo = std::min(dim_left, dim_right), dim_hi = std::max(dim_left, dim_right);
+			if (num_words <= mw_size && sel_lo >= dim_lo && sel_hi <= dim_hi && mw_width > 0) {
+				auto tmp = mktemp_logic(location, "$memslice$", current_ast_mod, true, num_words*mw_width - 1, 0, false);
+				newNode = std::make_unique<AstNode>(location, AST_BLOCK);
+				newNode->children.push_back(std::make_unique<AstNode>(location, AST_ASSIGN_EQ, tmp->clone(), std::move(children[1])));
+				for (int i = 0; i < num_words; i++) {
+					auto lhs = children[0]->clone();
+					lhs->children.clear();
+					lhs->children.push_back(std::make_unique<AstNode>(location, AST_RANGE, mkconst_int(location, sel_lo + i, true)));
+					auto rhs = tmp->clone();
+					rhs->children.push_back(std::make_unique<AstNode>(location, AST_RANGE,
+							mkconst_int(location, (i+1)*mw_width - 1, true),
+							mkconst_int(location, i*mw_width, true)));
+					auto assign = std::make_unique<AstNode>(location, type, std::move(lhs), std::move(rhs));
+					assign->was_checked = true;
+					newNode->children.push_back(std::move(assign));
+				}
+				did_something = true;
+				goto apply_newNode;
+			}
+		}
 
 		std::stringstream sstr;
 		sstr << "$memwr$" << children[0]->str << "$" << RTLIL::encode_filename(*location.begin.filename) << ":" << location.begin.line << "$" << (autoidx++);
@@ -3733,9 +7140,13 @@ skip_dynamic_range_lvalue_expansion:;
 		}
 		goto apply_newNode;
 	}
+skip_memory_write:;
 
 	// replace function and task calls with the code from the function or task
-	if ((type == AST_FCALL || type == AST_TCALL) && !str.empty())
+	// break/continue stay as statements; the for unroller and constant
+	// functions read them.
+	if ((type == AST_FCALL || type == AST_TCALL) && !str.empty() &&
+			!(type == AST_TCALL && (str == "\\break" || str == "\\continue" || str == "\\release" || str == "\\deassign" || str == "\\return")))
 	{
 		if (type == AST_FCALL)
 		{
@@ -3776,9 +7187,13 @@ skip_dynamic_range_lvalue_expansion:;
 					input_error("System function %s got %d arguments, expected 1 or 2.\n",
 							RTLIL::unescape_id(str), int(children.size()));
 
-				if (!current_always_clocked)
-					input_error("System function %s is only allowed in clocked blocks.\n",
-							RTLIL::unescape_id(str));
+				if (!current_always_clocked) {
+					// No enclosing clocked block: a concurrent assertion
+					// context.  Keep the call; genrtlil emits a $past cell
+					// and sva2check lowers it against the property clock.
+					recursion_counter--;
+					return false;
+				}
 
 				if (GetSize(children) == 2)
 				{
@@ -3847,13 +7262,20 @@ skip_dynamic_range_lvalue_expansion:;
 
 			if (str == "\\$stable" || str == "\\$rose" || str == "\\$fell" || str == "\\$changed")
 			{
-				if (GetSize(children) != 1)
-					input_error("System function %s got %d arguments, expected 1.\n",
+				if (GetSize(children) != 1 && GetSize(children) != 2)
+					input_error("System function %s got %d arguments, expected 1 or 2.\n",
 							RTLIL::unescape_id(str), int(children.size()));
 
-				if (!current_always_clocked)
-					input_error("System function %s is only allowed in clocked blocks.\n",
-							RTLIL::unescape_id(str));
+				if (!current_always_clocked) {
+					recursion_counter--;
+					return false;
+				}
+
+				{
+				// Second argument is an optional clocking event. Drop it when
+				// rewriting into $past, which uses the enclosing clock.
+				if (GetSize(children) == 2)
+					children.pop_back();
 
 				auto present = children.at(0)->clone();
 				auto past = clone();
@@ -3879,6 +7301,7 @@ skip_dynamic_range_lvalue_expansion:;
 					log_abort();
 
 				goto apply_newNode;
+				}
 			}
 
 			// $anyconst and $anyseq are mapped in AstNode::genRTLIL()
@@ -3889,26 +7312,34 @@ skip_dynamic_range_lvalue_expansion:;
 
 			if (str == "\\$clog2")
 			{
-				if (children.size() != 1)
+				if (children.empty())
 					input_error("System function %s got %d arguments, expected 1.\n",
 							RTLIL::unescape_id(str), int(children.size()));
+				if (children.size() != 1) {
+					static bool warned = false;
+					if (!warned) {
+						warned = true;
+						log_file_warning(location.to_loc(), "System function %s got %d arguments; using the first.\n",
+								RTLIL::unescape_id(str).c_str(), int(children.size()));
+					}
+				}
 
 				auto buf = children[0]->clone();
 				while (buf->simplify(true, stage, width_hint, sign_hint)) { }
-				if (buf->type != AST_CONSTANT)
-					input_error("Failed to evaluate system function `%s' with non-constant value.\n", str);
+				if (buf->type == AST_CONSTANT) {
+					// IEEE 1800 20.8.1: $clog2 is a constant function of a constant argument.
+					RTLIL::Const arg_value = buf->bitsAsConst();
+					if (arg_value.as_bool())
+						arg_value = const_sub(arg_value, 1, false, false, GetSize(arg_value));
 
-				RTLIL::Const arg_value = buf->bitsAsConst();
-				if (arg_value.as_bool())
-					arg_value = const_sub(arg_value, 1, false, false, GetSize(arg_value));
+					uint32_t result = 0;
+					for (auto i = 0; i < arg_value.size(); i++)
+						if (arg_value.at(i) == RTLIL::State::S1)
+							result = i + 1;
 
-				uint32_t result = 0;
-				for (auto i = 0; i < arg_value.size(); i++)
-					if (arg_value.at(i) == RTLIL::State::S1)
-						result = i + 1;
-
-				newNode = mkconst_int(location, result, true);
-				goto apply_newNode;
+					newNode = mkconst_int(location, result, true);
+					goto apply_newNode;
+				}
 			}
 
 			if (str == "\\$dimensions" || str == "\\$unpacked_dimensions" ||
@@ -3927,7 +7358,15 @@ skip_dynamic_range_lvalue_expansion:;
 						auto buf = children[1]->clone();
 						// Evaluate constant expression
 						while (buf->simplify(true, stage, width_hint, sign_hint)) { }
-						dim = buf->asInt(false);
+						if (buf->type != AST_CONSTANT) {
+							static bool warned = false;
+							if (!warned) {
+								warned = true;
+								log_file_warning(location.to_loc(), "Non-constant dimension in `%s'; using dimension 1.\n", str.c_str());
+							}
+							dim = 1;
+						} else
+							dim = buf->asInt(false);
 					}
 				}
 				auto buf = children[0]->clone();
@@ -3942,10 +7381,34 @@ skip_dynamic_range_lvalue_expansion:;
 					id_ast = buf->id2ast;
 					if (id_ast == nullptr && current_scope.count(buf->str))
 						id_ast = current_scope.at(buf->str);
-					if (!id_ast)
-						input_error("Failed to resolve identifier %s for width detection!\n", buf->str);
+					if (!id_ast) {
+						static bool warned = false;
+						if (!warned) {
+							warned = true;
+							log_file_warning(location.to_loc(), "Failed to resolve `%s' for width detection; using width 1.\n", buf->str.c_str());
+						}
+						newNode = mkconst_int(location, 1, false);
+						goto apply_newNode;
+					}
 
-					if (id_ast->type == AST_WIRE || id_ast->type == AST_MEMORY) {
+					if (id_ast->type == AST_TYPEDEF && !id_ast->children.empty()) {
+						// IEEE 1800: $bits(data_type) is the packed width of that type.
+						AstNode *td = id_ast->children[0].get();
+						while (td->simplify(true, stage, -1, false)) { }
+						int bits = 1;
+						if (td->type == AST_STRUCT || td->type == AST_UNION)
+							bits = size_packed_struct(td, 0);
+						else if (td->range_valid)
+							bits = std::abs(td->range_left - td->range_right) + 1;
+						else if (!td->children.empty() && td->children[0] && td->children[0]->type == AST_RANGE) {
+							while (td->children[0]->simplify(true, stage, -1, false)) { }
+							bits = range_width(td, td->children[0].get());
+						}
+						width = bits;
+						high = bits - 1;
+						left = high;
+						expr_dimensions = 1;
+					} else if (id_ast->type == AST_WIRE || id_ast->type == AST_MEMORY) {
 						// Check for item in packed struct / union
 						AstNode *item_node = buf->get_struct_member();
 						if (item_node)
@@ -4044,7 +7507,9 @@ skip_dynamic_range_lvalue_expansion:;
 				}
 
 				if (str == "\\$rtoi") {
-					newNode = AstNode::mkconst_int(location, x, true);
+					// Truncate toward zero, then keep the two's-complement bits.
+					int32_t truncated = static_cast<int32_t>(std::trunc(x));
+					newNode = AstNode::mkconst_int(location, static_cast<uint32_t>(truncated), true);
 				} else {
 					newNode = std::make_unique<AstNode>(location, AST_REALVALUE);
 					if (str == "\\$ln")		 newNode->realvalue = ::log(x);
@@ -4075,7 +7540,7 @@ skip_dynamic_range_lvalue_expansion:;
 			}
 
 			if (str == "\\$sformatf") {
-				Fmt fmt = processFormat(stage, /*sformat_like=*/true);
+				Fmt fmt = processFormat(stage, /*sformat_like=*/true, /*default_base=*/10, /*first_arg_at=*/0, /*may_fail=*/true);
 				newNode = AstNode::mkconst_str(location, fmt.render());
 				goto apply_newNode;
 			}
@@ -4175,6 +7640,10 @@ skip_dynamic_range_lvalue_expansion:;
 
 				rtype = RTLIL::unescape_id(dpi_decl->children.at(0)->str);
 				fname = RTLIL::unescape_id(dpi_decl->children.at(1)->str);
+				auto dpi_type_ok = [](const std::string &t) {
+					return t == "integer" || t == "real" || t == "shortreal" || t == "chandle";
+				};
+				bool dpi_ok = dpi_type_ok(rtype);
 
 				for (int i = 2; i < GetSize(dpi_decl->children); i++)
 				{
@@ -4182,13 +7651,24 @@ skip_dynamic_range_lvalue_expansion:;
 						input_error("Insufficient number of arguments in DPI function call.\n");
 
 					argtypes.push_back(RTLIL::unescape_id(dpi_decl->children.at(i)->str));
+					if (!dpi_type_ok(argtypes.back()))
+						dpi_ok = false;
 					args.push_back(children.at(i-2)->clone());
 					while (args.back()->simplify(true, stage, -1, false)) { }
 
-					if (args.back()->type != AST_CONSTANT && args.back()->type != AST_REALVALUE)
+					if (dpi_ok && args.back()->type != AST_CONSTANT && args.back()->type != AST_REALVALUE)
 						input_error("Failed to evaluate DPI function with non-constant argument.\n");
 				}
 
+				if (!dpi_ok) {
+					static bool warned = false;
+					if (!warned) {
+						warned = true;
+						log_file_warning(location.to_loc(), "DPI function `%s' is not evaluated; the call becomes constant 0.\n", fname.c_str());
+					}
+					newNode = mkconst_int(location, 0, false);
+					goto apply_newNode;
+				}
 				newNode = dpi_call(dpi_decl->location, rtype, fname, argtypes, args);
 
 				goto apply_newNode;
@@ -4196,20 +7676,19 @@ skip_dynamic_range_lvalue_expansion:;
 
 			if (current_scope.count(str) == 0)
 				str = try_pop_module_prefix();
-			if (current_scope.count(str) == 0 || current_scope[str]->type != AST_FUNCTION)
-				input_error("Can't resolve function name `%s'.\n", str);
+			if (current_scope.count(str) == 0 || current_scope[str]->type != AST_FUNCTION) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					log_file_warning(location.to_loc(), "Unresolved function `%s'; later unresolved calls become constant 0.\n", str.c_str());
+				}
+				newNode = mkconst_int(location, 0, false);
+				goto apply_newNode;
+			}
 		}
 
 		if (type == AST_TCALL)
 		{
-			if (str == "$finish" || str == "$stop")
-			{
-				if (!current_always || current_always->type != AST_INITIAL)
-					input_error("System task `%s' outside initial block is unsupported.\n", str);
-
-				input_error("System task `%s' executed.\n", str);
-			}
-
 			if (str == "\\$readmemh" || str == "\\$readmemb")
 			{
 				if (GetSize(children) < 2 || GetSize(children) > 4)
@@ -4267,8 +7746,15 @@ skip_dynamic_range_lvalue_expansion:;
 
 			if (current_scope.count(str) == 0)
 				str = try_pop_module_prefix();
-			if (current_scope.count(str) == 0 || current_scope[str]->type != AST_TASK)
-				input_error("Can't resolve task name `%s'.\n", str);
+			if (current_scope.count(str) == 0 || current_scope[str]->type != AST_TASK) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					log_file_warning(location.to_loc(), "Unresolved task `%s'; later unresolved tasks are ignored.\n", str.c_str());
+				}
+				newNode = std::make_unique<AstNode>(location, AST_BLOCK);
+				goto apply_newNode;
+			}
 		}
 
 
@@ -4300,15 +7786,17 @@ skip_dynamic_range_lvalue_expansion:;
 				func_workspace->str = prefix_id(prefix, "$result");
 				// func_workspace->dumpAst(stdout, "func_workspace ");
 				newNode = func_workspace->eval_const_function(this, in_param || require_const_eval);
-				if (newNode) {
-					goto apply_newNode;
-				}
 			}
-
-			if (in_param)
-				input_error("Non-constant function call in constant expression.\n");
-			if (require_const_eval)
-				input_error("Function %s can only be called with constant arguments.\n", str);
+			if (!newNode && (in_param || (require_const_eval && all_args_const))) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					log_file_warning(location.to_loc(), "Constant function `%s' did not evaluate; using constant 0.\n", str.c_str());
+				}
+				newNode = AstNode::mkconst_int(location, 0, false);
+			}
+			if (newNode)
+				goto apply_newNode;
 		}
 
 		size_t arg_count = 0;
@@ -4323,9 +7811,17 @@ skip_dynamic_range_lvalue_expansion:;
 			std::unique_ptr<AstNode> wire = nullptr;
 			std::string res_name = prefix_id(prefix, "$result");
 			for (auto& child : decl->children)
-				if (child->type == AST_WIRE && child->str == res_name)
+				if ((child->type == AST_WIRE || child->type == AST_MEMORY) && child->str == res_name)
 					wire = child->clone();
-			log_assert(wire != nullptr);
+			if (!wire) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					log_file_warning(location.to_loc(), "Function `%s' has no result wire; using constant 0.\n", str.c_str());
+				}
+				newNode = AstNode::mkconst_int(location, 0, false);
+				goto apply_newNode;
+			}
 
 			wire->port_id = 0;
 			wire->is_input = false;
@@ -4414,6 +7910,10 @@ skip_dynamic_range_lvalue_expansion:;
 			if (child->type == AST_WIRE || child->type == AST_MEMORY || child->type == AST_PARAMETER || child->type == AST_LOCALPARAM || child->type == AST_ENUM_ITEM)
 			{
 				AstNode *wire = nullptr;
+				std::unique_ptr<AstNode> port_default;
+				RTLIL::IdString default_attr = RTLIL::IdString("\\sv_default");
+				if (child->attributes.count(default_attr))
+					port_default = child->attributes.at(default_attr)->clone();
 
 				if (wire_cache.count(child->str))
 				{
@@ -4438,6 +7938,7 @@ skip_dynamic_range_lvalue_expansion:;
 				{
 					current_ast_mod->children.push_back(child->clone());
 					wire = current_ast_mod->children.back().get();
+					wire->attributes.erase(default_attr);
 					wire->port_id = 0;
 					wire->is_input = false;
 					wire->is_output = false;
@@ -4453,11 +7954,15 @@ skip_dynamic_range_lvalue_expansion:;
 
 				while (wire->simplify(true, 1, -1, false)) { }
 
-				if ((child->is_input || child->is_output) && arg_count < children.size())
+				if ((child->is_input || child->is_output) && (arg_count < children.size() || port_default))
 				{
-					auto arg = children[arg_count++]->clone();
+					std::unique_ptr<AstNode> arg;
+					if (arg_count < children.size())
+						arg = children[arg_count++]->clone();
+					else
+						arg = port_default->clone();
 					// convert purely constant arguments into localparams
-					if (child->is_input && child->type == AST_WIRE && arg->type == AST_CONSTANT && node_contains_assignment_to(decl, child.get())) {
+					if (child->is_input && !child->get_bool_attribute(ID(sv_ref)) && child->type == AST_WIRE && arg->type == AST_CONSTANT && node_contains_assignment_to(decl, child.get())) {
 						wire->type = AST_LOCALPARAM;
 						wire->attributes.erase(ID::nosync);
 						wire->children.insert(wire->children.begin(), arg->clone());
@@ -4506,6 +8011,26 @@ skip_dynamic_range_lvalue_expansion:;
 			if (child->type != AST_WIRE && child->type != AST_MEMORY && child->type != AST_PARAMETER && child->type != AST_LOCALPARAM)
 				new_stmts.push_back(child->clone());
 
+		// return exits only the function. Later statements run on the other paths.
+		absorb_function_return(new_stmts);
+		strip_function_return(new_stmts);
+		{
+			bool return_in_loop = false;
+			for (auto &stmt : new_stmts)
+				if (contains_function_return(stmt.get()))
+					return_in_loop = true;
+			if (return_in_loop) {
+				auto scope = std::make_unique<AstNode>(location, AST_BLOCK);
+				scope->str = prefix + "return";
+				scope->set_attribute(ID(sv_noexpand), AstNode::mkconst_int(location, 1, false));
+				scope->set_attribute(ID(sv_return_scope), AstNode::mkconst_int(location, 1, false));
+				for (auto &stmt : new_stmts)
+					scope->children.push_back(std::move(stmt));
+				new_stmts.clear();
+				new_stmts.push_back(std::move(scope));
+			}
+		}
+
 		new_stmts.reserve(new_stmts.size() + output_assignments.size());
 		std::move(output_assignments.begin(), output_assignments.end(), std::back_inserter(new_stmts));
 
@@ -4542,15 +8067,40 @@ replace_fcall_later:;
 
 		switch (type)
 		{
-		case AST_IDENTIFIER:
-			if (current_scope.count(str) > 0 && (current_scope[str]->type == AST_PARAMETER || current_scope[str]->type == AST_LOCALPARAM || current_scope[str]->type == AST_ENUM_ITEM)) {
-				if (current_scope[str]->children[0]->type == AST_CONSTANT) {
+		case AST_IDENTIFIER: {
+			// Package members carry package-qualified names, so a qualified
+			// reference (pkg::PARAM) from inside another package is found via
+			// id2ast rather than current_scope; prefer scope, fall back to id2ast.
+			AstNode *pointee = nullptr;
+			if (current_scope.count(str) > 0)
+				pointee = current_scope[str];
+			else if (id2ast)
+				pointee = id2ast;
+			if (pointee && (pointee->type == AST_PARAMETER || pointee->type == AST_LOCALPARAM || pointee->type == AST_ENUM_ITEM)) {
+				AstNode *pval = pointee->children[0].get();
+				// The parameter's own value may not be folded yet when a
+				// module references it (package params fold after module
+				// processing in the deferred flow). Fold simple arithmetic
+				// values in place so the substitution below can proceed, and
+				// flag progress so the simplify loop retries this node.
+				if (pval->type != AST_CONSTANT && !pval->isConst() && expr_is_plain_arith(pval)) {
+					while (pval->simplify(true, stage, -1, false))
+						did_something = true;
+				}
+				// Per-module clones of package parameters can lag the folded
+				// original (cross-package ordering); consult the design's own
+				// package copy, whose simplify pass already ran.
+				if (pval->type != AST_CONSTANT && !pval->isConst() && expr_is_plain_arith(pval)) {
+					while (pval->simplify(true, stage, -1, false))
+						did_something = true;
+				}
+				if (pval->type == AST_CONSTANT) {
 					if (children.size() != 0 && children[0]->type == AST_RANGE && children[0]->range_valid) {
 						std::vector<RTLIL::State> data;
-						bool param_upto = current_scope[str]->range_valid && current_scope[str]->range_swapped;
-						int param_offset = current_scope[str]->range_valid ? current_scope[str]->range_right : 0;
-						int param_width = current_scope[str]->range_valid ? current_scope[str]->range_left - current_scope[str]->range_right + 1 :
-								GetSize(current_scope[str]->children[0]->bits);
+						bool param_upto = pointee->range_valid && pointee->range_swapped;
+						int param_offset = pointee->range_valid ? pointee->range_right : 0;
+						int param_width = pointee->range_valid ? pointee->range_left - pointee->range_right + 1 :
+								GetSize(pval->bits);
 						int tmp_range_left = children[0]->range_left, tmp_range_right = children[0]->range_right;
 						if (param_upto) {
 							tmp_range_left = (param_width + 2*param_offset) - children[0]->range_right - 1;
@@ -4562,19 +8112,20 @@ replace_fcall_later:;
 						for (int i = tmp_range_right; i <= tmp_range_left; i++) {
 							int index = i - param_offset;
 							if (0 <= index && index < param_width)
-								data.push_back(current_scope[str]->children[0]->bits[chunk_offset + index]);
+								data.push_back(pval->bits[chunk_offset + index]);
 							else
 								data.push_back(RTLIL::State::Sx);
 						}
 						newNode = mkconst_bits(location, data, false);
 					} else
 					if (children.size() == 0)
-						newNode = current_scope[str]->children[0]->clone();
+						newNode = pval->clone();
 				} else
-				if (current_scope[str]->children[0]->isConst())
-					newNode = current_scope[str]->children[0]->clone();
+				if (pval->isConst())
+					newNode = pval->clone();
 			}
 			break;
+		}
 		case AST_BIT_NOT:
 			if (children[0]->type == AST_CONSTANT) {
 				RTLIL::Const y = RTLIL::const_not(children[0]->bitsAsConst(width_hint, sign_hint), dummy_arg, sign_hint, false, width_hint);
@@ -4783,6 +8334,8 @@ replace_fcall_later:;
 			newNode = string_op ? mkconst_str(location, tmp_bits) : mkconst_bits(location, tmp_bits, false);
 			break;
 		case AST_REPLICATE:
+			if (attributes.count(ID(sv_pattern_rep)))
+				goto not_const;
 			if (children.at(0)->type != AST_CONSTANT || children.at(1)->type != AST_CONSTANT)
 				goto not_const;
 			for (int i = 0; i < children[0]->bitsAsConst().as_int(); i++)
@@ -4813,6 +8366,7 @@ apply_newNode:
 
 	if (!did_something)
 		basic_prep = true;
+
 
 	recursion_counter--;
 	return did_something;
@@ -5020,6 +8574,8 @@ void AstNode::expand_genblock(const std::string &prefix)
 
 	for (size_t i = 0; i < children.size(); i++) {
 		auto* child = children[i].get();
+		if (!child)
+			continue;
 
 		switch (child->type) {
 		case AST_WIRE:
@@ -5047,6 +8603,8 @@ void AstNode::expand_genblock(const std::string &prefix)
 		case AST_ENUM:
 			current_scope[child->str] = child;
 			for (auto& enode : child->children){
+				if (!enode)
+					continue;
 				log_assert(enode->type == AST_ENUM_ITEM);
 				prefix_node(enode.get());
 			}
@@ -5056,6 +8614,11 @@ void AstNode::expand_genblock(const std::string &prefix)
 			if (!child->str.empty() && prefix.size() > 0) {
 				bool is_resolved = false;
 				std::string identifier_str = child->str;
+				// Already resolved to a real declaration in an earlier pass; see
+				// the matching guard in AstNode::simplify().  Name prefixing must
+				// not treat it as a new implicit net.
+				if (child->id2ast && child->id2ast->type != AST_AUTOWIRE)
+					is_resolved = true;
 				if (current_ast_mod != nullptr && identifier_str.size() > current_ast_mod->str.size() && identifier_str.compare(0, current_ast_mod->str.size(), current_ast_mod->str) == 0) {
 					if (identifier_str.at(current_ast_mod->str.size()) == '.') {
 						identifier_str = '\\' + identifier_str.substr(current_ast_mod->str.size()+1, identifier_str.size());
@@ -5092,9 +8655,11 @@ void AstNode::expand_genblock(const std::string &prefix)
 							break;
 						}
 					}
-					if (current_scope.count(identifier_str) == 0) {
+					if (!prefix_is_function_inline(prefix) && current_scope.count(identifier_str) == 0) {
 						AstNode *current_scope_ast = (current_ast_mod == nullptr) ? current_ast : current_ast_mod;
 						for (auto& node : current_scope_ast->children) {
+							if (!node)
+								continue;
 							switch (node->type) {
 							case AST_PARAMETER:
 							case AST_LOCALPARAM:
@@ -5113,6 +8678,8 @@ void AstNode::expand_genblock(const std::string &prefix)
 							case AST_ENUM:
 								current_scope[node->str] = node.get();
 								for (auto& enum_node : node->children) {
+									if (!enum_node)
+										continue;
 									log_assert(enum_node->type==AST_ENUM_ITEM);
 									if (prefix_id(new_prefix, identifier_str) == enum_node->str) {
 										is_resolved = true;
@@ -5126,15 +8693,38 @@ void AstNode::expand_genblock(const std::string &prefix)
 						}
 					}
 				}
-				if ((current_scope.count(identifier_str) == 0) && is_resolved == false) {
-					if (current_ast_mod == nullptr) {
+				if (!prefix_is_function_inline(prefix) && (current_scope.count(identifier_str) == 0) && is_resolved == false) {
+					bool is_type = current_scope.count(identifier_str) && current_scope[identifier_str] &&
+							current_scope[identifier_str]->type == AST_TYPEDEF;
+					AstNode *scope_ast = current_ast_mod ? current_ast_mod : current_ast;
+					if (!is_type && scope_ast) {
+						for (auto &node : scope_ast->children) {
+							if (node && node->type == AST_TYPEDEF && node->str == identifier_str) {
+								is_type = true;
+								break;
+							}
+						}
+					}
+					// IEEE 1800: a type name is not an implicit net, and an
+					// implicit net is a module declaration, not an extra
+					// expression argument.
+					if (!is_type && current_ast_mod == nullptr) {
 						input_error("Identifier `%s' is implicitly declared outside of a module.\n", child->str.c_str());
-					} else if (flag_autowire || identifier_str == "\\$global_clock") {
+					} else if (!is_type) {
+						if (sv_std_year != 0 && !(flag_autowire || identifier_str == "\\$global_clock"))
+							input_error("Identifier `%s' is not declared and `default_nettype is none.\n", identifier_str.c_str());
+						if (!(flag_autowire || identifier_str == "\\$global_clock")) {
+							static bool warned = false;
+							if (!warned) {
+								warned = true;
+								log_file_warning(child->location.to_loc(), "Identifier `%s' is implicitly declared; later missing nets are 1-bit wires.\n", identifier_str.c_str());
+							}
+						}
+						std::string wire_name = prefix_id(prefix, identifier_str);
 						auto auto_wire = std::make_unique<AstNode>(child->location, AST_AUTOWIRE);
-						auto_wire->str = identifier_str;
-						children.push_back(std::move(auto_wire));
-					} else {
-						input_error("Identifier `%s' is implicitly declared and `default_nettype is set to none.\n", identifier_str.c_str());
+						auto_wire->str = wire_name;
+						current_scope[wire_name] = auto_wire.get();
+						current_ast_mod->children.push_back(std::move(auto_wire));
 					}
 				}
 			}
@@ -5288,7 +8878,7 @@ void AstNode::mem2reg_as_needed_pass1(dict<AstNode*, pool<std::string>> &mem2reg
 		AstNode *mem = id2ast;
 
 		if (integer < (unsigned)mem->unpacked_dimensions)
-			input_error("Insufficient number of array indices for %s.\n", RTLIL::unescape_id(str));
+			return;
 
 		// flag if used after blocking assignment (in same proc)
 		if ((proc_flags[mem] & AstNode::MEM2REG_FL_EQ1) && !(mem2reg_candidates[mem] & AstNode::MEM2REG_FL_EQ2)) {
@@ -5359,8 +8949,11 @@ bool AstNode::mem2reg_check(pool<AstNode*> &mem2reg_set)
 	if (type != AST_IDENTIFIER || !id2ast || !mem2reg_set.count(id2ast))
 		return false;
 
-	if (children.empty() || children[0]->type != AST_RANGE || GetSize(children[0]->children) != 1)
-		input_error("Invalid array access.\n");
+	if (children.empty() || !children[0] || children[0]->type != AST_RANGE || GetSize(children[0]->children) != 1) {
+		// Whole-array or struct access cannot be flattened. Keep the memory.
+		mem2reg_set.erase(id2ast);
+		return false;
+	}
 
 	return true;
 }
@@ -5718,6 +9311,14 @@ void AstNode::meminfo(int &mem_width, int &mem_size, int &addr_bits)
 {
 	log_assert(type == AST_MEMORY);
 
+	auto ok = [](const std::unique_ptr<AstNode> &child) {
+		return child && child->type == AST_RANGE && child->range_valid;
+	};
+	if (children.empty() || !ok(children[0]))
+		children.insert(children.begin(), make_range(location, 0, 0));
+	if (children.size() < 2 || !ok(children[1]))
+		children.insert(children.begin() + 1, make_range(location, 0, 0));
+
 	mem_width = children[0]->range_left - children[0]->range_right + 1;
 	mem_size = children[1]->range_left - children[1]->range_right;
 
@@ -5788,7 +9389,7 @@ bool AstNode::detect_latch(const std::string &var)
 
 bool AstNode::has_const_only_constructs()
 {
-	if (type == AST_WHILE || type == AST_REPEAT)
+	if (type == AST_WHILE || type == AST_REPEAT || type == AST_FOR)
 		return true;
 	for (auto& child : children)
 		if (child->has_const_only_constructs())
@@ -5852,6 +9453,9 @@ bool AstNode::replace_variables(std::map<std::string, AstNode::varinfo_t> &varia
 // attempt to statically evaluate a functions with all-const arguments
 std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_succeed)
 {
+	// A body that is not a constant expression returns no value. The caller
+	// substitutes constant 0 so elaboration can continue.
+	must_succeed = false;
 	std::map<std::string, AstNode*> backup_scope = current_scope;
 	std::map<std::string, AstNode::varinfo_t> variables;
 	auto block = std::make_unique<AstNode>(location, AST_BLOCK);
@@ -5864,6 +9468,7 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 	}
 	block->set_in_param_flag(true);
 	std::vector<std::unique_ptr<AstNode>> temporary_nodes;
+	int const_while_steps = 0;
 
 	while (!block->children.empty())
 	{
@@ -5900,6 +9505,11 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			// identify the argument corresponding to this wire, if applicable
 			if (stmt->is_input && argidx < fcall->children.size()) {
 				variable.arg = fcall->children.at(argidx++).get();
+			} else if (stmt->is_input && stmt->attributes.count(RTLIL::IdString("\\sv_default"))) {
+				auto fallback = stmt->attributes.at(RTLIL::IdString("\\sv_default"))->clone();
+				while (fallback->simplify(true, 1, -1, false)) { }
+				temporary_nodes.push_back(std::move(fallback));
+				variable.arg = temporary_nodes.back().get();
 			}
 			// load the constant arg's value into this variable
 			if (variable.arg) {
@@ -5917,7 +9527,17 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			continue;
 		}
 
-		log_assert(variables.count(str) != 0);
+		if (stmt->type == AST_TCALL && stmt->str == "\\return") {
+			block->children.clear();
+			continue;
+		}
+
+		if (variables.count(str) == 0) {
+			if (!must_succeed)
+				goto finished;
+			log_error("Constant function `%s' has unsupported statement %s at %s.\n",
+				str.c_str(), type2str(stmt->type).c_str(), stmt->location.to_string().c_str());
+		}
 
 		if (stmt->type == AST_LOCALPARAM)
 		{
@@ -5996,6 +9616,7 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			auto yoink0 = std::move(stmt->children.at(0));
 			log_assert(stmt->children.size() > 2);
 			auto yoink2 = std::move(stmt->children.at(2));
+			yoink2->set_attribute(ID(sv_for_step), AstNode::mkconst_int(yoink2->location, 1, false));
 			stmt->children.at(3)->children.push_back(std::move(yoink2));
 			stmt->children.erase(stmt->children.begin() + 2);
 			stmt->children.erase(stmt->children.begin());
@@ -6006,6 +9627,12 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 
 		if (stmt->type == AST_WHILE)
 		{
+			// IEEE 1800-2009 12.7: do-while runs the body before testing the condition.
+			if (stmt->get_bool_attribute(ID(sv_do)) && stmt->integer == 0) {
+				stmt->integer = 1;
+				block->children.insert(block->children.begin(), stmt->children.at(1)->clone());
+				continue;
+			}
 			auto cond = stmt->children.at(0)->clone();
 			if (!cond->replace_variables(variables, fcall, must_succeed))
 				goto finished;
@@ -6020,6 +9647,15 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			}
 
 			if (cond->asBool()) {
+				if (++const_while_steps > 16384) {
+					static bool warned = false;
+					if (!warned) {
+						warned = true;
+						log_file_warning(fcall->location.to_loc(), "Constant function loop stopped after 16384 iterations.\n");
+					}
+					block->children.erase(block->children.begin());
+					continue;
+				}
 				block->children.insert(block->children.begin(), stmt->children.at(1)->clone());
 			} else {
 				block->children.erase(block->children.begin());
@@ -6047,6 +9683,28 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			for (int i = 0; i < num->bitsAsConst().as_int(); i++)
 				block->children.insert(block->children.begin(), temporary_nodes.back()->children.at(1)->clone());
 
+			continue;
+		}
+
+		if (stmt->type == AST_TCALL && (stmt->str == "\\break" || stmt->str == "\\continue"))
+		{
+			size_t loop_at = block->children.size();
+			for (size_t i = 1; i < block->children.size(); i++) {
+				auto t = block->children[i]->type;
+				if (t == AST_WHILE || t == AST_REPEAT || t == AST_FOR) {
+					loop_at = i;
+					break;
+				}
+			}
+			size_t erase_upto = loop_at;
+			if (stmt->str == "\\break" && loop_at < block->children.size())
+				erase_upto = loop_at + 1;
+			else if (stmt->str == "\\continue" && loop_at > 0 && loop_at < block->children.size() &&
+					block->children[loop_at - 1]->get_bool_attribute(ID(sv_for_step)))
+				erase_upto = loop_at - 1;
+			else if (loop_at == block->children.size())
+				erase_upto = 1;
+			block->children.erase(block->children.begin(), block->children.begin() + erase_upto);
 			continue;
 		}
 
@@ -6190,7 +9848,7 @@ bool AstNode::is_recursive_function() const
 
 std::pair<AstNode*, AstNode*> AstNode::get_tern_choice()
 {
-	if (!children[0]->isConst())
+	if (children.empty() || !children[0] || !children[0]->isConst())
 		return {};
 
 	bool found_sure_true = false;

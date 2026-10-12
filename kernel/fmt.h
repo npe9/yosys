@@ -57,6 +57,7 @@ struct FmtPart {
 		STRING    = 2,
 		UNICHAR   = 3,
 		VLOG_TIME = 4,
+		REAL      = 5,
 	} type;
 
 	// LITERAL type
@@ -88,6 +89,10 @@ struct FmtPart {
 
 	// VLOG_TIME type
 	bool realtime = false;
+
+	// REAL type: conversion letter ('e', 'f' or 'g') and precision
+	char real_conv = 'f';
+	size_t precision = 6;
 };
 
 struct Fmt {

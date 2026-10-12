@@ -84,6 +84,17 @@ struct VerilogFrontend : public Frontend {
 		log("        enable support for SystemVerilog features. (only a small subset\n");
 		log("        of SystemVerilog is supported)\n");
 		log("\n");
+		log("    -std=<standard>\n");
+		log("        select a language dialect:\n");
+		log("          1364-2005   Verilog-2005\n");
+		log("          1800-2009   SystemVerilog-2009\n");
+		log("          1800-2012   SystemVerilog-2012\n");
+		log("          1800-2017   SystemVerilog-2017\n");
+		log("          1800-2023   SystemVerilog-2023\n");
+		log("        An 1800 year implies -sv and rejects features newer than that\n");
+		log("        year. -sv alone stays permissive. Later years are supersets of\n");
+		log("        earlier ones for the features this frontend distinguishes.\n");
+		log("\n");
 		log("    -formal\n");
 		log("        enable support for SystemVerilog assertions and some Yosys extensions\n");
 		log("        replace the implicit -D SYNTHESIS with -D FORMAL\n");
@@ -284,6 +295,9 @@ struct VerilogFrontend : public Frontend {
 		ParseMode parse_mode = {};
 		ParseState parse_state = {};
 		parse_mode.sv = false;
+		parse_mode.std_year = 0;
+		bool saw_sv_flag = false;
+		bool saw_verilog2005 = false;
 		parse_mode.formal = false;
 		parse_mode.noassert = false;
 		parse_mode.noassume = false;
@@ -300,7 +314,23 @@ struct VerilogFrontend : public Frontend {
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			std::string arg = args[argidx];
 			if (arg == "-sv") {
+				saw_sv_flag = true;
 				parse_mode.sv = true;
+				continue;
+			}
+			if (arg.compare(0, 5, "-std=") == 0) {
+				std::string spec = arg.substr(5);
+				if (spec == "1364-2005" || spec == "verilog-2005") {
+					saw_verilog2005 = true;
+					parse_mode.sv = false;
+					parse_mode.std_year = 0;
+				} else if (spec == "1800-2009" || spec == "1800-2012" ||
+						spec == "1800-2017" || spec == "1800-2023") {
+					parse_mode.sv = true;
+					parse_mode.std_year = std::stoi(spec.substr(5));
+				} else {
+					log_error("Unknown language standard `%s'. Expected 1364-2005, 1800-2009, 1800-2012, 1800-2017, or 1800-2023.\n", spec.c_str());
+				}
 				continue;
 			}
 			if (arg == "-formal") {
@@ -409,6 +439,12 @@ struct VerilogFrontend : public Frontend {
 			if (arg == "-lib") {
 				parse_mode.lib = true;
 				defines_map.add("BLACKBOX", "");
+				// Techlib models (e.g. +/xilinx/cells_sim.v) gate their
+				// synthesizable specify timing behind `ifdef YOSYS; the
+				// frontend no longer predefines it globally so that design
+				// files keep their standard assertion dialect, but library
+				// reads must see it for flows like synth_xilinx/abc9.
+				defines_map.add("YOSYS", "1");
 				continue;
 			}
 			if (arg == "-nowb") {
@@ -488,6 +524,9 @@ struct VerilogFrontend : public Frontend {
 			break;
 		}
 
+		if (saw_sv_flag && saw_verilog2005)
+			log_error("-sv cannot be combined with -std=1364-2005.\n");
+
 		if (parse_mode.formal || !flag_nosynthesis)
 			defines_map.add(parse_mode.formal ? "FORMAL" : "SYNTHESIS", "1");
 
@@ -496,7 +535,10 @@ struct VerilogFrontend : public Frontend {
 		log_header(design, "Executing Verilog-2005 frontend: %s\n", filename);
 
 		log("Parsing %s%s input from `%s' to AST representation.\n",
-				parse_mode.formal ? "formal " : "", parse_mode.sv ? "SystemVerilog" : "Verilog", filename.c_str());
+				parse_mode.formal ? "formal " : "",
+				parse_mode.std_year ? stringf("SystemVerilog IEEE 1800-%d", parse_mode.std_year).c_str() :
+					parse_mode.sv ? "SystemVerilog" : "Verilog",
+				filename.c_str());
 
 		if (flag_relative_share) {
 			auto share_path = proc_share_dirname();
@@ -505,6 +547,8 @@ struct VerilogFrontend : public Frontend {
 			log("new filename %s\n", filename.c_str());
 		}
 		AST::sv_mode_but_global_and_used_for_literally_one_condition = parse_mode.sv;
+		AST::keep_sva_cells = parse_mode.formal;
+		AST::sv_std_year = parse_mode.std_year;
 		std::string code_after_preproc;
 
 		parse_state.lexin = f;

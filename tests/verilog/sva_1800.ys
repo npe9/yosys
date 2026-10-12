@@ -1,0 +1,2 @@
+read_verilog -sv -formal sva_1800.sv
+hierarchy -top m

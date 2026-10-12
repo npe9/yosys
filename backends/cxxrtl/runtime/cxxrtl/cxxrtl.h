@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cassert>
 #include <limits>
@@ -1094,6 +1095,7 @@ struct fmt_part {
 		STRING    = 2,
 		UNICHAR   = 3,
 		VLOG_TIME = 4,
+		REAL      = 5,
 	} type;
 
 	// LITERAL type
@@ -1127,6 +1129,10 @@ struct fmt_part {
 	bool realtime; // = false;
 	// + int64_t itime;
 	// + double ftime;
+
+	// REAL type: conversion letter ('e', 'f' or 'g') and precision
+	char real_conv; // = 'f';
+	size_t precision; // = 6;
 
 	// Format the part as a string.
 	//
@@ -1253,6 +1259,23 @@ struct fmt_part {
 					buf = realtime ? std::to_string(performer->vlog_realtime()) : std::to_string(performer->vlog_time());
 				} else {
 					buf = realtime ? std::to_string(0.0) : std::to_string(0);
+				}
+				break;
+			}
+
+			case REAL: {
+				if (Bits == 64) {
+					uint64_t raw = val.template get<uint64_t>();
+					double d;
+					std::memcpy(&d, &raw, sizeof(d));
+					char conv[8] = "%.*";
+					conv[3] = real_conv;
+					conv[4] = 0;
+					char numbuf[768];
+					snprintf(numbuf, sizeof(numbuf), conv, (int)precision, d);
+					buf = numbuf;
+				} else {
+					buf = "?";
 				}
 				break;
 			}

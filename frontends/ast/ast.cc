@@ -39,6 +39,8 @@ using namespace AST_INTERNAL;
 // instantiate global variables (public API)
 namespace AST {
 	bool sv_mode_but_global_and_used_for_literally_one_condition;
+	bool keep_sva_cells;
+	int sv_std_year;
 	unsigned long long astnodes = 0;
 	unsigned long long astnode_count() { return astnodes; }
 }
@@ -54,6 +56,7 @@ namespace AST_INTERNAL {
 	AstNode *current_always, *current_top_block, *current_block, *current_block_child;
 	Module *current_module;
 	bool current_always_clocked;
+	bool current_sva_context;
 	dict<std::string, int> current_memwr_count;
 	dict<std::string, pool<int>> current_memwr_visible;
 }
@@ -179,6 +182,8 @@ std::string AST::type2str(AstNodeType type)
 	X(AST_STRUCT)
 	X(AST_UNION)
 	X(AST_STRUCT_ITEM)
+	X(AST_SVA)
+	X(AST_CLASS)
 #undef X
 	default:
 		log_abort();
@@ -249,6 +254,32 @@ AstNode::AstNode(AstSrcLocType loc, AstNodeType type, std::unique_ptr<AstNode> c
 	fixup_hierarchy_flags();
 }
 
+// rewrite id2ast back-pointers after a deep copy: pointers into the source
+// subtree are rebound to the parallel node of the clone; pointers outside
+// the source subtree are dropped (they would dangle once the source tree
+// is destroyed). Used only where a clone outlives its source tree, e.g.
+// package ASTs stored in design->verilog_packages.
+static void rebase_id2ast(AstNode *n, std::unordered_map<const AstNode *, AstNode *> &clonemap)
+{
+	if (n->id2ast) {
+		auto it = clonemap.find(n->id2ast);
+		n->id2ast = it != clonemap.end() ? it->second : nullptr;
+	}
+	for (auto &c : n->children)
+		if (c)
+			rebase_id2ast(c.get(), clonemap);
+}
+
+// clone for retention beyond the source tree's lifetime (see rebase_id2ast)
+std::unique_ptr<AstNode> AstNode::clone_rebased() const
+{
+	auto that = std::make_unique<AstNode>(this->location, this->type);
+	std::unordered_map<const AstNode *, AstNode *> clonemap;
+	cloneInto(*that.get(), &clonemap);
+	rebase_id2ast(that.get(), clonemap);
+	return that;
+}
+
 // create a (deep recursive) copy of a node
 std::unique_ptr<AstNode> AstNode::clone() const
 {
@@ -260,6 +291,13 @@ std::unique_ptr<AstNode> AstNode::clone() const
 // create a (deep recursive) copy of a node use 'other' as target root node
 void AstNode::cloneInto(AstNode &other) const
 {
+	cloneInto(other, nullptr);
+}
+
+void AstNode::cloneInto(AstNode &other, std::unordered_map<const AstNode *, AstNode *> *clonemap) const
+{
+	if (clonemap)
+		(*clonemap)[this] = &other;
 	other.type = type;
 	other.str = str;
 	other.bits = bits;
@@ -293,8 +331,16 @@ void AstNode::cloneInto(AstNode &other) const
 	// Keep in_lvalue_from_above and in_param_from_above untouched
 
 	other.delete_children();
-	for (auto& child : this->children)
-		other.children.push_back(child->clone());
+	if (clonemap) {
+		for (auto& child : this->children) {
+			auto cc = std::make_unique<AstNode>(child->location, child->type);
+			child->cloneInto(*cc, clonemap);
+			other.children.push_back(std::move(cc));
+		}
+	} else {
+		for (auto& child : this->children)
+			other.children.push_back(child->clone());
+	}
 	for (auto& [key, val] : this->attributes)
 		other.attributes[key] = (val->clone());
 	 // fixup to set flags on cloned children
@@ -900,9 +946,7 @@ std::unique_ptr<AstNode> AstNode::mkconst_bits(AstSrcLocType loc, const std::vec
 std::unique_ptr<AstNode> AstNode::mkconst_str(AstSrcLocType loc, const std::vector<RTLIL::State> &v)
 {
 	auto node = mkconst_str(loc, RTLIL::Const(v).decode_string());
-	while (GetSize(node->bits) < GetSize(v))
-		node->bits.push_back(RTLIL::State::S0);
-	log_assert(node->bits == v);
+	node->bits = v;
 	return node;
 }
 
@@ -1049,7 +1093,12 @@ uint64_t AstNode::asInt(bool is_signed)
 	if (type == AST_REALVALUE)
 		return uint64_t(realvalue);
 
-	log_abort();
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		log_warning("Non-constant value of type %s used as an integer; using 0.\n", type2str(type).c_str());
+	}
+	return 0;
 }
 
 double AstNode::asReal(bool is_signed)
@@ -1082,7 +1131,8 @@ double AstNode::asReal(bool is_signed)
 
 RTLIL::Const AstNode::realAsConst(int width)
 {
-	double v = round(realvalue);
+	// IEEE 1800 6.12.2: real-to-integer conversion truncates toward zero.
+	double v = std::trunc(realvalue);
 	RTLIL::Const result;
 	if (!std::isfinite(v)) {
 		result = std::vector<RTLIL::State>(width, RTLIL::State::Sx);
@@ -1113,7 +1163,9 @@ void AST::set_src_attr(RTLIL::AttrObject *obj, const AstNode *ast)
 static bool param_has_no_default(const AstNode* param) {
 	const auto &children = param->children;
 	log_assert(param->type == AST_PARAMETER);
-	log_assert(children.size() <= 2);
+	// Children are the default value slot followed by an optional wiretype
+	// and an optional packed range from the declared type.
+	log_assert(children.size() <= 3);
 	return children.empty() ||
 		(children.size() == 1 && children[0]->type == AST_RANGE);
 }
@@ -1164,6 +1216,15 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 		bool blackbox_module = flag_lib;
 
 		if (!blackbox_module && !flag_noblackbox) {
+			// A portless empty module is useless as a blackbox stub and
+			// would be excluded from the default design selection (boxed
+			// modules), so only portless-free logic below applies.
+			bool has_ports = false;
+			for (const auto& child : ast->children)
+				if (child->type == AST_WIRE && (child->is_input || child->is_output)) {
+					has_ports = true;
+					break;
+				}
 			blackbox_module = true;
 			for (const auto& child : ast->children) {
 				if (child->type == AST_WIRE && (child->is_input || child->is_output))
@@ -1176,6 +1237,8 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 				blackbox_module = false;
 				break;
 			}
+			if (blackbox_module && !has_ports)
+				blackbox_module = false;
 		}
 
 		// simplify this module or interface using the current design as context
@@ -1378,7 +1441,7 @@ static void rename_in_package_stmts(AstNode *pkg)
 	std::function<void(std::unique_ptr<AstNode>&)> rename =
 		[&rename, &idents, pkg](std::unique_ptr<AstNode>& node) {
 			for (auto& child : node->children) {
-				if (idents.count(child->str))
+				if (!child->str.empty() && idents.count(child->str))
 					child->str = pkg->str + "::" + child->str.substr(1);
 				rename(child);
 			}
@@ -1416,6 +1479,53 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 	ast->fixup_hierarchy_flags(true);
 
 	log_assert(current_ast->type == AST_DESIGN);
+	bool has_module = false;
+	for (const auto& child : current_ast->children)
+		if (child && (child->type == AST_MODULE || child->type == AST_INTERFACE))
+			has_module = true;
+	if (!has_module && !current_ast->children.empty()) {
+		auto unit = std::make_unique<AstNode>(current_ast->location, AST_MODULE);
+		unit->str = "\\$sv_unit";
+		std::vector<std::unique_ptr<AstNode>> kept;
+		for (auto& child : current_ast->children) {
+			if (child && child->type == AST_PACKAGE)
+				kept.push_back(std::move(child));
+			else if (child) {
+				// Compilation-unit declarations must remain visible to later
+				// read_verilog invocations (IEEE compilation-unit semantics,
+				// e.g. tests/verilog/typedef_across_files.ys).  Register them
+				// as globals like module-free AST roots always did, and give
+				// repeated units unique module names to avoid re-definition.
+				if (child->type == AST_PARAMETER)
+					child->type = AST_LOCALPARAM; // cannot be overridden
+				design->verilog_globals.push_back(child->clone_rebased());
+				unit->children.push_back(std::move(child));
+			}
+		}
+		if (!unit->children.empty()) {
+			while (design->has(unit->str))
+				unit->str += "$";
+			kept.push_back(std::move(unit));
+		}
+		current_ast->children = std::move(kept);
+	}
+	// Pass 1: register every package in this compilation unit before any
+	// module is elaborated.  Module bodies may import a package that is
+	// declared later in the same read_verilog invocation (IEEE 1800
+	// compilation-unit semantics); deferring package registration until
+	// after module processing would degrade those imports to implicit nets.
+	for (const auto& child : current_ast->children)
+	{
+		if (child->type == AST_PACKAGE) {
+			// process enum/other declarations
+			current_ast_mod = child.get();
+			child->simplify(true, 1, -1, false);
+			rename_in_package_stmts(child.get());
+			design->verilog_packages.push_back(child->clone_rebased());
+			current_ast_mod = nullptr;
+			current_scope.clear();
+		}
+	}
 	for (const auto& child : current_ast->children)
 	{
 		if (child->type == AST_MODULE || child->type == AST_INTERFACE)
@@ -1433,7 +1543,7 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 							log_assert(e->type == AST_ENUM_ITEM);
 							e->str = n->str + std::string("::") + e->str.substr(1);
 						}
-					} else {
+					} else if (!cloned_node->str.empty() && cloned_node->str[0] == '\\') {
 						cloned_node->str = n->str + std::string("::") + cloned_node->str.substr(1);
 					}
 					child->children.push_back(std::move(cloned_node));
@@ -1477,17 +1587,13 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 			current_ast_mod = nullptr;
 		}
 		else if (child->type == AST_PACKAGE) {
-			// process enum/other declarations
-			child->simplify(true, 1, -1, false);
-			rename_in_package_stmts(child.get());
-			design->verilog_packages.push_back(child->clone());
-			current_scope.clear();
+			// handled in pass 1 above
 		}
 		else {
 			// must be global definition
 			if (child->type == AST_PARAMETER)
 				child->type = AST_LOCALPARAM; // cannot be overridden
-			design->verilog_globals.push_back(child->clone());
+			design->verilog_globals.push_back(child->clone_rebased());
 			current_scope.clear();
 		}
 	}
@@ -1807,6 +1913,14 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 	int para_counter = 0;
 	std::vector<std::pair<RTLIL::IdString, RTLIL::Const>> named_parameters;
 	for (const auto& child : ast->children) {
+		if (child->type == AST_TYPEDEF) {
+			// type parameter: include string overrides in the derived name
+			auto it = parameters.find(child->str);
+			if (it != parameters.end() && (it->second.flags & RTLIL::CONST_FLAG_STRING) != 0) {
+				named_parameters.emplace_back(child->str, it->second);
+				continue;
+			}
+		}
 		if (child->type != AST_PARAMETER)
 			continue;
 		para_counter++;
@@ -1844,6 +1958,40 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 	auto loc = ast->location;
 	if (!new_ast->attributes.count(ID::hdlname))
 		new_ast->set_attribute(ID::hdlname, AstNode::mkconst_str(loc, stripped_name.substr(1)));
+
+	// type parameters (declared as typedefs): splice in the override type
+	for (auto& child : new_ast->children) {
+		if (child->type != AST_TYPEDEF)
+			continue;
+		auto it = parameters.find(child->str);
+		if (it == parameters.end() || (it->second.flags & RTLIL::CONST_FLAG_STRING) == 0)
+			continue;
+		std::string tname = it->second.decode_string();
+		std::string tbase = tname.compare(0, 1, "\\") == 0 ? tname.substr(1) : tname;
+		AstNode *resolved = nullptr;
+		for (auto& cand : new_ast->children) {
+			if (cand->type != AST_TYPEDEF)
+				continue;
+			// the override name comes from the instantiator's scope (often
+			// unqualified via import); the parametric module sees the same
+			// typedef package-qualified, so match a full name or a :: suffix
+			if (cand->str == tname || cand->str.size() > tbase.size() + 2 &&
+					cand->str.compare(cand->str.size() - tbase.size(), tbase.size(), tbase) == 0 &&
+					cand->str.compare(cand->str.size() - tbase.size() - 2, 2, "::") == 0) {
+				resolved = cand.get();
+				break;
+			}
+		}
+		if (resolved && !resolved->children.empty() && !child->children.empty()) {
+			child->children[0] = resolved->children[0]->clone();
+			if (!quiet)
+				log("Type parameter %s = %s\n", child->str.c_str(), tname.c_str());
+		} else {
+			log_file_warning(child->location.to_loc(), "Type parameter override `%s` = `%s` not resolved; keeping default.\n",
+					child->str.c_str(), tname.c_str());
+		}
+		rewritten.insert(child->str);
+	}
 
 	para_counter = 0;
 	for (auto& child : new_ast->children) {

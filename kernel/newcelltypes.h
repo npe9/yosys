@@ -83,6 +83,8 @@ struct CellTableBuilder {
 		setup_type(ID($specrule), {ID::SRC_EN, ID::DST_EN, ID::SRC, ID::DST}, {}, features);
 		setup_type(ID($print), {ID::EN, ID::ARGS, ID::TRG}, {}, features);
 		setup_type(ID($check), {ID::A, ID::EN, ID::ARGS, ID::TRG}, {}, features);
+		setup_type(ID($finish), {ID::EN, ID::TRG}, {}, features);
+		setup_type(ID($stop), {ID::EN, ID::TRG}, {}, features);
 		setup_type(ID($set_tag), {ID::A, ID::SET, ID::CLR}, {ID::Y}, features);
 		setup_type(ID($get_tag), {ID::A}, {ID::Y}, features);
 		setup_type(ID($overwrite_tag), {ID::A, ID::SET, ID::CLR}, {}, features);

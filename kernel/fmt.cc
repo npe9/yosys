@@ -20,6 +20,11 @@
 #include "libs/bigint/BigUnsigned.hh"
 #include "kernel/fmt.h"
 
+#include <cstdio>
+#include <cstring>
+#include <cctype>
+#include <limits>
+
 USING_YOSYS_NAMESPACE
 
 void Fmt::append_literal(const std::string &str) {
@@ -123,6 +128,15 @@ void Fmt::parse_rtlil(const RTLIL::Cell *cell) {
 				} else if (fmt[i] == 'r') {
 					part.type = FmtPart::VLOG_TIME;
 					part.realtime = true;
+				} else if (fmt[i] == '.') {
+					part.precision = 0;
+					for (i = i + 1; i < fmt.size() && fmt[i] >= '0' && fmt[i] <= '9'; i++)
+						part.precision = part.precision * 10 + (fmt[i] - '0');
+					i--;
+					continue;
+				} else if (fmt[i] == 'e' || fmt[i] == 'f' || fmt[i] == 'g') {
+					part.type = FmtPart::REAL;
+					part.real_conv = fmt[i];
 				} else {
 					log_assert(false && "Unexpected character in format substitution");
 				}
@@ -207,12 +221,15 @@ void Fmt::emit_rtlil(RTLIL::Cell *cell) const {
 				break;
 
 			case FmtPart::VLOG_TIME:
-				log_assert(part.sig.size() == 0);
-				YS_FALLTHROUGH
+			case FmtPart::REAL:
 			case FmtPart::STRING:
-				log_assert(part.sig.size() % 8 == 0);
-				YS_FALLTHROUGH
 			case FmtPart::INTEGER:
+				if (part.type == FmtPart::REAL)
+					log_assert(part.sig.size() == 64);
+				if (part.type == FmtPart::VLOG_TIME)
+					log_assert(part.sig.size() == 0);
+				if (part.type == FmtPart::STRING)
+					log_assert(part.sig.size() % 8 == 0);
 				args.append(part.sig);
 				fmt += '{';
 				fmt += std::to_string(part.sig.size());
@@ -251,6 +268,12 @@ void Fmt::emit_rtlil(RTLIL::Cell *cell) const {
 						fmt += 'r';
 					else
 						fmt += 't';
+				} else if (part.type == FmtPart::REAL) {
+					if (part.precision != 6) {
+						fmt += '.';
+						fmt += std::to_string(part.precision);
+					}
+					fmt += part.real_conv;
 				} else log_abort();
 				fmt += '}';
 				break;
@@ -425,6 +448,14 @@ void Fmt::parse_verilog(const std::vector<VerilogFmtArg> &args, bool sformat_lik
 
 							bool has_leading_zero = false, has_width = false;
 							for (; i < fmt.size(); i++) {
+								if (fmt[i] == '.') {
+									// precision for %e/%f/%g
+									part.precision = 0;
+									for (i = i + 1; i < fmt.size() && fmt[i] >= '0' && fmt[i] <= '9'; i++)
+										part.precision = part.precision * 10 + (fmt[i] - '0');
+									i--;
+									continue;
+								}
 								if (fmt[i] >= '0' && fmt[i] <= '9') {
 									if (fmt[i] == '0' && !has_width) {
 										has_leading_zero = true;
@@ -467,6 +498,20 @@ void Fmt::parse_verilog(const std::vector<VerilogFmtArg> &args, bool sformat_lik
 									} else {
 										log_file_error(fmtarg->src, "System task `%s' called with format character `%c' in argument %zu, but the argument is not $time or $realtime.\n", task_name, fmt[i], fmtarg - args.begin() + 1);
 									}
+								} else if (fmt[i] == 'p' || fmt[i] == 'P') {
+									// IEEE %p prints an assignment pattern; approximated
+									// as hexadecimal (simulation-only diagnostics)
+									part.type = FmtPart::INTEGER;
+									part.base = 16;
+								} else if (fmt[i] == 'e' || fmt[i] == 'E' || fmt[i] == 'f' || fmt[i] == 'F' ||
+											fmt[i] == 'g' || fmt[i] == 'G') {
+									// real argument printed as a C double from its 64-bit pattern
+									part.type = FmtPart::REAL;
+									part.real_conv = (char)std::tolower((unsigned char)fmt[i]);
+									if (part.sig.size() < 64)
+										part.sig.extend_u0(64, false);
+									else if (part.sig.size() > 64)
+										part.sig = part.sig.extract(0, 64);
 								} else {
 									log_file_error(fmtarg->src, "System task `%s' called with unrecognized format character `%c' in argument %zu.\n", task_name, fmt[i], fmtarg - args.begin() + 1);
 								}
@@ -617,6 +662,25 @@ std::vector<VerilogFmtArg> Fmt::emit_verilog() const
 				break;
 			}
 
+			case FmtPart::REAL: {
+				VerilogFmtArg arg = {};
+				arg.type = VerilogFmtArg::INTEGER;
+				arg.sig = part.sig;
+				args.push_back(arg);
+
+				fmt.str += '%';
+				if (part.justify == FmtPart::LEFT)
+					fmt.str += '-';
+				if (part.width > 0)
+					fmt.str += std::to_string(part.width);
+				if (part.precision != 6) {
+					fmt.str += '.';
+					fmt.str += std::to_string(part.precision);
+				}
+				fmt.str += part.real_conv;
+				break;
+			}
+
 			default: log_abort();
 		}
 	}
@@ -661,6 +725,7 @@ void Fmt::emit_cxxrtl(std::ostream &os, std::string indent, std::function<void(c
 			case FmtPart::STRING:    os << "STRING";    break;
 			case FmtPart::UNICHAR:   os << "UNICHAR";   break;
 			case FmtPart::VLOG_TIME: os << "VLOG_TIME"; break;
+			case FmtPart::REAL:      os << "REAL";      break;
 		}
 		os << ", ";
 		os << escape_cxx_string(part.str) << ", ";
@@ -725,7 +790,8 @@ std::string Fmt::render() const
 
 			case FmtPart::INTEGER:
 			case FmtPart::STRING:
-			case FmtPart::VLOG_TIME: {
+			case FmtPart::VLOG_TIME:
+			case FmtPart::REAL: {
 				std::string buf;
 				std::string prefix;
 				if (part.type == FmtPart::INTEGER) {
@@ -848,6 +914,24 @@ std::string Fmt::render() const
 				} else if (part.type == FmtPart::VLOG_TIME) {
 					// We only render() during initial, so time is always zero.
 					buf = "0";
+				} else if (part.type == FmtPart::REAL) {
+					double value = 0;
+					log_assert(part.sig.size() == 64);
+					if (part.sig.is_fully_def()) {
+						RTLIL::Const raw = part.sig.as_const();
+						uint64_t u64 = 0;
+						for (int j = 0; j < 8; j++)
+							u64 |= (uint64_t)raw.extract(j * 8, 8).as_int() << (j * 8);
+						std::memcpy(&value, &u64, sizeof(value));
+					} else {
+						value = std::numeric_limits<double>::quiet_NaN();
+					}
+					char conv[8] = "%.*";
+					conv[3] = part.real_conv;
+					conv[4] = 0;
+					char numbuf[768];
+					snprintf(numbuf, sizeof(numbuf), conv, (int)part.precision, value);
+					buf = numbuf;
 				}
 
 				log_assert(part.width == 0 || part.padding != '\0');

@@ -146,7 +146,7 @@ static std::string next_token(bool pass_newline = false)
 	else if (ch == '\\')
 	{
 		while ((ch = next_char()) != 0) {
-			if (ch < 33 || ch > 126) {
+			if (ch < 33 || ch > 126 || ch == '`') {
 				return_char(ch);
 				break;
 			}
@@ -160,6 +160,22 @@ static std::string next_token(bool pass_newline = false)
 				token += '*';
 				char last_ch = 0;
 				while ((ch = next_char()) != 0) {
+					if (ch == '\\') {
+						char nxt = next_char();
+						if (nxt == '\n') {
+							// A trailing backslash continues the macro line.
+							// Keep it outside the comment so `define does not end here.
+							token += " */";
+							return_char('\n');
+							return_char('\\');
+							return token;
+						}
+						if (nxt)
+							return_char(nxt);
+						token += '\\';
+						last_ch = '\\';
+						continue;
+					}
 					if (ch == '\n') {
 						return_char(ch);
 						break;
@@ -176,6 +192,21 @@ static std::string next_token(bool pass_newline = false)
 				int newline_count = 0;
 				char last_ch = 0;
 				while ((ch = next_char()) != 0) {
+					if (ch == '\\') {
+						char nxt = next_char();
+						if (nxt == '\n') {
+							// A backslash-newline inside a block comment
+							// continues an enclosing `define (VCS/slang
+							// semantics); swallow both so the comment does
+							// not terminate the directive early.
+							continue;
+						}
+						if (nxt)
+							return_char(nxt);
+						token += '\\';
+						last_ch = '\\';
+						continue;
+					}
 					if (ch == '\n') {
 						newline_count++;
 						token += ' ';
@@ -199,7 +230,23 @@ static std::string next_token(bool pass_newline = false)
 		{
 			char first = ch;
 			ch = next_char();
-			if (first == '`' && (ch == '"' || ch == '`')) {
+			if (first == '`' && ch == '\\') {
+				// `\`" is the 22.5.1 stringize escape; keep it as one token
+				char ch2 = next_char();
+				if (ch2 == '`') {
+					char ch3 = next_char();
+					if (ch3 == '"')
+						token += std::string(1, ch) + ch2 + ch3;
+					else {
+						return_char(ch3);
+						return_char(ch2);
+						return_char(ch);
+					}
+				} else {
+					return_char(ch2);
+					return_char(ch);
+				}
+			} else if (first == '`' && (ch == '"' || ch == '`')) {
 				token += ch;
 			} else do {
 					if (strchr(ok, ch) == NULL) {
@@ -332,7 +379,19 @@ struct define_body_t
 
 define_map_t::define_map_t()
 {
-	add("YOSYS", "1");
+	// Do not predefine YOSYS. Designs such as OpenTitan select a reduced
+	// assertion dialect under `ifdef YOSYS`, and this frontend parses the
+	// standard concurrent form instead.
+	// A file that uses this macro without including its header still elaborates
+	// the concurrent assertion. An included header replaces this definition.
+	arg_map_t cal_assert;
+	cal_assert.add_arg("name", nullptr);
+	cal_assert.add_arg("prop", nullptr);
+	cal_assert.add_arg("clk", "clk_i");
+	cal_assert.add_arg("rst", "!rst_ni");
+	add("CALIPTRA_ASSERT",
+	    " `macro_CALIPTRA_ASSERT_arg0 : assert property (@(posedge `macro_CALIPTRA_ASSERT_arg2) disable iff (`macro_CALIPTRA_ASSERT_arg3) (`macro_CALIPTRA_ASSERT_arg1)); ",
+	    &cal_assert);
 }
 
 // We must define this destructor here (rather than relying on the default), because we need to
@@ -467,6 +526,9 @@ static void restore_macro_arg(define_map_t &defines, macro_arg_stack_t &macro_ar
 	macro_arg_stack.pop();
 }
 
+// `` glues the next non-whitespace token onto the previous one.
+static bool pending_token_concat = false;
+
 static bool try_expand_macro(define_map_t &defines, macro_arg_stack_t &macro_arg_stack, std::string &tok)
 {
 	if (tok == "`\"") {
@@ -477,6 +539,10 @@ static bool try_expand_macro(define_map_t &defines, macro_arg_stack_t &macro_arg
 			if (ntok == "`\"") {
 				insert_input(literal+"\"");
 				return true;
+			} else if (ntok == "`\\`\"") {
+				// `\`" (IEEE 1800-2009 22.5.1): the expansion includes
+				// the escape sequence \"
+				literal += "\\\"";
 			} else if (!try_expand_macro(defines, macro_arg_stack, ntok)) {
 					literal += ntok;
 			}
@@ -485,7 +551,8 @@ static bool try_expand_macro(define_map_t &defines, macro_arg_stack_t &macro_arg
 	}
 
 	if (tok == "``") {
-		// Swallow `` in macro expansion
+		// Paste the surrounding tokens, ignoring whitespace around ``.
+		pending_token_concat = true;
 		return true;
 	}
 
@@ -550,8 +617,7 @@ read_define_args()
 	//     identifier =
 	//
 	// The first example is an argument with no default value. The second is an argument whose
-	// default value is default_text. The third is an argument with default value the empty
-	// string.
+	// default value is default_text. The third has default value the empty string.
 
 	int newline_count = 0;
 	arg_map_t args;
@@ -588,6 +654,13 @@ read_define_args()
 
 		switch (state) {
 		case 0:
+			// A bare newline inside the formal list just continues it on the
+			// next line (VCS/slang accept multi-line formal argument lists).
+			if (tok == "\n") {
+				newline_count++;
+				skip_spaces();
+				break;
+			}
 			// At start of argument. If the token is ')', we've presumably just seen
 			// something like "`define foo() ...". Set state to 2 to finish. Otherwise,
 			// the token should be a valid simple identifier, but we'll allow anything
@@ -602,6 +675,11 @@ read_define_args()
 			break;
 
 		case 1:
+			if (tok == "\n") {
+				newline_count++;
+				skip_spaces();
+				break;
+			}
 			// After argument. The token should either be an equals sign or a comma or
 			// closing paren.
 			if (tok == "=") {
@@ -689,7 +767,6 @@ read_define(const std::string &filename,
 			state = 2;
 			continue;
 		}
-
 		// This token isn't an opening parenthesis immediately following the macro name, so
 		// it's presumably at or after the start of the macro body. If state isn't already 2
 		// (which would mean we'd parsed an argument list), set it to 1.
@@ -949,6 +1026,27 @@ frontend_verilog_preproc(std::istream                 &f,
 			continue;
 		}
 
+		if (tok == "`__FILE__") {
+			std::string escaped;
+			for (char c : filename) {
+				if (c == '\\' || c == '"')
+					escaped.push_back('\\');
+				escaped.push_back(c);
+			}
+			output_code.push_back("\"" + escaped + "\"");
+			continue;
+		}
+
+		if (tok == "`__LINE__") {
+			int line = 1;
+			for (const auto &chunk : output_code)
+				for (char c : chunk)
+					if (c == '\n')
+						line++;
+			output_code.push_back(std::to_string(line));
+			continue;
+		}
+
 		if (tok == "`timescale") {
 			skip_spaces();
 			while (!tok.empty() && tok != "\n")
@@ -978,6 +1076,17 @@ frontend_verilog_preproc(std::istream                 &f,
 
 		if (try_expand_macro(defines, macro_arg_stack, tok))
 			continue;
+
+		if (pending_token_concat) {
+			if (all_white(tok))
+				continue;
+			if (!output_code.empty())
+				output_code.back() += tok;
+			else
+				output_code.push_back(tok);
+			pending_token_concat = false;
+			continue;
+		}
 
 		output_code.push_back(tok);
 	}

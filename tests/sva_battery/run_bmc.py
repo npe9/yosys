@@ -26,9 +26,8 @@ import subprocess
 import sys
 import tempfile
 
-# in-tree copy: tests/sva_battery/ -> repo root is three levels up
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-YOSYS = os.environ.get("YOSYS", os.path.join(ROOT, "build", "yosys"))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+YOSYS = os.environ.get("YOSYS", os.path.join(ROOT, "third_party/yosys/build/yosys"))
 SMTBMC = os.environ.get("SMTBMC", os.path.join(os.path.dirname(YOSYS), "yosys-smtbmc"))
 
 PREP = """read_verilog -sv -formal {files}
@@ -80,7 +79,7 @@ def expectations(path):
     return exp
 
 
-def check_one(yosys, smtbmc, path, top, solver, bound, timeout):
+def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
     label = os.path.basename(path)
     exp = expectations(path)
     bound = max([24] + [n + 4 for k, n in exp.values() if n is not None])
@@ -114,12 +113,22 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout):
             top = m.group(1)
 
         try:
-            p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" -s "$2" -t "$3" -m "$4" "$5"',
-                     "y", smtbmc, solver, str(bound), top or label, smt], timeout=timeout)
+            cmd = [smtbmc, "-s", solver, "-t", str(bound), "-m", top or label, smt]
+            p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$@"', "y"] + cmd, timeout=timeout)
         except subprocess.TimeoutExpired:
             print("%s: smtbmc timed out after %ds" % (label, timeout))
             return None
         blob = p.stdout + "\n" + p.stderr
+        # smtbmc's exit code is not a reliable error signal (it is nonzero
+        # for ordinary cex/induction-failed outcomes); a real invocation
+        # failure never reaches the "Solver:" progress banner.
+        if "Solver:" not in blob:
+            err = ""
+            for line in blob.splitlines():
+                if "error" in line.lower() or "ERROR" in line:
+                    err = line.strip()[:120]
+            print("%s: smtbmc failed: %s" % (label, err or "exit %d, no output" % p.returncode))
+            return None
 
         step = None
         failed = []
@@ -142,6 +151,23 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout):
                 verdicts[name] = ("cex", step)
             deleted.append(name)
 
+    # proof upgrade: with --prove, run one temporal-induction pass over the
+    # surviving properties. base case was already checked to bound above
+    # (per-property, with cex steps); this pass only upgrades "holds" to
+    # "proved" on "Temporal induction successful." -- its Assert-failed /
+    # FAILED output for a spurious step-case cex is ignored by design.
+    if prove:
+        remaining = [n for n in exp if n in verdicts and verdicts[n][0] == "holds"]
+        if remaining:
+            cmd = [smtbmc, "-s", solver, "-t", str(bound), "-m", top or label, "-i", smt]
+            try:
+                p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$@"', "y"] + cmd, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                p = None
+            if p is not None and "Temporal induction successful." in (p.stdout + p.stderr):
+                for name in remaining:
+                    verdicts[name] = ("proved", bound)
+
     print("%s: %d properties checked (bound %d):" % (label, len(exp), bound))
     ok = True
     for name in sorted(set(verdicts) - set(exp)):
@@ -154,7 +180,9 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout):
             print("  MISSING   %s (expected %s)" % (name, kind))
             ok = False
             continue
-        if kind == "proved" and v[0] == "holds":
+        if kind == "proved" and v[0] == "proved":
+            print("  proved    %s (temporal induction)" % name)
+        elif kind == "proved" and v[0] == "holds":
             print("  holds     %s (no CEX to step %d)" % (name, v[1]))
         elif kind == "dis" and v[0] == "cex" and (n is None or v[1] == n):
             print("  cex@%d    %s (as expected)" % (v[1], name))
@@ -173,12 +201,15 @@ def main():
     ap.add_argument("--smtbmc", default=SMTBMC)
     ap.add_argument("-s", "--solver", default="z3")
     ap.add_argument("-t", "--bound", type=int, default=24)
+    ap.add_argument("--prove", action="store_true",
+                    help="also run smtbmc temporal induction (-i); properties "
+                         "with successful induction are reported as proved")
     ap.add_argument("--timeout", type=int, default=300)
     args = ap.parse_args()
 
     ok = True
     for path in args.files:
-        r = check_one(args.yosys, args.smtbmc, path, args.top, args.solver, args.bound, args.timeout)
+        r = check_one(args.yosys, args.smtbmc, path, args.top, args.solver, args.bound, args.timeout, args.prove)
         if r is None or not r:
             ok = False
     sys.exit(0 if ok else 1)

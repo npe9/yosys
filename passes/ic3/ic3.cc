@@ -150,7 +150,7 @@ struct Ic3Solver
 
 	int nsolves;
 	long long n_bad, n_blockq, n_gen, n_init, n_ctg;
-	double t_addclause, t_generalize;
+	double t_addclause, t_generalize, t_encode;
 
 	Ic3Solver(RTLIL::Module *module, bool init_zero, int max_frames) :
 			module(module), sigmap(module), ez(), satgen(&ez, &sigmap),
@@ -158,7 +158,7 @@ struct Ic3Solver
 			ctg_depth_max(0),
 			nsolves(0),
 			n_bad(0), n_blockq(0), n_gen(0), n_init(0), n_ctg(0),
-			t_addclause(0), t_generalize(0)
+			t_addclause(0), t_generalize(0), t_encode(0)
 	{
 		act.push_back(0);
 		frames.emplace_back();
@@ -608,8 +608,10 @@ struct Ic3Solver
 			if (r != 2)
 				return r;
 		}
+		auto t0 = std::chrono::steady_clock::now();
 		encode(prop);
-		fprintf(stderr, "ic3-debug: proving %s clauses=%d vars=%d states=%d\n", log_id(prop), ez.numCnfClauses(), ez.numCnfVariables(), GetSize(state1));
+		t_encode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+		fprintf(stderr, "ic3-debug: proving %s clauses=%d vars=%d states=%d t_encode=%.3fs\n", log_id(prop), ez.numCnfClauses(), ez.numCnfVariables(), GetSize(state1), t_encode);
 
 		std::vector<bool> model;
 		if (bad_sat(0, 1, model)) {

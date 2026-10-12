@@ -26,9 +26,8 @@ import subprocess
 import sys
 import tempfile
 
-# in-tree copy: tests/sva_battery/ -> repo root is three levels up
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-YOSYS = os.environ.get("YOSYS", os.path.join(ROOT, "build", "yosys"))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+YOSYS = os.environ.get("YOSYS", os.path.join(ROOT, "third_party/yosys/build/yosys"))
 
 PREP = """read_verilog -sv -formal {inc} {files}
 hierarchy -check{top}

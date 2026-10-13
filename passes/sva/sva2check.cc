@@ -34,6 +34,12 @@
 //     lowers to a FLAVOR "liveness" $check (A = p, not negated, EN = 1'b1)
 //     for the native ic3 liveness engine; the operand must be a plain
 //     boolean expression (no temporal operators, locals, or named decls)
+//   liveness v2: a |->/|=> consequent of unbounded (s_)eventually with a
+//     plain boolean operand (nested-temporal response) lowers to a single
+//     pending-bit FF on the property clock, D = !b && (open || pend) with
+//     open = antecedent end (|=> delayed one tick onto the first window
+//     tick); FLAVOR "liveness", A = !pend || b (ic3: bad = pend && !b).
+//     Locals and named-decls reject as in v1
 //   v1 multi-clock: the direct consequent of |->/|=> may be a `clocked`
 //     sub-sequence on a different clock (optionally under strong/weak):
 //     it compiles as its own monitor island on the inner clock, started by
@@ -2875,6 +2881,9 @@ struct Sva2CheckPass : public Pass {
 		log("Unbounded eventually/s_eventually of a plain expression lowers to a\n");
 		log("FLAVOR \"liveness\" $check (A = p, EN = 1'b1) for the native ic3\n");
 		log("liveness engine; temporal operands keep the \"bound it\" error.\n");
+		log("a |->/|=> consequent of unbounded (s_)eventually with a plain boolean\n");
+		log("operand lowers the same way through a pending-bit monitor\n");
+		log("(A = !pend || b, bad = pend && !b).\n");
 		log("\n");
 		log("With -expose_bad, additionally create a module output port per\n");
 		log("converted check named bad_<check> driven by EN && !A, for AIGER\n");
@@ -3125,6 +3134,27 @@ struct Sva2CheckPass : public Pass {
 					liveness = !bcell;
 				}
 
+				// v2 liveness, nested-temporal response: the consequent of
+				// |->/|=> is an unbounded (s_)eventually whose operand is a
+				// plain boolean.  Anything else on the consequent (bounded
+				// eventually, temporal operand) keeps the prop_fail path:
+				// bounded lowers as safety, temporal hits the existing clear
+				// error, so only the genuinely uncheckable shapes fall.
+				bool tresp = false;
+				Cell *tev = nullptr;
+				if (flavor == "assert" && !liveness && body &&
+						(sva_op(body) == "|->" || sva_op(body) == "|=>")) {
+					auto ip = comp.ports_of(body);
+					Cell *cc = ip.size() == 2 ? comp.child_cell(body->getPort(ip[1])) : nullptr;
+					if (cc && (sva_op(cc) == "eventually" || sva_op(cc) == "s_eventually")) {
+						auto ep = comp.ports_of(cc);
+						if (ep.size() == 1 && !comp.child_cell(cc->getPort(ep[0]))) {
+							tresp = true;
+							tev = cc;
+						}
+					}
+				}
+
 				SigSpec fail;
 				SigSpec new_a;
 				bool strong_until = false;
@@ -3143,6 +3173,62 @@ struct Sva2CheckPass : public Pass {
 					// -expose_bad
 					new_a = comp.reduce1(psig);
 					fail = mod->Not(NEW_ID, new_a);
+				} else if (tresp) {
+					// Violation of (a |=> F b) is an attempt whose antecedent
+					// completes at t with no b from t+1 on (|->: from t on,
+					// the consequent window includes the end tick).  Track
+					// "some attempt outstanding" in one global pend bit on
+					// the property clock; the violation is then exactly a
+					// reachable cycle in (pend && !b) = !A, which is what
+					// the existing liveness engine decides.
+					//   Sound: on such a cycle b is false everywhere and
+					//     pend stays high; the clear-dominant D means the
+					//     bit can only be high entering the cycle if an
+					//     attempt opened with no b since -- a b at or after
+					//     the open tick would have zeroed it, and an open
+					//     pulse coincident with a b opens a window that
+					//     contains that very tick, so the b satisfies it
+					//     too.  (Set-dominant would instead keep demanding
+					//     b across a b at the open tick -- a false
+					//     violation for e.g. b on the |-> end tick or the
+					//     |=> first consequent tick.)
+					//   Complete: a genuine violation never clears the bit
+					//     after the open tick, so its tail is such a cycle.
+					//   One bit suffices because every window is a suffix
+					//     [open, inf): a b at tick t lies in every
+					//     outstanding window (all opened at <= t), so one b
+					//     clears all of them -- the gfp only needs "some
+					//     obligation outstanding", not a count.
+					if (comp.multiclock)
+						log_error("sva2check: temporal response in a multi-clock property is not supported in %s.\n", log_id(cell));
+					pool<Cell *> seen;
+					if (comp.tree_has_locals(body, seen))
+						log_error("sva2check: local variables in a %s temporal response are not supported in %s.\n",
+								sva_op(body).c_str(), log_id(cell));
+					auto ip = comp.ports_of(body);
+					// antecedent end pulse, compiled exactly as prop_fail's
+					// implication branch does (every tick attempts)
+					SigSpec open = comp.seq_dispatch(body->getPort(ip[0]),
+							comp.child_cell(body->getPort(ip[0])), Const(1, 1), Const(1, 1));
+					// |=> evaluates the consequent one tick after the
+					// antecedent end (same shift as prop_fail); the open
+					// pulse must land on the obligation's first window tick
+					// so that a b there lies inside the window and clears
+					if (sva_op(body) == "|=>")
+						open = comp.delay(open, 1, "impl");
+					SigSpec bsig = comp.resolve(tev->getPort(comp.ports_of(tev)[0]));
+					if (Cell *decl = comp.decl_for_wire(bsig))
+						log_error("sva2check: named declaration operand of unbounded %s is not supported in %s.\n",
+								sva_op(tev).c_str(), log_id(cell));
+					SigSpec b1 = comp.reduce1(bsig);
+					SigSpec pend = comp.feedback([=](SigSpec q) {
+						return mod->And(NEW_ID, mod->Not(NEW_ID, b1), mod->Or(NEW_ID, open, q));
+					}, "tresp_pend", 1);
+					// A = !pend || b (ic3: bad := !A = pend && !b);
+					// fail = !A for -expose_bad
+					new_a = mod->Or(NEW_ID, mod->Not(NEW_ID, pend), b1);
+					fail = mod->Not(NEW_ID, new_a);
+					liveness = true;
 				} else {
 					// v1.5 strong until: p s_until q == (p until q) && F q
 					// with p, q plain booleans; the weak monitor keeps this

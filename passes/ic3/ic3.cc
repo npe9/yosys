@@ -160,6 +160,9 @@ struct Ic3Solver
 	// state vector: one entry per register bit (t=1 and t=2 literals)
 	std::vector<int> state1, state2;
 	int bad1, bad2;
+	// register Q bit behind each state1 entry (set by encode()), for
+	// translating gfp cubes back into netlist logic in prove_liveness
+	RTLIL::SigSpec istate_bits;
 
 	// frame activation literals and per-frame clause (cube) sets, 1-based;
 	// index 0 is an unused placeholder so frame numbers match the literature.
@@ -337,6 +340,7 @@ struct Ic3Solver
 
 		// ordered state vector (register Q bits only) per timestep
 		RTLIL::SigSpec istates = satgen.initial_state.export_all();
+		istate_bits = istates;
 		states.assign(ntf + 1, {});
 		for (auto bit : istates)
 			for (int t = 1; t <= ntf; t++)
@@ -1031,19 +1035,28 @@ struct Ic3Solver
 	// reachable cycle all of whose states satisfy !p.  Proof:
 	//   Phase A: safety IC3 with bad := !p (exactly what encode() builds
 	//     for this cell).  If it proves, !p is unreachable and F p holds
-	//     trivially; otherwise the final frames (each an over-approximation
-	//     of the reachable states) seed S.
-	//   Phase B: greatest-fixpoint pruning of S: repeatedly remove cubes c
-	//     of (S ∧ !p) whose states cannot stay -- c(s1) ∧ T(s1,s2) ∧
-	//     S(s2) ∧ !p(s2) UNSAT means every c-state must exit S ∧ !p, so no
-	//     !p-cycle can pass through c.  Survivors (states with a successor
-	//     in S ∧ !p) are excluded for the rest of the round via a
-	//     per-round activation literal; rounds repeat until a full scan
-	//     adds no clause (then S ∧ !p = S*).
-	//   Phase C: SAT(Init ∧ !p ∧ S*) -- SAT gives the initial state of an
-	//     infinite !p-path (disproof), UNSAT proves F p.
-	// Returns 0 proved, 1 disproved (depth 0).  With cex_file non-empty, a
-	// disproof additionally exports the lasso witness (see export_lasso).
+	//     trivially; otherwise the gfp below decides on this solver.
+	//   Phase B: greatest-fixpoint pruning of S, seeded from top: repeatedly
+	//     remove cubes c of (S ∧ !p) whose states cannot stay -- c(s1) ∧
+	//     T(s1,s2) ∧ S(s2) ∧ !p(s2) UNSAT means every c-state must exit
+	//     S ∧ !p, so no !p-cycle can pass through c.  Survivors (states
+	//     with a successor in S ∧ !p) are excluded for the rest of the
+	//     round via a per-round activation literal; rounds repeat until a
+	//     full scan adds no clause (then S ∧ !p = S*).  Top is a valid
+	//     seed because the gfp keeps every fair-cycle state from any
+	//     over-approximation (the fixpoint is independent of the seed as
+	//     long as it covers νZ); the Phase A frames must NOT seed it, as
+	//     they hold bad-BLOCKING clauses (cubes of states that reach bad),
+	//     whose negations exclude exactly the lasso states and collapsed
+	//     S ∧ !p to UNSAT, false-proving liveness properties whose bad
+	//     states are first reachable after init (e.g. F p with p true only
+	//     finitely often).
+	//   Phase C: reachability of S* ∧ !p from Init, decided by the safety
+	//     core on a fresh solver (member ∧ EN ∧ ¬A as a temporary $check):
+	//     reachable gives the disproof, unreachable proves F p.
+	// Returns 0 proved, 1 disproved (depth 0), 2 undecided.  With cex_file
+	// non-empty, a disproof additionally exports the lasso witness (see
+	// export_lasso).
 	int prove_liveness(RTLIL::Cell *prop, int &depth, const std::string &cex_file = "")
 	{
 		// A k-induction proof of bad := !p also proves F p; any other
@@ -1062,13 +1075,11 @@ struct Ic3Solver
 			fprintf(stderr, "ic3-live: %s phaseA r=%d depth=%d frames=%zu state=%zu\n",
 					log_id(prop), r, depth, frames.size(), state1.size());
 
-		// Phase B: S seeded with the union of the Phase A frame clauses
+		// Phase B: S seeded from top (see the proof sketch above; the Phase
+		// A frame clauses would poison the gfp)
 		int sf = new_frame();
-		for (int i = 1; i < sf; i++)
-			for (auto &cube : frames[i])
-				add_live_clause(cube, sf);
 		if (trace)
-			fprintf(stderr, "ic3-live: S seeded clauses=%zu\n", frames[sf].size());
+			fprintf(stderr, "ic3-live: S seeded from top, phaseA frames=%zu\n", frames.size());
 
 		std::vector<int> round_lits;
 		if (!state1.empty()) {
@@ -1132,24 +1143,71 @@ struct Ic3Solver
 			}
 		}
 
-		// Phase C: Init ∧ !p ∧ S (round literals pinned so the per-round
-		// survivor exclusions are neutralized)
-		std::vector<int> assumptions;
-		push_assum(assumptions, -init_act);
-		for (int i = 1; i < (int)act.size(); i++)
-			push_assum(assumptions, i == sf ? -act[i] : act[i]);
-		for (int rl : round_lits)
-			push_assum(assumptions, rl);
-		assumptions.push_back(bad1);
-		n_init++;
-		std::vector<bool> s0;
-		bool cex = solve_model(assumptions, state1, s0);
+		// Phase C: is a fair-cycle state REACHABLE from Init?  The
+		// disproof of F p needs a reachable state of S* ∧ !p, not an
+		// initial one: the bad path starts once a fair-cycle state is
+		// entered, so every genuine lasso has a (possibly empty) stem
+		// and requiring Init ∈ S* ∧ !p misses all of them and
+		// false-proves the property (observed: lasso-style violations
+		// reported "proved" while simulation showed the assertion
+		// failing forever).  Membership in S* is the conjunction of the
+		// prune clauses (¬cube) over the state register bits, so
+		// compile reach_bad = member ∧ EN ∧ ¬A into a temporary $check
+		// and let the safety core decide reachability on a fresh
+		// solver (a hand-nested second fixpoint would need an unrolled
+		// reachability encoding this 2-timeframe solver does not
+		// have).  member = top (no prune clauses) covers the constant-
+		// bad case, where Init itself is the witness.  An undecided
+		// reachability result propagates as an undecided liveness
+		// verdict rather than a guess.
+		SigSpec member;
+		for (auto &cube : frames[sf]) {
+			SigSpec clause;
+			for (int i = 0; i < GetSize(cube); i++) {
+				if (!cube[i])
+					continue;
+				// clause = "some bit differs from the cube" (the cube's
+				// match-set is what pruning removed from S)
+				SigSpec lit = cube[i] > 0 ? module->Not(NEW_ID, istate_bits.extract(i, 1))
+						: istate_bits.extract(i, 1);
+				clause = clause.empty() ? lit : module->Or(NEW_ID, clause, lit);
+			}
+			log_assert(!clause.empty());
+			member = member.empty() ? clause : module->And(NEW_ID, member, clause);
+		}
+		if (member.empty())
+			member = SigSpec(State::S1);
+		RTLIL::Cell *rc = module->addCell("$ic3_live_reach", ID($check));
+		rc->setPort(ID(A), module->Or(NEW_ID, module->Not(NEW_ID, member),
+				prop->getPort(ID(A))));
+		rc->setPort(ID(EN), SigSpec(State::S1));
+		rc->setPort(ID(TRG), SigSpec());
+		Ic3Solver reach_solver(module, init_zero, max_frames);
+		reach_solver.assume_cells = assume_cells;
+		reach_solver.kind_max = kind_max;
+		reach_solver.bmc_max = bmc_max;
+		reach_solver.ctg_depth_max = ctg_depth_max;
+		int rdepth = 0;
+		int rr = reach_solver.prove(rc, rdepth);
+		module->remove(rc);
 		if (trace)
-			fprintf(stderr, "ic3-live: phaseC sat=%d\n", cex ? 1 : 0);
-		if (cex) {
+			fprintf(stderr, "ic3-live: phaseC reachability r=%d (depth %d)\n", rr, rdepth);
+		if (rr == 2)
+			return 2;
+		if (rr == 1) {
 			depth = 0;
-			if (!cex_file.empty())
-				export_lasso(cex_file, sf, round_lits, s0);
+			if (!cex_file.empty() && !state1.empty()) {
+				// any S* ∧ !p state seeds the lasso walk; the witness
+				// covers the cycle (the reachability stem from Init is
+				// not part of the export)
+				std::vector<int> assumptions = act_assumptions(sf);
+				for (int rl : round_lits)
+					push_assum(assumptions, rl);
+				assumptions.push_back(bad1);
+				std::vector<bool> s0;
+				if (solve_model(assumptions, state1, s0))
+					export_lasso(cex_file, sf, round_lits, s0);
+			}
 			return 1;
 		}
 		return 0;
@@ -1465,9 +1523,12 @@ struct Ic3Pass : Pass
 			if (result == 0) {
 				log("ic3: %s: proved\n", name.c_str());
 				n_proved++;
-			} else {
+			} else if (result == 1) {
 				log("ic3: %s: disproved (depth %d)\n", name.c_str(), depth);
 				n_disproved++;
+			} else {
+				log("ic3: %s: undecided\n", name.c_str());
+				n_undecided++;
 			}
 
 			if (verbose) {

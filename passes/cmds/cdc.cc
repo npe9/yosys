@@ -21,8 +21,9 @@
 //
 // Infers clock domains from FF clock pins, propagates domain tags through
 // combinatorial logic to a fixpoint, and classifies FF input crossings:
-// two-flop synchronizers (OK), bare bits and buses (ERROR), synchronized
-// buses (WARNING), and asynchronous resets from foreign domains (WARNING).
+// two-flop synchronizers (OK), Gray-coded buses (OK), bare bits and buses
+// (ERROR), synchronized buses (WARNING), and asynchronous resets from
+// foreign domains (WARNING).
 // The design must be process-free: run 'proc' before this pass.
 
 #include "kernel/yosys.h"
@@ -42,6 +43,17 @@ struct CdcFinding {
 	std::string bit;
 	std::string cell;
 	std::string module;
+};
+
+struct Crossing {
+	int dst;
+	std::set<int> srcs;
+	std::string bit;
+	SigBit dbit;	// sigmap'd crossing net: the destination-FF D bit
+	std::string cell;
+	bool synced;
+	Cell *ffcell;
+	int qidx;
 };
 
 struct CdcAnalyzer
@@ -220,14 +232,16 @@ struct CdcAnalyzer
 		}
 	}
 
-	// Follow the synchronizer chain forward from the crossing FF: count
+	// Follow the synchronizer chain forward from the crossing FF: collect
 	// consecutive flip-flops of domain d_ff, each Q bit feeding the next D
-	// bit. A chain of 2 or more stages means the crossing is synchronized.
-	bool is_synchronized(Cell *cell, int qidx, int d_ff)
+	// bit. Returns the chain (crossing FF first, synchronizer tail last);
+	// 2+ entries mean the crossing is synchronized.
+	std::vector<std::pair<Cell *, int>> sync_chain(Cell *cell, int qidx, int d_ff)
 	{
 		std::set<std::pair<Cell *, int>> visited;
+		std::vector<std::pair<Cell *, int>> chain;
 		visited.insert(std::make_pair(cell, qidx));
-		int stages = 1;
+		chain.push_back(std::make_pair(cell, qidx));
 		Cell *cur_cell = cell;
 		int cur_idx = qidx;
 
@@ -274,11 +288,16 @@ struct CdcAnalyzer
 			});
 
 			visited.insert(cands.front());
+			chain.push_back(cands.front());
 			cur_cell = cands.front().first;
 			cur_idx = cands.front().second;
-			stages++;
 		}
-		return stages >= 2;
+		return chain;
+	}
+
+	bool is_synchronized(Cell *cell, int qidx, int d_ff)
+	{
+		return GetSize(sync_chain(cell, qidx, d_ff)) >= 2;
 	}
 
 	// Forward cone of a sync FF's Q bit: every comb cell traversed (into
@@ -319,17 +338,187 @@ struct CdcAnalyzer
 		}
 	}
 
+	// Source side of a Gray-coded bus: every crossing bit must be produced
+	// by a $xor encoder of the shape gray[i] = w[i] ^ w[i+1] over one
+	// common source vector w (matching bin -> bin ^ (bin >> 1)), with the
+	// component bits spanning a contiguous, monotonic run of w and only
+	// the last bit's neighbor constant (gray[MSB] = w[MSB] ^ 0).  The
+	// encoder is located on the crossing D bit itself; a registered
+	// encoder output is hopped across before checking.  Component bits
+	// arrive ordered by (ffcell, qidx).
+	bool gray_encoder(const std::vector<Crossing> &comp)
+	{
+		int n = GetSize(comp);
+		std::vector<std::vector<std::pair<SigBit, SigBit>>> opts(n);
+		for (int k = 0; k < n; k++) {
+			SigBit dbit = comp[k].dbit;
+			Cell *x = nullptr;
+			for (int hop = 0; hop < 4; hop++) {
+				auto dit = drivers.find(dbit);
+				if (dit == drivers.end())
+					return false;
+				x = dit->second.first;
+				if (!x->is_builtin_ff())
+					break;
+				FfData ff(nullptr, x);
+				SigSpec q = sigmap(ff.sig_q), d = sigmap(ff.sig_d);
+				int idx = -1;
+				for (int i = 0; i < GetSize(q); i++)
+					if (q[i] == dbit) {
+						idx = i;
+						break;
+					}
+				if (idx < 0 || idx >= GetSize(d))
+					return false;
+				dbit = sigmap(d[idx]);
+			}
+			if (x == nullptr || x->type != ID($xor))
+				return false;
+			SigSpec y = sigmap(x->getPort(ID::Y));
+			SigSpec a = sigmap(x->getPort(ID::A));
+			SigSpec b = sigmap(x->getPort(ID::B));
+			int yidx = -1;
+			for (int i = 0; i < GetSize(y); i++)
+				if (y[i] == dbit) {
+					yidx = i;
+					break;
+				}
+			if (yidx < 0 || yidx >= GetSize(a) || yidx >= GetSize(b))
+				return false;
+			SigBit in[2] = {a[yidx], b[yidx]};
+			for (int swap = 0; swap < 2; swap++) {
+				SigBit cur = in[swap], nxt = in[swap ^ 1];
+				if (cur.wire == nullptr)
+					continue;
+				if (nxt.wire != nullptr) {
+					if (nxt.wire != cur.wire)
+						continue;
+					int dn = nxt.offset - cur.offset;
+					if (dn != 1 && dn != -1)
+						continue;
+				} else if (k != n - 1) {
+					continue;
+				}
+				opts[k].push_back(std::make_pair(cur, nxt));
+			}
+			if (opts[k].empty())
+				return false;
+		}
+		// Pick one orientation per bit so adjacent bits share the w
+		// neighbor: gray[i+1]'s w bit must be gray[i]'s nxt bit, with the
+		// offsets stepping one way through a single wire.
+		std::function<bool(int, Wire *, int, int, SigBit)> dfs = [&](int k, Wire *w, int prev_off, int step, SigBit prev_nxt) {
+			if (k == n)
+				return true;
+			for (auto &opt : opts[k]) {
+				SigBit cur = opt.first, nxt = opt.second;
+				if (w != nullptr && cur.wire != w)
+					continue;
+				if (k > 0) {
+					if (cur != prev_nxt)
+						continue;
+					int d = cur.offset - prev_off;
+					if (d != 1 && d != -1)
+						continue;
+					if (step != 0 && d != step)
+						continue;
+					if (step == 0)
+						step = d;
+				}
+				if (dfs(k + 1, w != nullptr ? w : cur.wire, cur.offset, step, nxt))
+					return true;
+			}
+			return false;
+		};
+		return dfs(0, nullptr, 0, 0, SigBit());
+	}
+
+	// Destination side of a Gray-coded bus: the synchronizer tail Q bits
+	// must feed a prefix-XOR decoder chain -- n synced bits reconverge in
+	// exactly n-1 shared $xor cells, the chain head taking two fresh
+	// synced Q bits and every further cell the running prefix (the previous
+	// cell's Y) plus one fresh synced Q bit, consuming all n synced Q bits
+	// exactly once.  A parity tree also has n-1 cells but its inner nodes
+	// take two prefixes, and an $eq compare is not $xor at all, so neither
+	// upgrades.  The chain is searched in the union of the bits' forward
+	// cones (a prefix chain's head is unreachable from the low bits, so a
+	// plain cone intersection can never contain it).
+	bool gray_decoder(const std::vector<Crossing> &comp)
+	{
+		int n = GetSize(comp);
+		std::vector<SigBit> qbits(n);
+		pool<Cell *> xorpool;
+		for (int k = 0; k < n; k++) {
+			auto chain = sync_chain(comp[k].ffcell, comp[k].qidx, comp[k].dst);
+			if (GetSize(chain) < 2)
+				return false;
+			Cell *tail = chain.back().first;
+			FfData ff(nullptr, tail);
+			if (chain.back().second < 0 || chain.back().second >= GetSize(ff.sig_q))
+				return false;
+			qbits[k] = sigmap(ff.sig_q[chain.back().second]);
+			pool<Cell *> comb, sinks;
+			q_cone(tail, chain.back().second, comb, sinks);
+			for (Cell *c : comb)
+				if (c->type == ID($xor))
+					xorpool.insert(c);
+		}
+		if (xorpool.empty())
+			return false;
+		dict<SigBit, int> qidx;
+		for (int k = 0; k < n; k++)
+			qidx[qbits[k]] = k;
+		struct Cand {
+			SigBit y, p, q;
+		};
+		std::vector<Cand> cands;
+		for (Cell *c : xorpool) {
+			SigSpec y = sigmap(c->getPort(ID::Y));
+			SigSpec a = sigmap(c->getPort(ID::A));
+			SigSpec b = sigmap(c->getPort(ID::B));
+			for (int i = 0; i < GetSize(y) && i < GetSize(a) && i < GetSize(b); i++) {
+				if (a[i] == b[i])
+					continue;
+				cands.push_back({y[i], a[i], b[i]});
+			}
+		}
+		long nodes = 0;
+		std::function<bool(SigBit, std::vector<char> &, int)> dfs = [&](SigBit prefy, std::vector<char> &used, int depth) {
+			if (++nodes > 100000)
+				return false;
+			if (depth == n - 1)
+				return true;
+			for (auto &cd : cands) {
+				int qi = -1;
+				if (cd.p == prefy && qidx.count(cd.q))
+					qi = qidx[cd.q];
+				else if (cd.q == prefy && qidx.count(cd.p))
+					qi = qidx[cd.p];
+				else
+					continue;
+				if (used[qi])
+					continue;
+				used[qi] = 1;
+				if (dfs(cd.y, used, depth + 1))
+					return true;
+				used[qi] = 0;
+			}
+			return false;
+		};
+		for (auto &cd : cands) {
+			if (!qidx.count(cd.p) || !qidx.count(cd.q))
+				continue;
+			std::vector<char> used(n, 0);
+			used[qidx[cd.p]] = 1;
+			used[qidx[cd.q]] = 1;
+			if (dfs(cd.y, used, 1))
+				return true;
+		}
+		return false;
+	}
+
 	void find_crossings()
 	{
-		struct Crossing {
-			int dst;
-			std::set<int> srcs;
-			std::string bit;
-			std::string cell;
-			bool synced;
-			Cell *ffcell;
-			int qidx;
-		};
 		std::vector<Crossing> crossings;
 
 		for (auto cell : module->cells()) {
@@ -352,7 +541,7 @@ struct CdcAnalyzer
 							foreign.insert(d);
 					if (foreign.empty())
 						continue;
-					crossings.push_back({d_ff, foreign, bit_name(dsig[i]), cname,
+					crossings.push_back({d_ff, foreign, bit_name(dsig[i]), dsig[i], cname,
 							is_synchronized(cell, i, d_ff), cell, i});
 				}
 			}
@@ -367,7 +556,7 @@ struct CdcAnalyzer
 						foreign.insert(d);
 				if (foreign.empty())
 					return;
-				crossings.push_back({d_ff, foreign, bit_name(bit) + tag, cname, false});
+				crossings.push_back({d_ff, foreign, bit_name(bit) + tag, bit, cname, false});
 			};
 			if (ff.has_ce)
 				check_control(ff.sig_ce, " (ce)");
@@ -406,8 +595,8 @@ struct CdcAnalyzer
 				// shares no comb cell and no sink FF with its group
 				// siblings is an independent synchronizer, not part of a
 				// bus -- promote it to OK.  Bits whose cones merge stay a
-				// synced-bus WARNING (Gray/decoder recognition would
-				// further upgrade a true Gray bus; not done yet).
+				// synced-bus WARNING unless the component structurally is
+				// a Gray-coded bus, which upgrades to OK gray-bus.
 				int n = GetSize(g.second);
 				std::vector<int> parent(n);
 				for (int i = 0; i < n; i++)
@@ -435,15 +624,41 @@ struct CdcAnalyzer
 					for (int b = a + 1; b < n; b++)
 						if (share(a, b))
 							parent[find(a)] = find(b);
-				std::map<int, int> comp_size;
+				std::map<int, std::vector<int>> comps;
 				for (int a = 0; a < n; a++)
-					comp_size[find(a)]++;
+					comps[find(a)].push_back(a);
+				// Gray recognition applies only to merged components; a
+				// recognized Gray bus needs the bin->gray $xor encoder on
+				// the source side and the prefix-XOR decoder chain on the
+				// destination side.  EQ-compare Gray recognition
+				// (local-Gray vs synced-Gray $eq cross-check, as in FIFO
+				// full/empty pointers) is the next increment.
+				std::map<int, bool> comp_gray;
+				for (auto &it : comps) {
+					if (GetSize(it.second) < 2)
+						continue;
+					std::vector<Crossing> comp;
+					for (int a : it.second)
+						comp.push_back(crossings[g.second[a]]);
+					std::sort(comp.begin(), comp.end(), [](const Crossing &x, const Crossing &y) {
+						if (x.ffcell->name != y.ffcell->name)
+							return x.ffcell->name < y.ffcell->name;
+						return x.qidx < y.qidx;
+					});
+					comp_gray[it.first] = gray_encoder(comp) && gray_decoder(comp);
+				}
 				for (int a = 0; a < n; a++) {
 					Crossing &c = crossings[g.second[a]];
-					bool lone = comp_size[find(a)] == 1;
-					findings.push_back({lone ? "OK" : "WARNING",
-							lone ? "synchronizer-2ff" : "synced-bus",
-							join_domains(c.srcs), domain_names[c.dst], c.bit, c.cell});
+					bool lone = GetSize(comps[find(a)]) == 1;
+					std::string sev = "WARNING", cls = "synced-bus";
+					if (lone) {
+						sev = "OK";
+						cls = "synchronizer-2ff";
+					} else if (comp_gray[find(a)]) {
+						sev = "OK";
+						cls = "gray-bus";
+					}
+					findings.push_back({sev, cls, join_domains(c.srcs), domain_names[c.dst], c.bit, c.cell});
 				}
 				continue;
 			}
@@ -525,6 +740,10 @@ struct CdcPass : public Pass {
 		log("\n");
 		log("  - synchronizer-2ff   (OK)      crossing followed by a 2+ stage chain of\n");
 		log("                                 same-domain flip-flops (Q feeding next D)\n");
+		log("  - gray-bus           (OK)      synced bus whose bits are Gray-coded:\n");
+		log("                                 bin->gray $xor encoder in the source\n");
+		log("                                 domain, prefix-XOR decoder chain over all\n");
+		log("                                 synced bits in the destination domain\n");
 		log("  - unsynchronized-bit (ERROR)   single-bit crossing without a synchronizer\n");
 		log("  - synced-bus         (WARNING) all bits of a multi-bit crossing use 2+\n");
 		log("                                 stage synchronizers; check Gray coding or\n");

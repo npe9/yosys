@@ -16,17 +16,22 @@
 //   -----------------+-------------------------------------------------------
 //   cdc_sync_2ff     | 1x OK       synchronizer-2ff    (clk_a -> clk_b)
 //   cdc_bare         | 1x ERROR    unsynchronized-bit  (clk_a -> clk_b)
-//   cdc_gray_bus     | 4x WARNING  synced-bus          (clk_a -> clk_b, 4 bits)
+//   cdc_gray_bus     | 4x OK       gray-bus            (clk_a -> clk_b, 4 bits)
 //   cdc_reset        | 2x WARNING  reset-cdc           (external port + foreign domain)
 //   cdc_async_fifo   | 8x WARNING  synced-bus          (two 4-bit gray pointers)
 //                    | 1x OK       synchronizer-2ff    (flag, clk_a -> clk_b)
 //
 // Note: findings group by (dst domain, src domain set); a multi-bit
 // group of synced crossings then splits by reconvergence (shared comb
-// cell or sink FF in the forward cone).  The FIFO pointers reconverge
-// at the full/empty compares and the gray-bus bits at the decoder XOR
-// chain, so they stay synced-bus; the flush flag's cone is disjoint and
-// promotes to OK.  Structural Gray-bus recognition is still open.
+// cell or sink FF in the forward cone).  The gray-bus bits upgrade to
+// OK: they match the canonical Gray structure -- a bin->gray $xor
+// encoder (gray[i] = w[i] ^ w[i+1] over one common vector) in the
+// source domain and a prefix-XOR decoder chain over all synced bits in
+// the destination domain.  The FIFO pointers reconverge at the
+// full/empty EQ compares rather than a decoder chain, so they stay
+// synced-bus; the flush flag's cone is disjoint and promotes to OK.
+// EQ-compare Gray recognition (local-Gray vs synced-Gray $eq
+// cross-check) is still open.
 //
 // Note: cdc_reset also contains an async-reset FF whose reset comes from a
 // top-level input port; both reset-cdc sub-cases (external port, foreign
@@ -76,7 +81,7 @@ endmodule
 // ---------------------------------------------------------------------------
 // (c) 4-bit Gray counter crossing with per-bit two-flop sync and a Gray
 //     decoder on the far side.
-//     Expect: 4 WARNING (synced-bus) -- one line per crossing bit.
+//     Expect: 4 OK (gray-bus) -- one line per crossing bit.
 // ---------------------------------------------------------------------------
 module cdc_gray_bus (
     input  logic clk_a,

@@ -10,7 +10,7 @@ pass intentionally changes).
 Expected findings (one table line per crossing bit, plus reset findings):
   cdc_sync_2ff   | 1x OK       synchronizer-2ff    (clk_a -> clk_b)
   cdc_bare       | 1x ERROR    unsynchronized-bit  (clk_a -> clk_b)
-  cdc_gray_bus   | 4x WARNING  synced-bus          (clk_a -> clk_b, 4 bits)
+  cdc_gray_bus   | 4x OK       gray-bus            (clk_a -> clk_b, 4 bits)
   cdc_reset      | 2x WARNING  reset-cdc           (external port + foreign domain)
   cdc_async_fifo | 8x WARNING  synced-bus          (two 4-bit gray pointers)
                    | 1x OK       synchronizer-2ff    (flag, clk_a -> clk_b)
@@ -31,14 +31,17 @@ CASES = os.path.join(REPO, "tests", "verilog", "cdc_cases.sv")
 # (dst domain, src domain set); a multi-bit group of synced crossings
 # then splits by reconvergence: bits whose forward cones merge (shared
 # comb cell or sink FF, e.g. the FIFO pointers' EQ compares or the Gray
-# decoder XOR chain) stay synced-bus WARNING, while a bit whose cone is
-# disjoint from its group siblings is promoted to OK synchronizer-2ff
-# (the async FIFO's flush flag).  Gray/decoder structural recognition
-# (upgrading a true Gray bus to OK) is still open.
+# decoder XOR chain) form a bus, while a bit whose cone is disjoint from
+# its group siblings is promoted to OK synchronizer-2ff (the async FIFO's
+# flush flag).  A merged bus upgrades to OK gray-bus when it matches the
+# canonical Gray structure -- bin->gray $xor encoder on the source side
+# and a prefix-XOR decoder chain over all synced bits on the destination
+# side; the FIFO pointers reconverge at $eq compares instead, so they
+# stay synced-bus WARNING.  EQ-compare Gray recognition is still open.
 EXPECTED = {
     ("cdc_sync_2ff", "OK", "synchronizer-2ff"): 1,
     ("cdc_bare", "ERROR", "unsynchronized-bit"): 1,
-    ("cdc_gray_bus", "WARNING", "synced-bus"): 4,
+    ("cdc_gray_bus", "OK", "gray-bus"): 4,
     ("cdc_reset", "WARNING", "reset-cdc"): 2,
     ("cdc_async_fifo", "WARNING", "synced-bus"): 8,
     ("cdc_async_fifo", "OK", "synchronizer-2ff"): 1,

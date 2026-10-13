@@ -180,6 +180,11 @@ struct Ic3Solver
 	// k-induction depth tried before the IC3 loop (0 = disabled)
 	int kind_max;
 
+	// a cex export was requested: disproofs may not be decided by a
+	// throwaway pre-pass solver (the exporter needs this solver's state
+	// vector), so prove() falls through to the main loop
+	bool want_cex = false;
+
 	// bounded reachability depth tried before everything else (0 = off);
 	// finds deep counterexamples (t7-class CEXes near the ctr-wrap
 	// boundary) in d cheap solves instead of d IC3 frames
@@ -665,7 +670,8 @@ struct Ic3Solver
 		auto t0 = std::chrono::steady_clock::now();
 		encode(prop);
 		t_encode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-		fprintf(stderr, "ic3-debug: proving %s clauses=%d vars=%d states=%d t_encode=%.3fs\n", log_id(prop), ez.numCnfClauses(), ez.numCnfVariables(), GetSize(state1), t_encode);
+		if (getenv("IC3_DEBUG"))
+			fprintf(stderr, "ic3-debug: proving %s clauses=%d vars=%d states=%d t_encode=%.3fs\n", log_id(prop), ez.numCnfClauses(), ez.numCnfVariables(), GetSize(state1), t_encode);
 
 		std::vector<bool> model;
 		if (bad_sat(0, 1, model)) {
@@ -748,12 +754,15 @@ struct Ic3Solver
 	// 0 = proved, 1 = disproved (depth set), 2 = undecided (depth set)
 	int prove(RTLIL::Cell *prop, int &depth)
 	{
+		// A disproof decided by a throwaway pre-pass solver leaves this
+		// solver unencoded, and the cex exporter needs its state vector:
+		// fall through to the main loop when a witness is requested.
 		int r = bmc_prepass(prop, depth);
 		if (r != 2)
-			return r;
+			return r == 1 && want_cex ? prove_core(prop, depth) : r;
 		r = kind_prepass(prop, depth);
 		if (r != 2)
-			return r;
+			return r == 1 && want_cex ? prove_core(prop, depth) : r;
 		return prove_core(prop, depth);
 	}
 
@@ -1464,6 +1473,7 @@ struct Ic3Pass : Pass
 			solver.kind_max = kind_max;
 			solver.bmc_max = bmc_max;
 			solver.ctg_depth_max = ctg_depth_max;
+			solver.want_cex = !cex_prefix.empty();
 
 			int depth = 0;
 			int result = solver.prove(cell, depth);

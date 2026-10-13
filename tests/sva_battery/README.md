@@ -77,6 +77,29 @@ Deep counterexamples that would need one IC3 frame per step (t7's
 ctr-wrap CEXes at depth 256/259) are found in <depth> cheap unrolled
 solves instead; a miss falls through to k-induction and IC3 as usual.
 
+## Counterexample minimization
+
+`min_cex.py` delta-debugs an `ic3 -cex` safety witness (.yw): it replays
+the witness through the battery prep (same pipeline as run_ic3.py plus
+`setundef -init -zero`, with the PREP-EXTRA-* pragmas honored; the prepped
+RTLIL is written once to a temp dir and every trial replays via
+`yosys -p "read_rtlil prep.il; sim -r trial.yw -summary sum.json"`),
+then greedily clears data-input bits of the steps up to the fired step k
+and truncates the suffix, keeping a change iff the SAME assertion still
+fires at the SAME step k:
+
+    python3 min_cex.py <file>.sv <prefix><prop>.yw [--top TOP] [--jobs 4] [-o OUT.yw]
+
+Output defaults to `<prefix><prop>.min.yw`. The target assertion is the
+rarest-firing path in the replay summary (a collateral constant-false
+property, e.g. tconst1's p1, fires at every step and is not chased);
+prefix steps are never removed -- indices would shift and step k would
+no longer mean the same cycle. `--clock` is accepted but unused: the yw
+header carries the clock and `sim -r` rejects `-clock`. Note: `ic3`'s
+default k-induction pre-pass disproves on a throwaway solver, so cex
+export currently requires `-kind 0` (and a design with registers -- a
+purely combinational disproof has no state vector to export).
+
 ## Known edges (fail by design, do not "fix" without a plan entry)
 
 - `t30a.sv` — unsupported syntax (aborts in the parser).

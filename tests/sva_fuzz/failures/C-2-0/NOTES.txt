@@ -1,0 +1,2 @@
+sim leg yosys ERROR (attempt 1)
+signature: sva2check: unsupported sequence operator 'and' in $auto$genrtlil.cc:2614:genRTLIL$18.

@@ -281,6 +281,44 @@ struct CdcAnalyzer
 		return stages >= 2;
 	}
 
+	// Forward cone of a sync FF's Q bit: every comb cell traversed (into
+	// `comb`) and every FF reached as a sink (any clock domain -- a sink
+	// ends the walk).  Two synced crossings of one group whose cones share
+	// a comb cell or a sink FF reconverge in the destination domain; a
+	// crossing whose cone shares nothing with its group siblings is an
+	// independent synchronizer even when the group carries a bus.
+	void q_cone(Cell *ff, int qidx, pool<Cell *> &comb, pool<Cell *> &sinks)
+	{
+		FfData ffdata(nullptr, ff);
+		if (qidx < 0 || qidx >= GetSize(ffdata.sig_q))
+			return;
+		pool<SigBit> seen;
+		std::vector<SigBit> work;
+		SigBit start = sigmap(ffdata.sig_q[qidx]);
+		seen.insert(start);
+		work.push_back(start);
+		while (!work.empty()) {
+			SigBit bit = work.back();
+			work.pop_back();
+			auto cit = consumers.find(bit);
+			if (cit == consumers.end())
+				continue;
+			for (Cell *c : cit->second) {
+				if (c->is_builtin_ff()) {
+					sinks.insert(c);
+					continue;
+				}
+				if (!comb.insert(c).second)
+					continue;
+				for (auto &conn : c->connections())
+					if (c->output(conn.first))
+						for (auto obit : sigmap(conn.second))
+							if (obit.wire && seen.insert(obit).second)
+								work.push_back(obit);
+			}
+		}
+	}
+
 	void find_crossings()
 	{
 		struct Crossing {
@@ -289,6 +327,8 @@ struct CdcAnalyzer
 			std::string bit;
 			std::string cell;
 			bool synced;
+			Cell *ffcell;
+			int qidx;
 		};
 		std::vector<Crossing> crossings;
 
@@ -313,7 +353,7 @@ struct CdcAnalyzer
 					if (foreign.empty())
 						continue;
 					crossings.push_back({d_ff, foreign, bit_name(dsig[i]), cname,
-							is_synchronized(cell, i, d_ff)});
+							is_synchronized(cell, i, d_ff), cell, i});
 				}
 			}
 
@@ -361,17 +401,58 @@ struct CdcAnalyzer
 					all_synced = false;
 					break;
 				}
+			if (g.second.size() > 1 && all_synced) {
+				// Reconvergence split: a synced crossing whose forward cone
+				// shares no comb cell and no sink FF with its group
+				// siblings is an independent synchronizer, not part of a
+				// bus -- promote it to OK.  Bits whose cones merge stay a
+				// synced-bus WARNING (Gray/decoder recognition would
+				// further upgrade a true Gray bus; not done yet).
+				int n = GetSize(g.second);
+				std::vector<int> parent(n);
+				for (int i = 0; i < n; i++)
+					parent[i] = i;
+				std::function<int(int)> find = [&](int x) {
+					while (parent[x] != x) {
+						parent[x] = parent[parent[x]];
+						x = parent[x];
+					}
+					return x;
+				};
+				std::vector<pool<Cell *>> comb(n), sinks(n);
+				for (int a = 0; a < n; a++)
+					q_cone(crossings[g.second[a]].ffcell, crossings[g.second[a]].qidx, comb[a], sinks[a]);
+				auto share = [&](int a, int b) {
+					for (Cell *c : comb[a])
+						if (comb[b].count(c))
+							return true;
+					for (Cell *c : sinks[a])
+						if (sinks[b].count(c))
+							return true;
+					return false;
+				};
+				for (int a = 0; a < n; a++)
+					for (int b = a + 1; b < n; b++)
+						if (share(a, b))
+							parent[find(a)] = find(b);
+				std::map<int, int> comp_size;
+				for (int a = 0; a < n; a++)
+					comp_size[find(a)]++;
+				for (int a = 0; a < n; a++) {
+					Crossing &c = crossings[g.second[a]];
+					bool lone = comp_size[find(a)] == 1;
+					findings.push_back({lone ? "OK" : "WARNING",
+							lone ? "synchronizer-2ff" : "synced-bus",
+							join_domains(c.srcs), domain_names[c.dst], c.bit, c.cell});
+				}
+				continue;
+			}
 			for (int i : g.second) {
 				Crossing &c = crossings[i];
 				std::string sev, cls;
 				if (g.second.size() > 1) {
-					if (all_synced) {
-						sev = "WARNING";
-						cls = "synced-bus";
-					} else {
-						sev = "ERROR";
-						cls = "unsynchronized-bus";
-					}
+					sev = "ERROR";
+					cls = "unsynchronized-bus";
 				} else {
 					if (c.synced) {
 						sev = "OK";

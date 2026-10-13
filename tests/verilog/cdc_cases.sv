@@ -18,13 +18,15 @@
 //   cdc_bare         | 1x ERROR    unsynchronized-bit  (clk_a -> clk_b)
 //   cdc_gray_bus     | 4x WARNING  synced-bus          (clk_a -> clk_b, 4 bits)
 //   cdc_reset        | 2x WARNING  reset-cdc           (external port + foreign domain)
-//   cdc_async_fifo   | 9x WARNING  synced-bus          (two 4-bit gray pointers + flag)
+//   cdc_async_fifo   | 8x WARNING  synced-bus          (two 4-bit gray pointers)
+//                    | 1x OK       synchronizer-2ff    (flag, clk_a -> clk_b)
 //
-// Note: findings group by (dst domain, src domain set); the FIFO flag's
-// 2FF chain shares its clk_a -> clk_b group with the write-gray pointer,
-// so it reports as synced-bus, not synchronizer-2ff (per-structure group
-// splitting is a planned refinement; tests/sva_battery/run_cdc.py pins
-// the current table).
+// Note: findings group by (dst domain, src domain set); a multi-bit
+// group of synced crossings then splits by reconvergence (shared comb
+// cell or sink FF in the forward cone).  The FIFO pointers reconverge
+// at the full/empty compares and the gray-bus bits at the decoder XOR
+// chain, so they stay synced-bus; the flush flag's cone is disjoint and
+// promotes to OK.  Structural Gray-bus recognition is still open.
 //
 // Note: cdc_reset also contains an async-reset FF whose reset comes from a
 // top-level input port; both reset-cdc sub-cases (external port, foreign

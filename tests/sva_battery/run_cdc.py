@@ -27,19 +27,21 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 YOSYS = os.environ.get("YOSYS", os.path.join(REPO, "build", "yosys"))
 CASES = os.path.join(REPO, "tests", "verilog", "cdc_cases.sv")
 
-# (module, severity, class) -> expected count.  NOTE: findings are
-# grouped by (dst domain, src domain set) and any multi-bit group of
-# synced crossings reports as one synced-bus WARNING per bit -- the
-# async FIFO's flag shares its clk_a -> clk_b group with the write-gray
-# pointer, so it reports as synced-bus, not synchronizer-2ff.  Finer
-# per-structure splitting (2ff chains / Gray+decoder groups) is a Layer B
-# refinement; until then the table pins the coarse behavior.
+# (module, severity, class) -> expected count.  Findings group by
+# (dst domain, src domain set); a multi-bit group of synced crossings
+# then splits by reconvergence: bits whose forward cones merge (shared
+# comb cell or sink FF, e.g. the FIFO pointers' EQ compares or the Gray
+# decoder XOR chain) stay synced-bus WARNING, while a bit whose cone is
+# disjoint from its group siblings is promoted to OK synchronizer-2ff
+# (the async FIFO's flush flag).  Gray/decoder structural recognition
+# (upgrading a true Gray bus to OK) is still open.
 EXPECTED = {
     ("cdc_sync_2ff", "OK", "synchronizer-2ff"): 1,
     ("cdc_bare", "ERROR", "unsynchronized-bit"): 1,
     ("cdc_gray_bus", "WARNING", "synced-bus"): 4,
     ("cdc_reset", "WARNING", "reset-cdc"): 2,
-    ("cdc_async_fifo", "WARNING", "synced-bus"): 9,
+    ("cdc_async_fifo", "WARNING", "synced-bus"): 8,
+    ("cdc_async_fifo", "OK", "synchronizer-2ff"): 1,
 }
 
 

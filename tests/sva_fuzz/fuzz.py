@@ -453,6 +453,10 @@ def main():
     for r in state["results"]:
         by[r["cls"]] = by.get(r["cls"], 0) + 1
     print("summary: %s" % json.dumps(by, sort_keys=True))
+    # gate semantics: anything but agreement is a failure
+    bad = {k: v for k, v in by.items() if k not in ("agree-quiet", "agree-cex")}
+    if bad:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

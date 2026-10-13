@@ -1775,6 +1775,32 @@ struct SvaCompiler {
 			return mod->And(NEW_ID, a_end, b_end);
 		}
 
+		if (op == "and") {
+			// sequence and: both operands match from the same start
+			// tick; the composite ends at the later of the two end
+			// ticks (LRM 16.7.3-style common-start union -- the same
+			// delayed-end idiom as `within`).  a's end at t completes
+			// the pair iff b matched at or before t (same-tick counts)
+			// and vice versa; a matched end too early for the sibling
+			// never fires because the sibling's end hasn't happened.
+			SigSpec a_end = seq_dispatch(port(0), child(0), start, gate);
+			SigSpec b_end = seq_dispatch(port(1), child(1), start, gate);
+			Cell *ac = child(0), *bc = child(1);
+			int la = ac ? seq_max_len(ac) : 1;
+			int lb = bc ? seq_max_len(bc) : 1;
+			if (la < 0 || la > 64 || lb < 0 || lb > 64)
+				log_error("sva2check: 'and' over an unbounded sequence in %s.\n", log_id(n));
+			// a's end can be t only while t is within la of the start,
+			// so "b matched by t" reaches la ticks back; symmetric.
+			SigSpec a_ever = a_end;
+			for (int j = 1; j <= lb; j++)
+				a_ever = orN({a_ever, delay(a_end, j, "sand")});
+			SigSpec b_ever = b_end;
+			for (int j = 1; j <= la; j++)
+				b_ever = orN({b_ever, delay(b_end, j, "sand")});
+			return orN({andN({a_end, b_ever}), andN({b_end, a_ever})});
+		}
+
 		if (op == "within") {
 			// a within b  ==  (1[*0:$] ##1 a ##1 1[*0:$]) intersect b
 			// (LRM 16.9.10): b matches and a matches some subinterval.
@@ -2695,7 +2721,7 @@ struct SvaCompiler {
 			Cell *b = child(1);
 			return b ? seq_min_len(b) : 1;
 		}
-		if (op == "intersect")
+		if (op == "intersect" || op == "and")
 			return std::max(cmin(0), cmin(1));
 		if (op == "or")
 			return std::min(cmin(0), cmin(1));

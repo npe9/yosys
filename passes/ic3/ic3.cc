@@ -753,91 +753,276 @@ struct Ic3Solver
 		return prove_core(prop, depth);
 	}
 
-	// Write a Yosys witness (.yw) for a safety disproof at `depth`: walk
-	// init -> s_1 -> ... -> s_depth (bad) through the shared encoding,
-	// recording the input valuation at each step.  Mirrors smtbmc's yw
-	// (input signals per step, LSB at the highest string index); the
-	// replay design re-derives register states itself, so it must be
-	// prepped EXACTLY like the ic3 run (same setundef -init -zero when
-	// -init-zero was used).
-	void export_cex(const std::string &file, int depth)
-	{
-		if (state1.empty()) {
-			log_warning("ic3: cex export needs a state vector; skipped.\n");
-			return;
-		}
-		std::vector<Wire *> inports;
+	// Witness I/O bookkeeping shared by the safety and liveness exporters:
+	// which toplevel input ports carry data (recorded per step) and which
+	// ones are flip-flop clocks.  sim -r regenerates clock waveforms from
+	// the yw "clocks" header and only consumes per-step bits for the
+	// remaining (data) inputs; a clock left in the data section would sit
+	// at its arbitrary model value forever and never produce an edge --
+	// the replayed trace stays at the initial state (observed on t10).
+	struct WitnessIo {
+		std::vector<Wire*> inports;
 		std::vector<int> inwidth;
 		std::vector<std::vector<int>> inlit;
+		std::vector<Wire*> clkports;
+		std::vector<int> clkoff;
+		std::vector<std::string> clkedge;
 		size_t total_bits = 0;
-		for (auto w : module->wires())
-			if (w->port_input) {
-				inports.push_back(w);
-				inlit.push_back(satgen.importSigSpec(w, 1));
-				inwidth.push_back(GetSize(inlit.back()));
-				total_bits += inwidth.back();
-			}
-		// model vector: state2 (successor state) then all input bits
-		std::vector<int> mvec = state2;
-		for (auto &l : inlit)
-			mvec.insert(mvec.end(), l.begin(), l.end());
+	};
 
-		std::vector<std::string> steps;
-		std::vector<int> curcube(state1.size(), 0);
-		int nsteps = std::max(depth, 1);
-		for (int i = 0; i < nsteps; i++) {
-			std::vector<int> assumptions;
-			if (i == 0)
-				push_assum(assumptions, -init_act);
-			else
-				push_cube(assumptions, curcube, state1);
-			std::vector<bool> model;
-			if (!solve_model(assumptions, mvec, model)) {
-				log_error("ic3: cex replay walk broke at step %d -- internal error.\n", i);
-				return;
+	// split toplevel inputs into data ports and clocks; clock candidates
+	// are netlist bits feeding the CLK pin of flip-flops, and only when
+	// every consumer agrees on polarity (the yw format has one edge per
+	// clock bit, so a mixed-polarity bit stays a data input)
+	void collect_witness_io(WitnessIo &wio)
+	{
+		dict<RTLIL::SigBit, int> clkpol;
+		for (auto cell : module->cells()) {
+			if (!cell->is_builtin_ff() || !cell->hasPort(ID::CLK))
+				continue;
+			int pol = cell->getParam(ID::CLK_POLARITY).as_bool() ? 1 : -1;
+			for (auto bit : sigmap(cell->getPort(ID::CLK))) {
+				auto it = clkpol.find(bit);
+				if (it == clkpol.end())
+					clkpol[bit] = pol;
+				else if (it->second != pol)
+					it->second = 0;
 			}
-			std::string bits(total_bits, '0');
-			size_t off = 0;
-			for (size_t p = 0; p < inports.size(); p++) {
-				for (int b = 0; b < inwidth[p]; b++) {
-					if (model[GetSize(state2) + off + b])
-						bits[total_bits - 1 - (off + b)] = '1';
+		}
+		for (auto w : module->wires()) {
+			if (!w->port_input)
+				continue;
+			int nclk = 0;
+			for (auto bit : sigmap(w))
+				if (clkpol.count(bit) && clkpol.at(bit) != 0)
+					nclk++;
+			if (nclk == GetSize(w)) {
+				int off = 0;
+				for (auto bit : sigmap(w)) {
+					wio.clkports.push_back(w);
+					wio.clkoff.push_back(off++);
+					wio.clkedge.push_back(clkpol.at(bit) > 0 ? "posedge" : "negedge");
 				}
-				off += inwidth[p];
+				continue;
 			}
-			steps.push_back(bits);
-			for (int j = 0; j < GetSize(state1); j++)
-				curcube[j] = model[j] ? state1[j] : -state1[j];
+			wio.inports.push_back(w);
+			wio.inlit.push_back(satgen.importSigSpec(w, 1));
+			wio.inwidth.push_back(GetSize(wio.inlit.back()));
+			wio.total_bits += wio.inwidth.back();
 		}
-		// the final state must violate the property
-		{
-			std::vector<int> assumptions;
-			push_cube(assumptions, curcube, state1);
-			assumptions.push_back(bad1);
-			if (!solve_assum(assumptions))
-				log_warning("ic3: cex final state does not satisfy bad -- depth mismatch?\n");
-		}
+	}
 
+	// pack the input section of a model vector into a yw step bit string;
+	// the inputs start at in_base (the state part comes first, see the
+	// exporters).  LSB at the highest string index, mirroring smtbmc.
+	std::string pack_input_bits(const WitnessIo &wio, const std::vector<bool> &model, size_t in_base)
+	{
+		std::string bits(wio.total_bits, '0');
+		size_t off = 0;
+		for (size_t p = 0; p < wio.inports.size(); p++) {
+			for (int b = 0; b < wio.inwidth[p]; b++) {
+				if (model[in_base + off + b])
+					bits[wio.total_bits - 1 - (off + b)] = '1';
+			}
+			off += wio.inwidth[p];
+		}
+		return bits;
+	}
+
+	// write the witness file: yw header (format/generator, clocks, data
+	// signals) followed by the linear steps.  The yw format has no
+	// standard lasso marker -- smtbmc --dump-yw writes linear steps only
+	// and detects loops out of band -- so a lasso goes into a
+	// non-standard "lasso" key holding the step the cycle repeats from;
+	// both readers in the tree (kernel/yw.cc for sim -r and
+	// backends/smt2/ywio.py) parse known keys only and ignore it.
+	void write_yw(const std::string &file, const WitnessIo &wio, const std::vector<std::string> &steps, int lasso)
+	{
 		FILE *f = fopen(file.c_str(), "w");
 		if (!f) {
 			log_error("ic3: cannot open %s for writing.\n", file.c_str());
 			return;
 		}
-		fprintf(f, "{\n  \"format\": \"Yosys Witness Trace\",\n  \"generator\": \"yosys-ic3\",\n  \"clocks\": [],\n  \"signals\": [\n");
-		for (size_t p = 0; p < inports.size(); p++) {
+		fprintf(f, "{\n  \"format\": \"Yosys Witness Trace\",\n  \"generator\": \"yosys-ic3\",\n");
+		if (lasso >= 0)
+			fprintf(f, "  \"lasso\": %d,\n", lasso);
+		if (wio.clkports.empty()) {
+			fprintf(f, "  \"clocks\": [],\n");
+		} else {
+			fprintf(f, "  \"clocks\": [\n");
+			for (size_t c = 0; c < wio.clkports.size(); c++) {
+				std::string esc;
+				for (char ch : wio.clkports[c]->name.str())
+					esc += ch == '\\' ? "\\\\" : std::string(1, ch);
+				fprintf(f, "    {\"path\": [\"%s\"], \"edge\": \"%s\", \"offset\": %d}%s\n",
+						esc.c_str(), wio.clkedge[c].c_str(), wio.clkoff[c],
+						c + 1 == wio.clkports.size() ? "" : ",");
+			}
+			fprintf(f, "  ],\n");
+		}
+		fprintf(f, "  \"signals\": [\n");
+		for (size_t p = 0; p < wio.inports.size(); p++) {
 			std::string esc;
-			for (char ch : inports[p]->name.str())
+			for (char ch : wio.inports[p]->name.str())
 				esc += ch == '\\' ? "\\\\" : std::string(1, ch);
 			fprintf(f, "    {\"path\": [\"%s\"], \"width\": %d, \"offset\": 0, \"init_only\": false}%s\n",
-					esc.c_str(), inwidth[p], p + 1 == inports.size() ? "" : ",");
+					esc.c_str(), wio.inwidth[p], p + 1 == wio.inports.size() ? "" : ",");
 		}
 		fprintf(f, "  ],\n  \"steps\": [\n");
 		for (size_t i = 0; i < steps.size(); i++)
 			fprintf(f, "    {\"bits\": \"%s\"}%s\n", steps[i].c_str(), i + 1 == steps.size() ? "" : ",");
 		fprintf(f, "  ]\n}\n");
 		fclose(f);
+	}
+
+	// Write a Yosys witness (.yw) for a safety disproof at `depth`: walk
+	// init -> s_1 -> ... -> s_depth (bad) through the shared encoding,
+	// recording the input valuation at each step, then append the
+	// valuation under which s_depth violates the property -- sim -r
+	// displays the last recorded valuation at the failing slot, so an
+	// input that only steers T into the bad state is not enough.  Mirrors
+	// smtbmc's yw (input signals per step, LSB at the highest string
+	// index); the replay design re-derives register states itself, so it
+	// must be prepped EXACTLY like the ic3 run (same setundef -init -zero
+	// when -init-zero was used).
+	void export_cex(const std::string &file, int depth)
+	{
+		if (state1.empty()) {
+			log_warning("ic3: cex export needs a state vector; skipped.\n");
+			return;
+		}
+		WitnessIo wio;
+		collect_witness_io(wio);
+		// model vector: state2 (successor state) then all data input bits
+		std::vector<int> mvec = state2;
+		for (auto &l : wio.inlit)
+			mvec.insert(mvec.end(), l.begin(), l.end());
+
+		std::vector<std::string> steps;
+		std::vector<int> curcube(state1.size(), 0);
+		if (depth == 0) {
+			// bad already at the initial state: record the initial cube
+			std::vector<int> assumptions;
+			push_assum(assumptions, -init_act);
+			std::vector<bool> model;
+			if (!solve_model(assumptions, state1, model)) {
+				log_error("ic3: cex replay walk broke at the initial state -- internal error.\n");
+				return;
+			}
+			for (int j = 0; j < GetSize(state1); j++)
+				curcube[j] = model[j] ? state1[j] : -state1[j];
+		} else {
+			for (int i = 0; i < depth; i++) {
+				std::vector<int> assumptions;
+				if (i == 0)
+					push_assum(assumptions, -init_act);
+				else
+					push_cube(assumptions, curcube, state1);
+				std::vector<bool> model;
+				if (!solve_model(assumptions, mvec, model)) {
+					log_error("ic3: cex replay walk broke at step %d -- internal error.\n", i);
+					return;
+				}
+				steps.push_back(pack_input_bits(wio, model, GetSize(state2)));
+				for (int j = 0; j < GetSize(state1); j++)
+					curcube[j] = model[j] ? state1[j] : -state1[j];
+			}
+		}
+		// closing step: the input valuation under which the final state
+		// violates the property (bad1 pairs it with the state, exactly the
+		// pair sim displays at the failing slot)
+		{
+			std::vector<int> assumptions;
+			push_cube(assumptions, curcube, state1);
+			assumptions.push_back(bad1);
+			std::vector<int> invec;
+			for (auto &l : wio.inlit)
+				invec.insert(invec.end(), l.begin(), l.end());
+			std::vector<bool> model;
+			if (solve_model(assumptions, invec, model))
+				steps.push_back(pack_input_bits(wio, model, 0));
+			else
+				log_warning("ic3: cex final state does not satisfy bad -- depth mismatch?\n");
+		}
+
+		write_yw(file, wio, steps, -1);
 		log("ic3: counterexample witness written to %s (%d steps)\n", file.c_str(), GetSize(steps));
-		log("ic3: replay: same prep, then `sim -r %s -vcd trace.vcd -n %d`\n", file.c_str(), GetSize(steps));
+		log("ic3: replay: same prep, then `sim -r %s -vcd trace.vcd` (assertion fires at the last step)\n", file.c_str());
+	}
+
+	// Write a Yosys witness (.yw) for a liveness disproof: s_0 (the Phase
+	// C initial state, model passed in) followed by successors inside the
+	// gfp survivor set until a state repeats at step k; the steps 0..end
+	// are a linear stem-plus-cycle trace (s_end -> s_k closes the loop).
+	// Each walk step reuses the Phase B consecution shape exactly:
+	// act_assumptions(sf) asserts the prune clauses over state1, the
+	// state2 twin clauses hang off -live2_act, and the round literals are
+	// pinned like in Phase C so the per-round survivor exclusions are
+	// neutralized.  bad1 pairs this step's recorded inputs with the
+	// current state -- precisely the (state, input) pair sim displays at
+	// the corresponding slot -- and bad2 mirrors the consecution query's
+	// successor-side !p.  The fixpoint guarantees every reached state has
+	// such a successor, so the walk cannot break; it ends when the state
+	// bit string recurs (finite state space) or at a step cap, in which
+	// case the witness is a partial stem without a "lasso" marker.
+	void export_lasso(const std::string &file, int sf, const std::vector<int> &round_lits, const std::vector<bool> &s0)
+	{
+		WitnessIo wio;
+		collect_witness_io(wio);
+		// model vector: state2 (successor state) then all data input bits
+		std::vector<int> mvec = state2;
+		for (auto &l : wio.inlit)
+			mvec.insert(mvec.end(), l.begin(), l.end());
+
+		auto state_bits = [](const std::vector<bool> &m, int n) {
+			std::string s(n, '0');
+			for (int i = 0; i < n; i++)
+				if (m[i])
+					s[i] = '1';
+			return s;
+		};
+
+		std::vector<int> curcube(state1.size());
+		for (int i = 0; i < GetSize(state1); i++)
+			curcube[i] = s0[i] ? state1[i] : -state1[i];
+		std::map<std::string, int> seen;
+		seen[state_bits(s0, GetSize(state1))] = 0;
+
+		std::vector<std::string> steps;
+		int loop_start = -1;
+		int cap = 4 * GetSize(state1) + 64;
+		for (int i = 0; i < cap; i++) {
+			std::vector<int> assumptions = act_assumptions(sf);
+			for (int rl : round_lits)
+				push_assum(assumptions, rl);
+			push_assum(assumptions, -live2_act);
+			push_cube(assumptions, curcube, state1);
+			assumptions.push_back(bad1);
+			assumptions.push_back(bad2);
+			std::vector<bool> model;
+			if (!solve_model(assumptions, mvec, model))
+				log_error("ic3: lasso walk broke at step %d -- internal error.\n", i);
+			steps.push_back(pack_input_bits(wio, model, GetSize(state2)));
+			std::string succ = state_bits(model, GetSize(state2));
+			for (int j = 0; j < GetSize(state1); j++)
+				curcube[j] = model[j] ? state1[j] : -state1[j];
+			auto it = seen.find(succ);
+			if (it != seen.end()) {
+				loop_start = it->second;
+				break;
+			}
+			seen[succ] = i + 1;
+		}
+		if (loop_start < 0)
+			log_warning("ic3: lasso walk hit the step cap (%d) without a recurring state; witness is a partial stem.\n", cap);
+
+		write_yw(file, wio, steps, loop_start);
+		if (loop_start >= 0)
+			log("ic3: lasso witness written to %s (%d steps, cycle repeats from step %d with period %d)\n",
+					file.c_str(), GetSize(steps), loop_start, GetSize(steps) - loop_start);
+		else
+			log("ic3: partial lasso witness written to %s (%d steps, cycle not closed)\n", file.c_str(), GetSize(steps));
+		log("ic3: replay: same prep, then `sim -r %s -vcd trace.vcd -append 1` to watch the cycle close\n", file.c_str());
 	}
 
 	// --- liveness (v1) ----------------------------------------------------
@@ -857,9 +1042,9 @@ struct Ic3Solver
 	//     adds no clause (then S ∧ !p = S*).
 	//   Phase C: SAT(Init ∧ !p ∧ S*) -- SAT gives the initial state of an
 	//     infinite !p-path (disproof), UNSAT proves F p.
-	// Returns 0 proved, 1 disproved (depth 0; minimal lasso witness export
-	// is out of scope in v1).
-	int prove_liveness(RTLIL::Cell *prop, int &depth)
+	// Returns 0 proved, 1 disproved (depth 0).  With cex_file non-empty, a
+	// disproof additionally exports the lasso witness (see export_lasso).
+	int prove_liveness(RTLIL::Cell *prop, int &depth, const std::string &cex_file = "")
 	{
 		// A k-induction proof of bad := !p also proves F p; any other
 		// pre-pass outcome falls through to the IC3 loop on this solver,
@@ -957,11 +1142,14 @@ struct Ic3Solver
 			push_assum(assumptions, rl);
 		assumptions.push_back(bad1);
 		n_init++;
-		bool cex = solve_assum(assumptions);
+		std::vector<bool> s0;
+		bool cex = solve_model(assumptions, state1, s0);
 		if (trace)
 			fprintf(stderr, "ic3-live: phaseC sat=%d\n", cex ? 1 : 0);
 		if (cex) {
 			depth = 0;
+			if (!cex_file.empty())
+				export_lasso(cex_file, sf, round_lits, s0);
 			return 1;
 		}
 		return 0;
@@ -1050,8 +1238,12 @@ struct Ic3Pass : Pass
 		log("With -cex <prefix>, each disproved safety property additionally writes a\n");
 		log("Yosys witness <prefix><property>.yw of the counterexample (input\n");
 		log("valuations per step; replay with the SAME prep and\n");
-		log("`sim -r <file>.yw -vcd trace.vcd`). Liveness disproofs do not export\n");
-		log("witnesses in v1.\n");
+		log("`sim -r <file>.yw -vcd trace.vcd`). Disproved liveness properties\n");
+		log("write a lasso witness: stem followed by one traversal of the\n");
+		log("violating cycle, with the loop-start step recorded in a\n");
+		log("non-standard \"lasso\" header field and printed in the log (sim -r\n");
+		log("ignores the field; pass -append to extend the replay past the\n");
+		log("closing step).\n");
 		log("\n");
 		log("    -top <name>\n");
 		log("        module to process (default: top module)\n");
@@ -1083,9 +1275,9 @@ struct Ic3Pass : Pass
 		log("        obligations on easy properties)\n");
 		log("\n");
 		log("    -cex <prefix>\n");
-		log("        write a Yosys witness (.yw) per disproved safety property;\n");
-		log("        replay with the same prep and\n");
-		log("        `sim -r <prefix><property>.yw -vcd trace.vcd`\n");
+		log("        write a Yosys witness (.yw) per disproved property (safety:\n");
+		log("        counterexample; liveness: lasso); replay with the same prep\n");
+		log("        and `sim -r <prefix><property>.yw -vcd trace.vcd`\n");
 		log("\n");
 		log("    -v\n");
 		log("        print per-property solve statistics\n");
@@ -1258,8 +1450,17 @@ struct Ic3Pass : Pass
 			solver.bmc_max = bmc_max;
 			solver.ctg_depth_max = ctg_depth_max;
 
+			std::string cex_file;
+			if (!cex_prefix.empty()) {
+				std::string safe = name;
+				for (auto &ch : safe)
+					if (!isalnum((unsigned char)ch) && ch != '_' && ch != '-')
+						ch = '_';
+				cex_file = stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str());
+			}
+
 			int depth = 0;
-			int result = solver.prove_liveness(cell, depth);
+			int result = solver.prove_liveness(cell, depth, cex_file);
 
 			if (result == 0) {
 				log("ic3: %s: proved\n", name.c_str());

@@ -42,7 +42,9 @@ expression proves the engine honors the assumption).
 - `xlive*.sv` — liveness (`s_eventually` of a plain expression), handled
   by ic3's native two-phase gfp engine, not by BMC (`run_bmc.py` does not
   support liveness). Expectations are `// PROVED` / `// DIS` with no `@N`
-  (v1 disproofs report depth 0; lasso-witness export is out of scope).
+  (disproofs report depth 0; with `-cex <prefix>` a disproof additionally
+  writes a lasso witness `<prefix><name>.yw`, replayable with the same
+  prep plus `setundef -init -zero` via `sim -r <file>.yw -vcd trace.vcd`).
   Read the verdict lines manually -- files with a `DIS` expectation exit
   nonzero from `run_ic3.py` by design.
 - `tmcloc1.sv` — multiclock local-variable scoreboard (8-bit data,

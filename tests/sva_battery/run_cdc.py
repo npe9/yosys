@@ -12,8 +12,11 @@ Expected findings (one table line per crossing bit, plus reset findings):
   cdc_bare       | 1x ERROR    unsynchronized-bit  (clk_a -> clk_b)
   cdc_gray_bus   | 4x OK       gray-bus            (clk_a -> clk_b, 4 bits)
   cdc_reset      | 2x WARNING  reset-cdc           (external port + foreign domain)
-  cdc_async_fifo | 8x WARNING  synced-bus          (two 4-bit gray pointers)
+  cdc_async_fifo | 8x OK       gray-bus            (two 4-bit gray pointers,
+                   |                                full/empty EQ compares)
                    | 1x OK       synchronizer-2ff    (flag, clk_a -> clk_b)
+  cdc_eq_bin     | 4x WARNING  synced-bus          (4-bit binary pointer,
+                   |                                EQ compare is not Gray)
 """
 
 import json
@@ -35,16 +38,18 @@ CASES = os.path.join(REPO, "tests", "verilog", "cdc_cases.sv")
 # its group siblings is promoted to OK synchronizer-2ff (the async FIFO's
 # flush flag).  A merged bus upgrades to OK gray-bus when it matches the
 # canonical Gray structure -- bin->gray $xor encoder on the source side
-# and a prefix-XOR decoder chain over all synced bits on the destination
-# side; the FIFO pointers reconverge at $eq compares instead, so they
-# stay synced-bus WARNING.  EQ-compare Gray recognition is still open.
+# and, on the destination side, either a prefix-XOR decoder chain over
+# all synced bits or an $eq compare against a local Gray-coded vector
+# (FIFO full/empty style); cdc_eq_bin's local side is binary, so it stays
+# synced-bus WARNING.
 EXPECTED = {
     ("cdc_sync_2ff", "OK", "synchronizer-2ff"): 1,
     ("cdc_bare", "ERROR", "unsynchronized-bit"): 1,
     ("cdc_gray_bus", "OK", "gray-bus"): 4,
     ("cdc_reset", "WARNING", "reset-cdc"): 2,
-    ("cdc_async_fifo", "WARNING", "synced-bus"): 8,
+    ("cdc_async_fifo", "OK", "gray-bus"): 8,
     ("cdc_async_fifo", "OK", "synchronizer-2ff"): 1,
+    ("cdc_eq_bin", "WARNING", "synced-bus"): 4,
 }
 
 

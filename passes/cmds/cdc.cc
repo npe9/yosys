@@ -338,20 +338,23 @@ struct CdcAnalyzer
 		}
 	}
 
-	// Source side of a Gray-coded bus: every crossing bit must be produced
-	// by a $xor encoder of the shape gray[i] = w[i] ^ w[i+1] over one
-	// common source vector w (matching bin -> bin ^ (bin >> 1)), with the
-	// component bits spanning a contiguous, monotonic run of w and only
-	// the last bit's neighbor constant (gray[MSB] = w[MSB] ^ 0).  The
-	// encoder is located on the crossing D bit itself; a registered
-	// encoder output is hopped across before checking.  Component bits
-	// arrive ordered by (ffcell, qidx).
-	bool gray_encoder(const std::vector<Crossing> &comp)
+	// Source side of a Gray-coded bus: every seed bit must be produced by a
+	// $xor encoder of the shape gray[i] = w[i] ^ w[i+1] over one common
+	// source vector w (matching bin -> bin ^ (bin >> 1)), with the bits
+	// spanning a contiguous, monotonic run of w and only the last bit's
+	// neighbor constant (gray[MSB] = w[MSB] ^ 0).  The encoder is located
+	// on the seed bit itself; a registered encoder output is hopped across
+	// before checking.  Seeds are the crossing D bits (ordered by (ffcell,
+	// qidx)) for the crossing case and the $eq operand bits for the
+	// EQ-compare case.  When `dom` >= 0, every flip-flop hopped through on
+	// the way back to the encoder $xor must belong to clock domain `dom`,
+	// so a foreign/source-domain vector is never accepted as local Gray.
+	bool gray_encoder(const std::vector<SigBit> &dbits, int dom)
 	{
-		int n = GetSize(comp);
+		int n = GetSize(dbits);
 		std::vector<std::vector<std::pair<SigBit, SigBit>>> opts(n);
 		for (int k = 0; k < n; k++) {
-			SigBit dbit = comp[k].dbit;
+			SigBit dbit = dbits[k];
 			Cell *x = nullptr;
 			for (int hop = 0; hop < 4; hop++) {
 				auto dit = drivers.find(dbit);
@@ -360,6 +363,8 @@ struct CdcAnalyzer
 				x = dit->second.first;
 				if (!x->is_builtin_ff())
 					break;
+				if (dom >= 0 && ff_domain(x) != dom)
+					return false;
 				FfData ff(nullptr, x);
 				SigSpec q = sigmap(ff.sig_q), d = sigmap(ff.sig_d);
 				int idx = -1;
@@ -407,7 +412,10 @@ struct CdcAnalyzer
 		// Pick one orientation per bit so adjacent bits share the w
 		// neighbor: gray[i+1]'s w bit must be gray[i]'s nxt bit, with the
 		// offsets stepping one way through a single wire.
+		long nodes = 0;
 		std::function<bool(int, Wire *, int, int, SigBit)> dfs = [&](int k, Wire *w, int prev_off, int step, SigBit prev_nxt) {
+			if (++nodes > 100000)
+				return false;
 			if (k == n)
 				return true;
 			for (auto &opt : opts[k]) {
@@ -431,6 +439,14 @@ struct CdcAnalyzer
 			return false;
 		};
 		return dfs(0, nullptr, 0, 0, SigBit());
+	}
+
+	bool gray_encoder(const std::vector<Crossing> &comp)
+	{
+		std::vector<SigBit> dbits;
+		for (auto &c : comp)
+			dbits.push_back(c.dbit);
+		return gray_encoder(dbits, -1);
 	}
 
 	// Destination side of a Gray-coded bus: the synchronizer tail Q bits
@@ -513,6 +529,109 @@ struct CdcAnalyzer
 			used[qidx[cd.q]] = 1;
 			if (dfs(cd.y, used, 1))
 				return true;
+		}
+		return false;
+	}
+
+	// EQ-compare Gray recognition (async FIFO full/empty style): the synced
+	// tail Q bits of the component reconverge at a $eq cell against a local
+	// Gray-coded vector.  One operand, bit by bit, must resolve through a
+	// bounded chain of single-bit inverters ($not, or $xor with a constant
+	// 1 -- so per-bit polarity such as FIFO full-flag inversion is allowed)
+	// to exactly the set of synced tail Q bits, each used once; the other
+	// operand must pass the Gray-encoder shape test with every hopped
+	// flip-flop in the component's destination domain.  A binary (non-Gray)
+	// local vector fails the shape test, and a foreign/source-domain vector
+	// fails the domain check, so neither upgrades.
+	bool eq_gray_compare(const std::vector<Crossing> &comp)
+	{
+		int n = GetSize(comp);
+		std::vector<SigBit> qbits(n);
+		pool<Cell *> eqpool;
+		for (int k = 0; k < n; k++) {
+			auto chain = sync_chain(comp[k].ffcell, comp[k].qidx, comp[k].dst);
+			if (GetSize(chain) < 2)
+				return false;
+			Cell *tail = chain.back().first;
+			FfData ff(nullptr, tail);
+			if (chain.back().second < 0 || chain.back().second >= GetSize(ff.sig_q))
+				return false;
+			qbits[k] = sigmap(ff.sig_q[chain.back().second]);
+			pool<Cell *> comb, sinks;
+			q_cone(tail, chain.back().second, comb, sinks);
+			for (Cell *c : comb)
+				if (c->type == ID($eq))
+					eqpool.insert(c);
+		}
+		if (eqpool.empty())
+			return false;
+		dict<SigBit, int> qidx;
+		for (int k = 0; k < n; k++)
+			qidx[qbits[k]] = k;
+
+		// Resolve one synced-side operand bit back through up to 4 hops of
+		// single-bit inverters to a synced tail Q bit; returns its component
+		// index or -1.  A direct (uninverted) tail Q bit resolves in 0 hops.
+		auto resolve_q = [&](SigBit bit) -> int {
+			for (int hop = 0; hop < 4; hop++) {
+				auto qit = qidx.find(bit);
+				if (qit != qidx.end())
+					return qit->second;
+				auto dit = drivers.find(bit);
+				if (dit == drivers.end())
+					return -1;
+				Cell *x = dit->second.first;
+				int yidx = dit->second.second;
+				SigBit nxt;
+				if (x->type == ID($not)) {
+					SigSpec a = sigmap(x->getPort(ID::A));
+					if (yidx < 0 || yidx >= GetSize(a))
+						return -1;
+					nxt = a[yidx];
+				} else if (x->type == ID($xor)) {
+					SigSpec a = sigmap(x->getPort(ID::A));
+					SigSpec b = sigmap(x->getPort(ID::B));
+					if (yidx < 0 || yidx >= GetSize(a) || yidx >= GetSize(b))
+						return -1;
+					if (a[yidx].wire == nullptr && a[yidx].data == RTLIL::S1)
+						nxt = b[yidx];
+					else if (b[yidx].wire == nullptr && b[yidx].data == RTLIL::S1)
+						nxt = a[yidx];
+					else
+						return -1;
+				} else
+					return -1;
+				bit = sigmap(nxt);
+			}
+			return qidx.count(bit) ? qidx[bit] : -1;
+		};
+
+		for (Cell *eq : eqpool) {
+			SigSpec a = sigmap(eq->getPort(ID::A));
+			SigSpec b = sigmap(eq->getPort(ID::B));
+			if (GetSize(a) != n || GetSize(b) != n)
+				continue;
+			for (int side = 0; side < 2; side++) {
+				SigSpec synced = side ? b : a;
+				SigSpec local = side ? a : b;
+				std::vector<char> used(n, 0);
+				bool sok = true;
+				for (int i = 0; i < n; i++) {
+					int qi = resolve_q(sigmap(synced[i]));
+					if (qi < 0 || used[qi]) {
+						sok = false;
+						break;
+					}
+					used[qi] = 1;
+				}
+				if (!sok)
+					continue;
+				std::vector<SigBit> lbits;
+				for (int i = 0; i < n; i++)
+					lbits.push_back(sigmap(local[i]));
+				if (gray_encoder(lbits, comp[0].dst))
+					return true;
+			}
 		}
 		return false;
 	}
@@ -629,10 +748,10 @@ struct CdcAnalyzer
 					comps[find(a)].push_back(a);
 				// Gray recognition applies only to merged components; a
 				// recognized Gray bus needs the bin->gray $xor encoder on
-				// the source side and the prefix-XOR decoder chain on the
-				// destination side.  EQ-compare Gray recognition
-				// (local-Gray vs synced-Gray $eq cross-check, as in FIFO
-				// full/empty pointers) is the next increment.
+				// the source side and, on the destination side, either the
+				// prefix-XOR decoder chain or an EQ-compare against a local
+				// Gray-coded vector (FIFO full/empty style, possibly with
+				// per-bit polarity on the synced operand).
 				std::map<int, bool> comp_gray;
 				for (auto &it : comps) {
 					if (GetSize(it.second) < 2)
@@ -645,7 +764,7 @@ struct CdcAnalyzer
 							return x.ffcell->name < y.ffcell->name;
 						return x.qidx < y.qidx;
 					});
-					comp_gray[it.first] = gray_encoder(comp) && gray_decoder(comp);
+					comp_gray[it.first] = (gray_encoder(comp) && gray_decoder(comp)) || eq_gray_compare(comp);
 				}
 				for (int a = 0; a < n; a++) {
 					Crossing &c = crossings[g.second[a]];
@@ -742,8 +861,10 @@ struct CdcPass : public Pass {
 		log("                                 same-domain flip-flops (Q feeding next D)\n");
 		log("  - gray-bus           (OK)      synced bus whose bits are Gray-coded:\n");
 		log("                                 bin->gray $xor encoder in the source\n");
-		log("                                 domain, prefix-XOR decoder chain over all\n");
-		log("                                 synced bits in the destination domain\n");
+		log("                                 domain, and in the destination domain either\n");
+		log("                                 a prefix-XOR decoder chain over all synced\n");
+		log("                                 bits or an $eq compare against a local\n");
+		log("                                 Gray-coded vector (FIFO full/empty style)\n");
 		log("  - unsynchronized-bit (ERROR)   single-bit crossing without a synchronizer\n");
 		log("  - synced-bus         (WARNING) all bits of a multi-bit crossing use 2+\n");
 		log("                                 stage synchronizers; check Gray coding or\n");

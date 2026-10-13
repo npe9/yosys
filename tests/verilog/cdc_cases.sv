@@ -1,7 +1,7 @@
 // cases.sv -- test cases for the yosys `cdc` pass (structural CDC analysis)
 //
 // Suggested flow (per module, or run `cdc` with no selection to analyze all
-// five modules in one go):
+// six modules in one go):
 //
 //   read_verilog -sv cases.sv
 //   hierarchy -check
@@ -18,20 +18,25 @@
 //   cdc_bare         | 1x ERROR    unsynchronized-bit  (clk_a -> clk_b)
 //   cdc_gray_bus     | 4x OK       gray-bus            (clk_a -> clk_b, 4 bits)
 //   cdc_reset        | 2x WARNING  reset-cdc           (external port + foreign domain)
-//   cdc_async_fifo   | 8x WARNING  synced-bus          (two 4-bit gray pointers)
+//   cdc_async_fifo   | 8x OK       gray-bus            (two 4-bit gray pointers,
+//                    |                                full/empty EQ compares)
 //                    | 1x OK       synchronizer-2ff    (flag, clk_a -> clk_b)
+//   cdc_eq_bin       | 4x WARNING  synced-bus          (4-bit binary pointer,
+//                    |                                EQ compare is not Gray)
 //
 // Note: findings group by (dst domain, src domain set); a multi-bit
 // group of synced crossings then splits by reconvergence (shared comb
 // cell or sink FF in the forward cone).  The gray-bus bits upgrade to
 // OK: they match the canonical Gray structure -- a bin->gray $xor
 // encoder (gray[i] = w[i] ^ w[i+1] over one common vector) in the
-// source domain and a prefix-XOR decoder chain over all synced bits in
-// the destination domain.  The FIFO pointers reconverge at the
-// full/empty EQ compares rather than a decoder chain, so they stay
-// synced-bus; the flush flag's cone is disjoint and promotes to OK.
-// EQ-compare Gray recognition (local-Gray vs synced-Gray $eq
-// cross-check) is still open.
+// source domain and, in the destination domain, either a prefix-XOR
+// decoder chain over all synced bits (cdc_gray_bus) or an EQ-compare of
+// the synced bits against a local Gray-coded vector (cdc_async_fifo
+// full/empty pointer checks; per-bit polarity on the synced operand, as
+// in the full flag's inverted top bits, is allowed).  A binary pointer
+// compared the same way (cdc_eq_bin) fails the encoder shape test and
+// stays synced-bus WARNING; the flush flag's cone is disjoint and
+// promotes to OK synchronizer-2ff.
 //
 // Note: cdc_reset also contains an async-reset FF whose reset comes from a
 // top-level input port; both reset-cdc sub-cases (external port, foreign
@@ -142,8 +147,9 @@ endmodule
 // (e) async FIFO: two clock domains, Gray pointers crossing in both
 //     directions (each synchronized with a 2x4-bit two-flop chain), plus one
 //     properly synchronized single-bit flag crossing.
-//     Expect: 8 WARNING (synced-bus: wgray->clk_b 4 bits, rgray->clk_a 4
-//     bits) + 1 OK (synchronizer-2ff for the flag).
+//     Expect: 8 OK (gray-bus: wgray->clk_b 4 bits, rgray->clk_a 4 bits,
+//     recognized via the full/empty EQ compares against the local Gray
+//     pointers) + 1 OK (synchronizer-2ff for the flag).
 // ---------------------------------------------------------------------------
 module cdc_async_fifo (
     input  logic clk_a,
@@ -199,4 +205,32 @@ module cdc_async_fifo (
     always_ff @(posedge clk_a) flush_a <= flush_req_i;
     always_ff @(posedge clk_b) fsync1 <= flush_a;
     always_ff @(posedge clk_b) flush_done <= fsync1;
+endmodule
+
+// ---------------------------------------------------------------------------
+// (f) negative case for EQ-compare Gray recognition: a 4-bit *binary*
+//     pointer synced through 2FF into the other domain and compared with
+//     an $eq, full/empty style, but without Gray coding on the local side.
+//     Expect: 4 WARNING (synced-bus) -- the EQ compare alone does not
+//     upgrade; the local side fails the bin->gray encoder shape test.
+// ---------------------------------------------------------------------------
+module cdc_eq_bin (
+    input  logic clk_a,
+    input  logic clk_b,
+    input  logic inc_a,
+    input  logic inc_b,
+    output logic empty
+);
+    logic [3:0] wbin;           // write pointer, clk_a domain (binary)
+    logic [3:0] rbin;           // read pointer, clk_b domain (binary)
+    logic [3:0] wsync1, wsync2; // wbin synchronized into clk_b
+
+    always_ff @(posedge clk_a) wbin <= wbin + inc_a;
+    always_ff @(posedge clk_b) rbin <= rbin + inc_b;
+
+    always_ff @(posedge clk_b) wsync1 <= wbin;
+    always_ff @(posedge clk_b) wsync2 <= wsync1;
+
+    // reconvergence at an $eq, but the local side is binary, not Gray
+    assign empty = (rbin == wsync2);
 endmodule

@@ -381,8 +381,19 @@ struct SvaCompiler {
 			}
 			rm.push_back(cell);
 		}
-		for (auto cell : rm)
+		for (auto cell : rm) {
+			// the removed cell's Y wires stay valid (lowering
+			// reconnects them), but expr_drv entries pointing at the
+			// removed cell dangle -- a later splice_expr chase (the
+			// throughout/within dyn_gate re-splice is one) would call
+			// getPort on freed memory and abort.  Drop those entries;
+			// the wire then splices as opaque design logic.
+			SigSpec y = cell->getPort(ID(Y));
+			for (auto bit : y)
+				if (bit.is_wire() && expr_drv.count(bit.wire) && expr_drv[bit.wire] == cell)
+					expr_drv.erase(bit.wire);
 			mod->remove(cell);
+		}
 	}
 
 	// LRM 16.14.6 sequence methods: the frontend parses `s5.triggered` /
@@ -2723,7 +2734,12 @@ struct SvaCompiler {
 			if (cc && sva_op(cc) == "bounds") {
 				auto bp = ports_of(cc);
 				if (!const_int(cc->getPort(bp[0]), lo)) return -1;
-				if (GetSize(bp) >= 2 && !const_int(cc->getPort(bp[1]), hi)) return -1;
+				if (GetSize(bp) >= 2) {
+					if (!const_int(cc->getPort(bp[1]), hi)) return -1;
+				} else {
+					// ##[k] == ##k: single-bound bounds cell
+					hi = lo;
+				}
 			} else if (cc) {
 				return -1;
 			} else {
@@ -2743,9 +2759,17 @@ struct SvaCompiler {
 			Cell *b = child(1);
 			if (b && sva_op(b) == "bounds") {
 				auto bp = ports_of(b);
-				int hi;
-				if (GetSize(bp) < 2 || !const_int(b->getPort(bp[1]), hi))
+				int lo, hi;
+				if (GetSize(bp) < 1 || !const_int(b->getPort(bp[0]), lo))
 					return -1;
+				if (GetSize(bp) >= 2) {
+					if (!const_int(b->getPort(bp[1]), hi))
+						return -1;
+				} else {
+					// [*N] exact repetition: the parser carries a
+					// single-bound bounds cell (== [*N:N])
+					hi = lo;
+				}
 				Cell *body = child(0);
 				int bl = body ? seq_max_len(body) : 1;
 				return hi * std::max(bl, 0);
@@ -3052,16 +3076,26 @@ struct Sva2CheckPass : public Pass {
 				// leaves bare `assert property (@(clk) p)` references as
 				// plain identifier wires) advances the instance chain.
 				Cell *clock = nullptr, *disable = nullptr, *body = nullptr;
-				SigSpec body_sig;
+				SigSpec body_sig, body_const;
 				bool bad = false;
 				for (int guard = 0; guard < 64; guard++) {
 					clock = nullptr, disable = nullptr, body = nullptr;
-					body_sig = SigSpec();
+					body_sig = SigSpec(), body_const = SigSpec();
 					bad = false;
 					for (auto port : comp.ports_of(spec)) {
 						SigSpec sp = spec->getPort(port);
-						if (sp.empty() || sp.is_fully_const())
+						if (sp.empty())
 							{ again = false; break; }
+						if (sp.is_fully_const()) {
+							// constant property body (e.g. ... 1'b1): the
+							// violation condition is its complement; a
+							// second const port is malformed
+							if (!body && body_sig.empty() && body_const.empty())
+								body_const = sp;
+							else
+								bad = true;
+							continue;
+						}
 						Cell *drv = comp.child_cell(sp);
 						if (drv) {
 							std::string op = sva_op(drv);
@@ -3101,7 +3135,7 @@ struct Sva2CheckPass : public Pass {
 						break;
 				}
 
-				if (bad || (!body && body_sig.empty())) {
+				if (bad || (!body && body_sig.empty() && body_const.empty())) {
 					unsupported++;
 					log("Skipping %s/%s: malformed spec.\n", log_id(mod), log_id(cell));
 					{ again = false; break; }
@@ -3116,6 +3150,23 @@ struct Sva2CheckPass : public Pass {
 				}
 				comp.clk = clksig[0];
 				comp.clk_pos = clop != "negedge";
+
+				if (!body && body_sig.empty() && !body_const.empty()) {
+					// Constant property body (e.g. assert property
+					// (@(posedge clk) 1'b1)): no temporal compile needed.
+					// $check A carries the "property holds" condition
+					// (assert bad := EN && !A, per the build in ic3 and
+					// write_smt2), so it is the constant itself; EN=1 stays
+					// from the frontend and the spec tree is dropped by the
+					// end-of-pass cleanup once no $check references it.
+					// A disable_iff on such a spec is ignored: conservative
+					// for the true body, and the false body is degenerate.
+					// the frontend pads $sva const ports to 32 bits;
+					// the boolean value is the low bit
+					cell->setPort(ID(A), SigSpec(body_const[0]));
+					converted++;
+					break;
+				}
 				comp.lower_sampled_value_cells(lowered_sv);
 				comp.lower_sequence_methods();
 

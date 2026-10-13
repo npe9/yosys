@@ -1,0 +1,22 @@
+`assert property (@(posedge clk) 1'b1)` -- a property body with no temporal
+operators -- is rejected by sva2check with "Skipping top/p0: malformed
+spec" (Converted 0 $check cells, 1 unsupported), even though the frontend
+already built a correct $check for it.
+
+Consequence: the $check is left driving the frontend's placeholder wire
+(frontends/ast/genrtlil.cc deliberately ties an uncompiled temporal
+property's A port to an undriven wire that reads x, "loud instead of
+passing vacuously"). In sim (-zinit) the x reads as not-1, so the
+constant-TRUE assertion fires at every step (see sum.json: fired at all
+steps 0..11); under the formal prep, setundef -init -zero turns the same
+x into 0 and smtbmc reports a spurious CEX at step 0. Both legs are
+equally wrong, so the differential would call this an "agreement" -- the
+harness detects the unsupported $check first and buckets it as class C.
+
+Fix direction (not applied): sva2check should recognize a $check whose A
+port is not driven by a $sva tree as an already-final combinational check
+and leave it alone (count it as converted, not unsupported), or the
+frontend should drive a constant property's $check directly.
+
+This shape is emitted by the generator's budget-exhausted fallbacks; it is
+fully LRM-legal syntax.

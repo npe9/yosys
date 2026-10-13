@@ -1,0 +1,7 @@
+class D, seed 1 index 231 (bound 12)
+sim leg exit -11, no ERROR line
+
+sim leg:    yosys sim.ys      (sim_leg.log, sum.json)
+formal leg: yosys formal.ys   (formal_leg.log, out.smt2)
+bmc:        yosys-smtbmc -s z3 -t 12 --dump-yw cex.yw -m top out.smt2
+cex replay: yosys replay.ys   (replay.log, sum2.json)

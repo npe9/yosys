@@ -1,0 +1,19 @@
+Minimized crash: any sampled-value function ($rose/$fell/$stable/$past(sig,1))
+as the LHS boolean of `throughout` aborts sva2check with an uncaught
+std::out_of_range (dict::at()); in other positions the same expression
+compiles fine (throughout RHS, plain LHS boolean, no throughout).
+
+Mechanism (passes/sva/sva2check.cc): the throughout case (~line 1686) keeps
+the LHS as a RAW expression in `dyn_gate` instead of splicing it at the
+current compile-time age; gate_now() (~line 463) later re-splices it via
+splice_expr(). A sampled-value function's output wire is created by
+lower_sampled_value_cells() and is not entered in the splicing map that
+splice_expr() consults for non-local wires, so the dict lookup throws.
+Fix direction (not applied): splice the throughout LHS at the start tick
+like any other boolean operand, or teach splice_expr to pass through
+sampled-value cell outputs instead of demanding a map entry.
+
+All five D findings in this batch (seeds 1, indexes 30/143/161/229/231)
+reduce to this same root cause; D-1-231 manifests as SIGSEGV (-11) instead
+of SIGABRT under `always`.
+Reproduce: yosys -p "read_verilog -sv -formal MIN.sv; sva2check; hierarchy -check -top top; proc"

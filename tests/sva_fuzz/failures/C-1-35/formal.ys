@@ -1,0 +1,11 @@
+read_verilog -sv -formal case.sv
+hierarchy -check -top top
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+memory
+opt_clean
+setundef -init -zero
+write_smt2 -wires out.smt2

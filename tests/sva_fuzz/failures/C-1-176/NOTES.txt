@@ -1,0 +1,2 @@
+sim leg sva2check left 1 unsupported $check(s)
+signature: sva2check: 1 of 0 $check cells unsupported (sim leg)

@@ -1,0 +1,81 @@
+{
+  "version": "Yosys sim summary",
+  "generator": "Yosys 0.69+ (git sha1 65deb7bab, Release, AppleClang /usr/bin/c++ 21.0.0.21000334) [github.com/YosysHQ/yosys at sva-frontend-ic3]",
+  "steps": 11,
+  "top": "top",
+  "assertions": [
+    {
+      "step": 0,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 1,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 2,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 3,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 4,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 5,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 6,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 7,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 8,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 9,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 10,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    },
+    {
+      "step": 11,
+      "type": "$check",
+      "path": ["\\p0"],
+      "src": "case.sv:5.3-5.44"
+    }
+  ],
+  "display_output": []
+}

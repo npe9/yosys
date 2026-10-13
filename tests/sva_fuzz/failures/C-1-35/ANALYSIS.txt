@@ -1,0 +1,6 @@
+Sequence-level `and` (e.g. `(a ##1 b) and (c ##1 d)`) is LRM-legal
+(1800-2009 A.2.10) but sva2check rejects it: "unsupported sequence
+operator 'and'". Emitted deliberately at low rate by the generator to
+register the gap; both plain and nested occurrences fail the same way.
+Note the operator IS reachable today only via this error -- there is no
+supported path. Battery t8/t9 avoid it entirely.

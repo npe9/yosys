@@ -1,0 +1,85 @@
+{
+ "format": "Yosys Witness Trace",
+ "generator": "sva-fuzz",
+ "clocks": [
+  {
+   "path": [
+    "\\clk"
+   ],
+   "edge": "posedge",
+   "offset": 0
+  }
+ ],
+ "signals": [
+  {
+   "path": [
+    "\\a"
+   ],
+   "width": 1,
+   "offset": 0,
+   "init_only": false
+  },
+  {
+   "path": [
+    "\\b"
+   ],
+   "width": 1,
+   "offset": 0,
+   "init_only": false
+  },
+  {
+   "path": [
+    "\\c"
+   ],
+   "width": 1,
+   "offset": 0,
+   "init_only": false
+  },
+  {
+   "path": [
+    "\\d"
+   ],
+   "width": 1,
+   "offset": 0,
+   "init_only": false
+  }
+ ],
+ "steps": [
+  {
+   "bits": "1011"
+  },
+  {
+   "bits": "1100"
+  },
+  {
+   "bits": "1101"
+  },
+  {
+   "bits": "0110"
+  },
+  {
+   "bits": "0000"
+  },
+  {
+   "bits": "0100"
+  },
+  {
+   "bits": "0110"
+  },
+  {
+   "bits": "1000"
+  },
+  {
+   "bits": "0111"
+  },
+  {
+   "bits": "1000"
+  },
+  {
+   "bits": "0100"
+  },
+  {
+   "bits": "0011"
+  }
+ ]
+}

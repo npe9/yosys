@@ -49,13 +49,16 @@
 // Rejected with a clear message: any other multi-clock element (mid-sequence
 //   or antecedent `clocked`, `clocked` under throughout/within/first_match,
 //   or_event/bare-identifier clocking events, instance bodies), unbounded
-//   eventually over a temporal operand, s_until over a temporal operand,
-//   local variable assignments, within, matches/streaming.
+//   eventually over a temporal operand, s_until over a temporal p (q may
+//   be a bounded sequence: its per-tick match pulse feeds the weak
+//   monitor and the F twin), local variable assignments, within, matches/
+//   streaming.
 //
-// Strong until v1: p s_until q / s_until_with with p, q plain booleans
-//   splits into the weak-until monitor on the main $check plus an F q
-//   obligation as a second $check named <name>$live with FLAVOR
-//   "liveness"; the ic3 pass proves each leg independently.
+// Strong until v1: p s_until q / s_until_with with p a plain boolean and
+//   q a plain boolean or a bounded sequence splits into the weak-until
+//   monitor on the main $check plus an F q obligation as a second $check
+//   named <name>$live with FLAVOR "liveness"; the ic3 pass proves each
+//   leg independently.
 //
 // Sequences compile to nondeterministic-start transducers shared across
 // attempts: compile_seq(node, start, gate) returns an "ends at this tick"
@@ -1658,8 +1661,13 @@ struct SvaCompiler {
 					return orN({andN({start, gate_now(gate)}), run_end});
 				}
 				if (hi >= 0 && hi <= 8) {
-					// bounded: chain hi copies, tap ends at >= m
-					return rep_chain_end(body_cell, body, start, gate, m, hi);
+					// bounded: chain hi copies, tap ends at >= m; [*0:N]
+					// also matches EMPTY at the start tick (rep_chain_end
+					// taps copies >= 1 only), so add that end explicitly
+					SigSpec r = rep_chain_end(body_cell, body, start, gate, m, hi);
+					if (m == 0)
+						r = orN({r, andN({start, gate_now(gate)})});
+					return r;
 				}
 				// [*m:$]: run of >= m; sub-sequence bodies fall back to the
 				// same run form only for boolean bodies, else bounded split
@@ -3307,21 +3315,35 @@ struct Sva2CheckPass : public Pass {
 					fail = mod->Not(NEW_ID, new_a);
 					liveness = true;
 				} else {
-					// v1.5 strong until: p s_until q == (p until q) && F q
-					// with p, q plain booleans; the weak monitor keeps this
-					// $check, the F q obligation is emitted below as a
-					// "<name>$live" liveness twin (same scheme as the
-					// eventually v1 lowering).  Temporal operands fall
-					// through to prop_dispatch's unsupported-op error.
+					// v1.5 strong until: p s_until q == (p until q) && F q.
+					// The weak monitor keeps this $check, the F q
+					// obligation is emitted below as a "<name>$live"
+					// liveness twin (same scheme as the eventually v1
+					// lowering).  q may be a plain boolean or a bounded
+					// sequence: in both cases "q holds at t" is a 1-bit
+					// wire -- for a sequence, its match pulse attempted
+					// at every tick (the LRM property promotion of a
+					// sequence).  The same wire feeds the weak monitor
+					// and the F twin.  A temporal p would need
+					// per-attempt deadline machinery; it keeps the
+					// unsupported-op error.
 					bool su_with = false;
 					if (body && (sva_op(body) == "s_until" || sva_op(body) == "s_until_with")) {
 						auto bp = comp.ports_of(body);
+						Cell *qc = bp.size() == 2 ? comp.child_cell(body->getPort(bp[1])) : nullptr;
 						if (bp.size() == 2 && !comp.child_cell(body->getPort(bp[0])) &&
-								!comp.child_cell(body->getPort(bp[1]))) {
+								(!qc || (comp.seq_max_len(qc) >= 0 && comp.seq_max_len(qc) <= 64))) {
 							strong_until = true;
 							su_with = sva_op(body) == "s_until_with";
 							su_p = comp.reduce1(comp.resolve(body->getPort(bp[0])));
-							su_q = comp.reduce1(comp.resolve(body->getPort(bp[1])));
+							if (!qc) {
+								su_q = comp.reduce1(comp.resolve(body->getPort(bp[1])));
+							} else {
+								pool<Cell *> seen;
+								if (comp.tree_has_locals(qc, seen))
+									log_error("sva2check: local variables in a s_until operand are not supported in %s.\n", log_id(body));
+								su_q = comp.seq_end(qc, Const(1, 1), Const(1, 1));
+							}
 						}
 					}
 					if (strong_until) {
@@ -3393,7 +3415,12 @@ struct Sva2CheckPass : public Pass {
 					live->connections_ = cell->connections_;
 					live->attributes = cell->attributes;
 					live->setParam(ID(FLAVOR), std::string("liveness"));
-					SigSpec la = disable ? mod->Or(NEW_ID, dsig, su_q) : su_q;
+					// `disable` names the disable cell even for no_disable,
+					// so gate on the flavor, not the pointer (an Or with an
+					// empty dsig port would sit in A otherwise)
+					SigSpec la = su_q;
+					if (dop == "disable_iff")
+						la = mod->Or(NEW_ID, dsig, la);
 					live->setPort(ID(A), la);
 					live->setPort(ID(EN), SigSpec(State::S1));
 					live->attributes[ID(sva2check)] = Const(1, 1);

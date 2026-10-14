@@ -82,6 +82,11 @@ def expectations(path):
 def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
     label = os.path.basename(path)
     exp = expectations(path)
+    if "BMC-SKIP" in open(path).read():
+        # ic3-only features write_smt2 cannot encode ($fair cells today):
+        # the expectation lives in run_battery's ic3 leg
+        print("%s: skipped (BMC-SKIP pragma)" % label)
+        return True
     bound = max([24] + [n + 4 for k, n in exp.values() if n is not None])
     verdicts = {}   # name -> ('cex', step) | ('holds', bound)
     deleted = []

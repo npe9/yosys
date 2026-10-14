@@ -2966,6 +2966,10 @@ struct Sva2CheckPass : public Pass {
 		log("Unbounded eventually/s_eventually of a plain expression lowers to a\n");
 		log("FLAVOR \"liveness\" $check (A = p, EN = 1'b1) for the native ic3\n");
 		log("liveness engine; temporal operands keep the \"bound it\" error.\n");
+		log("The same shape under assume/restrict flavor lowers to a $fair cell\n");
+		log("(a fairness constraint: the predicate must hold infinitely often; ic3\n");
+		log("prunes its liveness gfp to survivor states that can still reach every\n");
+		log("$fair predicate within the set, so only fair !p-cycles disprove).\n");
 		log("a |->/|=> consequent of unbounded (s_)eventually with a plain boolean\n");
 		log("operand lowers the same way through a pending-bit monitor\n");
 		log("(A = !pend || b, bad = pend && !b).\n");
@@ -3270,8 +3274,36 @@ struct Sva2CheckPass : public Pass {
 				SigSpec fail;
 				SigSpec new_a;
 				bool strong_until = false;
+				bool fairness = false;
 				SigSpec su_p, su_q;
-				if (liveness) {
+				if ((flavor == "assume" || flavor == "restrict") && body &&
+						(sva_op(body) == "eventually" || sva_op(body) == "s_eventually")) {
+					// fairness: assume/restrict of an unbounded
+					// (s_)eventually with a plain boolean operand is a
+					// FAIRNESS constraint (the predicate must hold
+					// infinitely often), not a proof obligation; lower to
+					// a $fair cell (the chformal-documented meaning:
+					// assume(s_eventually ...)).  The ic3 liveness engine
+					// prunes its gfp survivor set to states that can still
+					// reach every $fair predicate within the set, so only
+					// fair !p-cycles disprove.  A temporal operand keeps
+					// the "bound it" error (same as the assert flavor).
+					auto bp = comp.ports_of(body);
+					Cell *bcell = bp.empty() ? nullptr : comp.child_cell(body->getPort(bp[0]));
+					if (bcell)
+						log_error("sva2check: unbounded %s with a temporal operand is not supported in %s; bound it.\n",
+								sva_op(body).c_str(), log_id(cell));
+					pool<Cell *> seen;
+					if (comp.tree_has_locals(body, seen))
+						log_error("sva2check: local variables in unbounded %s are not supported in %s.\n",
+								sva_op(body).c_str(), log_id(cell));
+					SigSpec psig = comp.resolve(bp.empty() ? SigSpec() : body->getPort(bp[0]));
+					if (Cell *decl = comp.decl_for_wire(psig))
+						log_error("sva2check: named declaration operand of unbounded %s is not supported in %s.\n",
+								sva_op(body).c_str(), log_id(cell));
+					new_a = comp.reduce1(psig);
+					fairness = true;
+				} else if (liveness) {
 					pool<Cell *> seen;
 					if (comp.tree_has_locals(body, seen))
 						log_error("sva2check: local variables in unbounded %s are not supported in %s.\n",
@@ -3411,6 +3443,14 @@ struct Sva2CheckPass : public Pass {
 				cell->setPort(ID(A), new_a);
 				if (liveness)
 					cell->setParam(ID(FLAVOR), std::string("liveness"));
+				if (fairness) {
+					// become the $fair cell; A/EN were just set, the
+					// $check-only params/ports go away
+					cell->type = ID($fair);
+					cell->parameters.clear();
+					cell->unsetPort(ID(TRG));
+					cell->unsetPort(ID(ARGS));
+				}
 				if (!comp.multiclock) {
 					cell->attributes[ID(CLK)] = Const(clksig[0].wire->name.str());
 					cell->attributes[ID(CLK_POLARITY)] = Const(comp.clk_pos ? 1 : 0, 1);
@@ -3453,7 +3493,9 @@ struct Sva2CheckPass : public Pass {
 					live->attributes[ID(sva2check)] = Const(1, 1);
 				}
 
-				if (expose_bad) {
+				if (expose_bad && !fairness) {
+					// fairness cells carry no bad_ export: the predicate
+					// is an assumption, not a fail condition
 					Wire *bad = mod->addWire("\\" + std::string("bad_") + log_id(cell));
 					bad->port_output = true;
 					mod->connect(bad, fail);

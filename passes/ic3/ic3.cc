@@ -157,6 +157,14 @@ struct Ic3Solver
 
 	std::vector<RTLIL::Cell*> assume_cells;
 
+	// fairness cells ($fair: assume(s_eventually ...), lowered by sva2check
+	// from assume/restrict of unbounded eventually): they seed the cone of
+	// influence in encode() but are NOT permanent constraints (that would
+	// force fair states at every step); prove_liveness imports their A/EN
+	// as fair predicates and prunes the gfp survivor set to states that
+	// can visit each of them infinitely.
+	std::vector<RTLIL::Cell*> fair_cells;
+
 	// state vector: one entry per register bit (t=1 and t=2 literals)
 	std::vector<int> state1, state2;
 	int bad1, bad2;
@@ -267,6 +275,10 @@ struct Ic3Solver
 		seed(prop->getPort(ID::A));
 		seed(prop->getPort(ID::EN));
 		for (auto cell : assume_cells) {
+			seed(cell->getPort(ID::A));
+			seed(cell->getPort(ID::EN));
+		}
+		for (auto cell : fair_cells) {
 			seed(cell->getPort(ID::A));
 			seed(cell->getPort(ID::EN));
 		}
@@ -1048,6 +1060,12 @@ struct Ic3Solver
 	//     S ∧ !p to UNSAT, false-proving liveness properties whose bad
 	//     states are first reachable after init (e.g. F p with p true only
 	//     finitely often).
+	//   Phase B (fairness): with $fair cells in the design the survivor
+	//     set must admit a cycle visiting every fair predicate infinitely:
+	//     per predicate, the attractor of (S ∧ fair_i) within S is grown
+	//     (seed = fair states; closure = states with a successor in the
+	//     set) and S-states outside it are pruned -- the Emerson-Lei fair
+	//     gfp.  Without $fair cells this block is skipped (empty fairv).
 	//   Phase C: reachability of S* ∧ !p from Init, decided by the safety
 	//     core on a fresh solver (member ∧ EN ∧ ¬A as a temporary $check):
 	//     reachable gives the disproof, unreachable proves F p.
@@ -1071,6 +1089,23 @@ struct Ic3Solver
 		if (trace)
 			fprintf(stderr, "ic3-live: %s phaseA r=%d depth=%d frames=%zu state=%zu\n",
 					log_id(prop), r, depth, frames.size(), state1.size());
+
+		// fairness predicates ($fair cells): state predicate "A holds at
+		// this tick" (inputs existential -- a path chooses its inputs, so
+		// "infinitely often" is over input valuations too).  fair_i = A ∧
+		// EN, padded like build_bad but with CONST_TRUE (a missing EN bit
+		// must not vacuously kill the predicate).
+		std::vector<int> fairv;
+		for (auto fc : fair_cells) {
+			std::vector<int> a = satgen.importSigSpec(fc->getPort(ID::A), 1);
+			std::vector<int> en = satgen.importSigSpec(fc->getPort(ID::EN), 1);
+			while (a.size() < en.size()) a.push_back(ez.CONST_TRUE);
+			while (en.size() < a.size()) en.push_back(ez.CONST_TRUE);
+			fairv.push_back(ez.vec_reduce_and(ez.vec_and(a, en)));
+		}
+		if (!fairv.empty())
+			log("ic3: %s: %d fairness constraint(s): disproof requires a fair !p-cycle\n",
+					log_id(prop), GetSize(fairv));
 
 		// Phase B: S seeded from top (see the proof sketch above; the Phase
 		// A frame clauses would poison the gfp)
@@ -1133,6 +1168,155 @@ struct Ic3Solver
 					add_live_clause(has_lit ? gen : csub, sf);
 					pruned_any = true;
 					n_prune++;
+				}
+				// Fair pruning (Emerson-Lei style).  The gfp survivor
+				// set must admit a cycle that visits EVERY fair
+				// predicate infinitely; a state can lie on such a
+				// cycle iff it can stay in S ∧ !p (the consecution
+				// prunes above) and reach (S ∧ !p ∧ fair_i) within S
+				// for every i.  The attractor Attr_i is a growing cube
+				// set -- seeded from fair states, closed under "has a
+				// successor in S ∩ Attr_i" -- and S-states outside it
+				// are pruned.  The outer round loop then re-prunes
+				// against the shrunken S, so the fixpoint is the
+				// standard fair gfp: exactly the states that can stay
+				// in !p while visiting each fair_i infinitely often.
+				for (size_t fi = 0; fi < fairv.size(); fi++) {
+					std::vector<std::vector<int>> attr;
+					std::vector<int> attr_al;   // discovery exclusion lits
+					size_t solves0 = nsolves;
+					auto base_assum = [&]() {
+						std::vector<int> a = act_assumptions(sf);
+						// ALL transient survivor exclusions off: the
+						// attractor ranges over all of S (permanent
+						// prunes only), including states the consecution
+						// loop already examined this round
+						for (int rl : round_lits)
+							push_assum(a, rl);
+						a.push_back(bad1);
+						return a;
+					};
+					// "svec state ∈ Attr" as one expression
+					auto attr_expr = [&](const std::vector<int> &svec) {
+						std::vector<int> disj;
+						for (auto &cube : attr) {
+							std::vector<int> conj;
+							for (int i = 0; i < (int)cube.size(); i++)
+								if (cube[i])
+									conj.push_back(cube[i] > 0 ? svec[i] : ez.NOT(svec[i]));
+							disj.push_back(conj.size() == 1 ? conj[0]
+									: ez.expression(ezSAT::OpAnd, conj));
+						}
+						return disj.empty() ? ez.CONST_FALSE
+								: disj.size() == 1 ? disj[0]
+								: ez.expression(ezSAT::OpOr, disj);
+					};
+					auto add_attr_cube = [&](const std::vector<bool> &model) {
+						std::vector<int> cube(state1.size());
+						for (int i = 0; i < (int)state1.size(); i++)
+							cube[i] = model[i] ? state1[i] : -state1[i];
+						attr.push_back(cube);
+						// unnamed frozen literal: named literals cache by
+						// string in ezSAT, and this name restarts every
+						// round -- a named literal would alias the previous
+						// round's exclusion clauses and over-exclude
+						int al = ez.frozen_literal();
+						attr_al.push_back(al);
+						std::vector<int> cl;
+						for (int i = 0; i < (int)cube.size(); i++)
+							cl.push_back(cube[i] > 0 ? ez.NOT(cube[i]) : -cube[i]);
+						cl.push_back(al);
+						ez.assume(ez.expression(ezSAT::OpOr, cl));
+					};
+					// seed: enumerate S ∧ !p states where a fair visit can
+					// ALSO stay in S ∧ !p (∃ input: fair now and the
+					// successor under that input remains -- a fair tick
+					// that immediately exits !p cannot be part of a fair
+					// !p-cycle)
+					while (1) {
+						std::vector<int> a = base_assum();
+						a.push_back(fairv[fi]);
+						push_assum(a, -live2_act);   // S over state2
+						a.push_back(bad2);           // successor stays ¬p
+						for (int al : attr_al)
+							push_assum(a, -al);
+						std::vector<bool> model;
+						n_bad++;
+						if (!solve_model(a, state1, model))
+							break;
+						add_attr_cube(model);
+					}
+					// closure: states with a successor in S ∩ Attr
+					while (1) {
+						std::vector<int> a = base_assum();
+						for (int al : attr_al)
+							push_assum(a, -al);
+						push_assum(a, -live2_act);   // S over state2
+						a.push_back(attr_expr(state2));
+						std::vector<bool> model;
+						n_bad++;
+						if (!solve_model(a, state1, model))
+							break;
+						add_attr_cube(model);
+					}
+					// prune: S ∧ !p states outside Attr cannot reach
+					// fair_i within S, so no fair cycle passes them
+					while (1) {
+						std::vector<int> a = base_assum();
+						for (int al : attr_al)
+							push_assum(a, al);   // exclusions off
+						a.push_back(ez.NOT(attr_expr(state1)));
+						std::vector<bool> model;
+						n_bad++;
+						if (!solve_model(a, state1, model))
+							break;
+						std::vector<int> csub(state1.size());
+						for (int i = 0; i < (int)state1.size(); i++)
+							csub[i] = model[i] ? state1[i] : -state1[i];
+						// generalize: drop literals while the cube still
+						// misses Attr entirely (cube ∧ Attr UNSAT)
+						std::vector<int> gen = csub;
+						for (int pass = 0; pass < 4; pass++) {
+							bool dropped = false;
+							for (int x = 0; x < (int)gen.size(); x++) {
+								if (!gen[x])
+									continue;
+								int saved = gen[x];
+								gen[x] = 0;
+								std::vector<int> ga;
+								push_cube(ga, gen, state1);
+								ga.push_back(attr_expr(state1));
+								n_gen++;
+								if (solve_assum(ga))
+									gen[x] = saved;
+								else
+									dropped = true;
+							}
+							if (!dropped)
+								break;
+						}
+						bool has_lit = false;
+						for (int lit : gen)
+							if (lit)
+								has_lit = true;
+						if (trace) {
+							std::string bits;
+							for (int i = 0; i < (int)csub.size(); i++)
+								bits += csub[i] ? (csub[i] > 0 ? "1" : "0") : "x";
+							fprintf(stderr, "ic3-live: fair%d: prune cube %s (gen %d lits)\n",
+									(int)fi, bits.c_str(), has_lit ? 1 : 0);
+						}
+						add_live_clause(has_lit ? gen : csub, sf);
+						pruned_any = true;
+						n_prune++;
+					}
+					if (trace)
+						fprintf(stderr, "ic3-live: fair%d: attr=%zu solves+%zu S-clauses=%zu\n",
+								(int)fi, attr.size(), nsolves - solves0, frames[sf].size());
+					if (nsolves - solves0 > 200000) {
+						log_warning("ic3: %s: fairness attractor did not converge after 200k solves -- undecided.\n", log_id(prop));
+						return 2;
+					}
 				}
 				if (trace)
 					fprintf(stderr, "ic3-live: round %d: cand=%d pruned=%d S-clauses=%zu\n",
@@ -1410,11 +1594,16 @@ struct Ic3Pass : Pass
 		std::vector<RTLIL::Cell*> props;
 		std::vector<RTLIL::Cell*> live_props;
 		std::vector<RTLIL::Cell*> assumes;
+		std::vector<RTLIL::Cell*> fairs;
 		for (auto cell : module->cells()) {
 			if (cell->type == ID($assert)) {
 				props.push_back(cell);
 			} else if (cell->type == ID($assume)) {
 				assumes.push_back(cell);
+			} else if (cell->type == ID($fair)) {
+				// assume(s_eventually ...): fairness constraint for the
+				// liveness engine (lowered by sva2check or chformal -fair)
+				fairs.push_back(cell);
 			} else if (cell->type == ID($live)) {
 				// $check FLAVOR "live" cells reach $live form via
 				// chformal -lower (async2sync); same F p semantics
@@ -1458,6 +1647,7 @@ struct Ic3Pass : Pass
 
 			Ic3Solver solver(module, init_zero, max_frames);
 			solver.assume_cells = assumes;
+			solver.fair_cells = fairs;
 			solver.kind_max = kind_max;
 			solver.bmc_max = bmc_max;
 			solver.ctg_depth_max = ctg_depth_max;
@@ -1502,6 +1692,7 @@ struct Ic3Pass : Pass
 
 			Ic3Solver solver(module, init_zero, max_frames);
 			solver.assume_cells = assumes;
+			solver.fair_cells = fairs;
 			solver.kind_max = kind_max;
 			solver.bmc_max = bmc_max;
 			solver.ctg_depth_max = ctg_depth_max;

@@ -107,30 +107,40 @@ class CaseGen:
     def rep(self, atom, allow_eq, no_single=False):
         roll = self.r.random()
         if allow_eq:
-            # Antecedent context: exercise non-contiguous repetition
-            # heavily ([->]/[=] over atoms AND small bounded sequences).
-            # sva2check accepts it anywhere inside an antecedent sequence
-            # (only property/consequent position is rejected, probed).
+            # Antecedent context: exercise repetitions over small bounded
+            # sequences heavily ([*]/[->]/[=] all accept a ## concat body;
+            # sva2check rejects them only in property/consequent position,
+            # probed).  sva2check accepts it anywhere inside an antecedent
+            # sequence.
             if roll < 0.30:
-                return "%s[*%d]" % (atom, self.r.randint(1, 4))
+                return self.star(atom, single=True)
             if roll < 0.55:
-                lo = self.r.randint(1, 3)
-                return "%s[*%d:%d]" % (atom, lo, lo + self.r.randint(1, 4 - lo))
+                return self.star(atom, single=False)
             return self.noncontig(atom)
         if roll < 0.5 and not no_single:
             return "%s[*%d]" % (atom, self.r.randint(1, 4))
         lo = self.r.randint(1, 3)
         return "%s[*%d:%d]" % (atom, lo, lo + self.r.randint(1, 4 - lo))
 
+    def seq_body(self, atom):
+        # small bounded sequence body for repetition operands
+        if self.r.random() < 0.40:
+            return "(%s ##%d %s)" % (self.atom(), self.r.randint(1, 2),
+                                     self.atom())
+        return atom
+
+    def star(self, atom, single):
+        body = self.seq_body(atom)
+        if single:
+            return "%s[*%d]" % (body, self.r.randint(1, 3))
+        lo = self.r.randint(1, 2)
+        return "%s[*%d:%d]" % (body, lo, lo + self.r.randint(1, 3 - lo))
+
     def noncontig(self, atom):
         # [->N]/[=N] and range forms; the operand is usually a plain atom,
         # sometimes a small bounded sequence -- exercises the seq_end-based
         # occurrence-counting lowering (battery tnoncons1).
-        if self.r.random() < 0.40:
-            body = "(%s ##%d %s)" % (self.atom(), self.r.randint(1, 2),
-                                     self.atom())
-        else:
-            body = atom
+        body = self.seq_body(atom)
         op = self.r.choice(["[->", "[=", "[->", "[="])
         if self.r.random() < 0.25:
             lo = self.r.randint(1, 2)

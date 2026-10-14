@@ -1192,6 +1192,10 @@ skip_fine_alu:
 			RTLIL::SigSpec new_a, new_b;
 
 			log_assert(GetSize(a) == GetSize(b));
+			// X-aware: a pair only counts as "definitely equal" when both
+			// bits are constant 0/1 and identical. Identical wire bits may
+			// carry x (x == x is x, not 1), and identical x/z constants are
+			// likewise unknown -- folding `a != a` to 0 is a 2-state-ism.
 			for (int i = 0; i < GetSize(a); i++) {
 				if (a[i].wire == NULL && b[i].wire == NULL && a[i] != b[i] && a[i].data <= RTLIL::State::S1 && b[i].data <= RTLIL::State::S1) {
 					RTLIL::SigSpec new_y = RTLIL::SigSpec(cell->type.in(ID($eq), ID($eqx)) ?  RTLIL::State::S0 : RTLIL::State::S1);
@@ -1199,7 +1203,7 @@ skip_fine_alu:
 					replace_cell(assign_map, module, cell, "isneq", ID::Y, new_y);
 					goto next_cell;
 				}
-				if (a[i] == b[i])
+				if (a[i].wire == NULL && b[i].wire == NULL && a[i] == b[i] && a[i].data <= RTLIL::State::S1)
 					continue;
 				new_a.append(a[i]);
 				new_b.append(b[i]);

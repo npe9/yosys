@@ -523,11 +523,11 @@ def run_case(seed, index, workdir):
     vcdf = os.path.join(workdir, "out.vcd")
     open(svf, "w").write(sv)
     open(ywf, "w").write(stim)
-    # NB: no flatten here, and proc -noopt: opt_expr's same-operand folds
-    # (x^x -> 0, a!=a -> 0, a-a -> 0) are 2-state-isms that destroy
-    # X-pessimism (x^x = x per calc.cc); proc alone normalizes the design
-    # for sim
-    script = ("read_verilog -sv %s; proc -noopt; sim -r %s -vcd %s"
+    # NB: no flatten here. proc runs opt_expr -keepdc, which preserves
+    # X-semantics (same-operand folds like x^x -> 0 are 2-state-isms
+    # gated behind -keepdc / fixed to be x-aware); proc alone normalizes
+    # the design for sim
+    script = ("read_verilog -sv %s; proc; sim -r %s -vcd %s"
               % (svf, ywf, vcdf))
     p = subprocess.run([YOSYS, "-p", script], capture_output=True, text=True,
                        timeout=60)

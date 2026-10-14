@@ -1,0 +1,7 @@
+sim leg yosys ERROR (attempt 1)
+signature: sva2check: unsupported property operator '##' in $auto$genrtlil.cc:2614:genRTLIL$14.
+
+Minimized repro: MIN.sv (nexttime of a bare sequence).  Mechanism
+analysis and a fix sketch: ANALYSIS.txt.  Re-run:
+
+  yosys -p 'read_verilog -sv -formal MIN.sv; sva2check'

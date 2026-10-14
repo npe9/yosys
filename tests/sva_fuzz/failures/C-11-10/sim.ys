@@ -1,0 +1,6 @@
+read_verilog -sv -formal case.sv
+sva2check
+hierarchy -check -top top
+proc
+flatten
+sim -r stim.yw -zinit -summary sum.json

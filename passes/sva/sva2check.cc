@@ -2505,13 +2505,13 @@ struct SvaCompiler {
 					age = age_tick(age);
 				slot_epoch++;
 				pending_wr.clear();
-				SigSpec r = inner ? prop_fail(inner, start_k)
+				SigSpec r = inner ? prop_dispatch(port(idx), inner, start_k)
 				                  : andN({start_k, mod->Not(NEW_ID, reduce1(port(idx)))});
 				age = saved_age;
 				pending_wr = saved_pending;
 				return r;
 			}
-			return inner ? prop_fail(inner, start_k)
+			return inner ? prop_dispatch(port(idx), inner, start_k)
 			             : andN({start_k, mod->Not(NEW_ID, reduce1(port(idx)))});
 		}
 		if (op == "until" || op == "until_with") {

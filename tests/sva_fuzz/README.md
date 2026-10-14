@@ -91,15 +91,21 @@ Deterministic per `(seed, index)`; `fuzz.py` imports it directly.
 - Property alphabet (all probe-verified against this tree; fully
   parenthesized, conservative `property_expr` shapes only):
   - booleans: inputs, `cnt` bits, `1'b0/1'b1`, optionally wrapped in
-    `$rose/$fell/$stable/$past(sig,1)`; `!`, `&&`, `||`, `->`, `<->`
+    `$rose/$fell/$stable/$past(sig,1..2)` and `$stable/$changed` of
+    small parenthesized exprs; `!`, `&&`, `||`, `->`, `<->`
   - sequences: `##N` (1..3), atom `[*N]`/`[*N:M]`/`[=N]` (1..4),
     `or`/`and`/`intersect`/`within`/`throughout`/`first_match`
     (repetitions apply to plain atoms only — `sva2check` rejects
     repetition of general sequences)
   - properties: `|->`, `|=>`, `not`, rare `s_always[N:M]` / `strong` /
-    `weak` (bounded == safety); `if (b) p else q` only as the direct
-    `|->`/`|=>` consequent; implication nesting only parenthesized in a
+    `weak` (bounded == safety); `if (b) p else q` at top level and as
+    the direct `|->`/`|=>` consequent; `case (sel) ... default` with a
+    1-2-bit selector; `nexttime`/`s_nexttime [1..2]` over booleans,
+    implications, and (rare) pinned `ATOM ##N ATOM` sequences;
+    all four abort operators `accept_on`/`reject_on`/`sync_accept_on`/
+    `sync_reject_on`; implication nesting only parenthesized in a
     consequent
+  - optional `disable iff (rst)` on the spec (a free `rst` input)
 - Fully bounded (no `[* ]`/`[= ]`/`[->]` unbounded reps, no `##[N:$]`, no
   `until`/`s_eventually` liveness) so the BMC leg always decides.
 - Depth ≤ 5, node budget 26.

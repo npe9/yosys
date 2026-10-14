@@ -1,0 +1,51 @@
+MECHANISM ANALYSIS -- sva2check rejects nexttime/s_nexttime of a sequence
+
+Repro (see MIN.sv):
+
+    module top(input clk, input a, input b);
+      p0: assert property (@(posedge clk) nexttime (a ##1 b));
+    endmodule
+
+`yosys -p 'read_verilog -sv -formal MIN.sv; sva2check'` ->
+`ERROR: sva2check: unsupported property operator '##' in ...`.
+
+LRM 1800-2009 16.12.3 defines `nexttime property_expr` / `nexttime
+[constant_expression] property_expr`, and a sequence_expr is a
+property_expr, so `nexttime (a ##1 b)` is legal SystemVerilog (likewise
+s_nexttime, any bracket constant, and any sequence operator at the
+operand's top: ##, [*]/[->]/[=], intersect, within, throughout, or,
+first_match -- all surface as their own "unsupported property operator
+'<op>'" signature of the same root cause).
+
+Root cause: passes/sva/sva2check.cc, SvaCompiler::prop_fail(), the
+"nexttime"/"s_nexttime" case (around line 2488).  The lowering peels the
+optional constant bound and then re-dispatches the operand with
+
+    Cell *inner = child(idx);
+    ...
+    SigSpec r = inner ? prop_fail(inner, start_k)
+                      : andN({start_k, mod->Not(NEW_ID, reduce1(port(idx)))});
+
+prop_fail() only understands *property* operators (|->/|=>, if/ifelse,
+case, always, not, accept_on, until, ...); its fall-through is the
+log_error above.  Sequence operands are supposed to reach
+strong_seq_fail() via prop_dispatch(), which is the function that tests
+is_seq_op() and routes "a sequence in property position completes
+strongly".  Because the nexttime case calls prop_fail() directly, a
+sequence operand never takes that route: the child's top sequence
+operator is reported as an "unsupported property operator".  The
+boolean-operand path (inner == nullptr, e.g. `nexttime (a && b)`) and
+property-operand path (`nexttime (a |-> b)`) are unaffected, which is
+why only sequence operands fail.
+
+Fix sketch: mirror the strong/weak cases immediately above (lines
+~2437-2447) and dispatch through prop_dispatch(port(idx), child(idx),
+start_k) -- or equivalently `inner && is_seq_op(sva_op(inner)) ?
+strong_seq_fail(inner, start_k) : prop_fail(...)` -- so sequence
+operands complete strongly at the shifted attempt start.  Note the
+same direct-prop_fail pattern is worth auditing for the other unary
+ wrappers that accept sva_not operands; nexttime is the one the fuzzer
+hits.
+
+Detected by tests/sva_fuzz (seed 11, index 10); the generator emits
+this shape at low rate on purpose (gen.py nexttime()).

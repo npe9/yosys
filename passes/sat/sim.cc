@@ -623,6 +623,13 @@ struct SimInstance
 		if (cell->type == ID($check))
 			return;
 
+		// Uncompiled SVA builtins keep reading x (their documented "loud"
+		// behavior); they are meaningless without sva2check and must not
+		// hard-error the time-0 evaluation sweep.
+		if (cell->type.in(ID($sva), ID($fair), ID($sampled), ID($rose),
+				ID($fell), ID($past), ID($stable), ID($changed)))
+			return;
+
 		if (cell->type.in(ID($finish), ID($stop)))
 			return;
 
@@ -655,6 +662,19 @@ struct SimInstance
 
 			set_state(port.data, data);
 		}
+	}
+
+	// Mark every state bit dirty once so that the next update_ph1() evaluates
+	// every cell with its initial (time-0) state. Without this, a cell whose
+	// inputs are all X at time 0 and never transition is never queued by the
+	// dirty-bit scheduler, and its output stays at the initial Sx instead of
+	// the computed X-cone value (e.g. ~{00xx} = 11xx, not xxxxxx).
+	void mark_all_dirty()
+	{
+		for (auto &it : state_nets)
+			dirty_bits.insert(it.first);
+		for (auto &child : children)
+			child.second->mark_all_dirty();
 	}
 
 	void update_ph1()
@@ -1511,6 +1531,8 @@ struct SimWorker : SimShared
 	void initialize_stable_past()
 	{
 
+		top->mark_all_dirty();
+
 		while (1)
 		{
 			if (debug)
@@ -1561,6 +1583,8 @@ struct SimWorker : SimShared
 		set_inports(clockn, State::Sx);
 
 		top->set_initstate_outputs(initstate ? State::S1 : State::S0);
+
+		top->mark_all_dirty();
 
 		update(false);
 

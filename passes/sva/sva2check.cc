@@ -1675,10 +1675,20 @@ struct SvaCompiler {
 					log_error("sva2check: unbounded repetition of a sequence in %s; bound it to <= 8.\n", log_id(n));
 				return rep_run_end(body_cell, body, start, gate, std::max(m, 1));
 			}
-			// non-contiguous repetitions of a boolean element
-			if (body_cell && sva_op(body_cell) != "true")
-				log_error("sva2check: non-contiguous repetition of a sequence in %s is not supported.\n", log_id(n));
-			SigSpec bsig = andN({reduce1(body), gate_now(gate)});
+			// non-contiguous repetitions of a boolean element or a
+			// bounded sequence: the counter below counts OCCURRENCES.
+			// For a sequence body the occurrence pulse is its match end
+			// with an attempt every tick (overlapping attempts merge,
+			// the documented approximation); a sequence whose own length
+			// is unbounded is rejected by the outer length machinery.
+			SigSpec bsig;
+			if (body_cell && sva_op(body_cell) != "true") {
+				if (tree_uses_locals(body_cell))
+					log_error("sva2check: local variables in a non-contiguous repetition are not supported in %s.\n", log_id(n));
+				bsig = seq_end(body_cell, Const(1, 1), gate);
+			} else {
+				bsig = andN({reduce1(body), gate_now(gate)});
+			}
 			int cap = std::max(m, 1);
 			int w = 1;
 			while ((1 << w) <= cap) w++;
@@ -1695,8 +1705,11 @@ struct SvaCompiler {
 			SigSpec enough = mod->Ge(NEW_ID, cnt, Const(m, w));
 			if (op == "[->]")
 				return andN({bsig, enough});
-			// [=m:n]: ends one or more ticks after the last b
-			SigSpec idle = mod->Not(NEW_ID, reduce1(body));
+			// [=m:n]: ends one or more ticks after the last occurrence;
+			// idle = no occurrence ends at this tick (for a boolean body
+			// bsig == body && gate, and Not(bsig) inside the gated end
+			// formula below coincides with the old Not(body))
+			SigSpec idle = mod->Not(NEW_ID, bsig);
 			SigSpec cnt_d = delay(cnt, 1, "rep_cnt_d");
 			SigSpec enough_d = mod->Ge(NEW_ID, cnt_d, Const(m, w));
 			return andN({idle, gate_now(gate), enough_d});

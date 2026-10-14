@@ -888,17 +888,25 @@ struct Ic3Solver
 		fclose(f);
 	}
 
-	// Write a Yosys witness (.yw) for a safety disproof at `depth`: walk
-	// init -> s_1 -> ... -> s_depth (bad) through the shared encoding,
-	// recording the input valuation at each step, then append the
-	// valuation under which s_depth violates the property -- sim -r
-	// displays the last recorded valuation at the failing slot, so an
-	// input that only steers T into the bad state is not enough.  Mirrors
-	// smtbmc's yw (input signals per step, LSB at the highest string
-	// index); the replay design re-derives register states itself, so it
-	// must be prepped EXACTLY like the ic3 run (same setundef -init -zero
-	// when -init-zero was used).
-	void export_cex(const std::string &file, int depth)
+	// Write a Yosys witness (.yw) for a safety disproof at `depth`
+	// (bad reachable from init in `depth` transitions).  The witness is
+	// re-derived by an EXACT bounded unroll on a throwaway solver, not
+	// walked through the IC3 frames: the frames over-approximate
+	// reachability, so a forward walk through them can end in a state
+	// whose successors are all good -- the old walk then failed its
+	// closing "final state is bad" query and emitted a garbage trace
+	// (tnoncons1: alternating inputs where four consecutive ones are
+	// needed).  The unroll solves
+	//    Init(x_0) && T(x_0,i_0,x_1) && ... && T(x_{d-1},i_{d-1},x_d)
+	//    && bad(x_d, i_d)
+	// exactly; step k of the witness records i_k (k = 0..depth), where
+	// i_0..i_{depth-1} steer init to the bad state and i_depth is the
+	// failing valuation sim displays at the bad-state slot (bad's comb
+	// cone reads inputs).  Mirrors smtbmc's yw (input signals per step,
+	// LSB at the highest string index); the replay design re-derives
+	// register states itself, so it must be prepped EXACTLY like the ic3
+	// run (same setundef -init -zero when -init-zero was used).
+	void export_cex(RTLIL::Cell *prop, const std::string &file, int depth)
 	{
 		if (state1.empty()) {
 			log_warning("ic3: cex export needs a state vector; skipped.\n");
@@ -906,57 +914,37 @@ struct Ic3Solver
 		}
 		WitnessIo wio;
 		collect_witness_io(wio);
-		// model vector: state2 (successor state) then all data input bits
-		std::vector<int> mvec = state2;
-		for (auto &l : wio.inlit)
-			mvec.insert(mvec.end(), l.begin(), l.end());
+
+		// states[1] is the initial state (Q@1) and states[t+1] = D@t, so
+		// x_depth is timeframe depth+1; the failing input is the input at
+		// that same timeframe.
+		Ic3Solver bs(module, init_zero, max_frames);
+		bs.assume_cells = assume_cells;
+		bs.encode(prop, depth + 1);
+
+		// model vector: per-timeframe data-input bits, t = 1..depth+1,
+		// same port order as wio (so pack_input_bits lines up)
+		std::vector<int> mvec;
+		for (int t = 1; t <= depth + 1; t++)
+			for (size_t p = 0; p < wio.inports.size(); p++) {
+				std::vector<int> v = bs.satgen.importSigSpec(wio.inports[p], t);
+				log_assert(GetSize(v) == wio.inwidth[p]);
+				mvec.insert(mvec.end(), v.begin(), v.end());
+			}
+
+		std::vector<int> assumptions;
+		bs.push_assum(assumptions, -bs.init_act);
+		assumptions.push_back(bs.badv.at(depth + 1));
+		std::vector<bool> model;
+		if (!bs.solve_model(assumptions, mvec, model)) {
+			log_warning("ic3: exact unroll found no witness at depth %d -- internal error.\n", depth);
+			return;
+		}
 
 		std::vector<std::string> steps;
-		std::vector<int> curcube(state1.size(), 0);
-		if (depth == 0) {
-			// bad already at the initial state: record the initial cube
-			std::vector<int> assumptions;
-			push_assum(assumptions, -init_act);
-			std::vector<bool> model;
-			if (!solve_model(assumptions, state1, model)) {
-				log_error("ic3: cex replay walk broke at the initial state -- internal error.\n");
-				return;
-			}
-			for (int j = 0; j < GetSize(state1); j++)
-				curcube[j] = model[j] ? state1[j] : -state1[j];
-		} else {
-			for (int i = 0; i < depth; i++) {
-				std::vector<int> assumptions;
-				if (i == 0)
-					push_assum(assumptions, -init_act);
-				else
-					push_cube(assumptions, curcube, state1);
-				std::vector<bool> model;
-				if (!solve_model(assumptions, mvec, model)) {
-					log_error("ic3: cex replay walk broke at step %d -- internal error.\n", i);
-					return;
-				}
-				steps.push_back(pack_input_bits(wio, model, GetSize(state2)));
-				for (int j = 0; j < GetSize(state1); j++)
-					curcube[j] = model[j] ? state1[j] : -state1[j];
-			}
-		}
-		// closing step: the input valuation under which the final state
-		// violates the property (bad1 pairs it with the state, exactly the
-		// pair sim displays at the failing slot)
-		{
-			std::vector<int> assumptions;
-			push_cube(assumptions, curcube, state1);
-			assumptions.push_back(bad1);
-			std::vector<int> invec;
-			for (auto &l : wio.inlit)
-				invec.insert(invec.end(), l.begin(), l.end());
-			std::vector<bool> model;
-			if (solve_model(assumptions, invec, model))
-				steps.push_back(pack_input_bits(wio, model, 0));
-			else
-				log_warning("ic3: cex final state does not satisfy bad -- depth mismatch?\n");
-		}
+		size_t per_step = wio.total_bits;
+		for (int k = 0; k <= depth; k++)
+			steps.push_back(pack_input_bits(wio, model, k * per_step));
 
 		write_yw(file, wio, steps, -1);
 		log("ic3: counterexample witness written to %s (%d steps)\n", file.c_str(), GetSize(steps));
@@ -1489,7 +1477,7 @@ struct Ic3Pass : Pass
 					for (auto &ch : safe)
 						if (!isalnum((unsigned char)ch) && ch != '_' && ch != '-')
 							ch = '_';
-					solver.export_cex(stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), depth);
+					solver.export_cex(cell, stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), depth);
 				}
 			} else {
 				log("ic3: %s: undecided\n", name.c_str());

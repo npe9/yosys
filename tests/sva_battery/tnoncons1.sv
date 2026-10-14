@@ -8,7 +8,7 @@
 // body are rejected clearly.
 module tnoncons1 (input logic clk, input logic a, input logic b);
   p0: assert property (@(posedge clk) always (((a ##1 b)[->1]) |-> b)); // PROVED
-  p1: assert property (@(posedge clk) always (((a[*2])[=2]) |-> (!a))); // DIS @5
-  p2: assert property (@(posedge clk) always (((a ##1 b)[->1]) |=> !a)); // DIS @3
-  p3: assert property (@(posedge clk) always (((a ##2 b)[=1]) |-> (!b || !a))); // DIS @4
+  p1: assert property (@(posedge clk) always (((a[*2])[=2]) |-> (!a))); // DIS @4
+  p2: assert property (@(posedge clk) always (((a ##1 b)[->1]) |=> !a)); // DIS @2
+  p3: assert property (@(posedge clk) always (((a ##2 b)[=1]) |-> (!b || !a))); // DIS @3
 endmodule

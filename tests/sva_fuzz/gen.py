@@ -106,15 +106,36 @@ class CaseGen:
 
     def rep(self, atom, allow_eq, no_single=False):
         roll = self.r.random()
+        if allow_eq:
+            # Antecedent context: exercise non-contiguous repetition
+            # heavily ([->]/[=] over atoms AND small bounded sequences).
+            # sva2check accepts it anywhere inside an antecedent sequence
+            # (only property/consequent position is rejected, probed).
+            if roll < 0.30:
+                return "%s[*%d]" % (atom, self.r.randint(1, 4))
+            if roll < 0.55:
+                lo = self.r.randint(1, 3)
+                return "%s[*%d:%d]" % (atom, lo, lo + self.r.randint(1, 4 - lo))
+            return self.noncontig(atom)
         if roll < 0.5 and not no_single:
             return "%s[*%d]" % (atom, self.r.randint(1, 4))
-        if roll < 0.85 or not allow_eq:
-            lo = self.r.randint(1, 3)
-            return "%s[*%d:%d]" % (atom, lo, lo + self.r.randint(1, 4 - lo))
-        # [=N] has an unbounded lookback window: sva2check only accepts it
-        # as the direct antecedent of |->/|=> (battery t7 usage); anywhere
-        # else it errors "no finite bound", so it is gated by allow_eq.
-        return "%s[=%d]" % (atom, self.r.randint(1, 4))
+        lo = self.r.randint(1, 3)
+        return "%s[*%d:%d]" % (atom, lo, lo + self.r.randint(1, 4 - lo))
+
+    def noncontig(self, atom):
+        # [->N]/[=N] and range forms; the operand is usually a plain atom,
+        # sometimes a small bounded sequence -- exercises the seq_end-based
+        # occurrence-counting lowering (battery tnoncons1).
+        if self.r.random() < 0.40:
+            body = "(%s ##%d %s)" % (self.atom(), self.r.randint(1, 2),
+                                     self.atom())
+        else:
+            body = atom
+        op = self.r.choice(["[->", "[=", "[->", "[="])
+        if self.r.random() < 0.25:
+            lo = self.r.randint(1, 2)
+            return "%s%s%d:%d]" % (body, op, lo, lo + self.r.randint(1, 2))
+        return "%s%s%d]" % (body, op, self.r.randint(1, 3))
 
     def seq(self, d, allow_eq=False, strict_win=False, plain=False,
             no_single_rep=False):
@@ -164,9 +185,9 @@ class CaseGen:
             if strict_win or plain:
                 # bare rep reads as unbounded in these two contexts
                 return self.atom()
-            # repetitions apply to a plain atom only: sva2check rejects
-            # repetition of a general sequence ([*N] single-bound form
-            # probes as unbounded there), so keep this conservative.
+            # [*]/[+] single-bound still apply to a plain atom only
+            # (sva2check rejects repetition of a general sequence there);
+            # [->]/[=] operands may be small bounded sequences via rep().
             return self.rep(self.atom(), allow_eq, no_single_rep)
         return "first_match(%s)" % self.seq(
             d - 1, strict_win=strict_win, plain=plain,

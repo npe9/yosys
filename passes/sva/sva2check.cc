@@ -1649,6 +1649,12 @@ struct SvaCompiler {
 					if (!const_int(b->getPort(bp[1]), hi_v))
 						log_error("sva2check: non-constant repetition bound in %s.\n", log_id(n));
 					hi = hi_v;
+				} else {
+					// single bound: exactly m (LRM F.3.4.2.3 derives
+					// [->m]/[=m]/[*m] from [*m] == [*m:m]; for boolean
+					// [*]-bodies the run form coincides, but [->]/[=] and
+					// sequence bodies need the exact window)
+					hi = m;
 				}
 			}
 			if (op == "[*]" || op == "[+]") {
@@ -1689,7 +1695,7 @@ struct SvaCompiler {
 			} else {
 				bsig = andN({reduce1(body), gate_now(gate)});
 			}
-			int cap = std::max(m, 1);
+			int cap = hi >= 0 ? std::max(hi, 1) : std::max(m, 1);
 			int w = 1;
 			while ((1 << w) <= cap) w++;
 			// an attempt counts b's from its start tick on; attempts are
@@ -1702,16 +1708,26 @@ struct SvaCompiler {
 			SigSpec capped = mod->Mux(NEW_ID, sum, Const(cap, w), sat);
 			mod->addDff(NEW_ID, clk, mod->Mux(NEW_ID, Const(0, w), capped, orN({start, started_w})), cnt_w, clk_pos);
 			SigSpec cnt = cnt_w;
-			SigSpec enough = mod->Ge(NEW_ID, cnt, Const(m, w));
+			// Occurrence index k of a match ending at this tick is cnt+1
+			// (cnt counts occurrence ends strictly before this tick).  LRM
+			// F.3.4.2.3: b[->m:n] == (!b[*0:$] ##1 b)[*m:n] matches at the
+			// end of the k-th occurrence for k in [m,n], so cnt must lie in
+			// [m-1, n-1]: lower bound cnt >= m-1, and for a bounded n also
+			// cnt < n (cnt saturates at n, so !sat).
+			SigSpec enough = mod->Ge(NEW_ID, cnt, Const(m > 0 ? m - 1 : 0, w));
+			if (hi >= 0)
+				enough = andN({enough, mod->Not(NEW_ID, sat)});
 			if (op == "[->]")
 				return andN({bsig, enough});
-			// [=m:n]: ends one or more ticks after the last occurrence;
-			// idle = no occurrence ends at this tick (for a boolean body
-			// bsig == body && gate, and Not(bsig) inside the gated end
-			// formula below coincides with the old Not(body))
+			// [=m:n]: per LRM F.3.4.2.3, b[=m:n] == b[->m:n] ##1 !b[*0:$]:
+			// a match at tick t ends one or more ticks after the k-th
+			// occurrence (t' <= t-1) with no occurrence in (t', t]; the
+			// count of occurrence ends at-or-before t-1 is the CURRENT
+			// cnt, so the window is cnt in [m, n] -- inclusive of n, and
+			// cnt <= n always holds (it saturates at cap=n), so no upper
+			// test.  (The [->] window [m-1, n-1] DOES exclude n via !sat.)
 			SigSpec idle = mod->Not(NEW_ID, bsig);
-			SigSpec cnt_d = delay(cnt, 1, "rep_cnt_d");
-			SigSpec enough_d = mod->Ge(NEW_ID, cnt_d, Const(m, w));
+			SigSpec enough_d = mod->Ge(NEW_ID, cnt, Const(m, w));
 			return andN({idle, gate_now(gate), enough_d});
 		}
 

@@ -48,6 +48,73 @@ class CaseGen:
         # free input driving property `case` selectors (1- or 2-bit,
         # never referenced outside the case selector)
         self.sel_w = self.r.choice([0, 0, 1, 2])
+        # property declarations emitted before p0 (declared-property
+        # instances with local variables / formals)
+        self.decls = []
+
+    def vexpr(self, v, w, d=1):
+        """boolean expression over a w-bit local v and module inputs"""
+        def wconst():
+            return "%d'd%d" % (w, self.r.randint(0, (1 << w) - 1))
+        def wexp():
+            if w == 1:
+                return self.r.choice(self.inputs)
+            ins = [self.r.choice(self.inputs) for _ in range(w)]
+            return "{" + ", ".join(ins) + "}"
+        if d <= 0 or self.r.random() < 0.5:
+            roll = self.r.random()
+            if roll < 0.4:
+                return "(%s == %s)" % (v, wconst())
+            if roll < 0.8:
+                return "(%s == %s)" % (v, wexp())
+            return "(%s[%d] == 1'b%d)" % (v, self.r.randint(0, w - 1),
+                                         self.r.randint(0, 1))
+        op = self.r.choice(["&&", "||"])
+        return "(%s %s %s)" % (self.vexpr(v, w, d - 1), op,
+                               self.vexpr(v, w, d - 1))
+
+    def declared_p0(self):
+        """With ~30% probability build p0 as an instance of a declared
+        property exercising the local-variable slots machinery (60%) or
+        formal-argument instance binding (40%).  Returns the p0 assert
+        line, or None for the normal inline body."""
+        if self.r.random() > 0.30:
+            return None
+        if self.r.random() < 0.6:
+            # local variable: capture at a bounded antecedent end, check
+            # in the consequent.  sva2check rejects locals over unbounded
+            # sequences, so the antecedent stays shallow (atoms/## only).
+            w = self.r.choice([1, 2, 3])
+            v = "v0"
+            ins = self.r.sample(self.inputs, min(w, len(self.inputs)))
+            while len(ins) < w:
+                ins.append(self.r.choice(self.inputs))
+            cap = ins[0] if w == 1 else "{" + ", ".join(ins[:w]) + "}"
+            ant = self.seq(self.r.randint(0, 1), allow_eq=False)
+            impl = "|->" if self.r.random() < 0.3 else "|=>"
+            con = self.vexpr(v, w)
+            self.decls.append(
+                "  property pd0;\n"
+                "    logic [%d:0] %s;\n"
+                "    @(posedge clk) (%s, %s = %s) %s (%s);\n"
+                "  endproperty" % (w - 1, v, ant, v, cap, impl, con))
+            return "p0: assert property (@(posedge clk) pd0);"
+        # formals: instance actuals bind to module inputs; the body
+        # references the formal parameters.  Untyped formal list (the
+        # parser rejects the SV-2012 `input logic` prefix).
+        nf = self.r.randint(1, 2)
+        formals = ["f%d" % i for i in range(nf)]
+        args = [self.r.choice(self.inputs) for _ in range(nf)]
+        ant = "(%s ##%d %s)" % (self.r.choice(formals),
+                                self.r.randint(0, 2), self.atom())
+        con = "(%s %s %s)" % (self.r.choice(formals),
+                              self.r.choice(["&&", "||"]),
+                              self.bexpr(0))
+        self.decls.append(
+            "  property pd0(%s);\n"
+            "    @(posedge clk) %s |-> %s;\n"
+            "  endproperty" % (", ".join(formals), ant, con))
+        return "p0: assert property (@(posedge clk) pd0(%s));" % ", ".join(args)
 
     def stim_signals(self):
         """(name, width) pairs the .yw stimulus drives, in port order."""
@@ -330,7 +397,13 @@ class CaseGen:
         spec = "@(posedge clk) "
         if self.has_rst:
             spec += "disable iff (rst) "
-        lines.append("  p0: assert property (%s%s);" % (spec, body))
+        lines.extend(self.decls)
+        if self.p0_line is not None:
+            # p0 is an instance of a declared property (locals/formals):
+            # the spec lives inside the declaration (battery tslot style)
+            lines.append("  " + self.p0_line)
+        else:
+            lines.append("  p0: assert property (%s%s);" % (spec, body))
         lines.append("endmodule")
         return "\n".join(lines) + "\n"
 
@@ -340,7 +413,8 @@ class CaseGen:
         # position when wrapped.  A property-level `if` can also head the
         # bare body (no always); `always (if ...)` would parse but the
         # bare form is the verified shape.
-        use_always = self.r.random() < 0.70
+        self.p0_line = self.declared_p0()
+        use_always = self.p0_line is None and self.r.random() < 0.70
         if not use_always and self.r.random() < 0.10:
             cond = self.bexpr(1)
             if self.r.random() < 0.75:

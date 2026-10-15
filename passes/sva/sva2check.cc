@@ -49,16 +49,20 @@
 // Rejected with a clear message: any other multi-clock element (mid-sequence
 //   or antecedent `clocked`, `clocked` under throughout/within/first_match,
 //   or_event/bare-identifier clocking events, instance bodies), unbounded
-//   eventually over a temporal operand, s_until over a temporal p (q may
-//   be a bounded sequence: its per-tick match pulse feeds the weak
-//   monitor and the F twin), local variable assignments, within, matches/
-//   streaming.
+//   eventually over a temporal operand, s_until_with over a temporal p
+//   (plain s_until accepts a bounded temporal p: its per-tick failure pulse
+//   feeds the weak monitor), local variable assignments, within,
+//   matches/streaming.
 //
-// Strong until v1: p s_until q / s_until_with with p a plain boolean and
-//   q a plain boolean or a bounded sequence splits into the weak-until
-//   monitor on the main $check plus an F q obligation as a second $check
-//   named <name>$live with FLAVOR "liveness"; the ic3 pass proves each
-//   leg independently.
+// Strong until v1: p s_until q / s_until_with with q a plain boolean or a
+//   bounded sequence splits into the weak-until monitor on the main $check
+//   plus an F q obligation as a second $check named <name>$live with FLAVOR
+//   "liveness"; the ic3 pass proves each leg independently.  p may be a
+//   plain boolean or a bounded temporal property (a sequence or
+//   implication with a finite horizon): it compiles to its per-tick
+//   failure pulse, inverted to the "p holds" level the monitor samples.
+//   s_until_with over a temporal p is rejected (the with-variant's q&p
+//   completion conjunct is not defined for temporal p).
 //
 // Sequences compile to nondeterministic-start transducers shared across
 // attempts: compile_seq(node, start, gate) returns an "ends at this tick"
@@ -144,6 +148,14 @@ struct SvaCompiler {
 	// gate referencing local variables reads the slot of the tick it
 	// constrains rather than the tick compilation started at
 	SigSpec dyn_gate;
+	// fixed anchor: ticks from the attempt start to the current sequence
+	// element's start tick, when uniform across attempts (built by ##
+	// fixed delays, |-> (0) and |=> (1) consequents); -1 = merged/unknown.
+	// [->]/[=] with a fixed anchor count occurrences exactly per attempt
+	// (window [m,n] via a delayed-counter subtraction); -1 keeps the
+	// merged-existential global counter (exact at the property level by
+	// the attempt-collapse argument, approximate inside ## chains).
+	int cur_anc = -1;
 	// set with slots_mode: ranged delays/repetitions split their tail
 	// compiles per admissible offset (single-hot ages) so local reads
 	// splice the slot of the tick their parse is at; product of split
@@ -1574,8 +1586,29 @@ struct SvaCompiler {
 			} else {
 				log_error("sva2check: ## delay bound %d too large in %s.\n", hi, log_id(n));
 			}
-			if (!slots_mode)
-				return seq_dispatch(port(ti), child(ti), t_start, gate);
+			// anchor bookkeeping: the end pulse of the LHS sits a fixed
+			// number of ticks after the attempt start only when the LHS has
+			// a fixed length (a [->]/[=] or ranged element ends at a
+			// variable offset -> -1); a fixed ## offset adds lo more, a
+			// ranged or unbounded delay makes the tail start variable
+			int lhs_anc = -1;
+			if (cur_anc >= 0) {
+				Cell *lhsc = lead2 ? nullptr : child(0);
+				if (!lhsc)
+					lhs_anc = cur_anc;  // implicit/boolean lhs: length 0
+				else {
+					int l0 = seq_min_len(lhsc), l1 = seq_max_len(lhsc);
+					lhs_anc = (l0 >= 0 && l0 == l1) ? cur_anc + l0 : -1;
+				}
+			}
+			int tail_anc = (lhs_anc >= 0 && hi >= 0 && hi == lo) ? lhs_anc + lo : -1;
+			if (!slots_mode) {
+				int saved_anc = cur_anc;
+				cur_anc = tail_anc;
+				SigSpec r = seq_dispatch(port(ti), child(ti), t_start, gate);
+				cur_anc = saved_anc;
+				return r;
+			}
 			// the tail is one or more ticks later: ages shift, same-tick
 			// pending writes expire
 			SigSpec saved_age = age;
@@ -1604,7 +1637,10 @@ struct SvaCompiler {
 					lhsvar = l0 < 0 || l0 != l1;
 				}
 				if (tailu || hi > lo || lhsvar) {
+					int saved_anc = cur_anc;
+					cur_anc = -1;  // split ends decompose at variable offsets
 					auto sp = seq_ends_split(n, SigSpec(), start, gate);
+					cur_anc = saved_anc;
 					if (sp.second) {
 						SigSpec r = Const(0, 1);
 						for (auto &e : sp.first)
@@ -1618,7 +1654,10 @@ struct SvaCompiler {
 			slot_epoch++;
 			if (lo > 0 || hi > 0)
 				pending_wr.clear();  // the tail is a later tick
+			int saved_anc = cur_anc;
+			cur_anc = tail_anc;
 			SigSpec r = seq_dispatch(port(ti), child(ti), t_start, gate);
+			cur_anc = saved_anc;
 			age = saved_age;
 			pending_wr = saved_pending;
 			return r;
@@ -1658,7 +1697,10 @@ struct SvaCompiler {
 				}
 			}
 			if (op == "[*]" || op == "[+]") {
-				// consecutive repetition
+				// consecutive repetition: chain/run ends sit at variable
+				// offsets from the attempt start, so nested [->]/[=]
+				// lose the fixed anchor
+				cur_anc = -1;
 				if (m == 0 && hi < 0) {
 					// [*]: empty or any run length; the run state still
 					// matters for the upper bound only, so the end is
@@ -1714,13 +1756,21 @@ struct SvaCompiler {
 			// collapses at the property level: the k-th occurrence (k >= m)
 			// is the m-th occurrence for the attempt starting right after
 			// the (k-m)-th, so every occurrence from the m-th on matches
-			// SOME attempt and the upper bound n is vacuous (exact k-in-
-			// [m,n] anchoring would only matter inside a ## chain, where
-			// the global counter is an approximation anyway).  [->] matches
+			// SOME attempt and the upper bound n is vacuous.  [->] matches
 			// AT the occurrence end (index k = cnt+1 >= m); [=m:n] ==
 			// [->m:n] ##1 !b[*0:$] matches one or more ticks after the last
 			// occurrence: cnt >= m (occurrences at-or-before t-1) and no
 			// occurrence at this tick.
+			//
+			// Inside ## chains with a non-uniform offset this is an
+			// over-approximation (documented).  cur_anc records the uniform
+			// case, but an EXACT anchored window cannot use the fixed
+			// subtraction T(t)-T(t-anc): [->]/[=] are variable-length
+			// elements evaluated at every tick >= their start, and a fixed
+			// delay measures from a sliding tick, not from the attempt
+			// start -- per-attempt windows need age-vector snapshot bases
+			// (slot-file machinery over possibly unbounded spans), which is
+			// the remaining open design.
 			SigSpec enough = mod->Ge(NEW_ID, cnt, Const(m > 0 ? m - 1 : 0, w));
 			if (op == "[->]")
 				return andN({bsig, enough});
@@ -2281,9 +2331,18 @@ struct SvaCompiler {
 		};
 
 		if (op == "|->" || op == "|=>" || op == "#-#" || op == "#=#") {
+			// the antecedent is a merged-existential context (concurrent
+			// attempts every tick): [->]/[=] keep the collapsed global
+			// counter there
+			int saved_anc0 = cur_anc;
+			cur_anc = -1;
 			SigSpec ant_end = seq_dispatch(port(0), child(0), start, Const(1, 1));
+			cur_anc = saved_anc0;
 			bool shift = op == "|=>" || op == "#=#";
 			SigSpec c_start = shift ? delay(ant_end, 1, "impl") : ant_end;
+			// the consequent starts a fixed 0 (|->) or 1 (|=>) tick after
+			// the attempt: [->]/[=] in it count occurrences per attempt
+			int cons_anc = shift ? 1 : 0;
 			// v1 multi-clock: a consequent rooted at a `clocked` node whose
 			// clock differs from the property clock compiles as its own
 			// monitor island on the inner clock.  The island start is
@@ -2389,12 +2448,17 @@ struct SvaCompiler {
 							slot_epoch++;
 						}
 						SigSpec r;
-						if (cbc)
-							r = strong_seq_fail(cbc, pulse);
-						else {
-							static std::vector<Wire *> no_formals;
-							r = andN({pulse,
-									mod->Not(NEW_ID, reduce1(splice_expr(cbody, no_formals, false)))});
+						{
+							int saved_anc = cur_anc;
+							cur_anc = 0;  // island tick 0 is the consequent start
+							if (cbc)
+								r = strong_seq_fail(cbc, pulse);
+							else {
+								static std::vector<Wire *> no_formals;
+								r = andN({pulse,
+										mod->Not(NEW_ID, reduce1(splice_expr(cbody, no_formals, false)))});
+							}
+							cur_anc = saved_anc;
 						}
 						if (slots_mode) {
 							island_mode = false;
@@ -2408,15 +2472,23 @@ struct SvaCompiler {
 					}
 				}
 			}
-			if (!slots_mode || !shift)
-				return prop_dispatch(port(1), child(1), c_start);
+			if (!slots_mode || !shift) {
+				int saved_anc = cur_anc;
+				cur_anc = cons_anc;
+				SigSpec r = prop_dispatch(port(1), child(1), c_start);
+				cur_anc = saved_anc;
+				return r;
+			}
 			// the consequent is one tick further along the same attempt
 			SigSpec saved_age = age;
 			dict<Wire *, std::pair<SigSpec, SigSpec>> saved_pending = pending_wr;
 			age = age_tick(age);
 			slot_epoch++;
 			pending_wr.clear();
+			int saved_anc2 = cur_anc;
+			cur_anc = cons_anc;
 			SigSpec r = prop_dispatch(port(1), child(1), c_start);
+			cur_anc = saved_anc2;
 			age = saved_age;
 			pending_wr = saved_pending;
 			return r;
@@ -3383,18 +3455,48 @@ struct Sva2CheckPass : public Pass {
 					// wire -- for a sequence, its match pulse attempted
 					// at every tick (the LRM property promotion of a
 					// sequence).  The same wire feeds the weak monitor
-					// and the F twin.  A temporal p would need
-					// per-attempt deadline machinery; it keeps the
-					// unsupported-op error.
+					// and the F twin.  p may be a plain boolean or a
+					// bounded property: a temporal p compiles to its
+					// per-tick failure pulse (prop_dispatch at start =
+					// 1 every tick, like the bounded eventually
+					// operand) -- "p holds at tick t" is "the p attempt
+					// starting at t completes", whose violation pulse
+					// fires at t's own deadline, exactly the sampling
+					// the weak monitor performs.  A bounded sequence in
+					// property position completes strongly (the usual
+					// finite-bound rule).  s_until_with keeps the
+					// boolean-only p (the with-variant's q&p completion
+					// conjunct is not defined for temporal p).
 					bool su_with = false;
 					if (body && (sva_op(body) == "s_until" || sva_op(body) == "s_until_with")) {
 						auto bp = comp.ports_of(body);
 						Cell *qc = bp.size() == 2 ? comp.child_cell(body->getPort(bp[1])) : nullptr;
-						if (bp.size() == 2 && !comp.child_cell(body->getPort(bp[0])) &&
+						Cell *pc = bp.size() == 2 ? comp.child_cell(body->getPort(bp[0])) : nullptr;
+						if (bp.size() == 2 && (!pc || sva_op(body) == "s_until") &&
 								(!qc || (comp.seq_max_len(qc) >= 0 && comp.seq_max_len(qc) <= 64))) {
 							strong_until = true;
 							su_with = sva_op(body) == "s_until_with";
-							su_p = comp.reduce1(comp.resolve(body->getPort(bp[0])));
+							if (!pc) {
+								su_p = comp.reduce1(comp.resolve(body->getPort(bp[0])));
+							} else {
+								pool<Cell *> seen;
+								if (comp.tree_has_locals(pc, seen))
+									log_error("sva2check: local variables in a s_until operand are not supported in %s.\n", log_id(body));
+								SigSpec saved_age = comp.age;
+								dict<Wire *, std::pair<SigSpec, SigSpec>> saved_pending = comp.pending_wr;
+								if (comp.slots_mode) {
+									comp.age = Const(0, comp.nslots);
+									comp.age = sigset(comp.age, 0, Const(1, 1)[0]);
+									comp.slot_epoch++;
+									comp.pending_wr.clear();
+								}
+								// per-tick failure pulse, inverted: the
+							// monitor samples the "p holds" level
+							su_p = comp.prop_dispatch(body->getPort(bp[0]), pc, Const(1, 1));
+							su_p = mod->Not(NEW_ID, su_p);
+								comp.age = saved_age;
+								comp.pending_wr = saved_pending;
+							}
 							if (!qc) {
 								su_q = comp.reduce1(comp.resolve(body->getPort(bp[1])));
 							} else {

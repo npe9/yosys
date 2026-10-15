@@ -1,0 +1,37 @@
+// Temporal-p strong until: (ptemp) s_until q == (ptemp until q) && F q with
+// p a bounded temporal property, not just a boolean.  p compiles to its
+// per-tick failure pulse (prop_dispatch at start=1 every tick, the same
+// scheme as the bounded eventually operand): "p holds at tick t" is "the
+// p attempt starting at t completes", and its violation pulse fires at
+// t's own deadline -- exactly the sampling the weak-until monitor
+// performs.  s_until_with over a temporal p stays rejected (the
+// with-variant's q&p completion conjunct is not defined for temporal p).
+//
+// The ctr shape makes every verdict structurally forced (b = t1,t2;
+// c = t3; a = t5; d = t1; e = 0; ctr wraps at 8):
+//   p1 fail_p = !(b(t-1)&&c(t)) && !(b(t-2)&&c(t-1)) is 1 at t1 -> DIS @1
+//   p2 q covers every fail_p tick (ctr<=2 | ctr>=5) -> PROVED
+//   p3 q = (ctr<=2) | a | (ctr==6): fail_p fires at t in {1,5,6,7} mod 8;
+//     t1 is masked by qsen(1)=q(0) and t7 by qsen(7)=q(6) -- the monitor's
+//     q-seen register covers q through t-1 ("no q since the attempt
+//     start") -- and t5/t6 by q directly -> PROVED
+//   p4 d at t1 with e never -> implication instance fails at t2 -> DIS @2
+//   p5 strong-completion b ##2 c fails from t2 on (no c) -> DIS @2
+//   (strong(seq) as the direct lhs of s_until is a parser limitation,
+//    not a lowering one: strong/weak property primaries sit above the
+//    sva_until precedence chain.)
+module tsuntil3 (input logic clk);
+  logic [2:0] ctr = 0;
+  logic a, b, c, d, e;
+  always_ff @(posedge clk) ctr <= ctr + 1;
+  assign b = (ctr == 3'd1) || (ctr == 3'd2);
+  assign c = (ctr == 3'd3);
+  assign a = (ctr == 3'd5);
+  assign d = (ctr == 3'd1);
+  assign e = 1'b0;
+  p1: assert property (@(posedge clk) (b ##1 c) s_until a); // DIS @1
+  p2: assert property (@(posedge clk) (b ##1 c) s_until ((ctr <= 3'd2) || (ctr >= 3'd5))); // PROVED
+  p3: assert property (@(posedge clk) (b ##1 c) s_until ((ctr <= 3'd2) || a || (ctr == 3'd6))); // PROVED
+  p4: assert property (@(posedge clk) (d |-> ##[0:1] e) s_until a); // DIS @2
+  p5: assert property (@(posedge clk) (b ##2 c) s_until a); // DIS @2
+endmodule

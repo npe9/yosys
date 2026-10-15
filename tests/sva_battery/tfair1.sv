@@ -2,8 +2,10 @@
 // (sva2check) and the ic3 liveness gfp prunes its survivor set to states
 // that can visit every $fair predicate within the set (Emerson-Lei fair
 // gfp, attractor per predicate), so only FAIR !p-cycles disprove.
-// BMC-SKIP: write_smt2 has no $fair encoding; expectations are checked
-// by the ic3 leg only.
+// BMC-SKIP: all three properties are liveness-class (s_eventually), so
+// the safety-only BMC leg has nothing to check (write_smt2 skips both the
+// liveness $check cells and the $fair cell with warnings); expectations
+// are checked by the ic3 leg only.  See tfair2 for $fair + safety legs.
 module tfair1 (input logic clk, input logic tick);
   logic b;
   logic [2:0] c;

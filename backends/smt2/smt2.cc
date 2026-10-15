@@ -1119,7 +1119,22 @@ struct Smt2Worker
 				log_error("Unsupported cell type %s for cell %s.%s -- please run `async2sync` or `clk2fflogic` before `write_smt2`.\n",
 						cell->type.unescape(), module, cell);
 			}
-			if (cell->type.in(ID($live), ID($fair), ID($equiv)))
+			if (cell->type == ID($fair)) {
+				// sva2check fairness constraint (assume/restrict of an
+				// unbounded eventually): SMT-LIB transition systems have
+				// no native fairness notion and yosys-smtbmc has no
+				// liveness engine, so there is no exact encoding -- skip
+				// like the liveness-$check cells above and keep the safety
+				// legs flowing.  Caveat: the safety legs then run under an
+				// environment WEAKER than the real one (unfair paths are
+				// no longer excluded), so a BMC CEX on a $fair design may
+				// be spurious while a BMC PASS stays sound (it checked a
+				// larger transition relation).  The ic3 pass handles $fair
+				// natively (Emerson-Lei fair gfp).
+				log_warning("skipping $fair cell %s.%s in write_smt2 (no SMT-LIB fairness encoding; the safety legs run without the fairness assumption -- a BMC CEX may be spurious, a PASS is sound).\n", module, cell);
+				continue;
+			}
+			if (cell->type.in(ID($live), ID($equiv)))
 				log_error("Unsupported cell type %s for cell %s.%s",
 						cell->type.unescape(), module, cell);
 

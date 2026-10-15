@@ -5,9 +5,15 @@ the native `ic3` pass, and the `write_smt2` + `yosys-smtbmc` BMC flow.
 
 ## Running
 
-From anywhere (the runners resolve the yosys binary via the `YOSYS` env
-var; default `third_party/yosys/build/yosys` relative to the repo root):
+In-tree (cmake build tree; runs the whole gate below):
 
+    cmake --build <build-dir> --target test-sva
+
+Individual pieces from anywhere (the runners resolve the yosys binary
+via the `YOSYS` env var; default `third_party/yosys/build/yosys`
+relative to the repo root):
+
+    make test            # in this directory: battery + cdc + seeded fuzz
     python3 run_ic3.py <file>.sv --timeout 90     # native IC3/PDR, no external solver
     python3 run_bmc.py <file>.sv                  # write_smt2 + yosys-smtbmc (z3 default, -s boolector)
 

@@ -562,7 +562,7 @@ if (NOT YOSYS_BUILD_PYTHON_ONLY AND YOSYS_ENABLE_UNIT_TESTS)
 	)
 
 	add_custom_target(test
-		DEPENDS test-unit test-vanilla
+		DEPENDS test-unit test-vanilla test-sva
 	)
 
 	# Docs.
@@ -586,6 +586,20 @@ if (NOT YOSYS_BUILD_PYTHON_ONLY AND YOSYS_ENABLE_UNIT_TESTS)
 		JOB_SERVER_AWARE TRUE
 	)
 endif()
+
+# SVA battery: per-property expectations over the ic3 and smtbmc
+# engines (tests/sva_battery), plus the seeded differential fuzz
+# spot-check.  Deliberately outside the unit-test guard above: it is
+# python-driven and needs no gtest.  Requires python3 and a z3-backed
+# yosys-smtbmc on PATH.
+add_custom_target(test-sva
+	COMMAND ${CMAKE_MAKE_PROGRAM} test
+		YOSYS=$<TARGET_FILE:yosys>
+	WORKING_DIRECTORY ${YOSYS_CMAKE_SOURCE_DIR}/tests/sva_battery
+	DEPENDS yosys $<$<TARGET_EXISTS:yosys-smtbmc>:yosys-smtbmc>
+	USES_TERMINAL
+	JOB_SERVER_AWARE TRUE
+)
 
 # Utilities.
 add_custom_target(print-version

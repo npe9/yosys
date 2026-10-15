@@ -2,6 +2,8 @@
 // b[=m] = b[->m] ##1 !b[*0:$]; the trailing !b run is blocked by any
 // further b, so a 3rd b inside the window kills every exact match).
 // ctr saturates at 7 for the same reason as tanc1 (see there).
+// IC3-CTG: 1  (the p_blk vacuity proof is counter/rotation-heavy: CTG
+// generalization closes it in ~1s vs ~15s plain, measured 2026-10-15)
 module tanc2 (input logic clk);
   logic [2:0] ctr = 0;
   always_ff @(posedge clk)

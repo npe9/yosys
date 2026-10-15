@@ -38,13 +38,13 @@ async2sync
 opt_clean
 memory
 opt_clean
-{extra_mem}ic3 -check-cells -init-zero{bmc}
+{extra_mem}ic3 -check-cells -init-zero{bmc}{ctg}
 """
 
 
 def prep_extras(path):
     """Per-file opt-in prep passes from pragma comments (multiclock etc.)."""
-    a2s = mem = bmc = ""
+    a2s = mem = bmc = ctg = ""
     for line in open(path):
         m = re.match(r'\s*//\s*PREP-EXTRA-AFTER-ASYNC2SYNC:\s*(.+)', line)
         if m:
@@ -58,7 +58,14 @@ def prep_extras(path):
         m = re.match(r'\s*//\s*IC3-BMC:\s*(\d+)', line)
         if m:
             bmc = " -bmc " + m.group(1)
-    return a2s, mem, bmc
+        # CTG-guided generalization depth (counter-heavy proofs the plain
+        # generalizer thrashes on, e.g. tanc2's [=]-antecedent vacuity;
+        # measured mixed -- 14x faster there, 3x slower on t10 -- so it
+        # stays opt-in rather than a default)
+        m = re.match(r'\s*//\s*IC3-CTG:\s*(\d+)', line)
+        if m:
+            ctg = " -ctg " + m.group(1)
+    return a2s, mem, bmc, ctg
 
 
 def run(cmd, **kw):
@@ -69,10 +76,10 @@ def check_one(yosys, path, top, inc_dirs, timeout):
     label = os.path.basename(path) if isinstance(path, str) else os.path.basename(path[0])
     files = path if isinstance(path, list) else [path]
     inc = " ".join("-I" + d for d in inc_dirs)
-    extra_a2s, extra_mem, bmc = prep_extras(files[0])
+    extra_a2s, extra_mem, bmc, ctg = prep_extras(files[0])
     script = PREP.format(inc=inc, files=" ".join(files),
                          top=" -top " + top if top else "",
-                         extra_a2s=extra_a2s, extra_mem=extra_mem, bmc=bmc)
+                         extra_a2s=extra_a2s, extra_mem=extra_mem, bmc=bmc, ctg=ctg)
     ys = os.path.join(tempfile.gettempdir(), f"ic3_{os.getpid()}.ys")
     with open(ys, "w") as fh:
         fh.write(script)

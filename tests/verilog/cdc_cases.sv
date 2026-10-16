@@ -23,6 +23,14 @@
 //                    | 1x OK       synchronizer-2ff    (flag, clk_a -> clk_b)
 //   cdc_eq_bin       | 4x WARNING  synced-bus          (4-bit binary pointer,
 //                    |                                EQ compare is not Gray)
+//   cdc_clk_div      | 1x OK       generated-clock     (divide-by-2 from clk_a)
+//                    | 1x OK       same-clock-family   (clk_a -> div_clk crossing)
+//                    | 4x OK       synchronizer-2ff    (div_clk -> clk_b sync)
+//   cdc_gate_icg     | 1x OK       clock-gate-icg      (latch-held enable)
+//   cdc_gate_reg     | 1x WARNING  clock-gate-reg      (registered comb AND)
+//   cdc_gate_bad     | 1x ERROR    clock-gating-glitch (async enable)
+//   cdc_reset_sync   | 2x OK       reset-sync-stage    (the 2 synchronizer FFs)
+//                    | 1x OK       reset-sync-deassert (counter reset by tail Q)
 //
 // Note: findings group by (dst domain, src domain set); a multi-bit
 // group of synced crossings then splits by reconvergence (shared comb
@@ -233,4 +241,139 @@ module cdc_eq_bin (
 
     // reconvergence at an $eq, but the local side is binary, not Gray
     assign empty = (rbin == wsync2);
+endmodule
+
+// ---------------------------------------------------------------------------
+// (g) generated clock: a divide-by-2 clock derived from clk_a.
+//     The div domain is reported OK generated-clock; a clk_a -> div_clk
+//     crossing is same-clock-family (OK, no synchronizer needed), while
+//     the div -> clk_b crossing is a true CDC and needs the 2FF chain.
+//     Expect: 1 OK generated-clock + 1 OK same-clock-family + 4 OK
+//     synchronizer-2ff (cnt_div into clk_b).
+// ---------------------------------------------------------------------------
+module cdc_clk_div (
+    input  logic clk_a,
+    input  logic clk_b,
+    input  logic inc,
+    output logic [3:0] cnt_div_b,
+    output logic kin_o
+);
+    // divide-by-2 generated clock (clk_a family)
+    logic div_ff;
+    always_ff @(posedge clk_a) div_ff <= ~div_ff;
+
+    logic div_clk;
+    assign div_clk = div_ff;
+
+    logic [3:0] cnt_div;
+    always_ff @(posedge div_clk) cnt_div <= cnt_div + 4'd1;
+
+    // same-family crossing: clk_a domain -> div domain (no synchronizer)
+    logic src_a;
+    always_ff @(posedge clk_a) src_a <= inc;
+    logic kin;
+    always_ff @(posedge div_clk) kin <= src_a;
+
+    // true CDC: div domain -> clk_b, properly synchronized
+    logic [3:0] m1, m2;
+    always_ff @(posedge clk_b) m1 <= cnt_div;
+    always_ff @(posedge clk_b) m2 <= m1;
+    assign cnt_div_b = m2;
+    assign kin_o = kin;
+endmodule
+
+// ---------------------------------------------------------------------------
+// (h) latch-based integrated clock gate (ICG): enable latched while the
+//     clock is low, then ANDed with the clock.  The latch holds the
+//     enable stable through the active clock phase, so the gate is
+//     glitch-free.
+//     Expect: 1 OK clock-gate-icg.
+// ---------------------------------------------------------------------------
+module cdc_gate_icg (
+    input  logic clk,
+    input  logic en,
+    output logic [3:0] cnt
+);
+    logic en_l;
+    always_latch begin
+        if (~clk)
+            en_l <= en;
+    end
+
+    logic gclk;
+    assign gclk = clk & en_l;
+
+    always_ff @(posedge gclk) cnt <= cnt + 4'd1;
+endmodule
+
+// ---------------------------------------------------------------------------
+// (i) register-held combinational clock gate: the enable is registered in
+//     the same domain, but it still changes right after the clock edge
+//     while the clock is high -- the AND gate can emit runt pulses.
+//     Expect: 1 WARNING clock-gate-reg.
+// ---------------------------------------------------------------------------
+module cdc_gate_reg (
+    input  logic clk,
+    input  logic en,
+    output logic [3:0] cnt
+);
+    logic en_r;
+    always_ff @(posedge clk) en_r <= en;
+
+    logic gclk;
+    assign gclk = clk & en_r;
+
+    always_ff @(posedge gclk) cnt <= cnt + 4'd1;
+endmodule
+
+// ---------------------------------------------------------------------------
+// (j) glitch-prone combinational clock gate: the enable is an
+//     asynchronous input, free to change at any phase of the clock.
+//     Expect: 1 ERROR clock-gating-glitch.
+// ---------------------------------------------------------------------------
+module cdc_gate_bad (
+    input  logic clk,
+    input  logic en_async,
+    output logic [3:0] cnt
+);
+    logic gclk;
+    assign gclk = clk & en_async;
+
+    always_ff @(posedge gclk) cnt <= cnt + 4'd1;
+endmodule
+
+// ---------------------------------------------------------------------------
+// (k) reset synchronizer: ext_rst_n asserts asynchronously, but the
+//     deassertion is synchronized into clk_b by the classic 2-stage
+//     chain (head D tied to 1, second stage D = head Q); the fanout FF's
+//     async reset is driven by the chain tail.
+//     Expect: 2 OK reset-sync-stage (the chain members) + 1 OK
+//     reset-sync-deassert (the counter).
+// ---------------------------------------------------------------------------
+module cdc_reset_sync (
+    input  logic clk_a,
+    input  logic clk_b,
+    input  logic ext_rst_n,
+    output logic [3:0] cnt_b
+);
+    // 2-stage reset synchronizer in the clk_b domain
+    logic rst_meta_n, rst_sync_n;
+    always_ff @(posedge clk_b or negedge ext_rst_n)
+        if (!ext_rst_n)
+            rst_meta_n <= 1'b0;
+        else
+            rst_meta_n <= 1'b1;
+
+    always_ff @(posedge clk_b or negedge ext_rst_n)
+        if (!ext_rst_n)
+            rst_sync_n <= 1'b0;
+        else
+            rst_sync_n <= rst_meta_n;
+
+    // fanout flop: async assert, but its deassertion is synchronized
+    always_ff @(posedge clk_b or negedge rst_sync_n)
+        if (!rst_sync_n)
+            cnt_b <= 4'd0;
+        else
+            cnt_b <= cnt_b + 4'd1;
 endmodule

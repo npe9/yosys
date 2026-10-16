@@ -17,6 +17,14 @@ Expected findings (one table line per crossing bit, plus reset findings):
                    | 1x OK       synchronizer-2ff    (flag, clk_a -> clk_b)
   cdc_eq_bin     | 4x WARNING  synced-bus          (4-bit binary pointer,
                    |                                EQ compare is not Gray)
+  cdc_clk_div    | 1x OK       generated-clock     (divide-by-2 from clk_a)
+                   | 1x OK       same-clock-family   (clk_a -> div_clk)
+                   | 4x OK       synchronizer-2ff    (div_clk -> clk_b sync)
+  cdc_gate_icg   | 1x OK       clock-gate-icg      (latch-held enable)
+  cdc_gate_reg   | 1x WARNING  clock-gate-reg      (registered comb AND)
+  cdc_gate_bad   | 1x ERROR    clock-gating-glitch (async enable)
+  cdc_reset_sync | 2x OK       reset-sync-stage    (the 2 synchronizer FFs)
+                   | 1x OK       reset-sync-deassert (counter reset by tail Q)
 """
 
 import json
@@ -50,6 +58,16 @@ EXPECTED = {
     ("cdc_async_fifo", "OK", "gray-bus"): 8,
     ("cdc_async_fifo", "OK", "synchronizer-2ff"): 1,
     ("cdc_eq_bin", "WARNING", "synced-bus"): 4,
+    # clock network analysis (generated clocks, gating, families)
+    ("cdc_clk_div", "OK", "generated-clock"): 1,
+    ("cdc_clk_div", "OK", "same-clock-family"): 1,
+    ("cdc_clk_div", "OK", "synchronizer-2ff"): 4,
+    ("cdc_gate_icg", "OK", "clock-gate-icg"): 1,
+    ("cdc_gate_reg", "WARNING", "clock-gate-reg"): 1,
+    ("cdc_gate_bad", "ERROR", "clock-gating-glitch"): 1,
+    # reset deassert sequencing
+    ("cdc_reset_sync", "OK", "reset-sync-stage"): 2,
+    ("cdc_reset_sync", "OK", "reset-sync-deassert"): 1,
 }
 
 

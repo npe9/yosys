@@ -23,7 +23,17 @@
 // combinatorial logic to a fixpoint, and classifies FF input crossings:
 // two-flop synchronizers (OK), Gray-coded buses (OK), bare bits and buses
 // (ERROR), synchronized buses (WARNING), and asynchronous resets from
-// foreign domains (WARNING).
+// foreign domains (WARNING when the deassertion is not synchronized in
+// the destination domain, OK when it is).
+//
+// Clock networks are analyzed per domain: generated clocks (register
+// dividers, gated clocks, clock muxes) are traced back to their parent
+// domain(s), a clock family (ultimate root) is derived so crossings
+// between related domains downgrade to OK same-clock-family, and the
+// gating structure is classified: latch-held enables are OK (ICG),
+// register-held enables are a runt-pulse WARNING, and asynchronous or
+// unheld enables are an ERROR (combinatorial gating glitch).
+//
 // The design must be process-free: run 'proc' before this pass.
 
 #include "kernel/yosys.h"
@@ -232,6 +242,417 @@ struct CdcAnalyzer
 		}
 	}
 
+	// ---------------- clock network analysis ----------------
+	//
+	// infer_domains() keys a domain by the exact clock bit at FF clock
+	// pins, so generated clocks (dividers, gated clocks, clock muxes)
+	// each became their own unrelated root domain -- a divide-by-2 clock
+	// was treated as fully asynchronous to the clock it divides.  This
+	// pass walks each domain's clock net back through the driver graph to
+	// find the parent domain(s) it derives from, derives a family (root
+	// domain) for same-family crossing softening, and classifies the
+	// gating structure (glitch hazard vs latch-based ICG vs register
+	// divider).
+
+	std::vector<int> domain_parent;	// immediate parent domain, -1 = root
+	std::vector<int> domain_family;	// ultimate root domain id
+
+	static bool is_gate_cell(Cell *cell)
+	{
+		return cell->type.in(ID($and), ID($nand), ID($or), ID($nor),
+				ID($xor), ID($xnor), ID($not), ID($mux));
+	}
+
+	int family_of(int d)
+	{
+		if (domain_family.empty())
+			return d;
+		return domain_family[d];
+	}
+
+	// Does the backward cone of `bit` contain a holding element (FF or
+	// latch)?  An enable that passes through a register or latch cannot
+	// change while the parent clock is active; a bare comb enable can,
+	// which is what makes combinatorial clock ANDing glitch-prone.
+	bool cone_has_hold(SigBit bit, bool &has_latch, int depth = 0)
+	{
+		pool<SigBit> seen;
+		std::vector<SigBit> work;
+		work.push_back(bit);
+		seen.insert(bit);
+		while (!work.empty() && depth < 64) {
+			SigBit b = work.back();
+			work.pop_back();
+			depth++;
+			auto dit = drivers.find(b);
+			if (dit == drivers.end())
+				continue;
+			Cell *drv = dit->second.first;
+			// NB: is_builtin_ff() is TRUE for latches too ($dl/$dlatch
+			// share the FF framework), so the latch check must come
+			// first
+			if (drv->type.in(ID($dl), ID($dlatch))) {
+				has_latch = true;
+				return true;
+			}
+			if (drv->is_builtin_ff())
+				return true;
+			for (auto &conn : drv->connections()) {
+				if (!drv->input(conn.first))
+					continue;
+				for (auto inbit : sigmap(conn.second))
+					if (inbit.wire && seen.insert(inbit).second)
+						work.push_back(inbit);
+			}
+		}
+		return false;
+	}
+
+	// bounded backward search: does the cone of `bit` contain any domain
+	// clock bit?  Distinguishes cascaded clock gates (clk & a) & b -- 'a'
+	// continues the clock path -- from data enables (clk & f(...)), whose
+	// cone must instead be checked for holding elements.
+	bool reaches_clock(SigBit bit)
+	{
+		pool<SigBit> seen;
+		std::vector<SigBit> work;
+		work.push_back(bit);
+		seen.insert(bit);
+		int steps = 0;
+		while (!work.empty() && steps < 256) {
+			SigBit b = work.back();
+			work.pop_back();
+			steps++;
+			if (clk_domains.count(b))
+				return true;
+			auto dit = drivers.find(b);
+			if (dit == drivers.end())
+				continue;
+			Cell *drv = dit->second.first;
+			if (drv->is_builtin_ff() || drv->type.in(ID($dl), ID($dlatch)))
+				continue;	// data register: cone continues, clocks don't
+			for (auto &conn : drv->connections()) {
+				if (!drv->input(conn.first))
+					continue;
+				for (auto inbit : sigmap(conn.second))
+					if (inbit.wire && seen.insert(inbit).second)
+						work.push_back(inbit);
+			}
+		}
+		return false;
+	}
+
+	// Walk one domain's clock net backwards.  Domain-clock input bits of
+	// path cells are parent candidates; port inputs that look like clocks
+	// (name contains "clk"/"clock") are external parents; every other
+	// non-constant input is an enable bit whose cone must hold for
+	// glitch-free gating.  Returns parents (deduped); fills path_cells,
+	// enbits, and ext_parent.
+	void analyze_clock(int d, std::set<int> &parents, pool<Cell *> &path_cells,
+			pool<SigBit> &enbits, bool &ext_parent)
+	{
+		auto looks_like_clock = [&](SigBit bit) {
+			std::string n = bit.wire->name.unescape();
+			std::string lo;
+			for (char ch : n)
+				lo += tolower((unsigned char)ch);
+			return lo.find("clk") != std::string::npos ||
+					lo.find("clock") != std::string::npos;
+		};
+		pool<SigBit> seen;
+		std::vector<SigBit> work;
+		SigBit root = domain_clks[d];
+		work.push_back(root);
+		seen.insert(root);
+		while (!work.empty()) {
+			SigBit bit = work.back();
+			work.pop_back();
+			auto dit = drivers.find(bit);
+			if (dit == drivers.end())
+				continue;	// port input or undriven: a root
+			Cell *drv = dit->second.first;
+			if (drv->is_builtin_ff() || drv->type.in(ID($dl), ID($dlatch))) {
+				// register/latch-generated clock (divider, gated-FF):
+				// the clock parent is the register's own clock domain.
+				if (drv->is_builtin_ff()) {
+					int p = ff_domain(drv);
+					if (p >= 0 && p != d)
+						parents.insert(p);
+				}
+				continue;
+			}
+			if (!is_gate_cell(drv))
+				continue;	// unrelated logic driving the net: stop
+			path_cells.insert(drv);
+			for (auto &conn : drv->connections()) {
+				if (!drv->input(conn.first))
+					continue;
+				for (auto inbit : sigmap(conn.second)) {
+					if (!inbit.wire)
+						continue;
+					auto cit = clk_domains.find(inbit);
+					if (cit != clk_domains.end()) {
+						if (cit->second != d)
+							parents.insert(cit->second);
+						continue;
+					}
+					if (inbit.wire->port_input && looks_like_clock(inbit)) {
+						// a top-level clock port this gate derives from
+						ext_parent = true;
+						continue;
+					}
+					if (!seen.count(inbit) && reaches_clock(inbit))
+						work.push_back(inbit);
+					else
+						enbits.insert(inbit);
+				}
+			}
+		}
+	}
+
+	void analyze_clock_network()
+	{
+		int ndom = GetSize(domain_names);
+		domain_parent.assign(ndom, -1);
+
+		// ---- pass 1: parents and gate classification ------------------
+		std::vector<std::string> gate_cls(ndom), gate_sev(ndom), gate_cell(ndom, "");
+		for (int d = 0; d < ndom; d++) {
+			std::set<int> parents;
+			pool<Cell *> path_cells;
+			pool<SigBit> enbits;
+			bool ext_parent = false;
+			analyze_clock(d, parents, path_cells, enbits, ext_parent);
+			if (parents.empty() && !ext_parent)
+				continue;	// a genuine root (port/undriven clock)
+			if (!parents.empty())
+				domain_parent[d] = *parents.begin();
+			std::string parent_names;
+			for (int p : parents) {
+				if (!parent_names.empty())
+					parent_names += ",";
+				parent_names += domain_names[p];
+			}
+			if (ext_parent) {
+				if (!parent_names.empty())
+					parent_names += ",";
+				parent_names += "(external)";
+			}
+			std::string clkname = bit_name(domain_clks[d]);
+			std::string cellname;
+			if (!path_cells.empty()) {
+				std::vector<Cell *> sorted(path_cells.begin(), path_cells.end());
+				std::sort(sorted.begin(), sorted.end(), [](Cell *a, Cell *b) { return a->name < b->name; });
+				cellname = sorted.front()->name.unescape();
+			} else {
+				// register-generated: name the generating register
+				auto dit = drivers.find(domain_clks[d]);
+				cellname = dit != drivers.end() ? dit->second.first->name.unescape() : clkname;
+			}
+			if (parents.size() > 1) {
+				// clock mux: asynchronous to every parent; the select
+				// line is checked like any other enable below
+				gate_sev[d] = "WARNING";
+				gate_cls[d] = "clock-mux";
+			}
+			if (enbits.empty()) {
+				if (gate_cls[d].empty()) {
+					gate_sev[d] = "OK";
+					gate_cls[d] = "generated-clock";
+				}
+			} else {
+				bool any_glitch = false, any_reg = false, all_latch = true;
+				for (SigBit en : enbits) {
+					bool has_latch = false;
+					bool hold = cone_has_hold(en, has_latch);
+					// enable not generated in (one of) the parent
+					// domain(s): it can change asynchronously w.r.t.
+					// the gate it feeds -> glitch, held or not
+					bool foreign = false;
+					for (int ed : bit_domains(en))
+						if (!parents.count(ed))
+							foreign = true;
+					if (foreign || !hold)
+						any_glitch = true;
+					else if (!has_latch)
+						any_reg = true;
+					all_latch = all_latch && has_latch;
+				}
+				if (any_glitch) {
+					gate_sev[d] = "ERROR";
+					gate_cls[d] = "clock-gating-glitch";
+				} else if (any_reg) {
+					gate_sev[d] = "WARNING";
+					gate_cls[d] = "clock-gate-reg";
+				} else if (all_latch) {
+					gate_sev[d] = "OK";
+					gate_cls[d] = "clock-gate-icg";
+				}
+			}
+			if (!gate_cls[d].empty())
+				findings.push_back({gate_sev[d], gate_cls[d], parent_names,
+						domain_names[d], clkname, cellname});
+		}
+
+		// ---- pass 2: family = ultimate root (multi-parent domains are
+		// their own family: a clock mux is asynchronous to everything)
+		domain_family.assign(ndom, -1);
+		for (int d = 0; d < ndom; d++) {
+			std::vector<int> path;
+			int cur = d;
+			while (domain_parent[cur] >= 0 && domain_family[cur] < 0) {
+				path.push_back(cur);
+				cur = domain_parent[cur];
+				if (GetSize(path) > ndom)
+					break;	// parent cycle: treat cur as a root
+			}
+			int root = domain_family[cur] >= 0 ? domain_family[cur] : cur;
+			for (int x : path)
+				domain_family[x] = root;
+			domain_family[d] = root;
+		}
+	}
+
+	// ---------------- reset deassert classification ----------------
+	//
+	// An async reset ASSERTED from a foreign domain is safe (that is what
+	// async-reset flops are for); the hazard is DEASSERTION skew and
+	// recovery-time violations, which is why resets are synchronized in
+	// the destination domain.  v1 warned for every foreign/external
+	// async reset; here we recognize the canonical pattern: a chain of
+	// >=2 same-domain single-bit FFs, all async-reset by one raw reset R,
+	// head D tied to 1 (assert value released one clock after deassert),
+	// each later stage D = previous stage Q.  Chain members are reported
+	// OK reset-sync-stage; flops whose reset net is a chain tail's Q are
+	// OK reset-sync-deassert; everything else keeps the v1 WARNING.
+
+	// canonical raw reset behind an async-reset net: walk back through
+	// inverters ($not / $xor-1) only; stops at FF Q, port, or logic.
+	SigBit arst_base(SigBit bit)
+	{
+		pool<SigBit> seen;
+		while (seen.insert(bit).second) {
+			auto dit = drivers.find(bit);
+			if (dit == drivers.end())
+				break;
+			Cell *drv = dit->second.first;
+			int yidx = dit->second.second;
+			SigBit nxt;
+			if (drv->type == ID($not)) {
+				SigSpec a = sigmap(drv->getPort(ID::A));
+				if (yidx < 0 || yidx >= GetSize(a))
+					break;
+				nxt = a[yidx];
+			} else if (drv->type == ID($xor)) {
+				SigSpec a = sigmap(drv->getPort(ID::A));
+				SigSpec b = sigmap(drv->getPort(ID::B));
+				if (yidx < 0 || yidx >= GetSize(a) || yidx >= GetSize(b))
+					break;
+				if (a[yidx].wire == nullptr && a[yidx].data == RTLIL::S1)
+					nxt = b[yidx];
+				else if (b[yidx].wire == nullptr && b[yidx].data == RTLIL::S1)
+					nxt = a[yidx];
+				else
+					break;
+			} else
+				break;
+			bit = sigmap(nxt);
+		}
+		return bit;
+	}
+
+	// lazily-computed per-(domain, base-reset) synchronizer table:
+	// stage_members = cells belonging to a >=2 chain; tail_qs = Q bits of
+	// chain tails (the nets it is safe to fan a reset tree out from)
+	dict<std::pair<int, SigBit>, std::pair<pool<Cell *>, pool<SigBit>>> reset_chains;
+	bool reset_chains_built = false;
+
+	bool d_const1(SigSpec sig)
+	{
+		sig = sigmap(sig);
+		for (auto bit : sig)
+			if (bit.wire || bit.data != RTLIL::S1)
+				return false;
+		return true;
+	}
+
+	void build_reset_chains()
+	{
+		reset_chains_built = true;
+		// index single-bit async-reset FFs by (domain, base reset)
+		dict<std::pair<int, SigBit>, pool<Cell *>> by_base;
+		for (auto cell : module->cells()) {
+			if (!cell->is_builtin_ff())
+				continue;
+			FfData ff(nullptr, cell);
+			if (!ff.has_clk || ff.width != 1 || !ff.has_arst || GetSize(ff.sig_arst) != 1)
+				continue;
+			int d = ff_domain(cell);
+			if (d < 0)
+				continue;
+			by_base[std::make_pair(d, arst_base(sigmap(ff.sig_arst[0])))].insert(cell);
+		}
+		for (auto &it : by_base) {
+			pool<Cell *> &stages = it.second;
+			if (stages.size() < 2)
+				continue;
+			// link each stage to the stage sampling its Q
+			dict<Cell *, Cell *> nxt;
+			pool<Cell *> heads;
+			for (Cell *c : stages) {
+				FfData cf(nullptr, c);
+				SigBit q = sigmap(cf.sig_q[0]);
+				if (d_const1(cf.sig_d))
+					heads.insert(c);
+				for (Cell *o : stages) {
+					if (o == c)
+						continue;
+					FfData of(nullptr, o);
+					if (sigmap(of.sig_d[0]) == q) {
+						nxt[c] = o;
+						break;
+					}
+				}
+			}
+			// walk head chains; a chain of >=2 stages is a synchronizer
+			for (Cell *h : heads) {
+				std::vector<Cell *> chain;
+				pool<Cell *> seen;
+				Cell *cur = h;
+				while (cur && seen.insert(cur).second) {
+					chain.push_back(cur);
+					auto nit = nxt.find(cur);
+					cur = nit != nxt.end() ? nit->second : nullptr;
+				}
+				if (GetSize(chain) < 2)
+					continue;
+				auto &slot = reset_chains[it.first];
+				for (Cell *c : chain)
+					slot.first.insert(c);
+				FfData tf(nullptr, chain.back());
+				slot.second.insert(sigmap(tf.sig_q[0]));
+			}
+		}
+	}
+
+	// classify one async-reset net on a domain-d FF:
+	//   "reset-sync-stage"     the FF itself belongs to a >=2 chain
+	//   "reset-sync-deassert"  its reset net is driven by a chain tail Q
+	//   ""                     no synchronizer found (caller warns)
+	std::string reset_class(int d_ff, Cell *cell, SigBit arst)
+	{
+		if (!reset_chains_built)
+			build_reset_chains();
+		SigBit base = arst_base(arst);
+		auto it = reset_chains.find(std::make_pair(d_ff, base));
+		if (it != reset_chains.end() && it->second.first.count(cell))
+			return "reset-sync-stage";
+		for (auto &rc : reset_chains)
+			if (rc.first.first == d_ff && rc.second.second.count(base))
+				return "reset-sync-deassert";
+		return "";
+	}
+
 	// Follow the synchronizer chain forward from the crossing FF: collect
 	// consecutive flip-flops of domain d_ff, each Q bit feeding the next D
 	// bit. Returns the chain (crossing FF first, synchronizer tail last);
@@ -302,11 +723,14 @@ struct CdcAnalyzer
 
 	// Forward cone of a sync FF's Q bit: every comb cell traversed (into
 	// `comb`) and every FF reached as a sink (any clock domain -- a sink
-	// ends the walk).  Two synced crossings of one group whose cones share
-	// a comb cell or a sink FF reconverge in the destination domain; a
+	// ends the walk), at (cell, bit index) granularity: a 4-bit vector
+	// synchronizer's bits all terminate at the same next-stage FF cell,
+	// and cell-level sink sharing would falsely call them reconvergent.
+	// Two synced crossings of one group whose cones share a comb cell or
+	// a sink (cell,idx) pair reconverge in the destination domain; a
 	// crossing whose cone shares nothing with its group siblings is an
 	// independent synchronizer even when the group carries a bus.
-	void q_cone(Cell *ff, int qidx, pool<Cell *> &comb, pool<Cell *> &sinks)
+	void q_cone(Cell *ff, int qidx, pool<Cell *> &comb, pool<std::pair<Cell *, int>> &sinks)
 	{
 		FfData ffdata(nullptr, ff);
 		if (qidx < 0 || qidx >= GetSize(ffdata.sig_q))
@@ -324,7 +748,15 @@ struct CdcAnalyzer
 				continue;
 			for (Cell *c : cit->second) {
 				if (c->is_builtin_ff()) {
-					sinks.insert(c);
+					int didx = -1;
+					FfData cf(nullptr, c);
+					SigSpec d = sigmap(cf.sig_d);
+					for (int j = 0; j < GetSize(d); j++)
+						if (d[j] == bit) {
+							didx = j;
+							break;
+						}
+					sinks.insert(std::make_pair(c, didx));
 					continue;
 				}
 				if (!comb.insert(c).second)
@@ -473,7 +905,8 @@ struct CdcAnalyzer
 			if (chain.back().second < 0 || chain.back().second >= GetSize(ff.sig_q))
 				return false;
 			qbits[k] = sigmap(ff.sig_q[chain.back().second]);
-			pool<Cell *> comb, sinks;
+			pool<Cell *> comb;
+			pool<std::pair<Cell *, int>> sinks;
 			q_cone(tail, chain.back().second, comb, sinks);
 			for (Cell *c : comb)
 				if (c->type == ID($xor))
@@ -557,7 +990,8 @@ struct CdcAnalyzer
 			if (chain.back().second < 0 || chain.back().second >= GetSize(ff.sig_q))
 				return false;
 			qbits[k] = sigmap(ff.sig_q[chain.back().second]);
-			pool<Cell *> comb, sinks;
+			pool<Cell *> comb;
+			pool<std::pair<Cell *, int>> sinks;
 			q_cone(tail, chain.back().second, comb, sinks);
 			for (Cell *c : comb)
 				if (c->type == ID($eq))
@@ -654,10 +1088,17 @@ struct CdcAnalyzer
 			if (GetSize(ff.sig_d) == ff.width) {
 				SigSpec dsig = sigmap(ff.sig_d);
 				for (int i = 0; i < ff.width; i++) {
-					std::set<int> foreign;
+					std::set<int> foreign, kin;
 					for (int d : bit_domains(dsig[i]))
-						if (d != d_ff)
-							foreign.insert(d);
+						if (d != d_ff) {
+							if (family_of(d) == family_of(d_ff))
+								kin.insert(d);
+							else
+								foreign.insert(d);
+						}
+					if (!kin.empty())
+						findings.push_back({"OK", "same-clock-family", join_domains(kin),
+								domain_names[d_ff], bit_name(dsig[i]), cname});
 					if (foreign.empty())
 						continue;
 					crossings.push_back({d_ff, foreign, bit_name(dsig[i]), dsig[i], cname,
@@ -669,10 +1110,17 @@ struct CdcAnalyzer
 				if (GetSize(sig) != 1)
 					return;
 				SigBit bit = sigmap(sig[0]);
-				std::set<int> foreign;
+				std::set<int> foreign, kin;
 				for (int d : bit_domains(bit))
-					if (d != d_ff)
-						foreign.insert(d);
+					if (d != d_ff) {
+						if (family_of(d) == family_of(d_ff))
+							kin.insert(d);
+						else
+							foreign.insert(d);
+					}
+				if (!kin.empty())
+					findings.push_back({"OK", "same-clock-family", join_domains(kin),
+							domain_names[d_ff], bit_name(bit) + tag, cname});
 				if (foreign.empty())
 					return;
 				crossings.push_back({d_ff, foreign, bit_name(bit) + tag, bit, cname, false});
@@ -686,13 +1134,23 @@ struct CdcAnalyzer
 				SigBit bit = sigmap(ff.sig_arst[0]);
 				std::set<int> foreign;
 				for (int d : bit_domains(bit))
-					if (d != d_ff)
+					if (d != d_ff && family_of(d) != family_of(d_ff))
 						foreign.insert(d);
-				if (!foreign.empty()) {
-					findings.push_back({"WARNING", "reset-cdc", join_domains(foreign),
-							domain_names[d_ff], bit_name(bit), cname});
-				} else if (bit.wire && bit.wire->port_input && domain_clks[d_ff] != bit) {
-					findings.push_back({"WARNING", "reset-cdc", "(external)",
+				bool external = foreign.empty() && bit.wire && bit.wire->port_input &&
+						domain_clks[d_ff] != bit;
+				std::string cls = reset_class(d_ff, cell, bit);
+				if (!foreign.empty() || external) {
+					std::string srcs = foreign.empty() ? "(external)" : join_domains(foreign);
+					if (cls.empty())
+						findings.push_back({"WARNING", "reset-cdc", srcs,
+								domain_names[d_ff], bit_name(bit), cname});
+					else
+						findings.push_back({"OK", cls, srcs,
+								domain_names[d_ff], bit_name(bit), cname});
+				} else if (cls == "reset-sync-deassert") {
+					// same-domain async reset, but generated by a reset
+					// synchronizer tail: deassertion is sequenced
+					findings.push_back({"OK", cls, "(synchronized)",
 							domain_names[d_ff], bit_name(bit), cname});
 				}
 			}
@@ -727,15 +1185,31 @@ struct CdcAnalyzer
 					}
 					return x;
 				};
-				std::vector<pool<Cell *>> comb(n), sinks(n);
-				for (int a = 0; a < n; a++)
+				std::vector<pool<Cell *>> comb(n), comb_tail(n);
+				std::vector<pool<std::pair<Cell *, int>>> sinks(n);
+				for (int a = 0; a < n; a++) {
 					q_cone(crossings[g.second[a]].ffcell, crossings[g.second[a]].qidx, comb[a], sinks[a]);
+					// the reconvergence that makes a synced group a bus
+					// (Gray decoder chain, full/empty EQ compare) usually
+					// sits on the synchronizer TAIL side, not on the
+					// crossing FF: a plain vector synchronizer's tail
+					// cones are bit-disjoint, while Gray/eq-reconverged
+					// tails share comb cells
+					pool<std::pair<Cell *, int>> tail_sinks;
+					auto chain = sync_chain(crossings[g.second[a]].ffcell,
+							crossings[g.second[a]].qidx, g.first.first);
+					q_cone(chain.back().first, chain.back().second,
+							comb_tail[a], tail_sinks);
+				}
 				auto share = [&](int a, int b) {
 					for (Cell *c : comb[a])
 						if (comb[b].count(c))
 							return true;
-					for (Cell *c : sinks[a])
+					for (auto &c : sinks[a])
 						if (sinks[b].count(c))
+							return true;
+					for (Cell *c : comb_tail[a])
+						if (comb_tail[b].count(c))
 							return true;
 					return false;
 				};
@@ -814,6 +1288,7 @@ struct CdcAnalyzer
 		build_maps();
 		infer_domains();
 		propagate();
+		analyze_clock_network();
 
 		for (auto &it : domains) {
 			if (it.first.wire && it.second.size() > 1) {
@@ -859,6 +1334,23 @@ struct CdcPass : public Pass {
 		log("\n");
 		log("  - synchronizer-2ff   (OK)      crossing followed by a 2+ stage chain of\n");
 		log("                                 same-domain flip-flops (Q feeding next D)\n");
+		log("  - same-clock-family  (OK)      crossing between domains derived from one\n");
+		log("                                 clock (e.g. a divide-by-2 generated clock):\n");
+		log("                                 synchronous, not a metastability risk\n");
+		log("  - generated-clock    (OK)      domain clock derived from a parent domain\n");
+		log("                                 without combinatorial gating (divider FF)\n");
+		log("  - clock-gate-icg     (OK)      gated clock whose enable cone holds a latch\n");
+		log("  - clock-gate-reg     (WARNING) enable held only by registers: combinational\n");
+		log("                                 clock ANDing can still emit runt pulses\n");
+		log("  - clock-gating-glitch (ERROR)  enable asynchronous to the parent clock or\n");
+		log("                                 never registered/latched: glitch hazard\n");
+		log("  - clock-mux          (WARNING) domain clock muxed from multiple parent\n");
+		log("                                 clocks: asynchronous to every one of them\n");
+		log("  - reset-sync-stage   (OK)      the flop belongs to a >=2-stage reset\n");
+		log("                                 synchronizer chain (async assert, the\n");
+		log("                                 chain synchronizes the deassertion)\n");
+		log("  - reset-sync-deassert (OK)     async reset driven by a reset synchronizer\n");
+		log("                                 tail in the destination domain\n");
 		log("  - gray-bus           (OK)      synced bus whose bits are Gray-coded:\n");
 		log("                                 bin->gray $xor encoder in the source\n");
 		log("                                 domain, and in the destination domain either\n");
@@ -872,6 +1364,15 @@ struct CdcPass : public Pass {
 		log("  - unsynchronized-bus (ERROR)   a multi-bit crossing with unsynchronized bits\n");
 		log("  - reset-cdc          (WARNING) asynchronous reset input driven from another\n");
 		log("                                 clock domain or from an external input port\n");
+		log("                                 whose deassertion is not synchronized in the\n");
+		log("                                 destination domain\n");
+		log("\n");
+		log("Each domain's clock net is traced back through the driver graph to the\n");
+		log("domain(s) it derives from (register dividers, gated clocks, clock muxes),\n");
+		log("and a clock family (ultimate root domain) is derived.  Crossings between\n");
+		log("domains of one family are reported OK same-clock-family instead of being\n");
+		log("treated as asynchronous.  Gated clocks are additionally classified by\n");
+		log("their enable's holding structure (see the class list above).\n");
 		log("\n");
 		log("Clock enable and synchronous reset inputs are checked like data inputs.\n");
 		log("Findings are printed as a table and counted in a final summary; the pass\n");

@@ -1,0 +1,27 @@
+# A typedef'd packed multi-dimensional type must keep its dimension
+# structure on the declared wire: `s[2]` is the 8-bit lane, not bit 2.
+# (Upstream main af9f71e51 flattens it to a bit select.)
+read_verilog -sv -formal <<EOT
+module top(input logic [39:0] i, output logic [7:0] o8, output logic o1, output logic [39:0] o40);
+  typedef logic [4:0][7:0] plane_t;
+  plane_t s;
+  assign s = i;
+  assign o8 = s[2];
+  assign o1 = s[2][3];
+  function automatic plane_t rot(plane_t st);
+    plane_t r;
+    for (int x = 0; x < 5; x++)
+      r[x] = st[(x == 0) ? 4 : x - 1];
+    return r;
+  endfunction
+  assign o40 = rot(s);
+  always_comb begin
+    assert (o8 == i[23:16]);
+    assert (o1 == i[19]);
+    assert (o40 == {i[31:0], i[39:32]});
+  end
+endmodule
+EOT
+prep -top top
+chformal -lower
+sat -verify -prove-asserts

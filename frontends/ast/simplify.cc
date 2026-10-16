@@ -5132,8 +5132,19 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			}
 
 			// Prepare to generate dimensions metadata for the resolved type.
-			newNode->dimensions.clear();
-			newNode->unpacked_dimensions = 0;
+			// If the template wire was already simplified its packed
+			// multirange has been compacted to one flat AST_RANGE and only
+			// `dimensions` still records the structure (`typedef logic
+			// [4:0][7:0] plane_t`); regenerating from the flat child would
+			// turn every `s[x]` lane select into a bit select.  Keep the
+			// template's metadata whenever no extra dimensions are added.
+			if (!add_packed_dimensions && type != AST_MEMORY && !template_node->dimensions.empty()) {
+				newNode->dimensions = template_node->dimensions;
+				newNode->unpacked_dimensions = template_node->unpacked_dimensions;
+			} else {
+				newNode->dimensions.clear();
+				newNode->unpacked_dimensions = 0;
+			}
 
 			goto apply_newNode;
 			}
@@ -5595,20 +5606,115 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 	}
 
-	// fold constant-index reads of parameter arrays initialized with an
-	// assignment pattern, e.g. `localparam int T [5] = '{1,2,3,4,0}; T[2]`
+	// fold reads of parameter arrays initialized with an assignment
+	// pattern, e.g. `localparam int T [5] = '{1,2,3,4,0}; T[2]`.
+	// Multi-dimensional arrays (`localparam int R [5][5] = '{'{..},..};
+	// R[x][y]`) arrive as one AST_MULTIRANGE child holding one AST_RANGE
+	// per index; each index descends one level into the nested pattern.
+	// A non-constant index (`RC[rnd]`) becomes a ternary chain over the
+	// elements, and a trailing packed part-select on a leaf constant
+	// (`RC[rnd][W-1:0]`) is sliced out of each leaf.  Without this the
+	// read stayed symbolic: a generate-if over it was silently skipped
+	// (prim_keccak rho offsets) and a dynamic index read an undriven
+	// wire (prim_keccak round constants).
 	if (type == AST_IDENTIFIER && id2ast &&
 			(id2ast->type == AST_LOCALPARAM || id2ast->type == AST_PARAMETER) &&
 			children.size() == 1 &&
-			children[0]->type == AST_RANGE && children[0]->range_valid &&
+			(children[0]->type == AST_RANGE || children[0]->type == AST_MULTIRANGE) &&
 			!id2ast->children.empty() && id2ast->children[0]->type == AST_ASSIGN_PATTERN) {
-		AstNode *pattern = id2ast->children[0].get();
-		int base = 0;
-		if (!id2ast->dimensions.empty())
-			base = id2ast->dimensions.front().range_right;
-		int idx = children[0]->range_left - base;
-		if (0 <= idx && idx < GetSize(pattern->children)) {
-			newNode = pattern->children[idx]->clone();
+		std::vector<AstNode*> sels;
+		if (children[0]->type == AST_RANGE)
+			sels.push_back(children[0].get());
+		else
+			for (auto &c : children[0]->children)
+				sels.push_back(c.get());
+		// packed slice of a leaf constant: bits are stored LSB-first with
+		// bit 0 at the parameter's packed range_right
+		std::function<std::unique_ptr<AstNode>(AstNode*, size_t)> resolve;
+		resolve = [&](AstNode *cur, size_t d) -> std::unique_ptr<AstNode> {
+			if (d == sels.size())
+				return cur->clone();
+			AstNode *sel = sels[d];
+			if (sel->type != AST_RANGE || sel->children.empty())
+				return nullptr;
+			if (cur->type == AST_ASSIGN_PATTERN) {
+				int base = 0;
+				if (d < id2ast->dimensions.size())
+					base = id2ast->dimensions[d].range_right;
+				if (sel->range_valid) {
+					if (sels.size() > 1 && sel->range_left != sel->range_right)
+						return nullptr;
+					int idx = sel->range_left - base;
+					if (idx < 0 || idx >= GetSize(cur->children))
+						return nullptr;
+					return resolve(cur->children[idx].get(), d + 1);
+				}
+				if (sel->children.size() != 1)
+					return nullptr;
+				std::vector<std::unique_ptr<AstNode>> leaves;
+				int w = -1;
+				bool all_const = true;
+				for (auto &child : cur->children) {
+					auto leaf = resolve(child.get(), d + 1);
+					if (!leaf)
+						return nullptr;
+					if (leaf->type != AST_CONSTANT || (w >= 0 && GetSize(leaf->bits) != w))
+						all_const = false;
+					else
+						w = GetSize(leaf->bits);
+					leaves.push_back(std::move(leaf));
+				}
+				auto idx = sel->children[0]->clone();
+				if (base != 0)
+					idx = std::make_unique<AstNode>(location, AST_SUB, std::move(idx), mkconst_int(location, base, true));
+				if (all_const && w > 0 && !in_param) {
+					// dynamic index into a constant table: one $shiftx over
+					// the flattened table (element i at bits [i*w +: w]),
+					// cast back to the element width.  A ternary chain here
+					// is O(n) muxes per read and made the AES S-box
+					// lookups in caliptra's fv_doe_* properties (256
+					// entries, called per byte per round) take minutes.
+					std::vector<RTLIL::State> flat;
+					for (auto &leaf : leaves)
+						flat.insert(flat.end(), leaf->bits.begin(), leaf->bits.end());
+					bool is_signed = leaves[0]->is_signed;
+					auto shamt = std::make_unique<AstNode>(location, AST_MUL, std::move(idx), mkconst_int(location, w, true));
+					auto sh = std::make_unique<AstNode>(location, AST_SHIFTX, mkconst_bits(location, flat, false), std::move(shamt));
+					auto cast = std::make_unique<AstNode>(location, AST_CAST_SIZE, mkconst_int(location, w, true), std::move(sh));
+					cast->is_signed = is_signed;
+					return cast;
+				}
+				// constant context or non-uniform leaves:
+				// idx == 0 ? e0 : idx == 1 ? e1 : ... : e_last
+				std::unique_ptr<AstNode> chain;
+				for (int i = GetSize(leaves) - 1; i >= 0; i--) {
+					auto leaf = std::move(leaves[i]);
+					if (!chain) {
+						chain = std::move(leaf);
+						continue;
+					}
+					auto cond = std::make_unique<AstNode>(location, AST_EQ,
+							sel->children[0]->clone(), mkconst_int(location, i + base, true));
+					chain = std::make_unique<AstNode>(location, AST_TERNARY,
+							std::move(cond), std::move(leaf), std::move(chain));
+				}
+				return chain;
+			}
+			// leaf: only a single constant packed part-select is supported
+			if (cur->type != AST_CONSTANT || d + 1 != sels.size() || !sel->range_valid)
+				return nullptr;
+			if (!id2ast->range_valid || id2ast->range_swapped)
+				return nullptr;
+			int lo = std::min(sel->range_left, sel->range_right) - id2ast->range_right;
+			int hi = std::max(sel->range_left, sel->range_right) - id2ast->range_right;
+			if (lo < 0 || hi >= GetSize(cur->bits))
+				return nullptr;
+			std::vector<RTLIL::State> bits(cur->bits.begin() + lo, cur->bits.begin() + hi + 1);
+			return mkconst_bits(location, bits, false);
+		};
+		auto folded = resolve(id2ast->children[0].get(), 0);
+		if (folded) {
+			newNode = std::move(folded);
 			goto apply_newNode;
 		}
 	}

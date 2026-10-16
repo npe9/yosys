@@ -22,6 +22,27 @@ pushed to `fork/upstream/<chunk>`.
 
 ## Series (in proposed PR order)
 
+### 0. `typedef-dims` — typedef'd packed multi-dimensional types lose their lanes
+- **Files:** one hunk in `frontends/ast/simplify.cc` (typedef-to-wire
+  resolution keeps the template's `dimensions` metadata instead of
+  regenerating it from the already-compacted flat range),
+  `tests/svtypes/typedef_multidim_lanes.ys`.
+- **Deps:** none.  **Reproduces on upstream main af9f71e51**: with
+  `typedef logic [4:0][7:0] plane_t; plane_t s;` the lane select `s[2]`
+  elaborates to bit 2 (`{7'h00, i[2]}`), silently miscompiling every
+  design that indexes a typedef'd packed array (OpenTitan prim_keccak's
+  `box_t`/`plane_t`: the whole round function collapsed to 49 cells).
+- **Gate:** the new `.ys` (SAT-proved lane/bit/function-argument
+  selects); `tests/svtypes` green.
+- **Value:** smallest possible correctness PR in the series; open it
+  first.  Found 2026-10-16 via the Keccak-f[1600] known-answer test.
+- **Status:** fix landed on the fork; chunk not yet materialized.
+  (The companion parameter-array fixes from the same session --
+  multi-dimensional `localparam int R [5][5]` folds and dynamic-index
+  reads via `$shiftx` -- depend on the fork's unpacked parameter-array
+  support, which upstream main does not parse, so they ride with the
+  `sva-frontend` chunk.)
+
 ### 1. `cdc-sdc` — structural CDC analysis + SDC subset frontend
 - **Files:** `passes/cmds/cdc.cc`, `passes/cmds/read_sdc.cc`,
   `passes/cmds/sdc_constraints.h`, `tests/verilog/cdc_cases.{sv,sdc,ys}`,

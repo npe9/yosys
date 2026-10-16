@@ -14,10 +14,18 @@ via the `YOSYS` env var; default `third_party/yosys/build/yosys`
 relative to the repo root):
 
     make test            # in this directory: battery + cdc + seeded fuzz
+                         # + conductor leg + xprop legs
     python3 run_ic3.py <file>.sv --timeout 90     # native IC3/PDR, no external solver
     python3 run_bmc.py <file>.sv                  # write_smt2 + yosys-smtbmc (z3 default, -s boolector)
+    python3 prove.py <file>.sv...                 # conductor: both lanes in parallel,
+                                                  # first-to-finish per property
 
 Both drivers exit 0 iff every property matches its expectation.
+The conductor additionally records which lane settled each property and
+exits 1 on cross-engine conflicts (a cex depth disagreement, or one lane
+proving what the other disproved -- both engines are sound on the
+identical prep, so that means an engine bug; the sequential battery legs
+remain the referee).
 
 ## Expectations
 

@@ -79,17 +79,31 @@ def expectations(path):
     return exp
 
 
-def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
+def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
+              stream=None):
     label = os.path.basename(path)
     exp = expectations(path)
+
+    def sline(msg):
+        # incremental verdict events for the prove.py conductor
+        if stream:
+            with open(stream, "a") as fh:
+                fh.write(msg + "\n")
+
     if "BMC-SKIP" in open(path).read():
         # ic3-only features write_smt2 cannot encode ($fair cells today):
         # the expectation lives in run_battery's ic3 leg
         print("%s: skipped (BMC-SKIP pragma)" % label)
+        sline("SKIP")
+        sline("DONE")
         return True
     bound = max([24] + [n + 4 for k, n in exp.values() if n is not None])
     verdicts = {}   # name -> ('cex', step) | ('holds', bound)
     deleted = []
+    skipped = set()  # liveness-flavored $check cells write_smt2 cannot
+                     # encode (warning at prep) -- no assertion exists in
+                     # the SMT, so 'holds'/'proved' for them would be
+                     # vacuous; their verdict comes from the ic3 leg
 
     for _ in range(64):
         deletes = "".join("delete c:\\%s\n" % n for n in deleted)
@@ -103,12 +117,17 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
         p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" "$2"', "y", yosys, ys],
                 timeout=timeout)
         blob = p.stdout + "\n" + p.stderr
+        for m in re.finditer(r"skipping liveness-flavored \$check cell \S+\.(\S+)",
+                             blob):
+            skipped.add(m.group(1))
         if p.returncode != 0:
             err = ""
             for line in blob.splitlines():
                 if "ERROR:" in line:
                     err = line.split("ERROR:", 1)[1].strip()
             print("%s: prep-failed: %s" % (label, err[:120]))
+            sline("ERROR prep-failed: %s" % err[:120])
+            sline("DONE")
             return None
         if not top:
             m = re.search(r"yosys-smt2-topmod (\S+)", open(smt).read())
@@ -122,6 +141,8 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
             p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$@"', "y"] + cmd, timeout=timeout)
         except subprocess.TimeoutExpired:
             print("%s: smtbmc timed out after %ds" % (label, timeout))
+            sline("ERROR smtbmc-timeout %d" % timeout)
+            sline("DONE")
             return None
         blob = p.stdout + "\n" + p.stderr
         # smtbmc's exit code is not a reliable error signal (it is nonzero
@@ -133,6 +154,8 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
                 if "error" in line.lower() or "ERROR" in line:
                     err = line.strip()[:120]
             print("%s: smtbmc failed: %s" % (label, err or "exit %d, no output" % p.returncode))
+            sline("ERROR smt-failed: %s" % (err or "exit %d" % p.returncode))
+            sline("DONE")
             return None
 
         step = None
@@ -148,12 +171,14 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
             if "Status: PASSED" not in blob and p.returncode == 0:
                 pass
             for name in exp:
-                if name not in verdicts and name not in deleted:
+                if name not in verdicts and name not in deleted and \
+                        name not in skipped:
                     verdicts[name] = ("holds", bound)
             break
         for name in failed:
             if name not in verdicts:
                 verdicts[name] = ("cex", step)
+                sline("VERDICT %s cex@%d" % (name, step))
             deleted.append(name)
 
     # proof upgrade: with --prove, run one temporal-induction pass over the
@@ -162,7 +187,8 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
     # "proved" on "Temporal induction successful." -- its Assert-failed /
     # FAILED output for a spurious step-case cex is ignored by design.
     if prove:
-        remaining = [n for n in exp if n in verdicts and verdicts[n][0] == "holds"]
+        remaining = [n for n in exp if n in verdicts and verdicts[n][0] == "holds"
+                     and n not in skipped]
         if remaining:
             cmd = [smtbmc, "-s", solver, "-t", str(bound), "-m", top or label, "-i", smt]
             try:
@@ -173,6 +199,15 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
                 for name in remaining:
                     verdicts[name] = ("proved", bound)
 
+    for name in exp:
+        if name not in verdicts:
+            continue
+        kind, vbound = verdicts[name]
+        if kind == "cex":
+            continue  # streamed when found
+        sline("VERDICT %s %s@%d" % (name, kind, vbound))
+    sline("DONE")
+
     print("%s: %d properties checked (bound %d):" % (label, len(exp), bound))
     ok = True
     for name in sorted(set(verdicts) - set(exp)):
@@ -180,6 +215,12 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove):
         print("  %-9s %s (no expectation)" % ("cex@%d" % v[1] if v[0] == "cex" else "holds", name))
     for name in sorted(exp):
         kind, n = exp[name]
+        if name in skipped:
+            # write_smt2 dropped the liveness-flavored $check: no assertion
+            # in the SMT, so this leg has nothing to check (ic3 leg decides)
+            print("  skipped   %s (liveness $check not SMT-encodable, ic3-only)"
+                  % name)
+            continue
         if kind == "dis" and n is None:
             # liveness-class expectation (s_until/s_eventually family): the
             # bmc leg checks the safety half only, the F-half is ic3-only
@@ -217,11 +258,15 @@ def main():
                     help="also run smtbmc temporal induction (-i); properties "
                          "with successful induction are reported as proved")
     ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--stream", default=None,
+                    help="append incremental VERDICT/ERROR/DONE lines for "
+                         "the prove.py conductor")
     args = ap.parse_args()
 
     ok = True
     for path in args.files:
-        r = check_one(args.yosys, args.smtbmc, path, args.top, args.solver, args.bound, args.timeout, args.prove)
+        r = check_one(args.yosys, args.smtbmc, path, args.top, args.solver,
+                      args.bound, args.timeout, args.prove, stream=args.stream)
         if r is None or not r:
             ok = False
     sys.exit(0 if ok else 1)

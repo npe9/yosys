@@ -1,0 +1,5 @@
+read_verilog -sv cdc_cases.sv
+hierarchy -check
+proc
+opt_clean
+cdc

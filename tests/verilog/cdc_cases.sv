@@ -31,6 +31,9 @@
 //   cdc_gate_bad     | 1x ERROR    clock-gating-glitch (async enable)
 //   cdc_reset_sync   | 2x OK       reset-sync-stage    (the 2 synchronizer FFs)
 //                    | 1x OK       reset-sync-deassert (counter reset by tail Q)
+//   cdc_constrained  | 1x WARNING  async-declared      (unsynchronized crossing,
+//                    |                                SDC-declared async clocks)
+//                    | 1x OK       synchronizer-2ff    (unaffected by pairing)
 //
 // Note: findings group by (dst domain, src domain set); a multi-bit
 // group of synced crossings then splits by reconvergence (shared comb
@@ -376,4 +379,33 @@ module cdc_reset_sync (
             cnt_b <= 4'd0;
         else
             cnt_b <= cnt_b + 4'd1;
+endmodule
+
+// ---------------------------------------------------------------------------
+// (l) SDC pairing: an unsynchronized crossing between clocks the
+//     constraints declare asynchronous (cdc_cases.sdc: cclk_a/cclk_b in
+//     set_clock_groups -asynchronous, plus a false path cclk_a_fast ->
+//     cclk_b; cclk_a carries both clocks).  The waiver downgrades the
+//     ERROR to a WARNING async-declared but keeps it visible; the
+//     properly synchronized crossing next to it is unaffected.
+//     Expect: 1 WARNING async-declared + 1 OK synchronizer-2ff.
+// ---------------------------------------------------------------------------
+module cdc_constrained (
+    input  logic cclk_a,
+    input  logic cclk_b,
+    input  logic din_c,
+    output logic dout_c,
+    output logic sync_o
+);
+    logic a;
+    always_ff @(posedge cclk_a) a <= din_c;
+
+    // unsynchronized crossing: pairs with the SDC async declaration
+    always_ff @(posedge cclk_b) dout_c <= a;
+
+    // properly synchronized crossing: unaffected by the pairing
+    logic m, s;
+    always_ff @(posedge cclk_b) m <= a;
+    always_ff @(posedge cclk_b) s <= m;
+    assign sync_o = s;
 endmodule

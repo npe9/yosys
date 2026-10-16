@@ -40,6 +40,7 @@
 #include "kernel/sigtools.h"
 #include "kernel/ff.h"
 #include "kernel/log_help.h"
+#include "passes/cmds/sdc_constraints.h"
 #include "libs/json11/json11.hpp"
 
 USING_YOSYS_NAMESPACE
@@ -653,6 +654,139 @@ struct CdcAnalyzer
 		return "";
 	}
 
+	// ---------------- SDC pairing (read_sdc scratchpad data) ----------------
+	//
+	// When read_sdc has stored constraints on the design scratchpad, clock
+	// targets map SDC clock names onto this module's domain names (domains
+	// are named after their clock port), and set_clock_groups
+	// -asynchronous / set_false_path clock pairs become an async-pair
+	// set.  An unsynchronized crossing whose every (src clock, dst clock)
+	// combination is declared asynchronous pairs with the declaration:
+	// downgraded from ERROR to WARNING async-declared (the designer
+	// waived it -- but a synchronizer is still recommended, so it stays
+	// visible).  Synchronized crossings are unaffected.
+
+	std::map<std::string, std::vector<std::string>> sdc_port_clocks;
+	std::set<std::pair<std::string, std::string>> sdc_async_pairs;
+	bool sdc_active = false;
+
+	static bool sdc_glob(const std::string &pat, const std::string &s)
+	{
+		// * and ? only, iterative DP
+		std::vector<char> prev(s.size() + 1), cur(s.size() + 1);
+		prev[0] = 1;
+		for (size_t i = 0; i <= pat.size(); i++) {
+			char pc = i ? pat[i - 1] : 0;
+			if (i) {
+				cur.assign(s.size() + 1, 0);
+				for (size_t j = 0; j <= s.size(); j++) {
+					if (!prev[j])
+						continue;
+					if (pc == '*') {
+						for (size_t k = j; k <= s.size(); k++)
+							cur[k] = 1;
+					} else if (j < s.size() && (pc == '?' || pc == s[j])) {
+						cur[j + 1] = 1;
+					}
+				}
+				prev.swap(cur);
+			}
+		}
+		return prev[s.size()];
+	}
+
+	std::vector<std::string> sdc_match_domains(const SdcTarget &t)
+	{
+		std::vector<std::string> hits;
+		if (t.kind != "port" && t.kind != "pin")
+			return hits;
+		for (auto &name : domain_names) {
+			if (t.wildcard ? sdc_glob(t.pattern, name)
+					: t.pattern == name)
+				hits.push_back(name);
+		}
+		return hits;
+	}
+
+	void load_sdc(Design *design)
+	{
+		SdcConstraints c;
+		if (!sdc_load_constraints(design, c))
+			return;
+		// clock name -> patterns from clock objects
+		std::map<std::string, SdcClock *> by_name;
+		for (auto &k : c.clocks)
+			by_name[k.name] = &k;
+		std::set<std::string> clock_names;
+		for (auto &k : c.clocks)
+			clock_names.insert(k.name);
+		auto match_clock_names = [&](const std::vector<SdcTarget> &targets) {
+			std::vector<std::string> out;
+			for (auto &t : targets) {
+				if (t.kind != "clock")
+					continue;
+				for (auto &cn : clock_names)
+					if (t.wildcard ? sdc_glob(t.pattern, cn) : t.pattern == cn)
+						out.push_back(cn);
+			}
+			return out;
+		};
+		for (auto &k : c.clocks)
+			for (auto &t : k.targets)
+				for (auto &dom : sdc_match_domains(t))
+					sdc_port_clocks[dom].push_back(k.name);
+		auto add_pairs = [&](const std::vector<std::string> &a,
+				const std::vector<std::string> &b) {
+			for (auto &x : a)
+				for (auto &y : b) {
+					sdc_async_pairs.insert(std::make_pair(x, y));
+					sdc_async_pairs.insert(std::make_pair(y, x));
+				}
+		};
+		for (auto &g : c.clock_groups) {
+			if (!g.asynchronous)
+				continue;
+			std::vector<std::vector<std::string>> names;
+			for (auto &grp : g.groups)
+				names.push_back(match_clock_names(grp));
+			for (size_t i = 0; i < names.size(); i++)
+				for (size_t j = i + 1; j < names.size(); j++) {
+					add_pairs(names[i], names[j]);
+					add_pairs(names[j], names[i]);
+				}
+		}
+		for (auto &p : c.path_exceptions) {
+			if (p.kind != "false_path")
+				continue;
+			add_pairs(match_clock_names(p.from), match_clock_names(p.to));
+		}
+		sdc_active = !sdc_port_clocks.empty() || !sdc_async_pairs.empty();
+		if (sdc_active)
+			log("cdc: %s: SDC pairing active (%d clocks mapped, %d async pairs)\n",
+					log_id(module->name), GetSize(sdc_port_clocks),
+					GetSize(sdc_async_pairs));
+	}
+
+	// every (src clock, dst clock) combination declared async?
+	bool async_declared(const std::set<int> &srcs, int dst)
+	{
+		if (!sdc_active)
+			return false;
+		auto dit = sdc_port_clocks.find(domain_names[dst]);
+		if (dit == sdc_port_clocks.end() || dit->second.empty())
+			return false;
+		for (int s : srcs) {
+			auto sit = sdc_port_clocks.find(domain_names[s]);
+			if (sit == sdc_port_clocks.end() || sit->second.empty())
+				return false;
+			for (auto &sn : sit->second)
+				for (auto &dn : dit->second)
+					if (!sdc_async_pairs.count(std::make_pair(sn, dn)))
+						return false;
+		}
+		return true;
+	}
+
 	// Follow the synchronizer chain forward from the crossing FF: collect
 	// consecutive flip-flops of domain d_ff, each Q bit feeding the next D
 	// bit. Returns the chain (crossing FF first, synchronizer tail last);
@@ -1161,20 +1295,45 @@ struct CdcAnalyzer
 			groups[std::make_pair(crossings[i].dst, crossings[i].srcs)].push_back(i);
 
 		for (auto &g : groups) {
-			bool all_synced = true;
+			// partition: unsynchronized members are errors (a multi-bit
+			// unsynchronized group is a bus); synchronized members go
+			// through the reconvergence/Gray split below
+			std::vector<int> unsynced, synced;
 			for (int i : g.second)
-				if (!crossings[i].synced) {
-					all_synced = false;
-					break;
+				(crossings[i].synced ? synced : unsynced).push_back(i);
+			for (int i : unsynced) {
+				Crossing &c = crossings[i];
+				std::string sev = "ERROR";
+				std::string cls = GetSize(unsynced) > 1 ?
+						"unsynchronized-bus" : "unsynchronized-bit";
+				// SDC pairing: a crossing the constraints declared
+				// asynchronous is the designer's waiver -- keep it
+				// visible but downgrade to a warning
+				if (async_declared(c.srcs, c.dst)) {
+					sev = "WARNING";
+					cls = "async-declared";
 				}
-			if (g.second.size() > 1 && all_synced) {
+				findings.push_back({sev, cls, join_domains(c.srcs),
+						domain_names[c.dst], c.bit, c.cell});
+			}
+			if (synced.empty())
+				continue;
+			if (GetSize(synced) == 1) {
+				// a lone synchronized member (of a mixed group) is an
+				// independent synchronizer
+				Crossing &c = crossings[synced.front()];
+				findings.push_back({"OK", "synchronizer-2ff", join_domains(c.srcs),
+						domain_names[c.dst], c.bit, c.cell});
+				continue;
+			}
+			{
 				// Reconvergence split: a synced crossing whose forward cone
 				// shares no comb cell and no sink FF with its group
 				// siblings is an independent synchronizer, not part of a
 				// bus -- promote it to OK.  Bits whose cones merge stay a
 				// synced-bus WARNING unless the component structurally is
 				// a Gray-coded bus, which upgrades to OK gray-bus.
-				int n = GetSize(g.second);
+				int n = GetSize(synced);
 				std::vector<int> parent(n);
 				for (int i = 0; i < n; i++)
 					parent[i] = i;
@@ -1188,7 +1347,7 @@ struct CdcAnalyzer
 				std::vector<pool<Cell *>> comb(n), comb_tail(n);
 				std::vector<pool<std::pair<Cell *, int>>> sinks(n);
 				for (int a = 0; a < n; a++) {
-					q_cone(crossings[g.second[a]].ffcell, crossings[g.second[a]].qidx, comb[a], sinks[a]);
+					q_cone(crossings[synced[a]].ffcell, crossings[synced[a]].qidx, comb[a], sinks[a]);
 					// the reconvergence that makes a synced group a bus
 					// (Gray decoder chain, full/empty EQ compare) usually
 					// sits on the synchronizer TAIL side, not on the
@@ -1196,8 +1355,8 @@ struct CdcAnalyzer
 					// cones are bit-disjoint, while Gray/eq-reconverged
 					// tails share comb cells
 					pool<std::pair<Cell *, int>> tail_sinks;
-					auto chain = sync_chain(crossings[g.second[a]].ffcell,
-							crossings[g.second[a]].qidx, g.first.first);
+					auto chain = sync_chain(crossings[synced[a]].ffcell,
+							crossings[synced[a]].qidx, g.first.first);
 					q_cone(chain.back().first, chain.back().second,
 							comb_tail[a], tail_sinks);
 				}
@@ -1232,7 +1391,7 @@ struct CdcAnalyzer
 						continue;
 					std::vector<Crossing> comp;
 					for (int a : it.second)
-						comp.push_back(crossings[g.second[a]]);
+						comp.push_back(crossings[synced[a]]);
 					std::sort(comp.begin(), comp.end(), [](const Crossing &x, const Crossing &y) {
 						if (x.ffcell->name != y.ffcell->name)
 							return x.ffcell->name < y.ffcell->name;
@@ -1241,7 +1400,7 @@ struct CdcAnalyzer
 					comp_gray[it.first] = (gray_encoder(comp) && gray_decoder(comp)) || eq_gray_compare(comp);
 				}
 				for (int a = 0; a < n; a++) {
-					Crossing &c = crossings[g.second[a]];
+					Crossing &c = crossings[synced[a]];
 					bool lone = GetSize(comps[find(a)]) == 1;
 					std::string sev = "WARNING", cls = "synced-bus";
 					if (lone) {
@@ -1253,24 +1412,6 @@ struct CdcAnalyzer
 					}
 					findings.push_back({sev, cls, join_domains(c.srcs), domain_names[c.dst], c.bit, c.cell});
 				}
-				continue;
-			}
-			for (int i : g.second) {
-				Crossing &c = crossings[i];
-				std::string sev, cls;
-				if (g.second.size() > 1) {
-					sev = "ERROR";
-					cls = "unsynchronized-bus";
-				} else {
-					if (c.synced) {
-						sev = "OK";
-						cls = "synchronizer-2ff";
-					} else {
-						sev = "ERROR";
-						cls = "unsynchronized-bit";
-					}
-				}
-				findings.push_back({sev, cls, join_domains(c.srcs), domain_names[c.dst], c.bit, c.cell});
 			}
 		}
 
@@ -1283,12 +1424,14 @@ struct CdcAnalyzer
 		});
 	}
 
-	void run()
+	void run(Design *design)
 	{
 		build_maps();
 		infer_domains();
 		propagate();
 		analyze_clock_network();
+		if (design)
+			load_sdc(design);
 
 		for (auto &it : domains) {
 			if (it.first.wire && it.second.size() > 1) {
@@ -1358,6 +1501,9 @@ struct CdcPass : public Pass {
 		log("                                 bits or an $eq compare against a local\n");
 		log("                                 Gray-coded vector (FIFO full/empty style)\n");
 		log("  - unsynchronized-bit (ERROR)   single-bit crossing without a synchronizer\n");
+		log("  - async-declared     (WARNING) unsynchronized crossing between clocks\n");
+		log("                                 declared asynchronous or false-pathed via\n");
+		log("                                 read_sdc constraints: waived, kept visible\n");
 		log("  - synced-bus         (WARNING) all bits of a multi-bit crossing use 2+\n");
 		log("                                 stage synchronizers; check Gray coding or\n");
 		log("                                 handshake coherence between the domains\n");
@@ -1377,6 +1523,13 @@ struct CdcPass : public Pass {
 		log("Clock enable and synchronous reset inputs are checked like data inputs.\n");
 		log("Findings are printed as a table and counted in a final summary; the pass\n");
 		log("never aborts on findings.\n");
+		log("\n");
+		log("If the design carries constraints from the read_sdc pass (scratchpad key\n");
+		log("sdc.json), clock targets are mapped onto the domain names and crossings\n");
+		log("between clocks declared asynchronous (set_clock_groups -asynchronous) or\n");
+		log("connected by set_false_path are paired with the declaration: unsynchronized\n");
+		log("ERRORs downgrade to WARNING async-declared.  Synchronized crossings,\n");
+		log("reset findings, and clock-network findings are unaffected.\n");
 		log("\n");
 		log("Options:\n");
 		log("\n");
@@ -1411,7 +1564,7 @@ struct CdcPass : public Pass {
 				log_error("Module %s still contains processes. Run 'proc' before 'cdc'.\n", module);
 
 			CdcAnalyzer analyzer(module);
-			analyzer.run();
+			analyzer.run(design);
 
 			num_nets += analyzer.num_crossing_nets;
 

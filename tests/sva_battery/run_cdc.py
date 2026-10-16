@@ -25,6 +25,9 @@ Expected findings (one table line per crossing bit, plus reset findings):
   cdc_gate_bad   | 1x ERROR    clock-gating-glitch (async enable)
   cdc_reset_sync | 2x OK       reset-sync-stage    (the 2 synchronizer FFs)
                    | 1x OK       reset-sync-deassert (counter reset by tail Q)
+  cdc_constrained| 1x WARNING  async-declared      (unsynchronized crossing,
+                   |                                SDC-declared async clocks)
+                   | 1x OK       synchronizer-2ff    (unaffected by pairing)
 """
 
 import json
@@ -68,12 +71,33 @@ EXPECTED = {
     # reset deassert sequencing
     ("cdc_reset_sync", "OK", "reset-sync-stage"): 2,
     ("cdc_reset_sync", "OK", "reset-sync-deassert"): 1,
+    # SDC pairing (cdc_cases.sdc declares cclk_a/cclk_b async)
+    ("cdc_constrained", "WARNING", "async-declared"): 1,
+    ("cdc_constrained", "OK", "synchronizer-2ff"): 1,
 }
+
+# read_sdc -dump lines the parser must produce for cdc_cases.sdc
+# (parser coverage: clocks, groups, false/multicycle paths, io delays,
+# max delay, generated clock)
+DUMP_EXPECT = [
+    "clock cclk_a period 10.000",
+    "clock cclk_b period 10.000",
+    "clock cclk_a_fast period 4.000",
+    "clock cclk_div period 0.000 generated",
+    "clock-groups async: cclk_a vs cclk_b",
+    "false_path cclk_a_fast -> cclk_b",
+    "multicycle_path 3 cclk_a -> cclk_b -setup",
+    "io-delay input port:din_c clock cclk_a max 2.000",
+    "io-delay output port:dout_c clock cclk_b max 1.500",
+    "max-delay 12.000 cclk_a -> cclk_b",
+]
 
 
 def main():
     jf = os.path.join(tempfile.gettempdir(), "cdc_gate_%d.json" % os.getpid())
-    script = "read_verilog -sv %s\nhierarchy -check\nproc\nopt_clean\ncdc -json %s\n" % (CASES, jf)
+    sdc = os.path.join(os.path.dirname(CASES), "cdc_cases.sdc")
+    script = ("read_verilog -sv %s\nhierarchy -check\nproc\nopt_clean\n"
+              "read_sdc %s\ncdc -json %s\n" % (CASES, sdc, jf))
     ys = os.path.join(tempfile.gettempdir(), "cdc_gate_%d.ys" % os.getpid())
     with open(ys, "w") as fh:
         fh.write(script)
@@ -104,14 +128,29 @@ def main():
         if key not in EXPECTED:
             bad.append("unexpected %dx %s/%s/%s" % (n, key[0], key[1], key[2]))
 
+    # parser coverage: read_sdc -dump on the same file
+    dump_script = ("read_verilog -sv %s\nhierarchy -check\n"
+                   "read_sdc -dump %s\n" % (CASES, sdc))
+    ys2 = os.path.join(tempfile.gettempdir(), "cdc_gate_dump_%d.ys" % os.getpid())
+    with open(ys2, "w") as fh:
+        fh.write(dump_script)
+    d = subprocess.run([YOSYS, ys2], capture_output=True, text=True)
+    if d.returncode != 0:
+        print("cdc gate: read_sdc -dump failed")
+        return 1
+    dump_lines = [l.strip() for l in (d.stdout + d.stderr).splitlines()]
+    for want in DUMP_EXPECT:
+        if want not in dump_lines:
+            bad.append("read_sdc -dump missing line: %r" % want)
+
     total = sum(got.values())
     if bad:
         print("cdc gate: MISMATCH over %d findings:" % total)
         for b in bad:
             print("  " + b)
         return 1
-    print("cdc gate: ok (%d findings across %d modules, table matches)" %
-          (total, len({k[0] for k in got})))
+    print("cdc gate: ok (%d findings across %d modules, table matches, "
+          "sdc dump ok)" % (total, len({k[0] for k in got})))
     return 0
 
 

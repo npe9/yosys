@@ -124,6 +124,9 @@ yosys_pass(check
 yosys_pass(cdc
 	cdc.cc
 )
+yosys_pass(read_sdc
+	read_sdc.cc
+)
 yosys_pass(edgetypes
 	edgetypes.cc
 )

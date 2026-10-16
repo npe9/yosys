@@ -8,6 +8,7 @@
 // req never clears, so there is exactly one request episode.
 //
 // PREP-EXTRA-AFTER-MEMORY: clk2fflogic
+// IC3-TIMEOUT: 400
 module tmcdom1(input logic clk_a, input logic clk_b, input logic req_pulse);
 
 	logic req;

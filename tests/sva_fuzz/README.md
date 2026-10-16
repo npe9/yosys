@@ -186,3 +186,57 @@ antecedents; single-bound `[*N]` anywhere below a property-position
 sequence; `or/and/intersect` anywhere below a within/throughout RHS;
 `not` of `->`/`<->`/`or`/repetitions; repetition of a non-atom sequence;
 `strong`/`weak`/`if` in operand position of `always`/`not`.
+
+## xprop.py — 4-state X-propagation differential fuzzer
+
+A separate harness (same directory, no shared code with the SVA fuzzer
+above). Each case is a random small combinational/registered expression
+tree over uninitialized registers (the X source) and driven inputs;
+a Yosys witness drives the inputs and `sim -r ... -vcd` produces the
+output trace. A Python 4-state reference implements the kernel's own
+`const_*` semantics (`kernel/calc.cc`), including the elaboration width
+rules (self-determined widths, context extension) verified against
+`genrtlil`'s emitted `$cell` widths — the reference re-derives what the
+frontend emitted, so a mismatch means sim diverges from the documented
+kernel semantics.
+
+Flags beyond `--seed/--count/--out`:
+
+- `--modes merge,pessimistic` — differential-check `sim` in each
+  x-propagation mode. `merge` (default) is the LRM conditional-operator
+  table (x select merges equal arms per bit). `pessimistic` enables the
+  `sim -xprop pessimistic` knob: any x in a `$mux`/`$_MUX_` select (or a
+  `$bwmux` select bit) poisons the result, even where the arms agree
+  (`$pmux` is already all-x on an x select via `is_onehot`). The poison
+  lands at the ternary cell's WIDTH — and the cell width is `max` of the
+  arm *produced* widths under the assignment context, not the context
+  itself (genrtlil.cc AST_TERNARY), which the reference models via
+  `arm_w`: plain-leaf/const arms emit at self width and only the connect
+  extension stays definite; context-propagating arms (and/or/xor/xnor/
+  add/sub/not/neg, shifts) carry the context as their emission width; the
+  1-bit-result ops (`$eq/$lt/...`, `$reduce_*`, `$logic_not`) emit Y at
+  `max(hint,1)` (probe-verified Y_WIDTH = context); concat arms extend
+  to the full hint (genrtlil.cc AST_CONCAT). Two more pipeline
+  realities: identical-arm muxes never reach sim (genrtlil emits the
+  cell but proc's bundled `opt_expr -keepdc` folds `A == B` muxes,
+  x-safe under merge but pessimism-unsafe), and the pessimism flag must
+  thread through *every* eval_node branch (muxes nest inside comparison
+  operands and reduction arguments).
+- `--techmap` — per case also runs `proc; techmap` (simlib gate
+  netlist: `$_AND_`/`$_MUX_`/`$_DFF_P_`/ripple adders/...) and checks
+  the RTL->gate X-containment invariant: wherever the coarse-cell sim is
+  definite, the gate netlist must agree definite; where the RTL is x the
+  gate may be x *or definite* (techmap is structurally less pessimistic:
+  per-bit gates beat `big2const`, carry chains contaminate upward only,
+  barrel-shifter mux trees merge over a bounded position set). A
+  definite-vs-definite mismatch or gate-x-over-RTL-definite is a
+  soundness finding; the proc-x -> gate-definite direction is counted as
+  expected drift, not a failure.
+- `--golden` — deterministic pin of the mode divergence (no fuzz
+  cases): `sel ? a : b` with the select x and both arms 1 must give
+  `o=1` in merge and `o=x` in pessimistic, plus the gate-containment
+  check on the same design. This is the regression the sva_battery gate
+  runs.
+
+`make test` in `tests/sva_battery` runs `--golden` and a seeded
+`--modes merge,pessimistic --techmap` batch.

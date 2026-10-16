@@ -132,6 +132,9 @@ struct SimShared
 	std::vector<std::unique_ptr<OutputWriter>> outputfiles;
 	std::vector<std::pair<int,std::map<int,Const>>> output_data;
 	bool ignore_x = false;
+	// xprop merge (default, LRM): x mux-select merges equal arms per bit.
+	// xprop pessimistic: any x in a mux/bwmux select poisons the result.
+	bool xprop_pessimistic = false;
 	bool date = false;
 	bool multiclock = false;
 	int next_output_id = 0;
@@ -613,7 +616,32 @@ struct SimInstance
 			if (err)
 				log_warning("Unsupported evaluable cell type: %s (%s.%s)\n", cell->type.unescape(), module, cell);
 			else
+			{
+				// -xprop=pessimistic: an x anywhere in a mux-family select
+				// poisons the result, dropping the LRM per-bit arm merge.
+				// ($pmux needs no override: is_onehot() rejects x selects,
+				// so const_pmux is already all-x pessimistic.)
+				if (shared->xprop_pessimistic && has_s && has_y)
+				{
+					Const sel = get_state(sig_s);
+					if (cell->type.in(ID($mux), ID($_MUX_), ID($_NMUX_)))
+					{
+						for (auto bit : sel)
+							if (bit == State::Sx) {
+								eval_state = Const(State::Sx, GetSize(sig_y));
+								break;
+							}
+					}
+					else if (cell->type == ID($bwmux))
+					{
+						log_assert(GetSize(sel) == GetSize(eval_state));
+						for (int i = 0; i < GetSize(sel); i++)
+							if (sel[i] == State::Sx)
+								eval_state.set(i, State::Sx);
+					}
+				}
 				set_state(sig_y, eval_state);
+			}
 			return;
 		}
 
@@ -2780,6 +2808,16 @@ struct SimPass : public Pass {
 		log("    -x\n");
 		log("        ignore constant x outputs in simulation file.\n");
 		log("\n");
+		log("    -xprop <merge|pessimistic>\n");
+		log("        x-propagation mode for mux selects (default: merge).\n");
+		log("        merge: an x select bit passes through arms that agree per\n");
+		log("        bit and x-es the rest (LRM conditional-operator table).\n");
+		log("        pessimistic: any x in a $mux/$_MUX_ select (or a $bwmux\n");
+		log("        select bit) poisons the whole result with x, even where\n");
+		log("        both arms agree.  ($pmux is always all-x on an x select.)\n");
+		log("        Use for verification pessimism / CDC screening; results\n");
+		log("        under this mode deliberately diverge from the LRM table.\n");
+		log("\n");
 		log("    -date\n");
 		log("        include date and full version info in output.\n");
 		log("\n");
@@ -3058,6 +3096,16 @@ struct SimPass : public Pass {
 			}
 			if (args[argidx] == "-x") {
 				worker.ignore_x = true;
+				continue;
+			}
+			if (args[argidx] == "-xprop" && argidx+1 < args.size()) {
+				std::string mode = args[++argidx];
+				if (mode == "merge")
+					worker.xprop_pessimistic = false;
+				else if (mode == "pessimistic")
+					worker.xprop_pessimistic = true;
+				else
+					log_cmd_error("Unknown -xprop mode '%s' (expected merge|pessimistic).\n", mode.c_str());
 				continue;
 			}
 			if (args[argidx] == "-date") {

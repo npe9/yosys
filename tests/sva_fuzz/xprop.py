@@ -107,11 +107,18 @@ def op_shift(a, amt, w, left):
     return "0" * n + a[:w - n]
 
 
-def op_mux(s, a, b):
+def op_mux(s, a, b, pes=False, poison_w=None):
     if s == "1":
         return a
     if s == "0":
         return b
+    if pes:
+        # -xprop=pessimistic: any x in the select poisons the mux -- but
+        # only at the cell's self width; the zero-extension to the
+        # assignment context stays definite (the real $mux cell is
+        # max(arm self widths) wide and zx-ed at the connect)
+        w = len(a) if poison_w is None else poison_w
+        return zx("x" * w, len(a))
     return "".join(x if x == y else "x" for x, y in zip(a, b))
 
 
@@ -156,42 +163,91 @@ def op_logic_not(a):
     return "1"
 
 
-def ctxify(node, w):
+def ctxify(node, w, widths):
     """Re-elaborate a self_expr subtree as if generated under context width
     w -- push w through context-propagating nodes (and/or/xor/xnor/add/sub/
     not/neg, mux arms). Self-determined roots (shifts, comparisons,
     reductions, logic_not, concat) ignore context and stay; eval's zx pads
-    their results exactly like the cells' Y_WIDTH padding."""
+    their results exactly like the cells' Y_WIDTH padding.  A mux node's
+    width field is its CELL width (max arm produced widths under the mux's
+    own hint), so pushing a new context recomputes the cell -- the
+    context reaches the cell only through the 1-bit-unary/concat arm
+    kinds (arm_w)."""
     k = node[0]
     if k == "zx":
         # push the context through the extension: the wrapped subtree
         # re-elaborates at w (a ("sub", ..., 1) under ("zx", _, 3)
         # becomes ("sub", ..., 3) -- cells compute at the context width)
-        return ("zx", ctxify(node[1], w), w)
+        return ("zx", ctxify(node[1], w, widths), w)
     if k in ("and", "or", "xor", "xnor", "add", "sub"):
-        return (k, ctxify(node[1], w), ctxify(node[2], w), w)
+        return (k, ctxify(node[1], w, widths), ctxify(node[2], w, widths), w)
     if k in ("not", "neg"):
-        return (k, ctxify(node[1], w), w)
+        return (k, ctxify(node[1], w, widths), w)
     if k == "mux":
-        return (k, node[1], ctxify(node[2], w), ctxify(node[3], w), w)
+        cw = max(arm_w(node[2], w, widths), arm_w(node[3], w, widths))
+        return (k, node[1], ctxify(node[2], cw, widths),
+                ctxify(node[3], cw, widths), cw)
     if k in ("shl", "shr"):
-        return (k, ctxify(node[1], w), node[2], w)
+        return (k, ctxify(node[1], w, widths), node[2], w)
     return node
 
 
-def eval_node(node, env):
+def arm_w(node, hint, widths):
+    """genRTLIL-produced width of a ternary arm generated under
+    width_hint=hint (genrtlil.cc AST_TERNARY: cell WIDTH = max of the
+    arm produced sizes; the result is then extended to hint at the
+    connect).  Leaves/consts ignore the hint; the 1-bit unary/comparison
+    ops emit Y at max(hint,1) (probe-verified: $eq, $reduce_*,
+    $logic_not arms all carry Y_WIDTH = context); concat extends to the
+    full hint; context-propagating ops (and/or/xor/xnor/add/sub/not/
+    neg, shifts) recurse with the same hint (the comparison-operand
+    extension pushes the max-operand width INSIDE each operand, so a
+    unary arm under a wider sibling emits at the sibling width --
+    verified: `A != (s ? -d : r1)` with 4-bit A gives $neg Y_WIDTH 4)."""
     k = node[0]
     if k == "zx":
-        return zx(eval_node(node[1], env), node[2])
+        return arm_w(node[1], -1, widths)
+    if k == "leaf":
+        return widths[node[1]]
+    if k == "const":
+        return len(node[1])
+    if k == "bool":
+        # $reduce_bool: arg wider than 1 -> cell at max(hint,1);
+        # 1-bit arg is returned as-is
+        sw = arm_w(node[1], -1, widths)
+        return max(hint, 1) if sw > 1 else sw
+    if k in ("reduce", "logic_not", "eq", "ne", "lt", "le"):
+        return max(hint, 1)
+    if k == "mux":
+        return node[4]
+    if k == "concat":
+        # concat children are self-determined, but the node extends to
+        # the full hint at the end (genrtlil.cc AST_CONCAT)
+        s = arm_w(node[1], -1, widths) + arm_w(node[2], -1, widths)
+        return max(s, hint) if hint > 0 else s
+    # context-propagating ops (and/or/xor/xnor/add/sub/not/neg, shifts):
+    # the cell emits at max(hint, operand produced widths), operands
+    # receiving the same hint (genrtlil.cc lines 1955-2023)
+    if k in ("and", "or", "xor", "xnor", "add", "sub"):
+        w = max(arm_w(node[1], hint, widths), arm_w(node[2], hint, widths))
+    else:
+        w = arm_w(node[1], hint, widths)
+    return max(w, hint) if hint > 0 else w
+
+
+def eval_node(node, env, pes=False):
+    k = node[0]
+    if k == "zx":
+        return zx(eval_node(node[1], env, pes), node[2])
     if k == "leaf":
         return env[node[1]]
     if k == "const":
         return node[1]
     if k == "not":
-        return op_not(zx(eval_node(node[1], env), node[2]))
+        return op_not(zx(eval_node(node[1], env, pes), node[2]))
     if k in ("and", "or", "xor", "xnor"):
-        a = zx(eval_node(node[1], env), node[3])
-        b = zx(eval_node(node[2], env), node[3])
+        a = zx(eval_node(node[1], env, pes), node[3])
+        b = zx(eval_node(node[2], env, pes), node[3])
         if k == "and":
             return op_and(a, b)
         if k == "or":
@@ -200,38 +256,47 @@ def eval_node(node, env):
             return op_xor(a, b)
         return op_not(op_xor(a, b))
     if k in ("add", "sub"):
-        return op_addsub(zx(eval_node(node[1], env), node[3]),
-                         zx(eval_node(node[2], env), node[3]),
+        return op_addsub(zx(eval_node(node[1], env, pes), node[3]),
+                         zx(eval_node(node[2], env, pes), node[3]),
                          k == "sub", node[3])
     if k == "neg":
-        return op_neg(zx(eval_node(node[1], env), node[2]), node[2])
+        return op_neg(zx(eval_node(node[1], env, pes), node[2]), node[2])
     if k in ("shl", "shr"):
-        return op_shift(eval_node(node[1], env), eval_node(node[2], env),
+        return op_shift(eval_node(node[1], env, pes),
+                        eval_node(node[2], env, pes),
                         node[3], k == "shl")
     if k == "mux":
-        return op_mux(zx(eval_node(node[1], env), 1),
-                      zx(eval_node(node[2], env), node[4]),
-                      zx(eval_node(node[3], env), node[4]))
+        if node[2] == node[3]:
+            # identical arms: genrtlil emits the $mux cell but proc's
+            # bundled opt_expr -keepdc folds A==B muxes before sim sees
+            # them (x-safe under LRM merge -- x?a:a = a -- but NOT under
+            # pessimism, so the reference must model the fold to match
+            # the actual pipeline in both modes)
+            return zx(eval_node(node[2], env, pes), node[4])
+        return op_mux(zx(eval_node(node[1], env, pes), 1),
+                      zx(eval_node(node[2], env, pes), node[4]),
+                      zx(eval_node(node[3], env, pes), node[4]), pes,
+                      poison_w=node[4])
     if k in ("eq", "ne"):
-        a = eval_node(node[1], env)
-        b = eval_node(node[2], env)
+        a = eval_node(node[1], env, pes)
+        b = eval_node(node[2], env, pes)
         w = max(len(a), len(b))
         return op_eq(zx(a, w), zx(b, w), k == "ne")
     if k in ("lt", "le"):
-        a = eval_node(node[1], env)
-        b = eval_node(node[2], env)
+        a = eval_node(node[1], env, pes)
+        b = eval_node(node[2], env, pes)
         w = max(len(a), len(b))
         return op_lt(zx(a, w), zx(b, w), k == "le")
     if k == "reduce":
-        return op_reduce(eval_node(node[1], env), node[2])
+        return op_reduce(eval_node(node[1], env, pes), node[2])
     if k == "bool":
         # mux select: yosys ReduceBool -- fold of the per-bit or table
         # (or-fold of a single bit from S0 is the bit itself)
-        return op_reduce(eval_node(node[1], env), "or")
+        return op_reduce(eval_node(node[1], env, pes), "or")
     if k == "logic_not":
-        return op_logic_not(eval_node(node[1], env))
+        return op_logic_not(eval_node(node[1], env, pes))
     if k == "concat":
-        return eval_node(node[1], env) + eval_node(node[2], env)
+        return eval_node(node[1], env, pes) + eval_node(node[2], env, pes)
     if k == "slice":
         v = eval_node(node[1], env)
         hi, lo = node[2], node[3]
@@ -251,6 +316,9 @@ class Gen:
         self.inputs = ["a", "b", "c", "d"][:self.n_in]
         self.regs = [("r%d" % i, rng.choice([1, 2, 3, 4]))
                      for i in range(rng.choice([1, 2, 3]))]
+        self.widths = {name: w for name, w in self.regs}
+        for s in self.inputs:
+            self.widths[s] = 1
         self.n_out = rng.choice([2, 3, 4])
 
     def self_leaf(self):
@@ -276,7 +344,7 @@ class Gen:
             # arms compute AT w (extend-then-operate), not extend-result:
             # yosys gives each arm genRTLIL(w) -- e.g. (0 - (~1'b1)) at
             # w=2 is 10 - 11 = 11, not zx(0-1, 2) = 01
-            return (op, ctxify(a, w), ctxify(b, w), w), w
+            return (op, ctxify(a, w, self.widths), ctxify(b, w, self.widths), w), w
         if roll < 0.46:
             a, w = self.self_expr(d - 1)
             return ("not", ("zx", a, w), w), w
@@ -291,8 +359,9 @@ class Gen:
             s, _ = self.self_expr(d - 1)
             a, wa = self.self_expr(d - 1)
             b, wb = self.self_expr(d - 1)
-            w = max(wa, wb)
-            return ("mux", ("bool", s), ctxify(a, w), ctxify(b, w), w), w
+            w = max(arm_w(a, -1, self.widths), arm_w(b, -1, self.widths))
+            return ("mux", ("bool", s), ctxify(a, w, self.widths),
+                    ctxify(b, w, self.widths), w), w
         if roll < 0.81:
             a, wa = self.self_expr(d - 1)
             b, wb = self.self_expr(d - 1)
@@ -302,7 +371,7 @@ class Gen:
             # detectSignWidthWorker + genRTLIL(width_hint); e.g.
             # 2'b00 != ~1'b1 is TRUE because ~ evaluates at 2 bits -> 2'b10)
             return (self.r.choice(["eq", "ne", "lt", "le"]),
-                    ctxify(a, w), ctxify(b, w)), 1
+                    ctxify(a, w, self.widths), ctxify(b, w, self.widths)), 1
         if roll < 0.87:
             a, w = self.self_expr(d - 1)
             return ("reduce", a, self.r.choice(["and", "or", "xor"])), 1
@@ -340,15 +409,15 @@ class Gen:
             # the WHOLE binop compute at its width, truncated only at the
             # assignment (verified: r1 + ({r1,r2} >> d) -> $add width 7)
             w = max(tw, wa, wb)
-            return (op, ctxify(a, w), ctxify(b, w), w), w
+            return (op, ctxify(a, w, self.widths), ctxify(b, w, self.widths), w), w
         if roll < 0.44:
             a, wa = self.expr_w(d - 1, tw)
             w = max(tw, wa)
-            return ("not", ctxify(a, w), w), w
+            return ("not", ctxify(a, w, self.widths), w), w
         if roll < 0.52:
             a, wa = self.expr_w(d - 1, tw)
             w = max(tw, wa)
-            return ("neg", ctxify(a, w), w), w
+            return ("neg", ctxify(a, w, self.widths), w), w
         if roll < 0.62:
             # shift: left operand is context-determined (genrtlil passes
             # width_hint into the left subtree, verified by $shl probes);
@@ -357,23 +426,25 @@ class Gen:
             a, wa = self.expr_w(d - 1, tw)
             b, wb = self.self_expr(d - 1)
             w = max(tw, wa)
-            return (self.r.choice(["shl", "shr"]), ctxify(a, w), b, w), w
+            return (self.r.choice(["shl", "shr"]), ctxify(a, w, self.widths), b, w), w
         if roll < 0.70:
             # select is self-determined (own width, then reduce_bool);
-            # arms take the context like any operand (verified by probe:
-            # s ? 1'b0 : (~1'b1) at ctx 6 -> 111110, and reductions as
-            # arms get Y_WIDTH = context)
+            # the ternary CELL width is max of the arm produced widths
+            # under this hint (arm_w) and the node records it; the
+            # result is extended to tw at the connect, so the produced
+            # width is max(cell, tw) (genrtlil.cc AST_TERNARY)
             s, _ = self.self_expr(d - 1)
             a, wa = self.expr_w(d - 1, tw)
             b, wb = self.expr_w(d - 1, tw)
-            w = max(tw, wa, wb)
-            return ("mux", ("bool", s), ctxify(a, w), ctxify(b, w), w), w
+            w = max(arm_w(a, tw, self.widths), arm_w(b, tw, self.widths))
+            return ("mux", ("bool", s), ctxify(a, w, self.widths),
+                    ctxify(b, w, self.widths), w), max(w, tw)
         if roll < 0.80:
             a, wa = self.self_expr(d - 1)
             b, wb = self.self_expr(d - 1)
             w = max(wa, wb)
             return (self.r.choice(["eq", "ne", "lt", "le"]),
-                    ctxify(a, w), ctxify(b, w)), 1
+                    ctxify(a, w, self.widths), ctxify(b, w, self.widths)), 1
         if roll < 0.86:
             a, w = self.self_expr(d - 1)
             return ("reduce", a, self.r.choice(["and", "or", "xor"])), 1
@@ -513,7 +584,52 @@ def parse_vcd(path):
     return out
 
 
-def run_case(seed, index, workdir):
+def sim_vcd(svf, ywf, vcdf, mode, techmap=False):
+    """Run yosys sim on svf with witness ywf, return parsed posedge slots or
+    (class, detail) on infrastructure failure."""
+    xprop = [] if mode == "merge" else ["-xprop", mode]
+    prep = "proc; techmap" if techmap else "proc"
+    script = ("read_verilog -sv %s; %s; sim %s -r %s -vcd %s"
+              % (svf, prep, " ".join(xprop), ywf, vcdf))
+    p = subprocess.run([YOSYS, "-p", script], capture_output=True, text=True,
+                       timeout=60)
+    if p.returncode != 0 or not os.path.exists(vcdf):
+        return ("infra", (p.stderr + p.stdout)[-300:])
+    return parse_vcd(vcdf)
+
+
+def check_gate_containment(proc_slots, gate_slots, nsteps, names):
+    """RTL-vs-gate drift check.  Soundness invariant: wherever the
+    coarse-cell (proc) sim is definite, the techmapped gate netlist must
+    agree definite.  proc x -> gate may be x OR definite (techmap is
+    structurally less pessimistic: per-bit gates beat big2const, ripple
+    carries contaminate upward only, barrel-shifter mux trees merge
+    over a bounded set of positions).  definite-vs-definite mismatch or
+    gate x where proc is definite is a real soundness finding."""
+    viol = []
+    drift = 0
+    # slot 0: the dirty scheduler can leave either side's outputs
+    # unevaluated; the interesting legs start at slot 1
+    for k in range(1, min(nsteps, len(proc_slots), len(gate_slots))):
+        for name in names:
+            a = proc_slots[k].get(name)
+            b = gate_slots[k].get(name)
+            if a is None or b is None:
+                continue
+            for i in range(len(a)):
+                ab, bb = a[i], b[i]
+                if ab in "01" and bb in "01" and ab != bb:
+                    viol.append((k, name, a, b))
+                    break
+                if ab in "01" and bb == "x":
+                    viol.append((k, name, a, b))
+                    break
+                if ab == "x" and bb in "01":
+                    drift += 1
+    return viol, drift
+
+
+def run_case(seed, index, workdir, mode="merge", techmap=False):
     rng = random.Random("x%d:%d" % (seed, index))
     g = Gen(rng)
     sv, outs, dnets = g.case()
@@ -527,16 +643,23 @@ def run_case(seed, index, workdir):
     # X-semantics (same-operand folds like x^x -> 0 are 2-state-isms
     # gated behind -keepdc / fixed to be x-aware); proc alone normalizes
     # the design for sim
-    script = ("read_verilog -sv %s; proc; sim -r %s -vcd %s"
-              % (svf, ywf, vcdf))
-    p = subprocess.run([YOSYS, "-p", script], capture_output=True, text=True,
-                       timeout=60)
-    if p.returncode != 0 or not os.path.exists(vcdf):
-        return ("infra", (p.stderr + p.stdout)[-300:])
-    slots = parse_vcd(vcdf)
+    slots = sim_vcd(svf, ywf, vcdf, mode)
+    if isinstance(slots, tuple):
+        return slots
     if len(slots) < nsteps:
         return ("infra", "only %d posedge slots (%d steps)"
                 % (len(slots), nsteps))
+    drift = 0
+    if techmap:
+        gvcdf = os.path.join(workdir, "out_gate.vcd")
+        gslots = sim_vcd(svf, ywf, gvcdf, mode, techmap=True)
+        if isinstance(gslots, tuple):
+            return gslots
+        viol, drift = check_gate_containment(slots, gslots, nsteps,
+                                             ["o%d" % i
+                                              for i in range(g.n_out)])
+        if viol:
+            return ("gate-violation", viol)
     state = {name: "x" * w for name, w in g.regs}
     steps = json.load(open(ywf))["steps"]
     mism = []
@@ -551,7 +674,7 @@ def run_case(seed, index, workdir):
         if k > 0:
             env = dict(inputs)
             env.update(state)
-            ref = {"o%d" % i: zx(eval_node(e, env), 6)
+            ref = {"o%d" % i: zx(eval_node(e, env, pes=(mode == "pessimistic")), 6)
                    for i, e in enumerate(outs)}
             got = slots[k]
             for name in sorted(ref):
@@ -562,7 +685,61 @@ def run_case(seed, index, workdir):
                  for j, (name, w) in enumerate(g.regs)}
     if mism:
         return ("mismatch", mism)
-    return ("agree", None)
+    return ("agree", drift)
+
+
+GOLDEN_SV = """\
+module top(input clk, input a, input b);
+  reg sel;                          // uninitialized -> x until first edge
+  wire o = sel ? a : b;             // arms equal at time 0 (a=b=1)
+  always @(posedge clk) sel <= a;
+endmodule
+"""
+GOLDEN_STIM = """\
+{"format": "Yosys Witness Trace", "generator": "golden",
+ "clocks": [{"path": ["\\\\clk"], "edge": "posedge", "offset": 0}],
+ "signals": [{"path": ["\\\\a"], "width": 1, "offset": 0, "init_only": false},
+             {"path": ["\\\\b"], "width": 1, "offset": 0, "init_only": false}],
+ "steps": [{"bits": "11"}, {"bits": "10"}, {"bits": "01"}]}
+"""
+
+
+def run_golden(workdir):
+    """Deterministic pin of the merge-vs-pessimistic divergence: with the
+    select x and both arms 1, LRM merge yields 1 and pessimistic yields
+    x.  Also pins the RTL->gate containment on the same design."""
+    svf = os.path.join(workdir, "golden.sv")
+    ywf = os.path.join(workdir, "golden.yw")
+    open(svf, "w").write(GOLDEN_SV)
+    open(ywf, "w").write(GOLDEN_STIM)
+    fails = []
+    for mode, want in (("merge", "1"), ("pessimistic", "x")):
+        vcdf = os.path.join(workdir, "golden_%s.vcd" % mode)
+        slots = sim_vcd(svf, ywf, vcdf, mode)
+        if isinstance(slots, tuple):
+            fails.append("golden %s: %s" % (mode, slots[1]))
+            continue
+        # slots[0] is the t=0 pre-edge slot: sel is still x there and the
+        # witness drives a=b=1 at step 0 -> arms equal -> merge=1, pes=x
+        got = slots[0].get("o") if slots else None
+        if got != want:
+            fails.append("golden %s: slot0 o=%s want %s" % (mode, got, want))
+    gvcdf = os.path.join(workdir, "golden_gate.vcd")
+    gslots = sim_vcd(svf, ywf, gvcdf, "merge", techmap=True)
+    pslots = sim_vcd(svf, ywf, os.path.join(workdir, "golden_rtl.vcd"),
+                     "merge")
+    if isinstance(gslots, tuple) or isinstance(pslots, tuple):
+        fails.append("golden techmap leg: infra failure")
+    else:
+        viol, _ = check_gate_containment(pslots, gslots, 3, ["o"])
+        if viol:
+            fails.append("golden techmap containment violated: %r" % viol[:2])
+    if fails:
+        for f in fails:
+            print("golden: %s" % f)
+        return False
+    print("golden: merge slot0 o=1, pessimistic slot0 o=x, gate containment ok")
+    return True
 
 
 def main():
@@ -570,28 +747,46 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--count", type=int, default=100)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--modes", default="merge",
+                    help="comma list: merge, pessimistic")
+    ap.add_argument("--techmap", action="store_true",
+                    help="also run the proc-vs-techmap gate-level "
+                         "containment leg per case")
+    ap.add_argument("--golden", action="store_true",
+                    help="run the deterministic mux-x divergence pin "
+                         "(no fuzz cases)")
     args = ap.parse_args()
 
-    ok = 0
-    bad = []
     outdir = args.out or tempfile.mkdtemp(prefix="xprop_")
     os.makedirs(outdir, exist_ok=True)
+    if args.golden:
+        sys.exit(0 if run_golden(outdir) else 1)
+
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    ok = 0
+    bad = []
+    total = 0
+    drift_total = 0
     for index in range(args.count):
-        workdir = os.path.join(outdir, "case_%04d" % index)
-        os.makedirs(workdir, exist_ok=True)
-        cls, detail = run_case(args.seed, index, workdir)
-        if cls == "agree":
-            ok += 1
-        else:
-            bad.append((index, cls, detail))
+        for mode in modes:
+            total += 1
+            workdir = os.path.join(outdir, "case_%04d_%s" % (index, mode))
+            os.makedirs(workdir, exist_ok=True)
+            cls, detail = run_case(args.seed, index, workdir, mode,
+                                   techmap=args.techmap)
+            if cls == "agree":
+                ok += 1
+                drift_total += detail
+            else:
+                bad.append((index, mode, cls, detail))
         if (index + 1) % 25 == 0:
             print("[%d/%d] ok=%d bad=%d" % (index + 1, args.count, ok,
                                             len(bad)), flush=True)
-    print("summary: %d/%d agreement, %d findings"
-          % (ok, args.count, len(bad)))
-    for index, cls, detail in bad[:10]:
-        print("case %d: %s" % (index, cls))
-        if cls == "mismatch":
+    print("summary: %d/%d agreement, %d findings, %d expected-drift bits"
+          % (ok, total, len(bad), drift_total))
+    for index, mode, cls, detail in bad[:10]:
+        print("case %d (%s): %s" % (index, mode, cls))
+        if cls in ("mismatch", "gate-violation"):
             for m in detail[:6]:
                 print("   step %d %s ref=%s sim=%s" % m)
         else:

@@ -11,11 +11,18 @@ export YOSYS
 FUZZ_SEED ?= 2
 FUZZ_COUNT ?= 150
 FUZZ_JOBS ?= 8
+XPROP_SEED ?= 3
+XPROP_COUNT ?= 40
 
 test:
 	python3 run_battery.py
 	python3 run_cdc.py
 	python3 ../sva_fuzz/fuzz.py --seed $(FUZZ_SEED) --count $(FUZZ_COUNT) \
 		--jobs $(FUZZ_JOBS) --out $$(mktemp -d /tmp/sva_fuzz_gate.XXXXXX)
+	python3 ../sva_fuzz/xprop.py --golden \
+		--out $$(mktemp -d /tmp/xprop_gold.XXXXXX)
+	python3 ../sva_fuzz/xprop.py --seed $(XPROP_SEED) --count $(XPROP_COUNT) \
+		--modes merge,pessimistic --techmap \
+		--out $$(mktemp -d /tmp/xprop_gate.XXXXXX)
 
 .PHONY: test

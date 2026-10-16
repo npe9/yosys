@@ -54,9 +54,26 @@ def fold_live_legs(results):
     return out
 
 
+def ic3_timeout(path):
+    """Per-file ic3 leg budget from `// IC3-TIMEOUT: N` (default 90s).
+    The historically slow files (heavy proofs, multiclock prep) carry an
+    explicit pragma so a loaded build machine doesn't manufacture
+    infrastructure failures; the values assume a quiet machine."""
+    try:
+        with open(path) as fh:
+            for line in fh:
+                m = re.match(r'\s*//\s*IC3-TIMEOUT:\s*(\d+)', line)
+                if m:
+                    return int(m.group(1))
+    except OSError:
+        pass
+    return 90
+
+
 def run_ic3(path):
     proc = subprocess.run(
-        [sys.executable, os.path.join(HERE, "run_ic3.py"), path, "--timeout", "90", "--yosys", YOSYS],
+        [sys.executable, os.path.join(HERE, "run_ic3.py"), path,
+         "--timeout", str(ic3_timeout(path)), "--yosys", YOSYS],
         capture_output=True, text=True)
     blob = proc.stdout + "\n" + proc.stderr
     if "prep-failed" in blob or "no summary" in blob or "timed out" in blob:

@@ -7,6 +7,7 @@
 // check, so DIS expectations carry no @N (liveness disproofs are depth 0
 // by design).  ctr runs 0,1,2,...; once gates the one-shot pulses so a,
 // b4 and blate fire exactly once (ticks 4, 5, 6) instead of every wrap.
+// IC3-TIMEOUT: 300
 module tresp1 (input logic clk);
   logic [7:0] ctr;
   logic once, a, b4, blate;

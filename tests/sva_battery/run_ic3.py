@@ -38,8 +38,13 @@ async2sync
 opt_clean
 memory
 opt_clean
-{extra_mem}ic3 -check-cells -init-zero{bmc}{ctg}
+{extra_mem}{engine}
 """
+
+# the engine step run by default: ic3 enumerates the $check cells
+# (lowered to $assert by async2sync) directly.  Other drivers swap this
+# for `sim -r <witness> ...` (cex replay) by formatting PREP themselves.
+ENGINE = "ic3 -check-cells -init-zero"
 
 
 def prep_extras(path):
@@ -72,14 +77,20 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def check_one(yosys, path, top, inc_dirs, timeout):
+def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
     label = os.path.basename(path) if isinstance(path, str) else os.path.basename(path[0])
     files = path if isinstance(path, list) else [path]
     inc = " ".join("-I" + d for d in inc_dirs)
     extra_a2s, extra_mem, bmc, ctg = prep_extras(files[0])
+    engine = ENGINE + bmc + ctg
+    if cex_prefix:
+        # disproved properties additionally write <prefix><prop>.yw
+        # witnesses (replay: same prep + `sim -r <w> -vcd trace.vcd`)
+        engine += " -cex " + cex_prefix
     script = PREP.format(inc=inc, files=" ".join(files),
                          top=" -top " + top if top else "",
-                         extra_a2s=extra_a2s, extra_mem=extra_mem, bmc=bmc, ctg=ctg)
+                         extra_a2s=extra_a2s, extra_mem=extra_mem,
+                         engine=engine)
     ys = os.path.join(tempfile.gettempdir(), f"ic3_{os.getpid()}.ys")
     with open(ys, "w") as fh:
         fh.write(script)
@@ -127,11 +138,16 @@ def main():
     ap.add_argument("--yosys", default=YOSYS)
     ap.add_argument("-I", "--include", action="append", default=[])
     ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--cex", default=None,
+                    help="prefix for per-property .yw counterexample "
+                         "witnesses of disproved properties (replay: same "
+                         "prep + `sim -r <prefix><prop>.yw`)")
     args = ap.parse_args()
 
     ok = True
     for path in args.files:
-        r = check_one(args.yosys, path, args.top, args.include, args.timeout)
+        r = check_one(args.yosys, path, args.top, args.include, args.timeout,
+                      cex_prefix=args.cex)
         if r is None:
             ok = False
             continue

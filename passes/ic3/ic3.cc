@@ -188,11 +188,6 @@ struct Ic3Solver
 	// k-induction depth tried before the IC3 loop (0 = disabled)
 	int kind_max;
 
-	// a cex export was requested: disproofs may not be decided by a
-	// throwaway pre-pass solver (the exporter needs this solver's state
-	// vector), so prove() falls through to the main loop
-	bool want_cex = false;
-
 	// bounded reachability depth tried before everything else (0 = off);
 	// finds deep counterexamples (t7-class CEXes near the ctr-wrap
 	// boundary) in d cheap solves instead of d IC3 frames
@@ -767,14 +762,17 @@ struct Ic3Solver
 	int prove(RTLIL::Cell *prop, int &depth)
 	{
 		// A disproof decided by a throwaway pre-pass solver leaves this
-		// solver unencoded, and the cex exporter needs its state vector:
-		// fall through to the main loop when a witness is requested.
+		// solver unencoded, but that is fine with -cex: export_cex
+		// re-derives the witness by an exact unroll on its own solver, so
+		// no re-run of the IC3 loop is needed just to populate a state
+		// vector (that fallback used to make -cex on a t7-class deep
+		// pre-pass cex pay the full frame-by-frame walk).
 		int r = bmc_prepass(prop, depth);
 		if (r != 2)
-			return r == 1 && want_cex ? prove_core(prop, depth) : r;
+			return r;
 		r = kind_prepass(prop, depth);
 		if (r != 2)
-			return r == 1 && want_cex ? prove_core(prop, depth) : r;
+			return r;
 		return prove_core(prop, depth);
 	}
 
@@ -920,10 +918,10 @@ struct Ic3Solver
 	// run (same setundef -init -zero when -init-zero was used).
 	void export_cex(RTLIL::Cell *prop, const std::string &file, int depth)
 	{
-		if (state1.empty()) {
-			log_warning("ic3: cex export needs a state vector; skipped.\n");
-			return;
-		}
+		// No state-vector requirement here: the exact unroll below builds
+		// its own encoding on the throwaway solver `bs`, and a stateless
+		// design (states[1] legitimately empty, e.g. tprove0) still has a
+		// well-defined depth-0 witness: the failing input valuation itself.
 		WitnessIo wio;
 		collect_witness_io(wio);
 
@@ -1651,7 +1649,6 @@ struct Ic3Pass : Pass
 			solver.kind_max = kind_max;
 			solver.bmc_max = bmc_max;
 			solver.ctg_depth_max = ctg_depth_max;
-			solver.want_cex = !cex_prefix.empty();
 
 			int depth = 0;
 			int result = solver.prove(cell, depth);

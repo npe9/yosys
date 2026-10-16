@@ -15,9 +15,21 @@ exactly as fast as one BMC round) -- the flag is recorded, not presumed.
 
 Lanes:
   smt: run_bmc.py --prove --stream <events>   (BMC rounds; temporal
-       induction upgrades survivors to proved; BMC-SKIP files emit SKIP)
+       induction upgrades survivors to proved; BMC-SKIP files emit SKIP;
+       with --cex each round also dumps its counterexample witness
+       .yw via smtbmc --dump-yw and streams WITNESS name file events)
   ic3: yosys <run_ic3 PREP + pragmas>         (per-property verdict
-       lines stream from the pass as properties decide)
+       lines stream from the pass as properties decide; with --cex the
+       pass gets -cex <dir>/ic3_ and writes <dir>/ic3_<prop>.yw per
+       disproof)
+
+With --cex <dir>, every safety-only disproof is then RE-VERIFIED by
+replaying its witness: same prep as the settling lane plus
+`sim -r <w> -summary <json> -vcd <vcd>`, and the summary must record
+the assertion firing at exactly the recorded cex step (REPLAY-OK).
+Liveness ($live leg) disproofs are lasso traces and stay manual.
+This closes the loop between formal counterexamples and executable
+debugging traces (register item 4, cex -> VCD export + replay).
 
 Merge policy per property (first definitive wins):
   cex@N (smt)             -> DIS@N   (sound disproof)
@@ -37,9 +49,12 @@ iff every expected property received its expected verdict, no conflicts
 were observed, and all --expect-engine attributions hold.
 
 Usage: python3 prove.py <file.sv>... [--timeout N] [--expect-engine name=lane]
+       [--cex <dir>]   keep .yw witnesses + sim -r replays; re-verify
+                       every safety disproof by replay
 """
 
 import argparse
+import json
 import os
 import queue
 import re
@@ -81,10 +96,85 @@ def spawn(cmd):
                             start_new_session=True)
 
 
+class DummyLane:
+    """Stand-in for a disabled lane (--smt-only/--ic3-only): no events,
+    already done, kill is a no-op."""
+
+    def __init__(self):
+        self.events = queue.Queue()
+        self.done = True
+
+    def poll(self):
+        return True
+
+    def kill(self):
+        pass
+
+
+def safe_name(name):
+    """ic3's witness-file sanitization: only [alnum_-] survives."""
+    return "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in name)
+
+
+def replay_confirm(yosys, path, top, include, witness, settle_engine,
+                   label, step, cexdir, timeout):
+    """Replay a .yw witness with `sim -r` on the settling lane's own prep
+    and confirm the assertion fires exactly at the recorded cex step.
+    Returns (ok, detail).  Writes <cexdir>/replay_<label>.{vcd,json}."""
+    vcd = os.path.join(cexdir, "replay_%s.vcd" % safe_name(label))
+    summary = os.path.join(cexdir, "replay_%s.json" % safe_name(label))
+    if settle_engine == "smt":
+        # the SMT witness was generated against run_bmc's prep (which adds
+        # setundef -init -zero); replay against exactly that.  The deleted-
+        # assert rounds don't matter: check cells are logic sinks, so the
+        # undeleted design evolves identically under the same inputs.
+        extra_a2s, extra_mem = run_bmc.prep_extras(path)
+        script = run_bmc.PREP.format(files=path,
+                                     top=" -top " + top if top else "",
+                                     deletes="", smt=os.devnull,
+                                     extra_a2s=extra_a2s, extra_mem=extra_mem)
+    else:
+        inc = " ".join("-I" + d for d in include)
+        extra_a2s, extra_mem, bmc, ctg = run_ic3.prep_extras(path)
+        script = run_ic3.PREP.format(inc=inc, files=path,
+                                     top=" -top " + top if top else "",
+                                     extra_a2s=extra_a2s, extra_mem=extra_mem,
+                                     engine=run_ic3.ENGINE + bmc + ctg)
+    script += "sim -r %s -summary %s -vcd %s\n" % (witness, summary, vcd)
+    ys = os.path.join(cexdir, "replay_%s.ys" % safe_name(label))
+    with open(ys, "w") as fh:
+        fh.write(script)
+    try:
+        proc = subprocess.run(
+            ["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" "$2"',
+             "y", yosys, ys],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "replay timed out after %ds" % timeout
+    if proc.returncode != 0 and not os.path.exists(summary):
+        err = ""
+        for line in (proc.stdout + proc.stderr).splitlines():
+            if "ERROR:" in line:
+                err = line.split("ERROR:", 1)[1].strip()
+        return False, "replay failed: %s" % (err[:120] or "exit %d"
+                                             % proc.returncode)
+    try:
+        doc = json.load(open(summary))
+    except (OSError, ValueError) as e:
+        return False, "replay produced no readable summary: %s" % e
+    fired = [a["step"] for a in doc.get("assertions", [])
+             if a.get("path") and a["path"][-1].lstrip("\\") == label]
+    if step in fired:
+        return True, "assertion fires at step %d (of %d)" % \
+            (step, doc.get("steps"))
+    return False, "assertion fires at %s, expected step %d" % \
+        (fired or "no steps", step)
+
+
 class SmtLane:
     """run_bmc.py --prove as a subprocess; events via its --stream file."""
 
-    def __init__(self, path, top, include, timeout, workdir):
+    def __init__(self, path, top, include, timeout, workdir, dump_yw=None):
         self.events = queue.Queue()
         self.stream = os.path.join(workdir, "smt_events.txt")
         self.done = False
@@ -95,6 +185,9 @@ class SmtLane:
             cmd += ["--top", top]
         for d in include:
             cmd += ["-I", d]
+        if dump_yw:
+            os.makedirs(dump_yw, exist_ok=True)
+            cmd += ["--dump-yw", dump_yw]
         self.proc = spawn(cmd)
 
     def poll(self):
@@ -111,6 +204,10 @@ class SmtLane:
             if m:
                 name, _ = norm(m.group(1))
                 self.events.put((m.group(2), name, int(m.group(3)), "safety"))
+            m = re.match(r"WITNESS (\S+) (\S+)", line)
+            if m:
+                name, _ = norm(m.group(1))
+                self.events.put(("witness", name, m.group(2), "safety"))
             elif line == "SKIP":
                 self.events.put(("skip", None, None, None))
             elif line.startswith("ERROR"):
@@ -136,15 +233,19 @@ class SmtLane:
 class Ic3Lane:
     """yosys ic3 pass as a subprocess; per-property lines from stdout."""
 
-    def __init__(self, path, top, include, workdir):
+    def __init__(self, path, top, include, workdir, cex_prefix=None):
         self.events = queue.Queue()
         self.done = False
         inc = " ".join("-I" + d for d in include)
         extra_a2s, extra_mem, bmc, ctg = run_ic3.prep_extras(path)
+        engine = run_ic3.ENGINE + bmc + ctg
+        if cex_prefix:
+            os.makedirs(os.path.dirname(cex_prefix) or ".", exist_ok=True)
+            engine += " -cex " + cex_prefix
         script = run_ic3.PREP.format(inc=inc, files=path,
                                      top=" -top " + top if top else "",
                                      extra_a2s=extra_a2s, extra_mem=extra_mem,
-                                     bmc=bmc, ctg=ctg)
+                                     engine=engine)
         ys = os.path.join(workdir, "prove_ic3.ys")
         with open(ys, "w") as fh:
             fh.write(script)
@@ -186,11 +287,19 @@ class Ic3Lane:
 def prove_file(path, args, workdir):
     t0 = time.time()
     exp = run_bmc.expectations(path)
-    smt = SmtLane(path, args.top, args.include, args.timeout, workdir)
-    ic3 = Ic3Lane(path, args.top, args.include, workdir)
+    cexdir = None
+    if args.cex:
+        cexdir = os.path.join(args.cex, os.path.splitext(os.path.basename(path))[0])
+        os.makedirs(cexdir, exist_ok=True)
+    smt = SmtLane(path, args.top, args.include, args.timeout, workdir,
+                   dump_yw=cexdir) if not args.ic3_only else DummyLane()
+    ic3 = Ic3Lane(path, args.top, args.include, workdir,
+                  cex_prefix=(os.path.join(cexdir, "ic3_") if cexdir else None)) \
+        if not args.smt_only else DummyLane()
     settled = {}   # name -> (verdict, step, engine, elapsed)
     legs = {}      # name -> {leg: (kind, step, engine)}
     soft = {}      # name -> (kind, step, engine)  non-definitive bests
+    witnesses = {}  # name -> (yw path, engine) from WITNESS events / ic3 naming
     problems = []
 
     def combined(name):
@@ -225,6 +334,9 @@ def prove_file(path, args, workdir):
             return
         if kind == "error":
             problems.append("lane error (%s): %s" % (engine, name))
+            return
+        if kind == "witness":
+            witnesses.setdefault(name, (os.path.join(cexdir, step), engine))
             return
         # map lane verdicts onto leg kinds
         lk = {"cex": "disproved", "holds": "undecided"}.get(kind, kind)
@@ -278,6 +390,17 @@ def prove_file(path, args, workdir):
             break
         time.sleep(0.1)
     timed_out = not (smt.done and ic3.done) and not early
+    if cexdir and not timed_out:
+        # ic3 logs the verdict line just BEFORE exporting the witness; on
+        # early exit give the lane a moment to finish those exports so
+        # every disproof settled by ic3 has its .yw for the replay.
+        want = [n for n, (v, s, e, _el) in settled.items()
+                if v.startswith("dis") and e == "ic3"]
+        deadline = time.time() + 15
+        while time.time() < deadline and \
+                not all(os.path.exists(os.path.join(cexdir, "ic3_%s.yw" % safe_name(n)))
+                        for n in want):
+            time.sleep(0.1)
     smt.kill()
     ic3.kill()
 
@@ -325,6 +448,45 @@ def prove_file(path, args, workdir):
             print("  ENGINE-MISMATCH %s: expected %s lane, got %s"
                   % (name, lane, got[2] if got else "no verdict"))
             ok = False
+    if cexdir:
+        # Counterexample replay: every safety-only disproof settles with a
+        # .yw witness; play it back through `sim -r` on the settling lane's
+        # prep and require the assertion to fire at exactly the recorded
+        # step.  Liveness ($live leg) disproofs are lasso traces and stay
+        # manual for now.
+        for name, (v, step, engine, _el) in sorted(settled.items()):
+            if not v.startswith("dis"):
+                continue
+            if set(legs.get(name, {})) != {"safety"}:
+                continue
+            witness = None
+            if engine == "ic3":
+                # prefer the settling lane's own witness (ic3's filename
+                # is derivable; smt's comes from the WITNESS stream event)
+                cand = os.path.join(cexdir, "ic3_%s.yw" % safe_name(name))
+                if os.path.exists(cand):
+                    witness = (cand, engine)
+            if witness is None:
+                witness = witnesses.get(name)
+            if witness is None:
+                print("  REPLAY-MISS  %s (no %s-lane witness)"
+                      % (name, engine))
+                ok = False
+                continue
+            wpath, wengine = witness
+            if not os.path.exists(wpath):
+                print("  REPLAY-MISS  %s (%s missing)" % (name, wpath))
+                ok = False
+                continue
+            rok, detail = replay_confirm(YOSYS, path, args.top, args.include,
+                                         wpath, wengine, name, step, cexdir,
+                                         timeout=min(180, args.timeout))
+            if rok:
+                print("  REPLAY-OK    %s @%d (%s witness; %s)"
+                      % (name, step, wengine, detail))
+            else:
+                print("  REPLAY-FAIL  %s @%d: %s" % (name, step, detail))
+                ok = False
     return ok
 
 
@@ -341,7 +503,22 @@ def main():
                          "win but lets the loser cross-check depths)")
     ap.add_argument("--expect-engine", action="append", default=[],
                     help="per-property lane attribution check, name=smt|ic3")
+    ap.add_argument("--cex", default=None,
+                    help="directory kept for counterexample artifacts: "
+                         "per-property .yw witnesses from both lanes plus "
+                         "sim -r replays (.vcd + summary .json); every "
+                         "safety disproof is re-verified by replay")
+    ap.add_argument("--smt-only", action="store_true",
+                    help="run only the SMT (run_bmc) lane -- bisect engine "
+                         "disagreements; settles every disproof with an "
+                         "smtbmc witness")
+    ap.add_argument("--ic3-only", action="store_true",
+                    help="run only the IC3 lane -- bisect engine "
+                         "disagreements")
     args = ap.parse_args()
+
+    if args.cex:
+        os.makedirs(args.cex, exist_ok=True)
 
     ok = True
     for path in args.files:

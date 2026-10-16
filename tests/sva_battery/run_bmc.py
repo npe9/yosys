@@ -80,7 +80,7 @@ def expectations(path):
 
 
 def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
-              stream=None):
+              stream=None, dump_yw=None):
     label = os.path.basename(path)
     exp = expectations(path)
 
@@ -105,7 +105,7 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
                      # the SMT, so 'holds'/'proved' for them would be
                      # vacuous; their verdict comes from the ic3 leg
 
-    for _ in range(64):
+    for rnd in range(64):
         deletes = "".join("delete c:\\%s\n" % n for n in deleted)
         extra_a2s, extra_mem = prep_extras(path)
         smt = os.path.join(tempfile.gettempdir(), "bmc_%d.smt2" % os.getpid())
@@ -137,7 +137,16 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
             top = m.group(1)
 
         try:
-            cmd = [smtbmc, "-s", solver, "-t", str(bound), "-m", top or label, smt]
+            # options must precede the .smt2 file: smtbmc parses with
+            # plain getopt and stops at the first non-option argument
+            cmd = [smtbmc, "-s", solver, "-t", str(bound), "-m", top or label]
+            yw_name = None
+            if dump_yw:
+                # one witness per round (smtbmc stops at the first failing
+                # step by default); the conductor replays it with sim -r
+                yw_name = "smt_r%d.yw" % rnd
+                cmd += ["--dump-yw", os.path.join(dump_yw, yw_name)]
+            cmd.append(smt)
             p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$@"', "y"] + cmd, timeout=timeout)
         except subprocess.TimeoutExpired:
             print("%s: smtbmc timed out after %ds" % (label, timeout))
@@ -179,6 +188,8 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
             if name not in verdicts:
                 verdicts[name] = ("cex", step)
                 sline("VERDICT %s cex@%d" % (name, step))
+                if yw_name:
+                    sline("WITNESS %s %s" % (name, yw_name))
             deleted.append(name)
 
     # proof upgrade: with --prove, run one temporal-induction pass over the
@@ -261,12 +272,17 @@ def main():
     ap.add_argument("--stream", default=None,
                     help="append incremental VERDICT/ERROR/DONE lines for "
                          "the prove.py conductor")
+    ap.add_argument("--dump-yw", default=None,
+                    help="directory for per-round .yw counterexample "
+                         "witnesses (one per BMC round, smt_rN.yw); the "
+                         "conductor replays them with sim -r")
     args = ap.parse_args()
 
     ok = True
     for path in args.files:
         r = check_one(args.yosys, args.smtbmc, path, args.top, args.solver,
-                      args.bound, args.timeout, args.prove, stream=args.stream)
+                      args.bound, args.timeout, args.prove, stream=args.stream,
+                      dump_yw=args.dump_yw)
         if r is None or not r:
             ok = False
     sys.exit(0 if ok else 1)

@@ -16,7 +16,11 @@ XPROP_COUNT ?= 40
 # Conductor leg: prove.py runs the SMT and IC3 lanes in parallel over a
 # representative mix (depth-0 pin, anchored ranges, $fair skip, s_until
 # liveness legs, nested-temporal proofs) and checks the merged
-# first-to-finish verdicts against the same expectations.
+# first-to-finish verdicts against the same expectations.  --cex keeps
+# per-property .yw witnesses from both lanes and re-verifies every safety
+# disproof by sim -r replay (assertion must fire at the recorded step);
+# the --smt-only pass pins the smt-witness replay path deterministically
+# (in the race, ic3 wins tprove0's disproofs on every quiet machine).
 CONDUCTOR_FILES ?= tprove0.sv ts1.sv tanc1.sv tanc2.sv tfair2.sv tsuntil3.sv tresp1.sv
 
 test:
@@ -24,7 +28,10 @@ test:
 	python3 run_cdc.py
 	python3 ../sva_fuzz/fuzz.py --seed $(FUZZ_SEED) --count $(FUZZ_COUNT) \
 		--jobs $(FUZZ_JOBS) --out $$(mktemp -d /tmp/sva_fuzz_gate.XXXXXX)
-	python3 prove.py --timeout 300 $(CONDUCTOR_FILES)
+	python3 prove.py --timeout 300 \
+		--cex $$(mktemp -d /tmp/prove_cex.XXXXXX) $(CONDUCTOR_FILES)
+	python3 prove.py --timeout 300 \
+		--cex $$(mktemp -d /tmp/prove_cex_smt.XXXXXX) --smt-only tprove0.sv
 	python3 ../sva_fuzz/xprop.py --golden \
 		--out $$(mktemp -d /tmp/xprop_gold.XXXXXX)
 	python3 ../sva_fuzz/xprop.py --seed $(XPROP_SEED) --count $(XPROP_COUNT) \

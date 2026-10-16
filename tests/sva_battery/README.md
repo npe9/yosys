@@ -14,11 +14,16 @@ via the `YOSYS` env var; default `third_party/yosys/build/yosys`
 relative to the repo root):
 
     make test            # in this directory: battery + cdc + seeded fuzz
-                         # + conductor leg + xprop legs
+                         # + conductor leg (with --cex replay checks) + xprop legs
     python3 run_ic3.py <file>.sv --timeout 90     # native IC3/PDR, no external solver
+    python3 run_ic3.py <file>.sv --cex <dir>/     # ... plus a .yw witness per disproof
     python3 run_bmc.py <file>.sv                  # write_smt2 + yosys-smtbmc (z3 default, -s boolector)
+    python3 run_bmc.py <file>.sv --dump-yw <dir>  # ... plus a .yw witness per BMC round
     python3 prove.py <file>.sv...                 # conductor: both lanes in parallel,
                                                   # first-to-finish per property
+    python3 prove.py <file>.sv --cex <dir>        # ... and re-verify every safety
+                                                  # disproof by sim -r witness replay
+    python3 prove.py --smt-only / --ic3-only f.sv # single-lane runs (bisect conflicts)
 
 Both drivers exit 0 iff every property matches its expectation.
 The conductor additionally records which lane settled each property and
@@ -26,6 +31,14 @@ exits 1 on cross-engine conflicts (a cex depth disagreement, or one lane
 proving what the other disproved -- both engines are sound on the
 identical prep, so that means an engine bug; the sequential battery legs
 remain the referee).
+
+With `--cex <dir>` the conductor keeps per-property artifacts under
+`<dir>/<file>/`: `ic3_<prop>.yw` / `smt_rN.yw` witnesses from both lanes,
+plus `replay_<prop>.{vcd,json,ys}` from replaying each safety disproof on
+the settling lane's own prep (`sim -r <w> -summary <json> -vcd <vcd>`);
+the battery requires the replay summary to record the assertion firing at
+exactly the recorded cex step (REPLAY-OK).  Liveness (`$live` leg)
+disproofs are lasso traces and are not replay-checked.
 
 ## Expectations
 
@@ -109,10 +122,12 @@ rarest-firing path in the replay summary (a collateral constant-false
 property, e.g. tconst1's p1, fires at every step and is not chased);
 prefix steps are never removed -- indices would shift and step k would
 no longer mean the same cycle. `--clock` is accepted but unused: the yw
-header carries the clock and `sim -r` rejects `-clock`. Note: `ic3`'s
-default k-induction pre-pass disproves on a throwaway solver, so cex
-export currently requires `-kind 0` (and a design with registers -- a
-purely combinational disproof has no state vector to export).
+header carries the clock and `sim -r` rejects `-clock`. Note: since
+2026-10-16 neither `-kind 0` nor registers are required for cex export --
+the exporter re-derives the witness by an exact unroll on its own solver
+(`export_cex`), pre-pass disproofs export directly without re-running the
+IC3 loop, and a purely combinational depth-0 disproof exports a
+single-step witness of its failing inputs (tprove0).
 
 ## Known edges (fail by design, do not "fix" without a plan entry)
 

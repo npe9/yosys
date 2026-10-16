@@ -1,3 +1,4 @@
+// IC3-TIMEOUT: 300
 module tfeat5(input logic clk);
   logic [7:0] ctr;
   always_ff @(posedge clk) ctr <= ctr + 8'd1;

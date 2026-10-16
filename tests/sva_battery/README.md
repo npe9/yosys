@@ -25,6 +25,12 @@ relative to the repo root):
                                                   # disproof by sim -r witness replay
     python3 prove.py --smt-only / --ic3-only f.sv # single-lane runs (bisect conflicts)
 
+LSP diagnostics server (register item "language server", v1: diagnostics
+only -- full-sync re-lint through the yosys frontend, no navigation yet):
+
+    python3 lsp.py --yosys $YOSYS        # stdio JSON-RPC server for editors
+    python3 run_lsp.py                   # protocol gate (make test leg)
+
 Both drivers exit 0 iff every property matches its expectation.
 The conductor additionally records which lane settled each property and
 exits 1 on cross-engine conflicts (a cex depth disagreement, or one lane

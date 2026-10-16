@@ -37,5 +37,6 @@ test:
 	python3 ../sva_fuzz/xprop.py --seed $(XPROP_SEED) --count $(XPROP_COUNT) \
 		--modes merge,pessimistic --techmap \
 		--out $$(mktemp -d /tmp/xprop_gate.XXXXXX)
+	python3 run_lsp.py
 
 .PHONY: test

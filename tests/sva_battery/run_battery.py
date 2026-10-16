@@ -179,10 +179,12 @@ def main():
         rel = os.path.basename(path)
         exp = expectations(path)
         n_props += len(exp)
+        file_failures = []
         for leg in (check_ic3, check_bmc):
             for msg in leg(path, exp):
-                failures.append(f"{rel}: {msg}")
-        print(f"{rel}: {'ok' if not failures else 'ISSUES'} ({len(exp)} properties)", flush=True)
+                file_failures.append(f"{rel}: {msg}")
+        failures.extend(file_failures)
+        print(f"{rel}: {'ok' if not file_failures else 'ISSUES'} ({len(exp)} properties)", flush=True)
     stress = sorted(os.path.basename(p) for p in
                     glob.glob(os.path.join(HERE, "x*.sv")))
     print(f"\ngreen leg: {len(files)} files, {n_props} properties")

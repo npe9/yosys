@@ -405,6 +405,11 @@ struct IFExpander
 // message. Otherwise, return a pointer to the module if we derived or loaded
 // something. or null otherwise (the module should be blackbox or we couldn't
 // find it and check is not set).
+// `hierarchy -check -permissive`: a missing module becomes a blackbox with
+// a warning (the fork's historical leniency) instead of an error; the
+// parent module is marked (* sv_degraded *) either way it survives.
+static bool hierarchy_permissive = false;
+
 RTLIL::Module *get_module(RTLIL::Design                  &design,
                           RTLIL::Cell                    &cell,
                           RTLIL::Module                  &parent,
@@ -457,9 +462,19 @@ RTLIL::Module *get_module(RTLIL::Design                  &design,
 	// We couldn't find the module anywhere. A single translation unit often
 	// instantiates primitives that live in another file. Keep the parent so
 	// its own logic still synthesizes.
-	if (check)
+	if (check && !hierarchy_permissive)
+		log_error("Module `%s' referenced in module `%s' in cell `%s' is not part of the design.  [`hierarchy -check -permissive` keeps it as a black box and marks the parent (* sv_degraded *)]\n",
+		          cell_type.c_str(), parent.name.c_str(), cell.name.c_str());
+	if (check) {
 		log_warning("Module `%s' referenced in module `%s' is not part of the design; treating it as a black box.\n",
 		            cell_type.c_str(), parent.name.c_str());
+		IdString attr = IdString("\\sv_degraded");
+		std::string cur;
+		if (parent.attributes.count(attr))
+			cur = parent.attributes.at(attr).decode_string();
+		std::string entry = stringf("missing module %s (blackbox) @cell %s", cell_type.c_str(), log_id(cell.name));
+		parent.attributes[attr] = RTLIL::Const(cur.empty() ? entry : cur + "; " + entry);
+	}
 
 	RTLIL::Module *bb = design.addModule(cell.type);
 	bb->set_bool_attribute(ID::blackbox);
@@ -848,6 +863,10 @@ struct HierarchyPass : public Pass {
 		log("needed. It also resolves assignments to wired logic data types (wand/wor),\n");
 		log("resolves positional module parameters, unrolls array instances, and more.\n");
 		log("\n");
+		log("    -permissive\n");
+		log("        with -check: a missing module is a warning + blackbox (parent marked\n");
+		log("        (* sv_degraded *)) instead of an error.\n");
+		log("\n");
 		log("    -check\n");
 		log("        also check the design hierarchy. this generates an error when\n");
 		log("        an unknown module is used as cell type.\n");
@@ -929,6 +948,7 @@ struct HierarchyPass : public Pass {
 		log_header(design, "Executing HIERARCHY pass (managing design hierarchy).\n");
 
 		bool flag_check = false;
+		hierarchy_permissive = false;
 		bool flag_simcheck = false;
 		bool flag_smtcheck = false;
 		bool purge_lib = false;
@@ -991,6 +1011,10 @@ struct HierarchyPass : public Pass {
 			}
 			if (args[argidx] == "-check") {
 				flag_check = true;
+				continue;
+			}
+			if (args[argidx] == "-permissive") {
+				hierarchy_permissive = true;
 				continue;
 			}
 			if (args[argidx] == "-simcheck") {

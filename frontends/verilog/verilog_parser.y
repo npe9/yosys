@@ -87,6 +87,10 @@
 			bool current_wire_rand, current_wire_const, current_wire_automatic;
 			bool current_modport_input, current_modport_output;
 			bool default_nettype_wire = true;
+			// inside an always_comb / always_latch body: a procedural event
+			// control is a syntax error there (IEEE 1800 9.2.2.2; upstream
+			// rejects it at the '@', tests/various/svalways.sh)
+			bool in_comb_body = false;
 			std::vector<bool> sv_keyword_stack;
 			std::istream* lexin;
 			// IEEE 1800-2009 default clocking / default disable iff (clause 16).
@@ -844,7 +848,7 @@
 // SVA repetition tokens (an `[*]'/`[+]'/`[->'/`[=]' bracket followed by an
 // expression is a repetition, by `]' an unbounded one, both kept over the
 // associative-dimension reading).
-%expect 131
+%expect 127
 
 %precedence FAKE_THEN
 %precedence TOK_ELSE
@@ -4001,7 +4005,9 @@ always_stmt:
 		else
 			node->attributes[ID::always_comb] = AstNode::mkconst_int(@2, 1, false);
 		(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_BLOCK));
+		extra->in_comb_body = true;
 	} behavioral_stmt {
+		extra->in_comb_body = false;
 		extra->ast_stack.pop_back();
 		extra->ast_stack.pop_back();
 	} |
@@ -4350,6 +4356,14 @@ sva_concurrent:
 		if ($1 != nullptr)
 			node->str = *$1;
 		extra->saveChild(std::move(node));
+	};
+
+// a procedural event control; rejected at the '@' inside always_comb /
+// always_latch bodies (IEEE 1800 9.2.2.2, upstream's wording)
+proc_at:
+	TOK_AT {
+		if (extra->in_comb_body)
+			err_at_loc(@1, "syntax error, unexpected '@'");
 	};
 
 asgn_delay:
@@ -4807,10 +4821,10 @@ behavioral_stmt:
 	} opt_rs_production_id rs_productions TOK_ENDSEQUENCE {
 		extra->ast_stack.pop_back();
 	} |
-	attr TOK_AT TOK_LPAREN event_wait_list TOK_RPAREN TOK_SEMICOL {
+	attr proc_at TOK_LPAREN event_wait_list TOK_RPAREN TOK_SEMICOL {
 		(void)$1;
 	} |
-	attr TOK_AT rvalue behavioral_stmt {
+	attr proc_at rvalue behavioral_stmt {
 		// wait-on-event statement, e.g. `@waiter.trigger;` or
 		// `@ev a = 1;` (IEEE 9.4.2, simulation-only): the wait itself is
 		// not modeled, but the statement body stays in the flow so it

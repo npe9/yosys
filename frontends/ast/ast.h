@@ -417,6 +417,29 @@ namespace AST
 	// extern std::string current_filename;
 	// also set by the language frontend to control some AST processing
 	extern bool sv_mode_but_global_and_used_for_literally_one_condition;
+
+	// register v3 A2/B4: every frontend leniency path (a dropped
+	// statement, a constant-0 substitution, an unknown type read as
+	// logic, ...) reports through degrade().  By default it is an error;
+	// under `read_verilog -permissive` it is a warning on EVERY occurrence
+	// (file:line) that also appends "<reason> @file:line" to the module's
+	// (* sv_degraded *) attribute, which the conformance ladder histograms
+	// and the provers refuse.
+	extern bool flag_permissive;
+	void degrade_impl(const LogSourceLocation &loc, const std::string &reason, bool warn_only = false);
+	// a leniency upstream yosys itself has (implicit nets under
+	// `default_nettype wire`): never an error, but warned per occurrence
+	// and recorded in sv_degraded like every other degradation
+	template<typename... Args>
+	void degrade_warn(const LogSourceLocation &loc, FmtString<TypeIdentity<Args>...> fmt, const Args &... args)
+	{
+		degrade_impl(loc, fmt.format(args...), true);
+	}
+	template<typename... Args>
+	void degrade(const LogSourceLocation &loc, FmtString<TypeIdentity<Args>...> fmt, const Args &... args)
+	{
+		degrade_impl(loc, fmt.format(args...));
+	}
 	// Set by the Verilog frontend. Synthesis drops $sva cells; -formal keeps them.
 	extern bool keep_sva_cells;
 	// 0 when -sv selected no year. Otherwise the IEEE 1800 year from -std=.

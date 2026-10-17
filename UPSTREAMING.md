@@ -105,6 +105,17 @@ the frontend on two corpus files; open item).
   `tests/sva_battery/README.md`; the independent LRM model
   `tests/sva_pbt` lists the known single-monitor divergences (F2-F6,
   F10) that per-attempt tracking still has to fix.
+- **Read policy (register v3 B4, 2026-10-17):** the fork's frontend
+  leniencies are errors by default and live behind `read_verilog
+  -permissive` / `hierarchy -check -permissive`, which warn per
+  occurrence and mark modules `(* sv_degraded *)` / `(* sv_permissive *)`
+  (proc_dlatch keys its always_comb latch policy on the latter).  Of
+  upstream's 20 "policy" tests the fork now passes 18 by default; the
+  remaining two are expectation-only differences (bug2493: a cell name
+  used as a wire is still an implicit net; positional_args: the fork
+  connects interface instances positionally through implicit member
+  wires that hierarchy resolves, upstream errors) plus the documented
+  smt2_fair_cells skip.
 - **Status:** planned; documented as the high-risk/high-value endgame.
 
 ### 4. `lsp` — editor diagnostics server

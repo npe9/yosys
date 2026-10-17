@@ -43,7 +43,7 @@ UNLOCATED = re.compile(r"^(?P<sev>ERROR|Warning):\s?(?P<msg>.*)$")
 
 SEVERITY = {"ERROR": 1, "Warning": 2}
 
-LINT_SCRIPT = "read_verilog -sv {file}\nhierarchy -check\n"
+LINT_SCRIPT = "read_verilog -sv -permissive {file}\nhierarchy -check -permissive\n"  # an editor wants diagnostics, not a hard stop (B4)
 
 
 def lint(text, yosys=None):

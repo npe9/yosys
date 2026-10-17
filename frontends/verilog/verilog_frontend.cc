@@ -95,6 +95,13 @@ struct VerilogFrontend : public Frontend {
 		log("        year. -sv alone stays permissive. Later years are supersets of\n");
 		log("        earlier ones for the features this frontend distinguishes.\n");
 		log("\n");
+		log("    -permissive\n");
+		log("        accept frontend degradations (dropped loops/blocks, constant-0\n");
+		log("        substitutions, unknown types read as logic, implicit declarations,\n");
+		log("        unresolved functions/tasks, ...) with a warning per occurrence and\n");
+		log("        an (* sv_degraded = \"<reason> @file:line; ...\" *) attribute on the\n");
+		log("        module.  Without it every such site is an error.\n");
+		log("\n");
 		log("    -formal\n");
 		log("        enable support for SystemVerilog assertions and some Yosys extensions\n");
 		log("        replace the implicit -D SYNTHESIS with -D FORMAL\n");
@@ -310,6 +317,7 @@ struct VerilogFrontend : public Frontend {
 
 		args.insert(args.begin()+1, verilog_defaults.begin(), verilog_defaults.end());
 
+		AST::flag_permissive = false;
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			std::string arg = args[argidx];
@@ -335,6 +343,10 @@ struct VerilogFrontend : public Frontend {
 			}
 			if (arg == "-formal") {
 				parse_mode.formal = true;
+				continue;
+			}
+			if (arg == "-permissive") {
+				AST::flag_permissive = true;
 				continue;
 			}
 			if (arg == "-nosynthesis") {

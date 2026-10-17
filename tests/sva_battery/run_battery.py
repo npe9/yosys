@@ -171,20 +171,25 @@ def check_bmc(path, exp):
 
 # Documented edges: file -> predicate matching the expected infrastructure
 # line from the ic3 leg (they never reach property verdicts).
+# A *_tb.sv instantiates a dut that lives in its sibling file; run
+# standalone, `hierarchy -check` now ERRORS on the missing module (B4: the
+# blackbox leniency moved behind -permissive), where it used to warn and
+# reach "no summary".  Both texts are the same documented edge.
+_missing_dut = lambda l: "no summary" in l or "not part of the design" in l
 KNOWN_EDGES = {
     "t30a.sv": lambda l: "prep-failed" in l,
-    "t40_case1.sv": lambda l: "no summary" in l,
-    "t40_tb.sv": lambda l: "no summary" in l,
-    "t41_case1.sv": lambda l: "no summary" in l,
-    "t41_tb.sv": lambda l: "no summary" in l,
-    "t42_case1.sv": lambda l: "no summary" in l,
-    "t42_tb.sv": lambda l: "no summary" in l,
-    "t43_tb.sv": lambda l: "no summary" in l,
-    "t43.sv": lambda l: "no summary" in l,
-    "tfix_a.sv": lambda l: "no summary" in l,
-    "tfix_b_tb.sv": lambda l: "no summary" in l,
-    "tfix_b.sv": lambda l: "no summary" in l,
-    "tfix_c.sv": lambda l: "no summary" in l,
+    "t40_case1.sv": _missing_dut,
+    "t40_tb.sv": _missing_dut,
+    "t41_case1.sv": _missing_dut,
+    "t41_tb.sv": _missing_dut,
+    "t42_case1.sv": _missing_dut,
+    "t42_tb.sv": _missing_dut,
+    "t43_tb.sv": _missing_dut,
+    "t43.sv": _missing_dut,
+    "tfix_a.sv": _missing_dut,
+    "tfix_b_tb.sv": _missing_dut,
+    "tfix_b.sv": _missing_dut,
+    "tfix_c.sv": _missing_dut,
 }
 
 

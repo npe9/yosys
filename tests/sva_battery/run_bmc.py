@@ -30,10 +30,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_ic3  # lowering_tags()
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-YOSYS = os.environ.get("YOSYS", os.path.join(ROOT, "third_party/yosys/build/yosys"))
+YOSYS = os.environ.get("YOSYS", os.path.join(os.path.dirname(ROOT), "build/yosys"))  # ROOT is tests/
 SMTBMC = os.environ.get("SMTBMC", os.path.join(os.path.dirname(YOSYS), "yosys-smtbmc"))
 
-PREP = """read_verilog -sv -formal {files}
+PREP = """read_verilog -sv -formal {flags} {files}
 hierarchy -check{top}
 sva2check
 proc
@@ -114,7 +114,7 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
         smt = os.path.join(tempfile.gettempdir(), "bmc_%d.smt2" % os.getpid())
         ys = os.path.join(tempfile.gettempdir(), "bmc_%d.ys" % os.getpid())
         with open(ys, "w") as fh:
-            fh.write(PREP.format(files=path, top=" -top " + top if top else "",
+            fh.write(PREP.format(flags=run_ic3.read_flags(path), files=path, top=" -top " + top if top else "",
                                  deletes=deletes, smt=smt,
                                  extra_a2s=extra_a2s, extra_mem=extra_mem))
         p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" "$2"', "y", yosys, ys],

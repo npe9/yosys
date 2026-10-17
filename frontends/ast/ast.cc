@@ -39,6 +39,32 @@ using namespace AST_INTERNAL;
 // instantiate global variables (public API)
 namespace AST {
 	bool sv_mode_but_global_and_used_for_literally_one_condition;
+	bool flag_permissive = false;
+
+	void degrade_impl(const LogSourceLocation &loc, const std::string &reason_in, bool warn_only)
+	{
+		std::string reason = reason_in;
+		while (!reason.empty() && (reason.back() == '\n' || reason.back() == ' '))
+			reason.pop_back();
+		if (!flag_permissive && !warn_only)
+			log_file_error(loc, "%s  [a frontend degradation: `read_verilog -permissive` accepts it with a warning and marks the module (* sv_degraded *)]\n", reason.c_str());
+		log_file_warning(loc, "[sv_degraded] %s\n", reason.c_str());
+		std::string where = loc.filename.empty() ? std::string("?") : stringf("%s:%d", loc.filename.c_str(), loc.start_line);
+		std::string entry = reason + " @" + where;
+		IdString attr = IdString("\\sv_degraded");
+		if (current_module) {
+			std::string cur;
+			if (current_module->attributes.count(attr))
+				cur = current_module->attributes.at(attr).decode_string();
+			current_module->attributes[attr] = RTLIL::Const(cur.empty() ? entry : cur + "; " + entry);
+		} else if (current_ast_mod) {
+			std::string cur;
+			auto it = current_ast_mod->attributes.find(attr);
+			if (it != current_ast_mod->attributes.end() && it->second)
+				cur = it->second->str;
+			current_ast_mod->attributes[attr] = AstNode::mkconst_str(current_ast_mod->location, cur.empty() ? entry : cur + "; " + entry);
+		}
+	}
 	bool keep_sva_cells;
 	int sv_std_year;
 	unsigned long long astnodes = 0;
@@ -1093,11 +1119,7 @@ uint64_t AstNode::asInt(bool is_signed)
 	if (type == AST_REALVALUE)
 		return uint64_t(realvalue);
 
-	static bool warned = false;
-	if (!warned) {
-		warned = true;
-		log_warning("Non-constant value of type %s used as an integer; using 0.\n", type2str(type).c_str());
-	}
+	degrade(location.to_loc(), "Non-constant value of type %s used as an integer; using 0.\n", type2str(type).c_str());
 	return 0;
 }
 
@@ -1192,6 +1214,11 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 	module->name = ast->str;
 	set_src_attr(module, ast);
 	module->set_bool_attribute(ID::cells_not_processed);
+	// record the read mode in the design: passes that have their own
+	// upstream-error / fork-leniency split (proc_dlatch's always_comb
+	// latch) key on it, and provers can refuse permissive designs
+	if (flag_permissive)
+		module->set_bool_attribute(IdString("\\sv_permissive"));
 
 	current_ast_mod = ast;
 	std::unique_ptr<AstNode> ast_before_simplify;
@@ -1521,10 +1548,37 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 	for (const auto& child : current_ast->children)
 	{
 		if (child->type == AST_PACKAGE) {
+			// A package body may reference EARLIER packages by qualified
+			// name (`localparam W = prim_util_pkg::vbits(N);` is all over
+			// OpenTitan).  Modules get those names from the clones appended
+			// below; packages used to get nothing, so the call was an
+			// "unresolved function" that became constant 0 -- silently
+			// until register v3 B4.  Inject the same qualified clones,
+			// tagged, and drop them again before this package is
+			// registered so it exports only its own members.
+			IdString scope_clone = IdString("\\pkg_scope_clone");
+			for (auto& n : design->verilog_packages) {
+				for (auto &o : n->children) {
+					auto cloned_node = o->clone();
+					if (cloned_node->type == AST_ENUM) {
+						for (auto &e : cloned_node->children) {
+							log_assert(e->type == AST_ENUM_ITEM);
+							e->str = n->str + std::string("::") + e->str.substr(1);
+						}
+					} else if (!cloned_node->str.empty() && cloned_node->str[0] == '\\') {
+						cloned_node->str = n->str + std::string("::") + cloned_node->str.substr(1);
+					}
+					cloned_node->attributes[scope_clone] = AstNode::mkconst_int(cloned_node->location, 1, false);
+					child->children.push_back(std::move(cloned_node));
+				}
+			}
 			// process enum/other declarations
 			current_ast_mod = child.get();
 			child->simplify(true, 1, -1, false);
 			rename_in_package_stmts(child.get());
+			child->children.erase(std::remove_if(child->children.begin(), child->children.end(),
+					[&](const std::unique_ptr<AstNode> &c) { return c && c->attributes.count(scope_clone); }),
+					child->children.end());
 			design->verilog_packages.push_back(child->clone_rebased());
 			current_ast_mod = nullptr;
 			current_scope.clear();

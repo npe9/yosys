@@ -207,11 +207,14 @@ static void check_unique_id(RTLIL::Module *module, RTLIL::IdString &id,
 	bool clash = module->wire(id) || module->cell(id) || module->processes.count(id) || module->memories.count(id);
 	if (!clash)
 		return;
-	static bool warned = false;
-	if (!warned) {
-		warned = true;
-		log_file_warning(node->location.to_loc(), "Duplicate %s `%s'; later duplicates are renamed.\n", to_add_kind, id.c_str());
-	}
+	if (node->attributes.count(IdString("\\checker_instance")))
+		log("Checker instance copy of %s `%s' renamed.\n", to_add_kind, id.c_str());
+	else if (!AST::flag_permissive)
+		// upstream's wording (tests/verilog/conflict_*.ys)
+		log_file_error(node->location.to_loc(), "Cannot add %s `%s' because a %s with the same name was already created.\n", to_add_kind, id.c_str(),
+				module->memories.count(id) ? "memory" : module->cell(id) ? "cell" : "signal");
+	else
+		degrade(node->location.to_loc(), "Duplicate %s `%s'; renamed.\n", to_add_kind, id.c_str());
 	id = stringf("%s$%d", id.c_str(), autoidx++);
 }
 
@@ -550,11 +553,7 @@ struct AST_INTERNAL::ProcessGenerator
 			for (auto& child : ast->children)
 				if (child != ast->children[0]) {
 					if (child->type != AST_COND && child->type != AST_CONDX && child->type != AST_CONDZ) {
-						static bool warned = false;
-						if (!warned) {
-							warned = true;
-							log_file_warning(ast->location.to_loc(), "Skipping case item of type %s while collecting signals.\n", type2str(child->type).c_str());
-						}
+						degrade(ast->location.to_loc(), "Skipping case item of type %s while collecting signals.\n", type2str(child->type).c_str());
 						continue;
 					}
 					collect_lvalues(reg, child.get(), type_eq, type_le, false);
@@ -954,11 +953,7 @@ struct AST_INTERNAL::ProcessGenerator
 					fmt.append_literal("\n");
 				fmt.emit_rtlil(cell);
 			} else if (!ast->str.empty()) {
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					log_file_warning(ast->location.to_loc(), "Ignoring task call `%s' during RTL generation.\n", ast->str.c_str());
-				}
+				degrade(ast->location.to_loc(), "Ignoring task call `%s' during RTL generation.\n", ast->str.c_str());
 			}
 			break;
 
@@ -1078,6 +1073,7 @@ struct AST_INTERNAL::ProcessGenerator
 // detect sign and width of an expression
 void AstNode::detectSignWidthWorker(int &width_hint, bool &sign_hint, bool *found_real)
 {
+	bool size_literal = false;  // AST_CAST_SIZE: was the size a literal constant before simplify
 	std::string type_name;
 	bool sub_sign_hint = true;
 	int sub_width_hint = -1;
@@ -1191,10 +1187,40 @@ void AstNode::detectSignWidthWorker(int &width_hint, bool &sign_hint, bool *foun
 		break;
 
 	case AST_CAST_SIZE:
+		size_literal = children.at(0)->type == AST_CONSTANT;
 		while (children.at(0)->simplify(true, 1, -1, false)) { }
+		// upstream (IEEE 1800 6.24.1): the size of a static cast is a
+		// constant expression and positive; the fork used to accept both
+		// silently (register v3 B4: policy tests static_cast_*)
+		{
+			// a cast to a typedef/enum name (`state_sel_e'(x)`, the type
+			// often from a package) reaches width detection as an
+			// identifier that simplify normalizes to its width later: not
+			// a non-constant size.  Everything else non-constant is.
+			AstNode *sz = children.at(0).get();
+			bool type_ref = sz->type == AST_IDENTIFIER &&
+					(sz->id2ast == nullptr || sz->id2ast->type == AST_TYPEDEF || sz->id2ast->type == AST_ENUM);
+			if (sz->type != AST_CONSTANT && !type_ref) {
+				// strict: upstream's error.  -permissive: the old lenient
+				// path (an unresolved type name from a missing package is
+				// an implicit wire here), recorded as a degradation
+				if (!AST::flag_permissive)
+					input_error("Static cast with non constant expression!\n");
+				degrade(location.to_loc(), "Static cast with a non-constant size `%s'; the operand width is used.\n", sz->str.c_str());
+			}
+		}
 		children.at(1)->detectSignWidthWorker(width_hint, sign_hint);
 		if (children.at(0)->type == AST_CONSTANT) {
 			this_width = children.at(0)->bitsAsConst().as_int();
+			// a literal size <= 0 is upstream's error; a parameter that
+			// folds to <= 0 on an early width-detection pass (package
+			// parameters are substituted later) keeps the lenient path --
+			// genRTLIL below checks the final value
+			if (this_width <= 0 && size_literal) {
+				if (!AST::flag_permissive)
+					input_error("Static cast with zero or negative size!\n");
+				degrade(location.to_loc(), "Static cast with size %d; the operand width is used.\n", this_width);
+			}
 			if (this_width > 0)
 				width_hint = max(width_hint, this_width);
 		}
@@ -1712,11 +1738,7 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			int add_undef_bits_lsb = 0;
 
 			if (id2ast == nullptr) {
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					log_file_warning(location.to_loc(), "Identifier `%s' has no declaration; using a 1-bit wire.\n", str.c_str());
-				}
+				degrade(location.to_loc(), "Identifier `%s' has no declaration; using a 1-bit wire.\n", str.c_str());
 				if (current_module) {
 					RTLIL::Wire *fallback = current_module->wire(str);
 					if (!fallback)
@@ -1733,13 +1755,13 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 
 				if (!is_sequence_method_name(str)) {
 					if (flag_autowire)
-						log_file_warning(location.to_loc(), "Identifier `%s' is implicitly declared.\n", str);
+						// upstream's own leniency under `default_nettype wire`;
+						// dotted names included: interface-port members
+						// (`intf.driver`) are implicit wires here by design,
+						// resolved by the hierarchy pass
+						degrade_warn(location.to_loc(), "Identifier `%s' is implicitly declared.\n", str);
 					else {
-						static bool warned = false;
-						if (!warned) {
-							warned = true;
-							log_file_warning(location.to_loc(), "Identifier `%s' is implicitly declared; later missing nets are 1-bit wires.\n", str.c_str());
-						}
+						degrade(location.to_loc(), "Identifier `%s' is implicitly declared; a 1-bit wire is implied.\n", str.c_str());
 					}
 				}
 			}
@@ -1909,10 +1931,24 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 	case AST_CAST_SIZE: {
 			RTLIL::SigSpec size = children[0]->genRTLIL();
 			int width = 1;
-			if (size.is_fully_const())
+			if (!size.is_fully_const()) {
+				if (!AST::flag_permissive)
+					input_error("Static cast with non constant expression!\n");
+				degrade(location.to_loc(), "Static cast with a non-constant size; the operand width is used.\n");
+				width = 1;  // the old lenient value
+			} else {
 				width = size.as_int();
-			if (width <= 0)
-				width = 1;
+				if (width <= 0) {
+					// strict: upstream's error.  -permissive: the old
+					// lenient width 1, recorded (a package parameter that
+					// is still 0 inside an inlined package function is
+					// register v3 D7)
+					if (!AST::flag_permissive)
+						input_error("Static cast with zero or negative size!\n");
+					degrade(location.to_loc(), "Static cast with size %d; width 1 is used.\n", width);
+					width = 1;
+				}
+			}
 			// determine the *signedness* of the expression
 			int sub_width_hint = -1;
 			bool sub_sign_hint = true;
@@ -2665,11 +2701,7 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			simplify(true, 1, -1, false);
 			if (type != AST_PREFIX)
 				return genRTLIL(width_hint, sign_hint);
-			static bool warned = false;
-			if (!warned) {
-				warned = true;
-				log_file_warning(location.to_loc(), "Hierarchical prefix did not resolve; using constant 0.\n");
-			}
+			degrade(location.to_loc(), "Hierarchical prefix did not resolve; using constant 0.\n");
 			int width = width_hint > 0 ? width_hint : 1;
 			return RTLIL::SigSpec(RTLIL::S0, width);
 		}

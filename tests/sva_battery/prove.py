@@ -129,14 +129,14 @@ def replay_confirm(yosys, path, top, include, witness, settle_engine,
         # assert rounds don't matter: check cells are logic sinks, so the
         # undeleted design evolves identically under the same inputs.
         extra_a2s, extra_mem = run_bmc.prep_extras(path)
-        script = run_bmc.PREP.format(files=path,
+        script = run_bmc.PREP.format(flags=run_ic3.read_flags(path), files=path,
                                      top=" -top " + top if top else "",
                                      deletes="", smt=os.devnull,
                                      extra_a2s=extra_a2s, extra_mem=extra_mem)
     else:
         inc = " ".join("-I" + d for d in include)
         extra_a2s, extra_mem, bmc, ctg = run_ic3.prep_extras(path)
-        script = run_ic3.PREP.format(inc=inc, files=path,
+        script = run_ic3.PREP.format(flags=run_ic3.read_flags(path), inc=inc, files=path,
                                      top=" -top " + top if top else "",
                                      extra_a2s=extra_a2s, extra_mem=extra_mem,
                                      engine=run_ic3.ENGINE + bmc + ctg)
@@ -242,7 +242,7 @@ class Ic3Lane:
         if cex_prefix:
             os.makedirs(os.path.dirname(cex_prefix) or ".", exist_ok=True)
             engine += " -cex " + cex_prefix
-        script = run_ic3.PREP.format(inc=inc, files=path,
+        script = run_ic3.PREP.format(flags=run_ic3.read_flags(path), inc=inc, files=path,
                                      top=" -top " + top if top else "",
                                      extra_a2s=extra_a2s, extra_mem=extra_mem,
                                      engine=engine)

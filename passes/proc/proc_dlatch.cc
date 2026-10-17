@@ -545,9 +545,23 @@ void proc_dlatch(proc_dlatch_db_t &db, RTLIL::Process *proc, LatchPolicy policy)
 				cell->set_bool_attribute(ID::always_latch);
 			db.generated_dlatches.insert(cell);
 
-			if (proc->get_bool_attribute(ID::always_comb))
-				log_warning("Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
+			if (proc->get_bool_attribute(ID::always_comb)) {
+				// upstream: an error (LRM 9.2.2.2: always_comb must not
+				// infer storage).  The fork's leniency survives only for
+				// designs read with `read_verilog -permissive`, as a
+				// warning that also marks the module (* sv_degraded *).
+				if (!db.module->get_bool_attribute(IdString("\\sv_permissive")))
+					log_error("Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
+							db.module->name.c_str(), log_signal(lhs), db.module->name.c_str(), proc->name.c_str());
+				log_warning("[sv_degraded] Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
 						db.module->name.c_str(), log_signal(lhs), db.module->name.c_str(), proc->name.c_str());
+				IdString attr = IdString("\\sv_degraded");
+				std::string cur;
+				if (db.module->attributes.count(attr))
+					cur = db.module->attributes.at(attr).decode_string();
+				std::string entry = stringf("always_comb latch for %s @%s", log_signal(lhs), src.c_str());
+				db.module->attributes[attr] = RTLIL::Const(cur.empty() ? entry : cur + "; " + entry);
+			}
 			else if (proc->get_bool_attribute(ID::always_latch))
 				log("Latch inferred for signal `%s.%s' from always_latch process `%s.%s': %s\n",
 						db.module->name.c_str(), log_signal(lhs), db.module->name.c_str(), proc->name.c_str(), cell);

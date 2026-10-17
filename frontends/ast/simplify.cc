@@ -3083,11 +3083,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			};
 			repl(current_ast_mod);
 		} else if (children.size() >= 2) {
-			static bool warned = false;
-			if (!warned) {
-				warned = true;
-				log_warning("Alias of a non-constant select is ignored.\n");
-			}
+			degrade(location.to_loc(), "Alias of a non-constant select is ignored.\n");
 		}
 		type = AST_BLOCK;
 		str.clear();
@@ -3099,11 +3095,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 	// A disable that simplify did not use as a block exit must not become an $sva cell.
 	if (type == AST_SVA && str == "disable") {
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			log_warning("disable that is not an unconditional exit of its named block is ignored.\n");
-		}
+		degrade(location.to_loc(), "disable that is not an unconditional exit of its named block is ignored.\n");
 		type = AST_BLOCK;
 		str.clear();
 		children.clear();
@@ -3934,6 +3926,22 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				}
 			};
 			collect_names(body.get());
+			// assertion labels of a checker instance are copied per
+			// instance: a label clash with another instance (or with the
+			// first copy) is instance expansion, not a degradation, so
+			// genrtlil renames these silently (the battery's tchk* files
+			// read them as <label>$N)
+			std::function<void(AstNode *)> mark_asserts = [&](AstNode *node) {
+				for (auto &ch : node->children) {
+					if (!ch)
+						continue;
+					if (ch->type == AST_ASSERT || ch->type == AST_ASSUME || ch->type == AST_LIVE ||
+							ch->type == AST_FAIR || ch->type == AST_COVER)
+						ch->attributes[IdString("\\checker_instance")] = mkconst_int(ch->location, 1, false);
+					mark_asserts(ch.get());
+				}
+			};
+			mark_asserts(body.get());
 
 			// Pass 2: rename declarations and their references in the
 			// clone. Actual argument expressions are spliced in pass 3, so
@@ -4998,11 +5006,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			if (!known_typedef) {
 				// The typedef often lives in a package this file did not elaborate.
 				// Keep any declared range and otherwise use a single logic bit.
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					log_file_warning(location.to_loc(), "Unknown identifier `%s' used as type name; treating unresolved types as logic.\n", type_name.c_str());
-				}
+				degrade(location.to_loc(), "Unknown identifier `%s' used as type name; treating unresolved types as logic.\n", type_name.c_str());
 				is_custom_type = false;
 				children.erase(children.begin());
 				if (children.empty() || !children[0] || children[0]->type != AST_RANGE)
@@ -5263,11 +5267,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			AstNode *missing = find_missing_autowire(child.get());
 			if (!missing)
 				continue;
-			static bool warned = false;
-			if (!warned) {
-				warned = true;
-				log_file_warning(child->location.to_loc(), "Range bound uses implicitly declared identifier `%s' from a missing package; using constant 0.\n", missing->str.c_str());
-			}
+			degrade(child->location.to_loc(), "Range bound uses implicitly declared identifier `%s' from a missing package; using constant 0.\n", missing->str.c_str());
 			child = mkconst_int(child->location, 0, true);
 			fixup_hierarchy_flags();
 			did_something = true;
@@ -5593,8 +5593,6 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			bool seq_meth = is_sequence_method_ref(str);
 			if (current_ast_mod == nullptr) {
 				input_error("Identifier `%s' is implicitly declared outside of a module.\n", str);
-			} else if (sv_std_year != 0 && !flag_autowire && str != "\\$global_clock" && !seq_meth) {
-				input_error("Identifier `%s' is not declared and `default_nettype is none.\n", str.c_str());
 			} else if (flag_autowire || str == "\\$global_clock" || seq_meth) {
 				auto auto_wire = std::make_unique<AstNode>(location, AST_AUTOWIRE);
 				auto_wire->str = str;
@@ -5602,12 +5600,12 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				current_ast_mod->children.push_back(std::move(auto_wire));
 				did_something = true;
 			} else {
-				// Missing packages still need a wire so elaboration can finish.
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					log_file_warning(location.to_loc(), "Identifier `%s' is implicitly declared; later missing nets are 1-bit wires.\n", str.c_str());
-				}
+				// `default_nettype none` (or -noautowire): upstream errors
+				// here; -permissive keeps the fork's wire so elaboration of
+				// a file with missing packages can finish (marked)
+				if (!flag_permissive)
+					input_error("Identifier `%s' is implicitly declared and `default_nettype is set to none.\n", str);
+				degrade(location.to_loc(), "Identifier `%s' is implicitly declared under `default_nettype none; a 1-bit wire is implied.\n", str.c_str());
 				auto auto_wire = std::make_unique<AstNode>(location, AST_AUTOWIRE);
 				auto_wire->str = str;
 				current_scope[str] = auto_wire.get();
@@ -5951,11 +5949,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	}
 
 	if (type == AST_WHILE) {
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			log_file_warning(location.to_loc(), "While loop outside a constant function is left unrolled.\n");
-		}
+		degrade(location.to_loc(), "While loop outside a constant function is left unrolled.\n");
 		newNode = std::make_unique<AstNode>(location, AST_BLOCK);
 		goto apply_newNode;
 	}
@@ -5969,11 +5963,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		while (count->simplify(true, stage, 32, true)) { }
 
 		if (count->type != AST_CONSTANT) {
-			static bool warned = false;
-			if (!warned) {
-				warned = true;
-				log_file_warning(location.to_loc(), "Repeat loop without a constant count is left unrolled.\n");
-			}
+			degrade(location.to_loc(), "Repeat loop without a constant count is left unrolled.\n");
 			type = AST_BLOCK;
 			children.clear();
 			did_something = true;
@@ -6122,12 +6112,11 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		int unroll_iters = 0;
 		while (1)
 		{
-			if (++unroll_iters > 1024) {
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					log_file_warning(location.to_loc(), "Stopping a for-loop after 1024 iterations.\n");
-				}
+			if (++unroll_iters > (1 << 20)) {
+				// upstream has no cap at all (memory-init loops of several
+				// thousand iterations are routine); the fork's old 1024 cap
+				// silently truncated them.  Keep only a runaway guard.
+				input_error("For-loop did not terminate after %d iterations.\n", 1 << 20);
 				break;
 			}
 			// eval 2nd expression
@@ -6140,11 +6129,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			}
 
 			if (buf->type != AST_CONSTANT) {
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					log_file_warning(location.to_loc(), "Loop condition is not constant; the loop is skipped.\n");
-				}
+				degrade(location.to_loc(), "Loop condition is not constant; the loop is skipped.\n");
 				break;
 			}
 
@@ -6309,11 +6294,7 @@ skip_for_unroll:
 		auto buf = children[0]->clone();
 		while (buf->simplify(true, stage, width_hint, sign_hint)) { }
 		if (buf->type != AST_CONSTANT) {
-			static bool warned = false;
-			if (!warned) {
-				warned = true;
-				log_file_warning(location.to_loc(), "Generate if condition is not constant; the block is skipped.\n");
-			}
+			degrade(location.to_loc(), "Generate if condition is not constant; the block is skipped.\n");
 			buf.reset();
 		} else if (buf->asBool() != 0) {
 			buf = children[1]->clone();
@@ -6348,11 +6329,7 @@ skip_for_unroll:
 		auto buf = children[0]->clone();
 		while (buf->simplify(true, stage, width_hint, sign_hint)) { }
 		if (buf->type != AST_CONSTANT) {
-			static bool warned = false;
-			if (!warned) {
-				warned = true;
-				log_file_warning(location.to_loc(), "Generate case selector is not constant; no case arm is generated.\n");
-			}
+			degrade(location.to_loc(), "Generate case selector is not constant; no case arm is generated.\n");
 			delete_children();
 			did_something = true;
 			goto skip_generate_case;
@@ -6798,8 +6775,14 @@ skip_dynamic_range_lvalue_expansion:;
 	// found right-hand side identifier for memory -> replace with memory read port
 	if (stage > 1 && type == AST_IDENTIFIER && id2ast != nullptr && id2ast->type == AST_MEMORY && !in_lvalue &&
 			children.size() == 1 && children[0]->type == AST_RANGE && children[0]->children.size() == 1) {
-		if (integer < (unsigned)id2ast->unpacked_dimensions)
+		if (integer < (unsigned)id2ast->unpacked_dimensions) {
+			// upstream: an error (tests/svtypes/multirange_subarray_access);
+			// the fork used to fall through to a whole-array reference
+			if (!flag_permissive)
+				input_error("Insufficient number of array indices for %s.\n", RTLIL::unescape_id(str));
+			degrade(location.to_loc(), "Insufficient number of array indices for %s; the reference is left unexpanded.\n", RTLIL::unescape_id(str).c_str());
 			goto skip_memory_read;
+		}
 		newNode = std::make_unique<AstNode>(location, AST_MEMRD, children[0]->children[0]->clone());
 		newNode->str = str;
 		newNode->id2ast = id2ast;
@@ -6812,8 +6795,14 @@ skip_dynamic_range_lvalue_expansion:;
 			id2ast->unpacked_dimensions == 1 && children.size() == 1 && children[0]->type == AST_RANGE &&
 			children[0]->children.size() == 2 && children[0]->range_valid &&
 			children[0]->range_left != children[0]->range_right) {
-		if (integer < (unsigned)id2ast->unpacked_dimensions)
+		if (integer < (unsigned)id2ast->unpacked_dimensions) {
+			// upstream: an error (tests/svtypes/multirange_subarray_access);
+			// the fork used to fall through to a whole-array reference
+			if (!flag_permissive)
+				input_error("Insufficient number of array indices for %s.\n", RTLIL::unescape_id(str));
+			degrade(location.to_loc(), "Insufficient number of array indices for %s; the reference is left unexpanded.\n", RTLIL::unescape_id(str).c_str());
 			goto skip_memory_read;
+		}
 		int mem_width, mem_size, addr_bits;
 		id2ast->meminfo(mem_width, mem_size, addr_bits);
 		int sel_left = children[0]->range_left, sel_right = children[0]->range_right;
@@ -6940,11 +6929,7 @@ skip_memory_read:;
 						if (!src) {
 							// IEEE 1800-2009 10.9: members without an assignment
 							// get the default value of their type.
-							static bool warned = false;
-							if (!warned) {
-								warned = true;
-								log_file_warning(item->location.to_loc(), "Named assignment pattern leaves member `%s' unassigned; using default value.\n", item->str.c_str());
-							}
+							degrade(item->location.to_loc(), "Named assignment pattern leaves member `%s' unassigned; using default value.\n", item->str.c_str());
 							int member_width = 1;
 							if (item->range_valid)
 								member_width = std::abs(item->range_left - item->range_right) + 1;
@@ -7235,7 +7220,7 @@ skip_memory_read:;
 							arrays_have_compatible_dims_from(lhs_mem, dim + 1, child->id2ast)) {
 						continue;
 					} else {
-						log_file_warning(location.to_loc(), "Nested assignment pattern does not match dimension %d; leaving the assignment unexpanded.\n", dim + 2);
+						degrade(location.to_loc(), "Nested assignment pattern does not match dimension %d; leaving the assignment unexpanded.\n", dim + 2);
 						pattern_shape_ok = false;
 						return;
 					}
@@ -7289,7 +7274,7 @@ skip_memory_read:;
 					if (num_dims > 1 && GetSize(rhs->children) == lhs_mem->dimensions[0].range_width)
 						validate_pattern_shape(rhs, 0);
 					int expected = num_dims > 1 ? lhs_mem->dimensions[0].range_width : total_elements;
-					log_file_warning(location.to_loc(), "Assignment pattern element count mismatch: got %d, expected %d. Leaving the assignment unexpanded.\n",
+					degrade(location.to_loc(), "Assignment pattern element count mismatch: got %d, expected %d. Leaving the assignment unexpanded.\n",
 						GetSize(rhs->children), expected);
 					goto skip_array_expand;
 				}
@@ -7382,8 +7367,12 @@ skip_array_expand:;
 			children[0]->id2ast->children[0]->range_valid && children[0]->id2ast->children[1]->range_valid &&
 			(children[0]->children.size() == 1 || children[0]->children.size() == 2) && children[0]->children[0]->type == AST_RANGE)
 	{
-		if (children[0]->integer < (unsigned)children[0]->id2ast->unpacked_dimensions)
+		if (children[0]->integer < (unsigned)children[0]->id2ast->unpacked_dimensions) {
+			if (!flag_permissive)
+				input_error("Insufficient number of array indices for %s.\n", RTLIL::unescape_id(children[0]->str));
+			degrade(location.to_loc(), "Insufficient number of array indices for %s; the assignment is left unexpanded.\n", RTLIL::unescape_id(children[0]->str).c_str());
 			goto skip_memory_write;
+		}
 
 		// multi-word slice write to a one-dimensional unpacked memory, e.g. arr[5:3] = x
 		// -> evaluate the right-hand side once into a temporary, then write each word
@@ -7787,12 +7776,8 @@ skip_memory_write:;
 					input_error("System function %s got %d arguments, expected 1.\n",
 							RTLIL::unescape_id(str), int(children.size()));
 				if (children.size() != 1) {
-					static bool warned = false;
-					if (!warned) {
-						warned = true;
-						log_file_warning(location.to_loc(), "System function %s got %d arguments; using the first.\n",
+					degrade(location.to_loc(), "System function %s got %d arguments; using the first.\n",
 								RTLIL::unescape_id(str).c_str(), int(children.size()));
-					}
 				}
 
 				auto buf = children[0]->clone();
@@ -7830,11 +7815,7 @@ skip_memory_write:;
 						// Evaluate constant expression
 						while (buf->simplify(true, stage, width_hint, sign_hint)) { }
 						if (buf->type != AST_CONSTANT) {
-							static bool warned = false;
-							if (!warned) {
-								warned = true;
-								log_file_warning(location.to_loc(), "Non-constant dimension in `%s'; using dimension 1.\n", str.c_str());
-							}
+							degrade(location.to_loc(), "Non-constant dimension in `%s'; using dimension 1.\n", str.c_str());
 							dim = 1;
 						} else
 							dim = buf->asInt(false);
@@ -7853,11 +7834,9 @@ skip_memory_write:;
 					if (id_ast == nullptr && current_scope.count(buf->str))
 						id_ast = current_scope.at(buf->str);
 					if (!id_ast) {
-						static bool warned = false;
-						if (!warned) {
-							warned = true;
-							log_file_warning(location.to_loc(), "Failed to resolve `%s' for width detection; using width 1.\n", buf->str.c_str());
-						}
+						if (!flag_permissive)
+							log_file_error(location.to_loc(), "Failed to detect width for identifier %s!\n", buf->str.c_str());
+						degrade(location.to_loc(), "Failed to resolve `%s' for width detection; using width 1.\n", buf->str.c_str());
 						newNode = mkconst_int(location, 1, false);
 						goto apply_newNode;
 					}
@@ -8132,11 +8111,7 @@ skip_memory_write:;
 				}
 
 				if (!dpi_ok) {
-					static bool warned = false;
-					if (!warned) {
-						warned = true;
-						log_file_warning(location.to_loc(), "DPI function `%s' is not evaluated; the call becomes constant 0.\n", fname.c_str());
-					}
+					degrade(location.to_loc(), "DPI function `%s' is not evaluated; the call becomes constant 0.\n", fname.c_str());
 					newNode = mkconst_int(location, 0, false);
 					goto apply_newNode;
 				}
@@ -8148,11 +8123,7 @@ skip_memory_write:;
 			if (current_scope.count(str) == 0)
 				str = try_pop_module_prefix();
 			if (current_scope.count(str) == 0 || current_scope[str]->type != AST_FUNCTION) {
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					log_file_warning(location.to_loc(), "Unresolved function `%s'; later unresolved calls become constant 0.\n", str.c_str());
-				}
+				degrade(location.to_loc(), "Unresolved function `%s'; the call becomes constant 0.\n", str.c_str());
 				newNode = mkconst_int(location, 0, false);
 				goto apply_newNode;
 			}
@@ -8233,11 +8204,8 @@ skip_memory_write:;
 				// and their tests expect a warning-free elaboration.
 				bool severity_task = str == "\\$fatal" || str == "\\$error" || str == "\\$warning" || str == "\\$info" ||
 						str == "$fatal" || str == "$error" || str == "$warning" || str == "$info";
-				static bool warned = false;
-				if (!warned && !severity_task) {
-					warned = true;
-					log_file_warning(location.to_loc(), "Unresolved task `%s'; later unresolved tasks are ignored.\n", str.c_str());
-				}
+				if (!severity_task)
+					degrade(location.to_loc(), "Unresolved task `%s'; the call is ignored.\n", str.c_str());
 				newNode = std::make_unique<AstNode>(location, AST_BLOCK);
 				goto apply_newNode;
 			}
@@ -8254,6 +8222,28 @@ skip_memory_write:;
 		auto decl_clone = decl->clone();
 		decl = decl_clone.get(); // sketchy?
 		decl->replace_result_wire_name_in_function(str, "$result"); // enables recursion
+		{
+			// a wildcard-imported package function was registered under
+			// its bare name (`\mix`) but its result variable and every
+			// reference to it inside the body carry the package-qualified
+			// name (`\r::mix`): rename that form too, or the inlined body
+			// never drives `$result` (register v3 D7: the stress `func`
+			// case read x where Verilator had the value)
+			std::string base = str;
+			if (!base.empty() && base[0] == '\\')
+				base = base.substr(1);
+			for (auto &c : decl->children) {
+				if (!c || (c->type != AST_WIRE && c->type != AST_MEMORY) || c->str == "$result")
+					continue;
+				std::string cs = c->str;
+				if (!cs.empty() && cs[0] == '\\')
+					cs = cs.substr(1);
+				if (cs.size() > base.size() + 2 && cs.compare(cs.size() - base.size() - 2, base.size() + 2, "::" + base) == 0) {
+					decl->replace_result_wire_name_in_function(c->str, "$result");
+					break;
+				}
+			}
+		}
 		decl->expand_genblock(prefix);
 
 		if (decl->type == AST_FUNCTION && !decl->attributes.count(ID::via_celltype))
@@ -8274,11 +8264,7 @@ skip_memory_write:;
 				newNode = func_workspace->eval_const_function(this, in_param || require_const_eval);
 			}
 			if (!newNode && (in_param || (require_const_eval && all_args_const))) {
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					log_file_warning(location.to_loc(), "Constant function `%s' did not evaluate; using constant 0.\n", str.c_str());
-				}
+				degrade(location.to_loc(), "Constant function `%s' did not evaluate; using constant 0.\n", str.c_str());
 				newNode = AstNode::mkconst_int(location, 0, false);
 			}
 			if (newNode)
@@ -8300,11 +8286,39 @@ skip_memory_write:;
 				if ((child->type == AST_WIRE || child->type == AST_MEMORY) && child->str == res_name)
 					wire = child->clone();
 			if (!wire) {
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					log_file_warning(location.to_loc(), "Function `%s' has no result wire; using constant 0.\n", str.c_str());
+				// a package function imported by wildcard keeps its result
+				// wire under the package-qualified name
+				// (`\r::mix$result`) while the call site's prefix is the
+				// bare name: match the unique `$result` child by suffix
+				// before giving up (this used to degrade to constant 0 on
+				// a throwaway elaboration pass and warn once; strict mode
+				// made it fatal: stress sim_equiv `func`, ibex_cheriot_ex)
+				// the result variable is named after the function (the
+				// package rename makes it `<prefix>r::mix`): match
+				// `<prefix><base>` or `<prefix>...::<base>`
+				std::string base = str;
+				if (!base.empty() && base[0] == '\\')
+					base = base.substr(1);
+				size_t qp = base.rfind("::");
+				if (qp != std::string::npos)
+					base = base.substr(qp + 2);
+				for (auto& child : decl->children) {
+					if (child->type != AST_WIRE && child->type != AST_MEMORY)
+						continue;
+					const std::string &cs = child->str;
+					if (cs.compare(0, prefix.size(), prefix) != 0)
+						continue;
+					std::string tail = cs.substr(prefix.size());
+					if (tail == base || (tail.size() > base.size() + 2 &&
+							tail.compare(tail.size() - base.size() - 2, base.size() + 2, "::" + base) == 0)) {
+						wire = child->clone();
+						wire->str = res_name;
+						break;
+					}
 				}
+			}
+			if (!wire) {
+				degrade(location.to_loc(), "Function `%s' has no result wire; using constant 0.\n", str.c_str());
 				newNode = AstNode::mkconst_int(location, 0, false);
 				goto apply_newNode;
 			}
@@ -9197,14 +9211,10 @@ void AstNode::expand_genblock(const std::string &prefix)
 					if (!is_type && current_ast_mod == nullptr) {
 						input_error("Identifier `%s' is implicitly declared outside of a module.\n", child->str.c_str());
 					} else if (!is_type) {
-						if (sv_std_year != 0 && !(flag_autowire || identifier_str == "\\$global_clock"))
-							input_error("Identifier `%s' is not declared and `default_nettype is none.\n", identifier_str.c_str());
 						if (!(flag_autowire || identifier_str == "\\$global_clock")) {
-							static bool warned = false;
-							if (!warned) {
-								warned = true;
-								log_file_warning(child->location.to_loc(), "Identifier `%s' is implicitly declared; later missing nets are 1-bit wires.\n", identifier_str.c_str());
-							}
+							if (!flag_permissive)
+								input_error("Identifier `%s' is implicitly declared and `default_nettype is set to none.\n", identifier_str.c_str());
+							degrade(child->location.to_loc(), "Identifier `%s' is implicitly declared under `default_nettype none; a 1-bit wire is implied.\n", identifier_str.c_str());
 						}
 						std::string wire_name = prefix_id(prefix, identifier_str);
 						auto auto_wire = std::make_unique<AstNode>(child->location, AST_AUTOWIRE);
@@ -9363,8 +9373,11 @@ void AstNode::mem2reg_as_needed_pass1(dict<AstNode*, pool<std::string>> &mem2reg
 	{
 		AstNode *mem = id2ast;
 
-		if (integer < (unsigned)mem->unpacked_dimensions)
+		if (integer < (unsigned)mem->unpacked_dimensions) {
+			if (!flag_permissive)
+				input_error("Insufficient number of array indices for %s.\n", RTLIL::unescape_id(str));
 			return;
+		}
 
 		// flag if used after blocking assignment (in same proc)
 		if ((proc_flags[mem] & AstNode::MEM2REG_FL_EQ1) && !(mem2reg_candidates[mem] & AstNode::MEM2REG_FL_EQ2)) {
@@ -10134,11 +10147,7 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 
 			if (cond->asBool()) {
 				if (++const_while_steps > 16384) {
-					static bool warned = false;
-					if (!warned) {
-						warned = true;
-						log_file_warning(fcall->location.to_loc(), "Constant function loop stopped after 16384 iterations.\n");
-					}
+					degrade(fcall->location.to_loc(), "Constant function loop stopped after 16384 iterations.\n");
 					block->children.erase(block->children.begin());
 					continue;
 				}

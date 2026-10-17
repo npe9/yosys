@@ -27,9 +27,9 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-YOSYS = os.environ.get("YOSYS", os.path.join(ROOT, "third_party/yosys/build/yosys"))
+YOSYS = os.environ.get("YOSYS", os.path.join(os.path.dirname(ROOT), "build/yosys"))  # ROOT is tests/
 
-PREP = """read_verilog -sv -formal {inc} {files}
+PREP = """read_verilog -sv -formal {flags} {inc} {files}
 hierarchy -check{top}
 sva2check
 proc
@@ -45,6 +45,20 @@ opt_clean
 # (lowered to $assert by async2sync) directly.  Other drivers swap this
 # for `sim -r <witness> ...` (cex replay) by formatting PREP themselves.
 ENGINE = "ic3 -check-cells -init-zero"
+
+
+def read_flags(path):
+    """Extra read_verilog flags from a `// READ-FLAGS: ...` pragma (e.g.
+    `-permissive` for a file that documents a frontend leniency it relies
+    on; the default read is strict since register v3 B4)."""
+    try:
+        for line in open(path):
+            m = re.match(r'\s*//\s*READ-FLAGS:\s*(.+)', line)
+            if m:
+                return m.group(1).strip()
+    except OSError:
+        pass
+    return ""
 
 
 def prep_extras(path):
@@ -87,8 +101,8 @@ def lowering_tags(yosys, files, top="", include=(), timeout=120):
     run (register v3 A3).  Drivers whose engine output carries no tag (the
     smtbmc leg) print these; the ic3 leg prints the tag ic3 logs itself."""
     inc = " ".join("-I" + d for d in include)
-    script = "read_verilog -sv -formal %s %s\nhierarchy -check%s\nsva2check\ndump t:$check\n" % (
-        inc, " ".join(files), (" -top " + top) if top else "")
+    script = "read_verilog -sv -formal %s %s %s\nhierarchy -check%s\nsva2check\ndump t:$check\n" % (
+        read_flags(files[-1]), inc, " ".join(files), (" -top " + top) if top else "")
     try:
         p = subprocess.run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" -p "$2"', "y", yosys, script],
                            capture_output=True, text=True, timeout=timeout)
@@ -123,7 +137,7 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
         # disproved properties additionally write <prefix><prop>.yw
         # witnesses (replay: same prep + `sim -r <w> -vcd trace.vcd`)
         engine += " -cex " + cex_prefix
-    script = PREP.format(inc=inc, files=" ".join(files),
+    script = PREP.format(flags=read_flags(files[-1]), inc=inc, files=" ".join(files),
                          top=" -top " + top if top else "",
                          extra_a2s=extra_a2s, extra_mem=extra_mem,
                          engine=engine)

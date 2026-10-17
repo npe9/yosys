@@ -112,6 +112,25 @@ attempt, bounded `s_eventually`, `or`/`implies` deciding early).  Their
 fix is per-attempt tracking (register v3 D5 / C0), after which this table
 shrinks with it.
 
+## Strict reads and the `READ-FLAGS` pragma
+
+Since register v3 B4 every frontend degradation (a dropped loop or
+block, a constant-0 substitution, an unknown type read as `logic`, an
+unresolved function or task, an implicit net under `default_nettype
+none`, an always_comb latch, ...) is an ERROR in `read_verilog`;
+`read_verilog -permissive` (and `hierarchy -check -permissive` for a
+missing module) accepts it with a warning per occurrence and appends
+`"<reason> @file:line"` to the module's `(* sv_degraded *)` attribute,
+and marks every module `(* sv_permissive *)`.  The battery reads
+strictly.  A file that documents a leniency it relies on carries
+`// READ-FLAGS: -permissive` (run_ic3/run_bmc/prove honour it; today
+only `tfix_b.sv`, for a conditional `disable` that the frontend
+ignores).  The LSP lints with `-permissive` (an editor wants
+diagnostics, not a hard stop).  The `*_tb.sv` files that instantiate a
+dut from a sibling file are the documented "missing dut" edge in
+run_battery.py: standalone they now fail `hierarchy -check` instead of
+reaching "no summary".
+
 ## File classes
 
 - `t*.sv` — the green battery. Run all: `for f in t*.sv; do ...`.

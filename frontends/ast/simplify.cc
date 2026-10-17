@@ -4520,8 +4520,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			std::unique_ptr<AstNode> node;
 			auto* child = children[0].get();
 			if (child->children.size() == 0) {
-				// Base type (e.g., int)
-				width = child->range_left - child->range_right +1;
+				// Base type (e.g., int).  An unsized one (`logic'(x)`,
+				// `bit'(x)`) has no range (range_left stays -1): a 1-bit
+				// cast (IEEE 1800-2017 6.24.1), not a 0-bit one (register
+				// v3: the last "Static cast with zero or negative size"
+				// class in OpenTitan, prim_max_tree / usb_fs_nb_in_pe)
+				width = child->range_left - child->range_right + 1;
+				if (width <= 0 && child->range_left == -1 && child->range_right == 0)
+					width = 1;   // the parser's "no range" marker (`int` carries [31:0] without range_valid)
 				node = mkconst_int(child->location, width, child->is_signed);
 			} else {
 				// User defined type

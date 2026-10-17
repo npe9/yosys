@@ -1,0 +1,16 @@
+# A cast to an unsized base type (`logic'(x)`, `bit'(x)`) is a 1-bit cast
+# (IEEE 1800-2017 6.24.1); the frontend used to compute its width from an
+# absent range as 0 and reject it ("Static cast with zero or negative
+# size": OpenTitan prim_max_tree, usb_fs_nb_in_pe).
+read_verilog -sv <<EOT
+module m(input logic [3:0] p, output logic y1, y2, output logic [31:0] z1, z2);
+  assign y1 = logic'(p);
+  assign y2 = p[0];
+  assign z1 = int'(p);
+  assign z2 = {28'd0, p};
+endmodule
+EOT
+hierarchy -top m
+proc
+sat -verify -prove y1 y2
+sat -verify -prove z1 z2

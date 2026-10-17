@@ -1,0 +1,10 @@
+# Register v3 D11: a Boolean operator whose operand is a sequence/property
+# expression (`c && (a |=> b)`) is not SystemVerilog (IEEE 1800-2017 16.12:
+# property operators are `and`/`or`/`not`); the frontend used to lower the
+# property to a 1-bit placeholder and the engines produced a verdict on it.
+logger -expect error "Boolean operator over a sequence/property" 1
+read_verilog -sv -formal <<EOT
+module m(input logic clk, input logic a, b, c);
+  p1: assert property (@(posedge clk) c && (a |=> b));
+endmodule
+EOT

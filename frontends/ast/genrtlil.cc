@@ -45,6 +45,40 @@ using namespace AST_INTERNAL;
 // when the stem names a sequence declaration (checked in simplify) the
 // method wire is lowered by the sva2check pass, so the autowire path
 // stays quiet for it.
+// Register v3 D11: a plain operator (`&&`, `||`, `!`, `?:`, arithmetic,
+// comparison, bitwise) over a sequence/property expression is not
+// SystemVerilog (IEEE 1800-2017 16.12 gives properties their own
+// and/or/not).  The frontend used to lower the property operand to a
+// 1-bit placeholder and the engines produced a verdict on it.
+// Boolean-valued SVA leaves (`inside`, `weq`, `wne`, `meq`, `true`, match
+// items) stay allowed.
+// An $sva node is Boolean-valued when it is a Boolean leaf, or the
+// Boolean `<->` / `->` operators (IEEE 1800-2012 11.4.7, which the parser
+// shares with the property `iff` / `implies`) over Boolean-valued operands.
+static bool sva_is_boolean(const AstNode *n)
+{
+	static const std::set<std::string> boolean_leaves = {"inside", "weq", "wne", "meq", "true", "assign", "set"};
+	if (n->type != AST_SVA)
+		return true;
+	if (boolean_leaves.count(n->str))
+		return true;
+	if (n->str == "iff" || n->str == "implies") {
+		for (auto &c : n->children)
+			if (c && !sva_is_boolean(c.get()))
+				return false;
+		return true;
+	}
+	return false;
+}
+
+static void refuse_sva_operand(const AstNode *op)
+{
+	for (auto &c : op->children)
+		if (c && c->type == AST_SVA && !sva_is_boolean(c.get()))
+			op->input_error("Boolean operator over a sequence/property expression (`%s`): use the property "
+					"operators and/or/not, or parenthesize a Boolean.\n", c->str.c_str());
+}
+
 // SVA local variables assigned in match items, per module (see AST_SVA)
 static dict<RTLIL::Module *, pool<std::string>> sva_local_names;
 
@@ -1998,6 +2032,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 
 	// replication of signals can be done directly using RTLIL::SigSpec
 	case AST_REPLICATE: {
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			RTLIL::SigSpec left = children[0]->genRTLIL();
 			RTLIL::SigSpec right = children[1]->genRTLIL();
 			int count = 1;
@@ -2051,6 +2087,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 		{
 			if (width_hint < 0)
 				detectSignWidth(width_hint, sign_hint);
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			RTLIL::SigSpec left = children[0]->genRTLIL(width_hint, sign_hint);
 			RTLIL::SigSpec right = children[1]->genRTLIL(width_hint, sign_hint);
 			int width = max(left.size(), right.size());
@@ -2090,6 +2128,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 		{
 			if (width_hint < 0)
 				detectSignWidth(width_hint, sign_hint);
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			RTLIL::SigSpec left = children[0]->genRTLIL(width_hint, sign_hint);
 			// for $shift and $shiftx, the second operand can be negative
 			RTLIL::SigSpec right = children[1]->genRTLIL(-1, type == AST_SHIFT || type == AST_SHIFTX);
@@ -2106,6 +2146,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			children[1]->detectSignWidth(right_width, right_signed);
 			if (width_hint < 0)
 				detectSignWidth(width_hint, sign_hint);
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			RTLIL::SigSpec left = children[0]->genRTLIL(width_hint, sign_hint);
 			RTLIL::SigSpec right = children[1]->genRTLIL(right_width, right_signed);
 			int width = width_hint > 0 ? width_hint : left.size();
@@ -2129,6 +2171,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			width_hint = -1, sign_hint = true;
 			children[0]->detectSignWidthWorker(width_hint, sign_hint);
 			children[1]->detectSignWidthWorker(width_hint, sign_hint);
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			RTLIL::SigSpec left = children[0]->genRTLIL(width_hint, sign_hint);
 			RTLIL::SigSpec right = children[1]->genRTLIL(width_hint, sign_hint);
 			RTLIL::SigSpec sig = binop2rtlil(this, type_name, width, left, right);
@@ -2144,6 +2188,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 		{
 			if (width_hint < 0)
 				detectSignWidth(width_hint, sign_hint);
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			RTLIL::SigSpec left = children[0]->genRTLIL(width_hint, sign_hint);
 			RTLIL::SigSpec right = children[1]->genRTLIL(width_hint, sign_hint);
 		#if 0
@@ -2169,6 +2215,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 	if (0) { case AST_LOGIC_AND: type_name = ID($logic_and); }
 	if (0) { case AST_LOGIC_OR:  type_name = ID($logic_or); }
 		{
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			RTLIL::SigSpec left = children[0]->genRTLIL();
 			RTLIL::SigSpec right = children[1]->genRTLIL();
 			return binop2rtlil(this, type_name, max(width_hint, 1), left, right);
@@ -2177,6 +2225,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 	// generate cells for unary operations: $logic_not
 	case AST_LOGIC_NOT:
 		{
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			RTLIL::SigSpec arg = children[0]->genRTLIL();
 			return uniop2rtlil(this, ID($logic_not), max(width_hint, 1), arg);
 		}
@@ -2184,6 +2234,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 	// generate multiplexer for ternary operator (aka ?:-operator)
 	case AST_TERNARY:
 		{
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			if (width_hint < 0)
 				detectSignWidth(width_hint, sign_hint);
 			is_signed = sign_hint;
@@ -2346,6 +2398,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 	// add entries to current_module->connections for assignments (outside of always blocks)
 	case AST_ASSIGN:
 		{
+			if (keep_sva_cells)
+				refuse_sva_operand(this);
 			RTLIL::SigSpec left = children[0]->genRTLIL();
 			RTLIL::SigSpec right = children[1]->genWidthRTLIL(left.size(), true);
 			if (left.has_const()) {

@@ -244,6 +244,12 @@ A cast binds tighter than a unary operator (`~W'(p)` is `~(W'(p))`,
 IEEE 1800-2017 11.3.2): the grammar used to fold `~W` into the size
 (tests/verilog/cast_unary_precedence.ys); this was the "Static cast with
 zero or negative size" class in package functions.
+A plain operator over a sequence/property operand (`c && (a |=> b)`,
+`!(a |=> b)`, `c ? (a |=> b) : 1`) is refused ("Boolean operator over a
+sequence/property expression"); it used to lower the property to a 1-bit
+placeholder and produce a verdict (tests/verilog/sva_bool_over_property.ys).
+Boolean-valued SVA leaves (`inside`, `weq`/`wne`, match items) are still
+operands of plain operators.
 
 ## Type parameters and the `TOP:` pragma
 

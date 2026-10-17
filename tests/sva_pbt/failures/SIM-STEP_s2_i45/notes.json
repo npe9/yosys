@@ -1,0 +1,25 @@
+{
+ "seed": 2,
+ "index": 45,
+ "class": "SIM-STEP",
+ "detail": "trace 0: model fires [1, 6], sim fires [0, 1, 4, 6, 8]",
+ "prop": "((((!cnt[1]) |=> a) implies ((c || a) |-> (a && $stable(b)))) and ((!$stable(b)) || (!c)))",
+ "size": 19,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  1,
+  6
+ ],
+ "model_fires_1": [
+  2,
+  7,
+  9
+ ],
+ "model_fires_2": [
+  1,
+  2,
+  3,
+  5,
+  7
+ ]
+}

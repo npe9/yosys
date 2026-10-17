@@ -1,0 +1,14 @@
+{
+ "seed": 1,
+ "index": 20,
+ "class": "OK",
+ "detail": "unsat+quiet",
+ "prop": "(s_eventually[0:1] ((b implies (d && d)) or ((cnt == 2'd3) |=> d)))",
+ "size": 11,
+ "accepts_invalid": [
+  "reversed-range"
+ ],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": []
+}

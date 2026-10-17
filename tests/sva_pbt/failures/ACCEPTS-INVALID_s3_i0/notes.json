@@ -1,0 +1,14 @@
+{
+ "seed": 3,
+ "index": 0,
+ "class": "OK",
+ "detail": "cex@2 confirmed",
+ "prop": "(always[0:0] (always[1:3] (($stable(c) && r) |=> d)))",
+ "size": 8,
+ "accepts_invalid": [
+  "reversed-range"
+ ],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": []
+}

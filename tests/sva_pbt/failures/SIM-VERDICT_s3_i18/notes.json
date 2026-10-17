@@ -1,0 +1,33 @@
+{
+ "seed": 3,
+ "index": 18,
+ "class": "SIM-VERDICT",
+ "detail": "trace 0: model fires [0, 4, 5], sim fires []",
+ "prop": "(c until_with ((a || r) && a))",
+ "size": 8,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  0,
+  4,
+  5
+ ],
+ "model_fires_1": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  9
+ ],
+ "model_fires_2": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  6,
+  7,
+  9
+ ]
+}

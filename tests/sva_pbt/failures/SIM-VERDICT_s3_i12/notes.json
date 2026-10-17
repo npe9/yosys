@@ -1,0 +1,16 @@
+{
+ "seed": 3,
+ "index": 12,
+ "class": "SIM-VERDICT",
+ "detail": "trace 0: model fires [4], sim fires []",
+ "prop": "disable iff (rst) (((!(!d)) until (!(!$stable(a)))) or ((!($fell(b) && $past(d))) or ($stable(b) ##1 (!(cnt == 2'd1)))))",
+ "size": 19,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  4
+ ],
+ "model_fires_1": [],
+ "model_fires_2": [
+  1
+ ]
+}

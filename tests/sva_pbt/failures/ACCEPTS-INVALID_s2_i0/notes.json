@@ -1,0 +1,16 @@
+{
+ "seed": 2,
+ "index": 0,
+ "class": "OK",
+ "detail": "cex@2 confirmed",
+ "prop": "((!b)[*3] |-> (((a && (a || b)) and (($fell(d) || $past(c)) || (d || 1'b0))) |-> $past(b, 2)))",
+ "size": 20,
+ "accepts_invalid": [
+  "reversed-range"
+ ],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": [
+  4
+ ]
+}

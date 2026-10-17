@@ -1,0 +1,12 @@
+{
+ "seed": 3,
+ "index": 27,
+ "class": "UNSUPPORTED",
+ "detail": "ERROR: sva2check: sequence in $auto$genrtlil.cc:2630:genRTLIL$13 used in property position has no finite bound (max -1 ticks).",
+ "prop": "($fell(d)[->2] or (!$fell(b))[*1])",
+ "size": 7,
+ "accepts_invalid": [],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": []
+}

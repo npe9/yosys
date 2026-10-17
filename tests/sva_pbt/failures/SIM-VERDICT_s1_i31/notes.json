@@ -1,0 +1,14 @@
+{
+ "seed": 1,
+ "index": 31,
+ "class": "SIM-VERDICT",
+ "detail": "trace 0: model fires [], sim fires [5]",
+ "prop": "((((!$rose(d)) && $past(b, 2)) until ($past(b, 2) && ($stable(d) && a))) implies (nexttime[2] (!(!$past(a, 2)))))",
+ "size": 16,
+ "accepts_invalid": [],
+ "model_fires_0": [],
+ "model_fires_1": [
+  6
+ ],
+ "model_fires_2": []
+}

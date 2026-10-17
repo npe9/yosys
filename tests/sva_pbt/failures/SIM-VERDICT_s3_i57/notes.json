@@ -1,0 +1,14 @@
+{
+ "seed": 3,
+ "index": 57,
+ "class": "SIM-VERDICT",
+ "detail": "trace 2: model fires [6], sim fires []",
+ "prop": "disable iff (rst) (s_eventually[2:4] ((r and ((!$fell(a)) || d)) |-> ((!b) until_with $fell(d))))",
+ "size": 14,
+ "accepts_invalid": [],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": [
+  6
+ ]
+}

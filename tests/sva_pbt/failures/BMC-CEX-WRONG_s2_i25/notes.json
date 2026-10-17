@@ -1,0 +1,14 @@
+{
+ "seed": 2,
+ "index": 25,
+ "class": "BMC-CEX-WRONG",
+ "detail": "BMC cex at 2, model on that trace fires [1]",
+ "prop": "(if ((!r)) ((r || (d && a)) |=> (a until $fell(b))) else ((b ##1 ((b || $rose(c)) && c)) |-> ((b && a) || (!b))))",
+ "size": 27,
+ "accepts_invalid": [],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": [
+  7
+ ]
+}

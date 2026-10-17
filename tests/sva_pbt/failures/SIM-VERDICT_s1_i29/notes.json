@@ -1,0 +1,18 @@
+{
+ "seed": 1,
+ "index": 29,
+ "class": "SIM-VERDICT",
+ "detail": "trace 0: model fires [2, 5], sim fires []",
+ "prop": "disable iff (((d && r) && d)) ($stable(b)[=1] |=> (d |-> ((b || (cnt[0] && $past(d))) until c)))",
+ "size": 18,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  2,
+  5
+ ],
+ "model_fires_1": [],
+ "model_fires_2": [
+  2,
+  8
+ ]
+}

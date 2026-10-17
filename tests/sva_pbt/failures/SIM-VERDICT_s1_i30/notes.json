@@ -1,0 +1,14 @@
+{
+ "seed": 1,
+ "index": 30,
+ "class": "SIM-VERDICT",
+ "detail": "trace 2: model fires [], sim fires [5]",
+ "prop": "disable iff (rst) (((c || cnt[0])[*1:2] and (a ##[3:5] $rose(a))) |=> (if ((b || a)) ((c || $stable(d)) |=> $past(a, 2)) else ((a && b) || $rose(a))))",
+ "size": 25,
+ "accepts_invalid": [
+  "reversed-range"
+ ],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": []
+}

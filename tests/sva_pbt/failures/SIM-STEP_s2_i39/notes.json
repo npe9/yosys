@@ -1,0 +1,22 @@
+{
+ "seed": 2,
+ "index": 39,
+ "class": "SIM-STEP",
+ "detail": "trace 0: model fires [1, 2], sim fires [5, 6]",
+ "prop": "((1'b1 intersect (a ##0 $stable(b))) |=> ((cnt == 2'd3) until_with ((!$fell(b)) && r)))",
+ "size": 13,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  1,
+  2
+ ],
+ "model_fires_1": [
+  2,
+  4,
+  6,
+  9
+ ],
+ "model_fires_2": [
+  9
+ ]
+}

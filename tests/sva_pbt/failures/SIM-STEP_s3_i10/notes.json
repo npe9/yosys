@@ -1,0 +1,30 @@
+{
+ "seed": 3,
+ "index": 10,
+ "class": "SIM-STEP",
+ "detail": "trace 0: model fires [2, 4, 6, 7, 8], sim fires [0, 2, 4, 6, 7, 8]",
+ "prop": "(((1'b1 ##[2:3] ($past(c, 2) && (r && a))) or ((a || r) || r)) implies (d && $rose(d)))",
+ "size": 18,
+ "accepts_invalid": [
+  "reversed-range"
+ ],
+ "model_fires_0": [
+  2,
+  4,
+  6,
+  7,
+  8
+ ],
+ "model_fires_1": [
+  3,
+  5,
+  6,
+  7,
+  8
+ ],
+ "model_fires_2": [
+  1,
+  2,
+  8
+ ]
+}

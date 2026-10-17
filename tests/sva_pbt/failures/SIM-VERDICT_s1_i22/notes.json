@@ -1,0 +1,16 @@
+{
+ "seed": 1,
+ "index": 22,
+ "class": "SIM-VERDICT",
+ "detail": "trace 0: model fires [4], sim fires []",
+ "prop": "((s_eventually[0:2] (if ($rose(b)) $rose(c) else (((cnt == 2'd2) || cnt[0]) && ((cnt == 2'd1) || r)))) or ($past(c)[=2] |=> cnt[0]))",
+ "size": 17,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  4
+ ],
+ "model_fires_1": [
+  6
+ ],
+ "model_fires_2": []
+}

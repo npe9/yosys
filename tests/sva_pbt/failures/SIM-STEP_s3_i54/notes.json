@@ -1,0 +1,15 @@
+{
+ "seed": 3,
+ "index": 54,
+ "class": "SIM-STEP",
+ "detail": "trace 2: model fires [8, 9], sim fires [4, 8, 9]",
+ "prop": "(s_eventually[2:4] (nexttime[1] (if (a) (($rose(b) && 1'b0) || (b && c)) else ((!$fell(d)) && d))))",
+ "size": 16,
+ "accepts_invalid": [],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": [
+  8,
+  9
+ ]
+}

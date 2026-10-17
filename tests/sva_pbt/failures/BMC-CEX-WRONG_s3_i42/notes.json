@@ -1,0 +1,12 @@
+{
+ "seed": 3,
+ "index": 42,
+ "class": "BMC-CEX-WRONG",
+ "detail": "BMC cex at 2, model on that trace fires []",
+ "prop": "disable iff (r) ((first_match((cnt == 2'd2)) implies (((!c) && d) until_with (b || $past(b, 2)))) or (nexttime[1] (b and (!(b && $rose(b))))))",
+ "size": 21,
+ "accepts_invalid": [],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": []
+}

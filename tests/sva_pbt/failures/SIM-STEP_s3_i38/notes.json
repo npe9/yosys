@@ -1,0 +1,24 @@
+{
+ "seed": 3,
+ "index": 38,
+ "class": "SIM-STEP",
+ "detail": "trace 2: model fires [4, 6], sim fires [4, 6, 7]",
+ "prop": "(((d ##[1:3] (($past(d) || $stable(c)) || $stable(d))) ##2 first_match($stable(a))) |-> ((not (!($rose(a) && a))) and ((!1'b0) || $past(d))))",
+ "size": 22,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  4,
+  5,
+  7,
+  9
+ ],
+ "model_fires_1": [
+  3,
+  6,
+  9
+ ],
+ "model_fires_2": [
+  4,
+  6
+ ]
+}

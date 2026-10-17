@@ -1,0 +1,12 @@
+{
+ "seed": 1,
+ "index": 8,
+ "class": "BMC-CEX-WRONG",
+ "detail": "BMC cex at 3, model on that trace fires []",
+ "prop": "(($past(d, 2) ##[1:3] ((!(c && d)) ##0 d)) or ((($past(d, 2) && c) && (cnt == 2'd2)) |=> ((!b) || (c && b))))",
+ "size": 22,
+ "accepts_invalid": [],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": []
+}

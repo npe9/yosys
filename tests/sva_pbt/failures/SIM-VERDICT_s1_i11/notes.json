@@ -1,0 +1,20 @@
+{
+ "seed": 1,
+ "index": 11,
+ "class": "SIM-VERDICT",
+ "detail": "trace 0: model fires [6], sim fires []",
+ "prop": "((((c && $rose(a)) && (d || a))[=1] within ((c && (a || $rose(d))) or (1'b1 && ((cnt == 2'd0) && d)))) |-> (!a))",
+ "size": 24,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  6
+ ],
+ "model_fires_1": [
+  1,
+  6,
+  8
+ ],
+ "model_fires_2": [
+  9
+ ]
+}

@@ -1,0 +1,14 @@
+{
+ "seed": 1,
+ "index": 50,
+ "class": "OK",
+ "detail": "unsat+quiet",
+ "prop": "(($past(d) ##1 ($rose(c) within a)) |-> ((cnt == 2'd3) until (a || ((cnt == 2'd0) && (cnt == 2'd0)))))",
+ "size": 14,
+ "accepts_invalid": [
+  "reversed-range"
+ ],
+ "model_fires_0": [],
+ "model_fires_1": [],
+ "model_fires_2": []
+}

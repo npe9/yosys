@@ -1,0 +1,30 @@
+{
+ "seed": 1,
+ "index": 16,
+ "class": "SIM-STEP",
+ "detail": "trace 0: model fires [0, 1, 3, 4, 7], sim fires [1, 4]",
+ "prop": "(c until_with ((!r) || (cnt[1] || c)))",
+ "size": 9,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  0,
+  1,
+  3,
+  4,
+  7
+ ],
+ "model_fires_1": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "model_fires_2": [
+  1,
+  2,
+  3,
+  4,
+  8,
+  9
+ ]
+}

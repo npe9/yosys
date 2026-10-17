@@ -1,0 +1,14 @@
+{
+ "seed": 3,
+ "index": 35,
+ "class": "SIM-VERDICT",
+ "detail": "trace 0: model fires [4], sim fires []",
+ "prop": "((((!b) && (r && d))[=1] or (r || (b || a))) |=> (s_eventually[1:3] ((!($stable(a) && a)) within (r || $fell(c)))))",
+ "size": 24,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  4
+ ],
+ "model_fires_1": [],
+ "model_fires_2": []
+}

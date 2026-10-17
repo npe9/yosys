@@ -1,0 +1,19 @@
+{
+ "seed": 3,
+ "index": 55,
+ "class": "SIM-STEP",
+ "detail": "trace 0: model fires [3, 5, 8], sim fires [5, 8]",
+ "prop": "disable iff (r) (((c ##[0:1] ((!r) || d)) |-> ((cnt == 2'd2) and (b && ($past(d) || $past(a))))) implies (!$past(a, 2)))",
+ "size": 19,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  3,
+  5,
+  8
+ ],
+ "model_fires_1": [],
+ "model_fires_2": [
+  2,
+  7
+ ]
+}

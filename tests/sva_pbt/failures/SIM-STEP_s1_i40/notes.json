@@ -1,0 +1,21 @@
+{
+ "seed": 1,
+ "index": 40,
+ "class": "SIM-STEP",
+ "detail": "trace 0: model fires [5], sim fires [5, 6]",
+ "prop": "((((d && d) && ($past(b, 2) || d)) and c) |=> (always[1:1] ((c && $past(c, 2)) and (!(b || $past(c))))))",
+ "size": 20,
+ "accepts_invalid": [
+  "reversed-range"
+ ],
+ "model_fires_0": [
+  5
+ ],
+ "model_fires_1": [
+  2
+ ],
+ "model_fires_2": [
+  3,
+  8
+ ]
+}

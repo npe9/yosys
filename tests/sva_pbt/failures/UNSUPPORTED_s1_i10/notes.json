@@ -1,0 +1,23 @@
+{
+ "seed": 1,
+ "index": 10,
+ "class": "UNSUPPORTED",
+ "detail": "ERROR: sva2check: sequence in $auto$genrtlil.cc:2630:genRTLIL$11 used in property position has no finite bound (max -1 ticks).",
+ "prop": "disable iff (rst) (((!$fell(c)) || (cnt == 2'd0)) throughout b[->1])",
+ "size": 9,
+ "accepts_invalid": [
+  "reversed-range"
+ ],
+ "model_fires_0": [
+  6
+ ],
+ "model_fires_1": [
+  2,
+  5,
+  7,
+  9
+ ],
+ "model_fires_2": [
+  5
+ ]
+}

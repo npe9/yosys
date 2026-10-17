@@ -1,0 +1,24 @@
+{
+ "seed": 2,
+ "index": 13,
+ "class": "SIM-VERDICT",
+ "detail": "trace 0: model fires [0, 6], sim fires []",
+ "prop": "(($past(c) && (!r)) until r)",
+ "size": 7,
+ "accepts_invalid": [],
+ "model_fires_0": [
+  0,
+  6
+ ],
+ "model_fires_1": [
+  0,
+  3,
+  5
+ ],
+ "model_fires_2": [
+  0,
+  1,
+  3,
+  9
+ ]
+}

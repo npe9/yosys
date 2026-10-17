@@ -8,7 +8,12 @@
  "accepts_invalid": [
   "reversed-range"
  ],
+ "shrunk_prop": "((c and (a ##[1:3] $rose(a))) |=> b)",
+ "shrunk_T": 9,
  "model_fires_0": [],
  "model_fires_1": [],
- "model_fires_2": []
+ "model_fires_2": [],
+ "shrunk_model_fires_0": [],
+ "shrunk_model_fires_1": [],
+ "shrunk_model_fires_2": []
 }

@@ -6,11 +6,18 @@
  "prop": "(($stable(b) || d) |=> ((d and $rose(d)) |=> (!a)))",
  "size": 11,
  "accepts_invalid": [],
+ "shrunk_prop": "((d and $rose(d)) |=> a)",
+ "shrunk_T": 5,
  "model_fires_0": [],
  "model_fires_1": [
   3
  ],
  "model_fires_2": [
   2
- ]
+ ],
+ "shrunk_model_fires_0": [
+  3
+ ],
+ "shrunk_model_fires_1": [],
+ "shrunk_model_fires_2": []
 }

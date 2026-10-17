@@ -328,18 +328,35 @@ struct SvaCompiler {
 		return mod->addWire(prefix + stringf("$%s$%d", role, uid++), width);
 	}
 
+	// `disable iff` condition of the check being compiled (empty when
+	// none).  LRM 16.15: an attempt is abandoned when the condition is
+	// true at ANY step of its evaluation, so every monitor state register
+	// is synchronously cleared while it holds -- in-flight attempts die,
+	// an attempt starting on a disabled step never arms.  Sampled-value
+	// registers ($past chains, role "past") are data, not attempt state,
+	// and are never cleared.  (Before this the condition was only ORed
+	// into the final check, i.e. sampled at the firing step: sva_pbt F7.)
+	SigSpec dis;
+
+	SigSpec dis_gate(SigSpec d)
+	{
+		if (dis.empty())
+			return d;
+		return mod->Mux(NEW_ID, d, Const(0, d.size()), dis);
+	}
+
 	// State register with next-state function fed back from Q.
 	SigSpec feedback(const std::function<SigSpec(SigSpec)> &f, const char *role, int width)
 	{
 		Wire *q = wn(role, width);
-		mod->addDff(NEW_ID, clk, f(q), q, clk_pos);
+		mod->addDff(NEW_ID, clk, dis_gate(f(q)), q, clk_pos);
 		return q;
 	}
 
 	SigSpec reg(SigSpec d, const char *role)
 	{
 		Wire *q = wn(role, d.size());
-		mod->addDff(NEW_ID, clk, d, q, clk_pos);
+		mod->addDff(NEW_ID, clk, strcmp(role, "past") == 0 ? d : dis_gate(d), q, clk_pos);
 		return q;
 	}
 
@@ -2426,13 +2443,23 @@ struct SvaCompiler {
 		}, "until_qseen", 1);
 		// until: at t either p holds (continue) or q holds (complete);
 		//        fail if neither and no q has been seen since the last start
-		// until_with: q completes only together with p; fail if p fails
-		//        before such a q
-		SigSpec fail_now = with ? andN({active, mod->Not(NEW_ID, p)})
-		                        : andN({active, mod->Not(NEW_ID, p), mod->Not(NEW_ID, q)});
-		if (with)
-			return andN({fail_now, mod->Not(NEW_ID, orN({q, q_seen}))});
-		return andN({fail_now, mod->Not(NEW_ID, q_seen)});
+		// until_with: q completes only together with p (LRM 16.12.10: p
+		//        must hold AT the step q first holds too); fail if p fails
+		//        before such a q -- the q step itself is NOT exempt
+		// `active` is the registered state (attempts started earlier);
+		// the attempt starting at this very tick is live now as well,
+		// otherwise a failure at the start step can never fire (sva_pbt F1).
+		SigSpec act_now = orN({start, active});
+		SigSpec fail_now = with ? andN({act_now, mod->Not(NEW_ID, p)})
+		                        : andN({act_now, mod->Not(NEW_ID, p), mod->Not(NEW_ID, q)});
+		// A q seen by an EARLIER attempt does not complete the attempt
+		// that starts at this tick (the attempts overlap; one monitor
+		// merges them -- documented approximation for pulse starts).  At
+		// the property root, where an attempt starts every tick, this
+		// makes the monitor exact: `p until q` fires at every step with
+		// !p && !q and `p until_with q` at every step with !p.
+		SigSpec seen_eff = andN({q_seen, mod->Not(NEW_ID, start)});
+		return andN({fail_now, mod->Not(NEW_ID, seen_eff)});
 	}
 
 	SigSpec prop_fail(Cell *n, SigSpec start)
@@ -3403,6 +3430,8 @@ struct Sva2CheckPass : public Pass {
 				}
 				comp.clk = clksig[0];
 				comp.clk_pos = clop != "negedge";
+				if (disable && sva_op(disable) == "disable_iff")
+					comp.dis = comp.reduce1(disable->getPort(ID(A)));
 
 				if (!body && body_sig.empty() && !body_const.empty()) {
 					// Constant property body (e.g. assert property

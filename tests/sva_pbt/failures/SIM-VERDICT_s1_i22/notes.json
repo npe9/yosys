@@ -6,11 +6,20 @@
  "prop": "((s_eventually[0:2] (if ($rose(b)) $rose(c) else (((cnt == 2'd2) || cnt[0]) && ((cnt == 2'd1) || r)))) or ($past(c)[=2] |=> cnt[0]))",
  "size": 17,
  "accepts_invalid": [],
+ "shrunk_prop": "($rose(b) or ($past(c)[=2] |=> cnt[0]))",
+ "shrunk_T": 7,
  "model_fires_0": [
   4
  ],
  "model_fires_1": [
   6
  ],
- "model_fires_2": []
+ "model_fires_2": [],
+ "shrunk_model_fires_0": [
+  6
+ ],
+ "shrunk_model_fires_1": [
+  6
+ ],
+ "shrunk_model_fires_2": []
 }

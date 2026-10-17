@@ -20,6 +20,11 @@
 //   (strong(seq) as the direct lhs of s_until is a parser limitation,
 //    not a lowering one: strong/weak property primaries sit above the
 //    sva_until precedence chain.)
+// 2026-10-16 expectation corrected (sva_pbt F1): at ctr=3 neither q nor
+// p = (b ##1 c) holds (b(3)=0), so the attempt starting there fails; the
+// LRM step is 3 (4 with the deadline-based sequence lowering), the
+// framework reports frame 7 -- step kept unpinned until per-attempt
+// tracking (register v3 D5) lands.
 module tsuntil3 (input logic clk);
   logic [2:0] ctr = 0;
   logic a, b, c, d, e;
@@ -31,7 +36,7 @@ module tsuntil3 (input logic clk);
   assign e = 1'b0;
   p1: assert property (@(posedge clk) (b ##1 c) s_until a); // DIS @1
   p2: assert property (@(posedge clk) (b ##1 c) s_until ((ctr <= 3'd2) || (ctr >= 3'd5))); // PROVED
-  p3: assert property (@(posedge clk) (b ##1 c) s_until ((ctr <= 3'd2) || a || (ctr == 3'd6))); // PROVED
+  p3: assert property (@(posedge clk) (b ##1 c) s_until ((ctr <= 3'd2) || a || (ctr == 3'd6))); // DIS
   p4: assert property (@(posedge clk) (d |-> ##[0:1] e) s_until a); // DIS @2
   p5: assert property (@(posedge clk) (b ##2 c) s_until a); // DIS @2
 endmodule

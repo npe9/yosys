@@ -6,6 +6,8 @@
  "prop": "((always[0:0] $stable(b)) or (nexttime[2] (((d && $stable(b)) || (cnt == 2'd3)) |=> r)))",
  "size": 12,
  "accepts_invalid": [],
+ "shrunk_prop": "($stable(b) or ((cnt == 2'd3) |=> r))",
+ "shrunk_T": 9,
  "model_fires_0": [
   4
  ],
@@ -14,5 +16,11 @@
  ],
  "model_fires_2": [
   7
- ]
+ ],
+ "shrunk_model_fires_0": [
+  4,
+  8
+ ],
+ "shrunk_model_fires_1": [],
+ "shrunk_model_fires_2": []
 }

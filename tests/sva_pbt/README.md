@@ -64,16 +64,26 @@ failures/` holds the repros after a run.
 
 | # | shape | framework behaviour | LRM |
 |---|---|---|---|
-| F1 | `p until_with q`, `p until q` | the `_with` obligation (p at q's step) is not enforced; an attempt that fails at its own start step 0 never fires | 16.12.10 |
+| F1 | `p until_with q`, `p until q` | FIXED (same day): the `_with` obligation was not enforced, a failure at the attempt's own start step never fired, and a q seen by an earlier attempt masked a new one | 16.12.10 |
 | F2 | `b[=n] \|-> q` | the match ending exactly at the n-th `b` is not considered (needs a later non-b step) | 16.9.2: `b[=n]` = `b[->n] ##1 !b[*0:$]`, empty tail included |
 | F3 | `(e) ##0 b[->n]` as property | fires at a step where a match exists | 16.9.2 |
 | F4 | `c ##[0:1] r` as property | sim never fires on failing traces (BMC does find the cex) | 16.12.1 |
 | F5 | `a[*1:2]` as property | sim fires one step late and never for the last step's attempt | 16.12.1 |
 | F6 | `s_eventually[m:n] <temporal>` | sim never fires when every alternative fails (BMC does) | 16.12.14 |
-| F7 | `disable iff (c) (nexttime[1] p)` | disable sampled at the firing step only, not over the attempt window | 16.15 |
+| F7 | `disable iff (c) (nexttime[1] p)` | FIXED (same day): the condition was only ORed into the final check; it now clears every monitor state register while true (in-flight attempts abandoned, nothing arms on a disabled step) | 16.15 |
 | F8 | `always[1:1] p` at the last trace step | sim reports the pending obligation as a failure | weak at trace end (convention; low) |
 | F9 | `<temporal> implies q` | fails as soon as q is false, before the left side is determined (step only) | 16.12.4 (low) |
+| F10 | `p1 or p2`, `p1 implies p2` with operands that resolve at different steps | a failure is reported as soon as one operand fails, while the other is still undecided (e.g. a sequence disjunct that can still match later); shows up as BMC counterexamples the model rejects | 16.12.4: the attempt is undecided until both sides are |
 | S1 | `a ##[3:1] b` | accepted | reversed range; most tools reject (low) |
 
-Until F1-F7 are fixed, `make pbt` is informative, not a gate: `pbt.py`
-exits nonzero on any high-severity class.
+F2-F6 share one root cause: sva2check compiles ONE monitor per
+sequence and starts it every tick, so match ends of different attempts
+are merged (`strong_seq_fail` ORs `end` over the deadline window with
+`start = 1'b1`): a later attempt's match hides an earlier attempt's
+failure (F4), the failure is only reported at the sequence's maximum
+length (F5, one step late / never for the last steps of a trace), and
+occurrence counters are shared (F2, F3).  The exact fix is per-attempt
+match tracking (ends tagged by match length, or the slot/age ring the
+local-variable machinery already has), register v3 item D5.  Until
+then `make pbt` is informative, not a gate: `pbt.py` exits nonzero on
+any high-severity class.

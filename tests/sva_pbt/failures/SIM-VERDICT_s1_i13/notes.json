@@ -6,9 +6,18 @@
  "prop": "(((a ##[1:2] $stable(c)) intersect $stable(b)[=2]) |=> (if ((r || ((cnt == 2'd1) && r))) ($fell(a) || (!$rose(d))) else $rose(d)))",
  "size": 19,
  "accepts_invalid": [],
+ "shrunk_prop": "($stable(b)[=1] |=> r)",
+ "shrunk_T": 3,
  "model_fires_0": [
   3
  ],
  "model_fires_1": [],
- "model_fires_2": []
+ "model_fires_2": [],
+ "shrunk_model_fires_0": [
+  1
+ ],
+ "shrunk_model_fires_1": [
+  2
+ ],
+ "shrunk_model_fires_2": []
 }

@@ -1,0 +1,35 @@
+{
+ "seed": 1,
+ "index": 7,
+ "class": "SIM-STEP",
+ "detail": "trace 0: model fires [7, 8], sim fires [7, 8, 9]",
+ "prop": "((r[*1] or ((a && r) throughout cnt[1])) |=> ((((cnt == 2'd1) || d) && $stable(d)) until_with c))",
+ "size": 17,
+ "accepts_invalid": [],
+ "shrunk_prop": "(r |=> ((cnt == 2'd0) until_with c))",
+ "shrunk_T": 4,
+ "model_fires_0": [
+  7,
+  8
+ ],
+ "model_fires_1": [
+  2,
+  6
+ ],
+ "model_fires_2": [
+  2,
+  5,
+  8,
+  9
+ ],
+ "shrunk_model_fires_0": [
+  2,
+  3
+ ],
+ "shrunk_model_fires_1": [
+  2
+ ],
+ "shrunk_model_fires_2": [
+  2
+ ]
+}

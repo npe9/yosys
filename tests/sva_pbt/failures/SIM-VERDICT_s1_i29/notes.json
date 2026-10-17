@@ -6,6 +6,8 @@
  "prop": "disable iff (((d && r) && d)) ($stable(b)[=1] |=> (d |-> ((b || (cnt[0] && $past(d))) until c)))",
  "size": 18,
  "accepts_invalid": [],
+ "shrunk_prop": "($stable(b)[=1] |=> b)",
+ "shrunk_T": 3,
  "model_fires_0": [
   2,
   5
@@ -14,5 +16,13 @@
  "model_fires_2": [
   2,
   8
+ ],
+ "shrunk_model_fires_0": [
+  1,
+  2
+ ],
+ "shrunk_model_fires_1": [],
+ "shrunk_model_fires_2": [
+  2
  ]
 }

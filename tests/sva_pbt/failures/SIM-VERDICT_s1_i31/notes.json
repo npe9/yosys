@@ -6,9 +6,17 @@
  "prop": "((((!$rose(d)) && $past(b, 2)) until ($past(b, 2) && ($stable(d) && a))) implies (nexttime[2] (!(!$past(a, 2)))))",
  "size": 16,
  "accepts_invalid": [],
+ "shrunk_prop": "($past(b) implies (nexttime[1] (!(!$past(a)))))",
+ "shrunk_T": 5,
  "model_fires_0": [],
  "model_fires_1": [
   6
  ],
- "model_fires_2": []
+ "model_fires_2": [],
+ "shrunk_model_fires_0": [],
+ "shrunk_model_fires_1": [
+  2,
+  3
+ ],
+ "shrunk_model_fires_2": []
 }

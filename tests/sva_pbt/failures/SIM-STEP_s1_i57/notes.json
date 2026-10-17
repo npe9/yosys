@@ -6,6 +6,8 @@
  "prop": "((c |=> ((d && $past(d)) && ($past(b) || a))) and ((($rose(a) && $past(a)) || $past(c, 2)) |-> a))",
  "size": 18,
  "accepts_invalid": [],
+ "shrunk_prop": "((c |=> d) and $past(c))",
+ "shrunk_T": 3,
  "model_fires_0": [
   3,
   7
@@ -24,5 +26,17 @@
   6,
   7,
   9
+ ],
+ "shrunk_model_fires_0": [
+  0,
+  1
+ ],
+ "shrunk_model_fires_1": [
+  0,
+  1
+ ],
+ "shrunk_model_fires_2": [
+  0,
+  1
  ]
 }

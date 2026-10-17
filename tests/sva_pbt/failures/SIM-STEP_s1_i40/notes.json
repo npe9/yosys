@@ -8,6 +8,8 @@
  "accepts_invalid": [
   "reversed-range"
  ],
+ "shrunk_prop": "((d and c) |=> c)",
+ "shrunk_T": 10,
  "model_fires_0": [
   5
  ],
@@ -17,5 +19,13 @@
  "model_fires_2": [
   3,
   8
+ ],
+ "shrunk_model_fires_0": [
+  1
+ ],
+ "shrunk_model_fires_1": [],
+ "shrunk_model_fires_2": [
+  2,
+  7
  ]
 }

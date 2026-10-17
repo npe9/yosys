@@ -6,6 +6,8 @@
  "prop": "((if ((!(cnt == 2'd1))) (always[0:2] (c || (r && $stable(a)))) else ((b || $rose(d)) |-> (!(d || d)))) implies ((d || b) && ($stable(c) || d)))",
  "size": 26,
  "accepts_invalid": [],
+ "shrunk_prop": "((always[0:1] c) implies $stable(c))",
+ "shrunk_T": 3,
  "model_fires_0": [
   1,
   4,
@@ -19,5 +21,10 @@
  "model_fires_2": [
   5,
   9
- ]
+ ],
+ "shrunk_model_fires_0": [
+  2
+ ],
+ "shrunk_model_fires_1": [],
+ "shrunk_model_fires_2": []
 }

@@ -6,6 +6,8 @@
  "prop": "((((c && $rose(a)) && (d || a))[=1] within ((c && (a || $rose(d))) or (1'b1 && ((cnt == 2'd0) && d)))) |-> (!a))",
  "size": 24,
  "accepts_invalid": [],
+ "shrunk_prop": "(c[=1] |-> (!a))",
+ "shrunk_T": 7,
  "model_fires_0": [
   6
  ],
@@ -16,5 +18,17 @@
  ],
  "model_fires_2": [
   9
+ ],
+ "shrunk_model_fires_0": [
+  6
+ ],
+ "shrunk_model_fires_1": [
+  1,
+  2,
+  4,
+  6
+ ],
+ "shrunk_model_fires_2": [
+  6
  ]
 }

@@ -96,7 +96,7 @@ positive control that shows each detector firing (`xapprox.sv`, plain /
 | `noncons-rep-seq-body-merged` | `[->]`/`[=]` over a SEQUENCE body (beyond the LRM's Boolean form) | occurrence ends of overlapping body attempts merge | tnoncons1 | xapprox p_ncseq |
 | `noncons-rep-unbounded-top-age` | anchored `[->]`/`[=]` in an unbounded property | the saturated top age falls back to the time-0 count | none | xapprox p_nc_loc |
 | `until-merged-attempts` | `until`/`until_with` not at the property root (pulse start) | a `q` seen by an earlier attempt does not close the attempt starting now; one monitor merges them | t8 | t8 p_utw_b |
-| `weak-as-strong` | `weak(seq)` as a property | compiled strongly: sound for model checking, conservative at the end of a finite simulation trace | tfeat1, twithin | xapprox p_weak |
+| `weak-as-strong` | `weak(seq)` as a property | compiled strongly: sound for model checking, conservative at the end of a finite simulation trace | tfeat1, twithin, tdeclclk | xapprox p_weak |
 
 The positive controls earned their keep immediately: no detector ever
 fired on a NAMED property, because `assert property (@(posedge clk) q)`

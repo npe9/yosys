@@ -1,0 +1,17 @@
+# IEEE 1800-2017 11.3.2: a cast is a primary, so `~W'(p)` is `~(W'(p))`,
+# not `(~W)'(p)`.  The parser used to give the unary operator the tighter
+# binding, so the size folded to ~4 = -5 ("Static cast with zero or
+# negative size"; register v3 D7b: every `~PW'(x)` in OpenTitan's package
+# functions).
+read_verilog -sv <<EOT
+module m(input logic [3:0] p, output logic [3:0] y1, y2, y3);
+  localparam int W = 4;
+  assign y1 = ~W'(p);
+  assign y2 = ~(W'(p));
+  assign y3 = -W'(p) + W'(p) + (~4'(p));
+endmodule
+EOT
+hierarchy -top m
+proc
+sat -verify -prove y1 y2
+sat -verify -prove y3 y1

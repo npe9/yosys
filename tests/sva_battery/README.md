@@ -236,6 +236,14 @@ accepts the result variable spelled by the function's own name).
 `tpkgfn.sv` pins it against the qualified form and a DIS control.
 `SVA_DEBUG_FCALL=1` makes the constant-function evaluator report why an
 evaluation failed instead of degrading silently.
+A wildcard-imported package function inlined in a continuous assign keeps
+its body (the inlined block's result references are renamed with the
+declaration); `tpkginl.sv` pins a concrete value with a one-bit-off DIS
+control (this was the stress `func` XFAIL).
+A cast binds tighter than a unary operator (`~W'(p)` is `~(W'(p))`,
+IEEE 1800-2017 11.3.2): the grammar used to fold `~W` into the size
+(tests/verilog/cast_unary_precedence.ys); this was the "Static cast with
+zero or negative size" class in package functions.
 
 ## Type parameters and the `TOP:` pragma
 

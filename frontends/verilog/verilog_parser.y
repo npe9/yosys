@@ -842,8 +842,8 @@
 %left TOK_PLUS TOK_MINUS
 %left TOK_ASTER TOK_SLASH TOK_PERC
 %left OP_POW
-%precedence OP_CAST
 %precedence UNARY_OPS
+%precedence OP_CAST
 
 %define parse.error detailed
 %define parse.lac full

@@ -8252,6 +8252,41 @@ skip_memory_write:;
 				}
 			}
 		}
+		{
+			// The package rename leaves the body assigning the result under
+			// `<pkg>::<name>` (or the bare name) while the declaration may
+			// already be `$result`; expand_genblock does not prefix a
+			// `::`-qualified reference, so the inlined block drove a wire
+			// nobody read and the call's value was x (register v3 D7d: the
+			// stress `func` XFAIL).  Rename every such reference to `$result`
+			// before the expansion, keyed on the references themselves.
+			std::string base = str;
+			if (!base.empty() && base[0] == '\\')
+				base = base.substr(1);
+			size_t bq = base.rfind("::");
+			if (bq != std::string::npos)
+				base = base.substr(bq + 2);
+			std::set<std::string> refs;
+			std::function<void(AstNode*)> scan = [&](AstNode *n) {
+				for (auto &c : n->children) {
+					if (!c)
+						continue;
+					if (c->type == AST_IDENTIFIER && c->str != "$result") {
+						std::string cs = c->str;
+						if (!cs.empty() && cs[0] == '\\')
+							cs = cs.substr(1);
+						size_t q = cs.rfind("::");
+						std::string b = q == std::string::npos ? cs : cs.substr(q + 2);
+						if (b == base && (q != std::string::npos || cs == base))
+							refs.insert(c->str);
+					}
+					scan(c.get());
+				}
+			};
+			scan(decl);
+			for (auto &r : refs)
+				decl->replace_result_wire_name_in_function(r, "$result");
+		}
 		decl->expand_genblock(prefix);
 
 		if (decl->type == AST_FUNCTION && !decl->attributes.count(ID::via_celltype))
@@ -8321,6 +8356,13 @@ skip_memory_write:;
 							tail.compare(tail.size() - base.size() - 2, base.size() + 2, "::" + base) == 0)) {
 						wire = child->clone();
 						wire->str = res_name;
+						// the body still assigns the result under the matched
+						// name; the call reads `res_name`.  Rename the references
+						// in this per-call clone, or the inlined block drives a
+						// wire nobody reads and the call's value is x (register
+						// v3 D7d: the stress `func` XFAIL, wildcard-imported
+						// package functions in continuous assigns).
+						decl->replace_result_wire_name_in_function(cs, res_name);
 						break;
 					}
 				}

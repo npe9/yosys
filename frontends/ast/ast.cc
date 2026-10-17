@@ -2072,6 +2072,7 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 		std::string tname = it->second.decode_string();
 		std::string tbase = tname.compare(0, 1, "\\") == 0 ? tname.substr(1) : tname;
 		AstNode *resolved = nullptr;
+		AstModule *scope_module = nullptr;   // the module the override's typedef came from, if any
 		// `scope::name`: the instantiating module (its own typedef, qualified
 		// by genrtlil so a module-local type reaches the child) or a package
 		{
@@ -2083,6 +2084,8 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 					for (auto& cand : am->ast->children)
 						if (cand->type == AST_TYPEDEF && cand->str == leaf) {
 							resolved = cand.get();
+							if (am->ast->type == AST_MODULE)
+								scope_module = am;
 							break;
 						}
 				tbase = tbase.substr(sep + 2);   // the bare name, for the fallbacks below
@@ -2125,6 +2128,69 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 			}
 		if (resolved && !resolved->children.empty() && !child->children.empty()) {
 			child->children[0] = resolved->children[0]->clone();
+			// a struct/typedef override from the instantiating MODULE may
+			// name other typedefs of that module (`addr_t addr;` inside
+			// `ar_chan_t`, pulp axi): bring those along transitively, under
+			// their own names, unless the child or the globals already have
+			// them (register v3 D0 follow-up)
+			if (scope_module) {
+				std::function<void(AstNode*)> bring = [&](AstNode *n) {
+					for (auto &c : n->children) {
+						if (!c)
+							continue;
+						if (c->type == AST_IDENTIFIER && !c->str.empty() && c->str.find("::") == std::string::npos) {
+							// a range bound naming a parameter of the parent
+							// (`logic [AddrWidth-1:0]`): bring it as a localparam
+							// (the parent AST is the derived one, so overrides
+							// are already substituted)
+							bool have = false;
+							for (auto &k : new_ast->children)
+								if ((k->type == AST_PARAMETER || k->type == AST_LOCALPARAM) && k->str == c->str)
+									have = true;
+							for (auto &k : enum_clones)
+								if ((k->type == AST_PARAMETER || k->type == AST_LOCALPARAM) && k->str == c->str)
+									have = true;
+							if (!have)
+								for (auto &k : scope_module->ast->children)
+									if ((k->type == AST_PARAMETER || k->type == AST_LOCALPARAM) && k->str == c->str) {
+										auto cl = k->clone();
+										cl->type = AST_LOCALPARAM;
+										AstNode *clp = cl.get();
+										enum_clones.push_back(std::move(cl));
+										if (!quiet)
+											log("Type parameter %s: also brings parameter %s from %s\n", child->str.c_str(), c->str.c_str(), log_id(scope_module->name));
+										bring(clp);
+										break;
+									}
+						}
+						if (c->type == AST_WIRETYPE && !c->str.empty() && c->str.find("::") == std::string::npos) {
+							bool have = false;
+							for (auto &k : new_ast->children)
+								if (k->type == AST_TYPEDEF && k->str == c->str)
+									have = true;
+							for (auto &k : enum_clones)
+								if (k->type == AST_TYPEDEF && k->str == c->str)
+									have = true;
+							for (auto &g : design->verilog_globals)
+								if (g && g->type == AST_TYPEDEF && g->str == c->str)
+									have = true;
+							if (!have)
+								for (auto &k : scope_module->ast->children)
+									if (k->type == AST_TYPEDEF && k->str == c->str) {
+										auto cl = k->clone();
+										AstNode *clp = cl.get();
+										enum_clones.push_back(std::move(cl));
+										if (!quiet)
+											log("Type parameter %s: also brings %s from %s\n", child->str.c_str(), c->str.c_str(), log_id(scope_module->name));
+										bring(clp);
+										break;
+									}
+						}
+						bring(c.get());
+					}
+				};
+				bring(child->children[0].get());
+			}
 			// an enum typedef refers to its AST_ENUM definition by name
 			// (attribute enum_type); the child module needs that node too
 			if (child->children[0]->attributes.count(ID::enum_type)) {

@@ -84,6 +84,7 @@ def expectations(path):
 
 def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
               stream=None, dump_yw=None):
+    top = top or run_ic3.top_pragma(path)   # `// TOP: <module>` for multi-root files
     label = os.path.basename(path)
     exp = expectations(path)
 

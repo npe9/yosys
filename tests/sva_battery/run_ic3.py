@@ -78,6 +78,19 @@ def read_flags(path):
     return ""
 
 
+def top_pragma(path):
+    """`// TOP: <module>` names the top of a multi-root file (a package next
+    to the design makes `hierarchy -check` unable to pick one)."""
+    try:
+        for line in open(path):
+            m = re.match(r'\s*//\s*TOP:\s*(\w+)', line)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
 def prep_extras(path):
     """Per-file opt-in prep passes from pragma comments (multiclock etc.)."""
     a2s = mem = bmc = ctg = ""
@@ -120,6 +133,7 @@ def lowering_tags(yosys, files, top="", include=(), timeout=120):
     run (register v3 A3).  Drivers whose engine output carries no tag (the
     smtbmc leg) print these; the ic3 leg prints the tag ic3 logs itself."""
     inc = " ".join("-I" + d for d in include)
+    top = top or top_pragma(files[-1])
     script = "read_verilog -sv -formal %s %s %s\nhierarchy -check%s\nsva2check\ndump t:$check\n" % (
         read_flags(files[-1]), inc, " ".join(files), (" -top " + top) if top else "")
     try:
@@ -150,6 +164,7 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
     label = os.path.basename(path) if isinstance(path, str) else os.path.basename(path[0])
     files = path if isinstance(path, list) else [path]
     inc = " ".join("-I" + d for d in inc_dirs)
+    top = top or top_pragma(files[-1])
     extra_a2s, extra_mem, bmc, ctg = prep_extras(files[0])
     engine = engine_for(files[-1]) + bmc + ctg
     if cex_prefix:

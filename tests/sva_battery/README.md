@@ -227,6 +227,18 @@ lowering; it does not show the lowering is LRM-correct (the oracle legs'
 job).  This leg finds fakes, not wrong answers.  `make mutate` runs it
 over the battery; the corpus runs are in `conformance/runs/mutation_*`.
 
+## Type parameters and the `TOP:` pragma
+
+`parameter type T = <default>` is a typedef that is also a parameter (the
+parser marks it `(* type_param *)`, the module advertises it to
+hierarchy); an instance's `.T(<typedef name>)` -- module-local, file-scope,
+package-qualified or an enum -- is spliced into the derived module by
+`derive`, so ports declared `T` take the override's width.  `tdtype.sv`
+pins it.  An anonymous type at the instance (`.T(logic [7:0])`) is not
+supported yet.  A file whose design sits beside a package has no unique
+root for `hierarchy -check`: `// TOP: <module>` names it, and
+run_ic3 / run_bmc / prove honour the pragma when no `--top` is given.
+
 ## File classes
 
 - `t*.sv` — the green battery. Run all: `for f in t*.sv; do ...`.

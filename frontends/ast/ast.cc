@@ -1408,7 +1408,8 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 			module->attributes[attr.first] = attr.second->asAttrConst();
 		}
 		for (const auto& node : ast->children)
-			if (node->type == AST_PARAMETER)
+			if (node->type == AST_PARAMETER ||
+					(node->type == AST_TYPEDEF && node->attributes.count(ID(type_param))))
 				current_module->avail_parameters(node->str);
 	}
 
@@ -2030,6 +2031,7 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 		new_ast->set_attribute(ID::hdlname, AstNode::mkconst_str(loc, stripped_name.substr(1)));
 
 	// type parameters (declared as typedefs): splice in the override type
+	std::vector<std::unique_ptr<AstNode>> enum_clones;
 	for (auto& child : new_ast->children) {
 		if (child->type != AST_TYPEDEF)
 			continue;
@@ -2039,21 +2041,72 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 		std::string tname = it->second.decode_string();
 		std::string tbase = tname.compare(0, 1, "\\") == 0 ? tname.substr(1) : tname;
 		AstNode *resolved = nullptr;
-		for (auto& cand : new_ast->children) {
-			if (cand->type != AST_TYPEDEF)
-				continue;
-			// the override name comes from the instantiator's scope (often
-			// unqualified via import); the parametric module sees the same
-			// typedef package-qualified, so match a full name or a :: suffix
-			if (cand->str == tname || cand->str.size() > tbase.size() + 2 &&
-					cand->str.compare(cand->str.size() - tbase.size(), tbase.size(), tbase) == 0 &&
-					cand->str.compare(cand->str.size() - tbase.size() - 2, 2, "::") == 0) {
+		// the override name comes from the instantiator's scope (often
+		// unqualified via import); the parametric module sees the same
+		// typedef package-qualified, so match a full name or a :: suffix
+		auto matches = [&](const std::string &cname) {
+			return cname == tname || (cname.size() > tbase.size() + 2 &&
+					cname.compare(cname.size() - tbase.size(), tbase.size(), tbase) == 0 &&
+					cname.compare(cname.size() - tbase.size() - 2, 2, "::") == 0);
+		};
+		for (auto& cand : new_ast->children)
+			if (cand->type == AST_TYPEDEF && matches(cand->str)) {
 				resolved = cand.get();
 				break;
 			}
-		}
+		// not the child's own typedef: a compilation-unit (file-scope)
+		// typedef, or a package's (register v3 D0)
+		if (!resolved)
+			for (auto& g : design->verilog_globals)
+				if (g && g->type == AST_TYPEDEF && matches(g->str)) {
+					resolved = g.get();
+					break;
+				}
+		if (!resolved)
+			for (auto mod : design->modules()) {
+				AstModule *am = dynamic_cast<AstModule*>(mod);
+				if (!am || !am->ast || am->ast->type != AST_PACKAGE)
+					continue;
+				for (auto& cand : am->ast->children)
+					if (cand->type == AST_TYPEDEF &&
+							(matches(cand->str) || matches(am->ast->str + "::" + cand->str.substr(cand->str[0] == '\\' ? 1 : 0)))) {
+						resolved = cand.get();
+						break;
+					}
+				if (resolved)
+					break;
+			}
 		if (resolved && !resolved->children.empty() && !child->children.empty()) {
 			child->children[0] = resolved->children[0]->clone();
+			// an enum typedef refers to its AST_ENUM definition by name
+			// (attribute enum_type); the child module needs that node too
+			if (child->children[0]->attributes.count(ID::enum_type)) {
+				std::string ename = child->children[0]->attributes.at(ID::enum_type)->str;
+				bool have = false;
+				for (auto& c : new_ast->children)
+					if (c->type == AST_ENUM && c->str == ename)
+						have = true;
+				AstNode *enode = nullptr;
+				if (!have) {
+					for (auto& g : design->verilog_globals)
+						if (g && g->type == AST_ENUM && g->str == ename)
+							enode = g.get();
+					if (!enode)
+						for (auto mod : design->modules()) {
+							AstModule *am = dynamic_cast<AstModule*>(mod);
+							if (!am || !am->ast)
+								continue;
+							for (auto& c : am->ast->children)
+								if (c->type == AST_ENUM && c->str == ename)
+									enode = c.get();
+						}
+					if (enode)
+						enum_clones.push_back(enode->clone());   // inserted after the loop (no mutation while iterating)
+					else
+						log_file_warning(child->location.to_loc(), "Type parameter override `%s` = `%s`: enum definition `%s` not found in any scope.\n",
+								child->str.c_str(), tname.c_str(), ename.c_str());
+				}
+			}
 			if (!quiet)
 				log("Type parameter %s = %s\n", child->str.c_str(), tname.c_str());
 		} else {
@@ -2062,6 +2115,8 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 		}
 		rewritten.insert(child->str);
 	}
+	for (auto& e : enum_clones)
+		new_ast->children.insert(new_ast->children.begin(), std::move(e));
 
 	para_counter = 0;
 	for (auto& child : new_ast->children) {

@@ -291,6 +291,7 @@ def prove_file(path, args, workdir):
     if args.cex:
         cexdir = os.path.join(args.cex, os.path.splitext(os.path.basename(path))[0])
         os.makedirs(cexdir, exist_ok=True)
+    args.top = args.top or run_ic3.top_pragma(path)   # `// TOP: <module>` for multi-root files
     smt = SmtLane(path, args.top, args.include, args.timeout, workdir,
                    dump_yw=cexdir) if not args.ic3_only else DummyLane()
     ic3 = Ic3Lane(path, args.top, args.include, workdir,

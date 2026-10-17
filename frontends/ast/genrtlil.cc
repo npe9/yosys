@@ -1572,6 +1572,10 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 	case AST_MODPORT:
 	case AST_MODPORTMEMBER:
 	case AST_TYPEDEF:
+		// a `parameter type` typedef is also a parameter: advertise it so
+		// hierarchy accepts an instance's `.T(<type>)` (register v3 D0)
+		if (attributes.count(ID(type_param)))
+			current_module->avail_parameters(str);
 	case AST_STRUCT:
 	case AST_UNION:
 		break;

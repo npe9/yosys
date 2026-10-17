@@ -122,6 +122,7 @@
 			AstNode* pushChild(std::unique_ptr<AstNode> child);
 			void addWiretypeNode(std::string *name, AstNode* node);
 			void addTypedefNode(std::string *name, std::unique_ptr<AstNode> node);
+			void addTypeParamNode(std::string *name, std::unique_ptr<AstNode> node);
 			void emitStructDefaults(const parser::location_type &loc, AstNode *parent, const std::string &varname, const std::vector<std::pair<std::string, std::unique_ptr<AstNode>>> &defs);
 			void enterTypeScope();
 			void exitTypeScope();
@@ -292,6 +293,19 @@
 			node->is_custom_type = true;
 			node->children.push_back(std::make_unique<AstNode>(node->location, AST_WIRETYPE));
 			node->children.back()->str = *name;
+		}
+
+		// `parameter type T = ...` / `#(type T = ...)`: a typedef that is also
+		// a parameter.  The typedef carries the default type; the mark makes
+		// the AST module advertise T to hierarchy (avail_parameters) so an
+		// instance's `.T(<type>)` override reaches derive, which splices the
+		// named type in (register v3 D0).
+		void ParseState::addTypeParamNode(std::string *name, std::unique_ptr<AstNode> node)
+		{
+			auto loc = node->location;
+			addTypedefNode(name, std::move(node));
+			AstNode *tnode = user_type_stack.back().at(*name);
+			tnode->set_attribute(ID(type_param), AstNode::mkconst_int(loc, 1, false));
 		}
 
 		void ParseState::addTypedefNode(std::string *name, std::unique_ptr<AstNode> node)
@@ -1067,23 +1081,23 @@ single_module_para:
 			if (range)
 				base->children.push_back(std::move(range));
 		}
-		extra->addTypedefNode($4.get(), std::move(base));
+		extra->addTypeParamNode($4.get(), std::move(base));
 	} |
 	attr TOK_PARAMETER TOK_TYPE TOK_ID TOK_EQ TOK_SCOPED_ID {
 		auto base = std::make_unique<AstNode>(@6, AST_WIRE);
 		base->is_logic = true;
 		extra->addWiretypeNode($6.get(), base.get());
-		extra->addTypedefNode($4.get(), std::move(base));
+		extra->addTypeParamNode($4.get(), std::move(base));
 	} |
 	attr TOK_PARAMETER TOK_TYPE TOK_ID TOK_EQ enum_struct_type {
-		extra->addTypedefNode($4.get(), std::move($6));
+		extra->addTypeParamNode($4.get(), std::move($6));
 	} |
 	attr TOK_PARAMETER TOK_TYPE TOK_ID TOK_EQ TOK_TYPE TOK_LPAREN type_operand TOK_RPAREN {
 		// `parameter type T = type(...)' (IEEE 1800-2009 6.23): the type
 		// operator yields a type, registered as an opaque alias
 		auto base = std::make_unique<AstNode>(@$, AST_WIRE);
 		base->is_logic = true;
-		extra->addTypedefNode($4.get(), std::move(base));
+		extra->addTypeParamNode($4.get(), std::move(base));
 	} |
 	attr TOK_LOCALPARAM TOK_TYPE TOK_ID TOK_EQ enum_struct_type {
 		extra->addTypedefNode($4.get(), std::move($6));
@@ -1097,7 +1111,7 @@ single_module_para:
 			if (range)
 				base->children.push_back(std::move(range));
 		}
-		extra->addTypedefNode($3.get(), std::move(base));
+		extra->addTypeParamNode($3.get(), std::move(base));
 	} |
 	attr TOK_LOCALPARAM TOK_TYPE TOK_ID TOK_EQ typedef_base_type range_or_multirange {
 		auto base = std::move($6);
@@ -2998,10 +3012,10 @@ param_type_rhs:
 
 param_type_decl_list:
 	TOK_ID TOK_EQ param_type_rhs {
-		extra->addTypedefNode($1.get(), std::move($3));
+		extra->addTypeParamNode($1.get(), std::move($3));
 	} |
 	param_type_decl_list TOK_COMMA TOK_ID TOK_EQ param_type_rhs {
-		extra->addTypedefNode($3.get(), std::move($5));
+		extra->addTypeParamNode($3.get(), std::move($5));
 	};
 
 param_decl:

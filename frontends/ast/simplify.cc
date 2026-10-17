@@ -8240,6 +8240,14 @@ skip_memory_write:;
 					cs = cs.substr(1);
 				if (cs.size() > base.size() + 2 && cs.compare(cs.size() - base.size() - 2, base.size() + 2, "::" + base) == 0) {
 					decl->replace_result_wire_name_in_function(c->str, "$result");
+					// the body may still spell the result variable by the bare
+					// name (`plus1 = ...` / `return` inside a wildcard-imported
+					// package function): the declaration was package-qualified by
+					// rename_in_package_stmts, the references were not, and the
+					// evaluator then saw an "assignment to a non-local variable"
+					// (register v3 D7c).  The helper skips FCALL/TCALL nodes, so
+					// a recursive call keeps its name.
+					decl->replace_result_wire_name_in_function("\\" + base, "$result");
 					break;
 				}
 			}
@@ -9954,7 +9962,8 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 {
 	// A body that is not a constant expression returns no value. The caller
 	// substitutes constant 0 so elaboration can continue.
-	must_succeed = false;
+	if (!getenv("SVA_DEBUG_FCALL"))   // (debug: keep the caller's must_succeed to see why an evaluation fails)
+		must_succeed = false;
 	std::map<std::string, AstNode*> backup_scope = current_scope;
 	std::map<std::string, AstNode::varinfo_t> variables;
 	auto block = std::make_unique<AstNode>(location, AST_BLOCK);
@@ -10076,6 +10085,23 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 						fcall->loc_string().c_str());
 			}
 
+			if (!variables.count(stmt->children.at(0)->str)) {
+				// the result variable spelled by the function's own name, bare
+				// or package-qualified (`plus1 = ...` / `u_pkg::plus1 = ...` in
+				// a wildcard-imported package function): the declaration was
+				// renamed to the prefixed `$result` (str), the reference was
+				// not.  Compare the bare base names and redirect (register v3
+				// D7c: "Constant function did not evaluate" on every imported
+				// constant function, ~95 OpenTitan files).
+				auto bare = [](std::string n) {
+					if (!n.empty() && n[0] == '\\')
+						n = n.substr(1);
+					size_t q = n.rfind("::");
+					return q == std::string::npos ? n : n.substr(q + 2);
+				};
+				if (variables.count(str) && bare(stmt->children.at(0)->str) == bare(fcall->str))
+					stmt->children.at(0)->str = str;
+			}
 			if (!variables.count(stmt->children.at(0)->str)) {
 				if (!must_succeed)
 					goto finished;

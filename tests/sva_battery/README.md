@@ -227,6 +227,16 @@ lowering; it does not show the lowering is LRM-correct (the oracle legs'
 job).  This leg finds fakes, not wrong answers.  `make mutate` runs it
 over the battery; the corpus runs are in `conformance/runs/mutation_*`.
 
+## Imported constant functions
+
+A wildcard-imported package function called by its bare name in a
+localparam evaluates, at module scope and inside another package (the
+package's own `import` is applied in the package pass; the evaluator
+accepts the result variable spelled by the function's own name).
+`tpkgfn.sv` pins it against the qualified form and a DIS control.
+`SVA_DEBUG_FCALL=1` makes the constant-function evaluator report why an
+evaluation failed instead of degrading silently.
+
 ## Type parameters and the `TOP:` pragma
 
 `parameter type T = <default>` is a typedef that is also a parameter (the

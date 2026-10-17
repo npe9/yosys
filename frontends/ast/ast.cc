@@ -1583,6 +1583,37 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 					child->children.push_back(std::move(cloned_node));
 				}
 			}
+			// A package's own `import other::*` / `import other::name` (register
+			// v3 D7a): the module-level import machinery runs only for
+			// modules, so a package body calling an imported function by its
+			// bare name was an "unresolved function".  Inject BARE-named
+			// clones of the imported members the same way, tagged and dropped
+			// again below.
+			std::vector<std::unique_ptr<AstNode>> import_clones;   // appended after the loop: never grow the vector being iterated
+			for (auto& imp : child->children) {
+				if (!imp || imp->type != AST_IMPORT)
+					continue;
+				bool wildcard = imp->children.empty();
+				std::set<std::string> items;
+				for (auto& it : imp->children)
+					if (it)
+						items.insert(it->str);
+				for (auto& n : design->verilog_packages) {
+					if (n->str != imp->str)
+						continue;
+					for (auto &o : n->children) {
+						if (!o || o->str.empty())
+							continue;
+						if (!wildcard && !items.count(o->str))
+							continue;
+						auto cloned_node = o->clone();
+						cloned_node->attributes[scope_clone] = AstNode::mkconst_int(cloned_node->location, 1, false);
+						import_clones.push_back(std::move(cloned_node));
+					}
+				}
+			}
+			for (auto& c : import_clones)
+				child->children.push_back(std::move(c));
 			// process enum/other declarations
 			current_ast_mod = child.get();
 			child->simplify(true, 1, -1, false);

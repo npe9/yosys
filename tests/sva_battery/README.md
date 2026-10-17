@@ -234,8 +234,9 @@ parser marks it `(* type_param *)`, the module advertises it to
 hierarchy); an instance's `.T(<typedef name>)` -- module-local, file-scope,
 package-qualified or an enum -- is spliced into the derived module by
 `derive`, so ports declared `T` take the override's width.  `tdtype.sv`
-pins it.  An anonymous type at the instance (`.T(logic [7:0])`) is not
-supported yet.  A file whose design sits beside a package has no unique
+pins it, including a module-local typedef (passed as `module::name`) and
+an anonymous type at the instance (`.T(logic [7:0])`, declared as a private
+typedef of the enclosing module by the parser).  A file whose design sits beside a package has no unique
 root for `hierarchy -check`: `// TOP: <module>` names it, and
 run_ic3 / run_bmc / prove honour the pragma when no `--top` is given.
 

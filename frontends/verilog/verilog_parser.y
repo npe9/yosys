@@ -862,7 +862,7 @@
 // SVA repetition tokens (an `[*]'/`[+]'/`[->'/`[=]' bracket followed by an
 // expression is a repetition, by `]' an unbounded one, both kept over the
 // associative-dimension reading).
-%expect 127
+%expect 131
 
 %precedence FAKE_THEN
 %precedence TOK_ELSE
@@ -3896,6 +3896,26 @@ cell_parameter:
 	} |
 	TOK_DOT TOK_ID TOK_LPAREN TOK_RPAREN {
 		// just ignore empty parameters
+	} |
+	TOK_DOT TOK_ID TOK_LPAREN typedef_base_type range_or_multirange TOK_RPAREN {
+		// `.T(logic [7:0])`: an anonymous data type as a type-parameter
+		// override (register v3 D0b).  Declare it as a typedef of the
+		// enclosing module under a private name and pass that name; genrtlil
+		// qualifies it `module::name` and derive splices it into the child.
+		auto base = std::move($4);
+		if ($5) {
+			auto range = checkRange(base.get(), std::move($5));
+			if (range)
+				base->children.push_back(std::move(range));
+		}
+		std::string tn = stringf("\\$tparam$%d", autoidx++);
+		extra->addTypedefNode(&tn, std::move(base));
+		auto node = std::make_unique<AstNode>(@$, AST_PARASET);
+		node->str = *$2;
+		auto ref = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
+		ref->str = tn;
+		node->children.push_back(std::move(ref));
+		extra->astbuf1->children.push_back(std::move(node));
 	} |
 	TOK_DOT TOK_ID TOK_LPAREN expr TOK_RPAREN {
 		auto node = std::make_unique<AstNode>(@$, AST_PARASET);

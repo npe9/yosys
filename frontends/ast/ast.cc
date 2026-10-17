@@ -2041,11 +2041,27 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 		std::string tname = it->second.decode_string();
 		std::string tbase = tname.compare(0, 1, "\\") == 0 ? tname.substr(1) : tname;
 		AstNode *resolved = nullptr;
+		// `scope::name`: the instantiating module (its own typedef, qualified
+		// by genrtlil so a module-local type reaches the child) or a package
+		{
+			size_t sep = tbase.rfind("::");
+			if (sep != std::string::npos) {
+				std::string scope = "\\" + tbase.substr(0, sep), leaf = "\\" + tbase.substr(sep + 2);
+				AstModule *am = dynamic_cast<AstModule*>(design->module(RTLIL::IdString(scope)));
+				if (am && am->ast)
+					for (auto& cand : am->ast->children)
+						if (cand->type == AST_TYPEDEF && cand->str == leaf) {
+							resolved = cand.get();
+							break;
+						}
+				tbase = tbase.substr(sep + 2);   // the bare name, for the fallbacks below
+			}
+		}
 		// the override name comes from the instantiator's scope (often
 		// unqualified via import); the parametric module sees the same
 		// typedef package-qualified, so match a full name or a :: suffix
 		auto matches = [&](const std::string &cname) {
-			return cname == tname || (cname.size() > tbase.size() + 2 &&
+			return cname == tname || cname == "\\" + tbase || (cname.size() > tbase.size() + 2 &&
 					cname.compare(cname.size() - tbase.size(), tbase.size(), tbase) == 0 &&
 					cname.compare(cname.size() - tbase.size() - 2, 2, "::") == 0);
 		};

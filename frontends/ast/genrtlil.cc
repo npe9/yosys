@@ -2398,7 +2398,21 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 						// derive can splice the type definition into the
 						// parametric module.
 						if (value->type == AST_IDENTIFIER && value->id2ast && value->id2ast->type == AST_TYPEDEF) {
-							cell->parameters[paraname] = RTLIL::Const(value->id2ast->str);
+							// a typedef of THIS module is invisible to the child:
+							// qualify it `module::name` so derive can look it up in
+							// this module's AST (register v3 D0); file-scope and
+							// package typedefs keep their own names
+							std::string tn = value->id2ast->str;
+							bool local = false;
+							if (current_ast_mod && current_ast_mod->type == AST_MODULE)
+								for (auto &c : current_ast_mod->children)
+									if (c.get() == value->id2ast) {
+										local = true;
+										break;
+									}
+							if (local && tn.compare(0, 1, "\\") == 0 && tn.find("::") == std::string::npos)
+								tn = current_ast_mod->str + "::" + tn.substr(1);
+							cell->parameters[paraname] = RTLIL::Const(tn);
 							continue;
 						}
 						cell->parameters[paraname] = RTLIL::Const(0);

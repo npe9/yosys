@@ -63,6 +63,20 @@ the frontend on two corpus files; open item).
   support, which upstream main does not parse, so they ride with the
   `sva-frontend` chunk.)
 
+### 0c. `cast-fixes` — two static-cast bugs that reproduce on upstream main
+- **Files:** `frontends/verilog/verilog_parser.y` (two `%precedence` lines
+  swapped: OP_CAST above UNARY_OPS, IEEE 1800-2017 11.3.2 makes the cast a
+  primary), `frontends/ast/simplify.cc` (one hunk: a cast to an unsized
+  base type is 1 bit, keyed on the parser's no-range marker),
+  `tests/verilog/cast_unary_precedence.ys`, `tests/verilog/cast_unsized_type.ys`.
+- **Reproduces on stock main (yosys-main worktree):** `assign y = ~W'(p);`
+  with `localparam int W = 4` -> "Static cast with zero or negative size"
+  (the size parses as ~4); `assign y = logic'(p);` -> the same error.
+  Both are SAT-pinned by the two tests.  Found 2026-10-17 via OpenTitan's
+  package functions (register v3 D7b) and prim_max_tree.
+- **Status:** landed on the fork (0bd82fcad, 203653d5d); chunk not yet
+  materialized.  Small and independent: open right after `typedef-dims`.
+
 ### 1. `cdc-sdc` — structural CDC analysis + SDC subset frontend
 - **Files:** `passes/cmds/cdc.cc`, `passes/cmds/read_sdc.cc`,
   `passes/cmds/sdc_constraints.h`, `tests/verilog/cdc_cases.{sv,sdc,ys}`,

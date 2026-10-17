@@ -80,21 +80,29 @@ the tags over all expectations; the gate is that no line says
 | `immediate` / `plain` | a non-temporal check the frontend already compiled (immediate assertion / clocked plain expression) |
 
 `sva2check -exact` turns every approximation into an error.  The
-approximation kinds, what they can miss, and the battery files that
-depend on them (from `sva2check -exact` over every `t*.sv`, 2026-10-17):
+approximation kinds, what they can miss, the battery files that depend
+on them (from `sva2check -exact` over every `t*.sv`, 2026-10-17) and the
+positive control that shows each detector firing (`xapprox.sv`, plain /
+`SVA_NOSPLIT=1` / `SVA_NOANC=1`; `t8.sv` for until):
 
-| kind | where | what can be missed | battery files |
-|---|---|---|---|
-| `first-match-overlap-window` | `first_match` over a ranged `##[lo:hi]` or `or` | an earlier parse end that belongs to ANOTHER overlapping attempt (beyond the static window) suppresses this attempt's `.first` | tfeat1, tfeat4 |
-| `first-match-any` | `first_match` over `and`/`intersect`, unbounded repetition, `[->]`/`[=]`, `within`, an instance body, or when the split budget is spent | `.first` degrades to the existential `.any` (later matches count) | none |
-| `first-match-locals-shared-slots` | `first_match` of a sequence with local variables | locals read from the shared slot file, not per parse | none |
-| `locals-lowest-hot-age` | a local-variable read at a point several attempt ages can reach | the lowest hot age wins; violations visible only to a younger overlapping attempt are missed | none (the age fold keeps linear sequences one-hot) |
-| `locals-merged-window` | ranged `##` whose tail reads locals and could not be split per offset | tail compiled once over the merged window | none |
-| `noncons-rep-merged-counter` | `[->m:n]`/`[=m:n]` with a finite bound inside a `##` chain, outside the anchored per-attempt path | the merged counter only checks `k >= m` (upper bound vacuous) | none |
-| `noncons-rep-seq-body-merged` | `[->]`/`[=]` over a SEQUENCE body (beyond the LRM's Boolean form) | occurrence ends of overlapping body attempts merge | tnoncons1 |
-| `noncons-rep-unbounded-top-age` | anchored `[->]`/`[=]` in an unbounded property | the saturated top age falls back to the time-0 count | none |
-| `until-merged-attempts` | `until`/`until_with` not at the property root (pulse start) | a `q` seen by an earlier attempt does not close the attempt starting now; one monitor merges them | t8 |
-| `weak-as-strong` | `weak(seq)` as a property | compiled strongly: sound for model checking, conservative at the end of a finite simulation trace | tfeat1, twithin |
+| kind | where | what can be missed | battery files | detector seen firing |
+|---|---|---|---|---|
+| `first-match-overlap-window` | `first_match` over a ranged `##[lo:hi]` or `or` | an earlier parse end that belongs to ANOTHER overlapping attempt (beyond the static window) suppresses this attempt's `.first` | tfeat1, tfeat4 | xapprox p_fm_win |
+| `first-match-any` | `first_match` over `and`/`intersect`, unbounded repetition, `[->]`/`[=]`, `within`, an instance body, or when the split budget is spent | `.first` degrades to the existential `.any` (later matches count) | none | xapprox p_fm_and |
+| `first-match-locals-shared-slots` | `first_match` of a sequence with local variables | locals read from the shared slot file, not per parse | none | xapprox p_fm_loc |
+| `locals-lowest-hot-age` | a local-variable read at a point several attempt ages can reach | the lowest hot age wins; violations visible only to a younger overlapping attempt are missed | none (the age fold keeps linear sequences one-hot; the per-offset split keeps ranged ones) | xapprox p_loc_win, p_fm_loc under SVA_NOSPLIT=1 |
+| `locals-merged-window` | ranged `##` whose tail is an `$sva` subtree reading locals and could not be split per offset | tail compiled once over the merged window | none | not observed: an expression tail reading a local shows up as `locals-lowest-hot-age` (the actual effect); an `$sva` tail that defeats the split was not constructed |
+| `noncons-rep-merged-counter` | `[->m:n]`/`[=m:n]` with a finite bound inside a `##` chain, outside the anchored per-attempt path | the merged counter only checks `k >= m` (upper bound vacuous) | none | xapprox p_nc_loc under SVA_NOANC=1 |
+| `noncons-rep-seq-body-merged` | `[->]`/`[=]` over a SEQUENCE body (beyond the LRM's Boolean form) | occurrence ends of overlapping body attempts merge | tnoncons1 | xapprox p_ncseq |
+| `noncons-rep-unbounded-top-age` | anchored `[->]`/`[=]` in an unbounded property | the saturated top age falls back to the time-0 count | none | xapprox p_nc_loc |
+| `until-merged-attempts` | `until`/`until_with` not at the property root (pulse start) | a `q` seen by an earlier attempt does not close the attempt starting now; one monitor merges them | t8 | t8 p_utw_b |
+| `weak-as-strong` | `weak(seq)` as a property | compiled strongly: sound for model checking, conservative at the end of a finite simulation trace | tfeat1, twithin | xapprox p_weak |
+
+The positive controls earned their keep immediately: no detector ever
+fired on a NAMED property, because `assert property (@(posedge clk) q)`
+with an unclocked `property q` was being lowered to `!q` on the undriven
+name wire and reported as converted (fixed the same day; `tdeclclk.sv`
+pins it).
 
 Not in this table because they are bugs, not documented approximations:
 the single-monitor divergences F2-F6 and F10 listed in

@@ -1763,7 +1763,7 @@ struct SvaCompiler {
 			// decomposed per parse age.  Falls back to the merged window
 			// below when a subsequence cannot be decomposed (documented
 			// approximation).
-			if (split_ranges && hi >= 0 && !in_split && getenv("SVA_NOSPLIT") == nullptr) {
+			if (split_ranges && hi >= 0 && !in_split) {
 				Cell *tailc = child(ti);
 				auto sig_uses_locals = [&](SigSpec s) {
 					for (auto bit : s)
@@ -1780,12 +1780,16 @@ struct SvaCompiler {
 					lhsvar = l0 < 0 || l0 != l1;
 				}
 				if (tailu || hi > lo || lhsvar) {
-					auto sp = seq_ends_split(n, SigSpec(), start, gate);
-					if (sp.second) {
-						SigSpec r = Const(0, 1);
-						for (auto &e : sp.first)
-							r = orN({r, e.end});
-						return r;
+					// SVA_NOSPLIT=1 skips the exact split (positive control
+					// for the merged-window detector below)
+					if (getenv("SVA_NOSPLIT") == nullptr) {
+						auto sp = seq_ends_split(n, SigSpec(), start, gate);
+						if (sp.second) {
+							SigSpec r = Const(0, 1);
+							for (auto &e : sp.first)
+								r = orN({r, e.end});
+							return r;
+						}
 					}
 					if (tailu)
 						approx("locals-merged-window", "## at " + std::string(log_id(n)));
@@ -2552,6 +2556,8 @@ struct SvaCompiler {
 		}
 		struct DepthGuard { int *c; ~DepthGuard() { --*c; } } dg { &depth_ctr };
 		std::string op = sva_op(n);
+		if (getenv("SVA_DEBUG_OPS"))
+			log("sva2check-debug: prop_fail %s (%s) in %s\n", op.c_str(), log_id(n), check_name.c_str());
 		auto ports = ports_of(n);
 		if (clone_scope && !clone_cmap.count(n))
 			ensure_stub(n);
@@ -2915,6 +2921,8 @@ struct SvaCompiler {
 		if (++depth_ctr > 200)
 			log_error("sva2check: runaway recursion in prop_dispatch.\n");
 		struct DepthGuard { int *c; ~DepthGuard() { --*c; } } dg { &depth_ctr };
+		if (c && getenv("SVA_DEBUG_OPS"))
+			log("sva2check-debug: prop_dispatch %s (%s) in %s\n", sva_op(c).c_str(), log_id(c), check_name.c_str());
 		if (c) {
 			if (!is_seq_op(sva_op(c))) {
 				// named instance: sequence declarations in property
@@ -3379,6 +3387,8 @@ struct Sva2CheckPass : public Pass {
 
 				SvaCompiler comp(mod, SigSpec(), true, stringf("$sva%s", log_id(cell)), &decls);
 				comp.check_name = log_id(cell);
+				if (getenv("SVA_DEBUG_OPS"))
+					log("sva2check-debug: check %s\n", log_id(cell));
 				comp.exact_mode = exact_mode;
 
 				SigSpec aport = cell->getPort(ID(A));
@@ -3779,6 +3789,34 @@ struct Sva2CheckPass : public Pass {
 						if (!had_slots && comp.slots_mode) {
 							// slot state is per-property: do not leak it into
 							// the next $check of this module
+							comp.slots_mode = false;
+							comp.nslots = 0;
+							comp.age = SigSpec();
+							comp.slotfiles.clear();
+							comp.pending_wr.clear();
+						}
+					} else if (Cell *dcell = comp.decl_for_wire(comp.resolve(body_sig))) {
+						// a bare declaration name under the outer spec's
+						// clock: `assert property (@(posedge clk) q)` with an
+						// UNCLOCKED `property q; ...`.  The declaration body
+						// is the property (instance with no actuals).  This
+						// used to fall through to the plain-wire branch below
+						// and lower to !q on the undriven name wire -- a
+						// silent wrong lowering (found by the A3 positive
+						// controls: no detector ever fired on named
+						// properties).
+						auto dp = comp.ports_of(dcell);
+						Cell *dbody = dp.empty() ? nullptr : comp.child_cell(dcell->getPort(dp[0]));
+						bool had_slots = comp.slots_mode;
+						pool<Cell *> seen;
+						if (dbody && comp.tree_has_locals(dbody, seen)) {
+							int l = comp.seq_max_len(dbody);
+							if (l < 0 || l > 64)
+								log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(dbody));
+							comp.init_slots(l);
+						}
+						fail = comp.prop_dispatch(body_sig, nullptr, Const(1, 1));
+						if (!had_slots && comp.slots_mode) {
 							comp.slots_mode = false;
 							comp.nslots = 0;
 							comp.age = SigSpec();

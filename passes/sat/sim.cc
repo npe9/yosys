@@ -132,6 +132,12 @@ struct SimShared
 	std::vector<std::unique_ptr<OutputWriter>> outputfiles;
 	std::vector<std::pair<int,std::map<int,Const>>> output_data;
 	bool ignore_x = false;
+	// register v3 B1/B2: unlowered formal cells are refused, x-valued
+	// checks are reported as such, and checks that never evaluate to a
+	// known value are summarized
+	bool allow_unlowered = false;
+	std::vector<std::string> unlowered;
+	dict<RTLIL::Cell*, bool> check_known;
 	// xprop merge (default, LRM): x mux-select merges equal arms per bit.
 	// xprop pessimistic: any x in a mux/bwmux select poisons the result.
 	bool xprop_pessimistic = false;
@@ -367,6 +373,14 @@ struct SimInstance
 
 			if (cell->type.in(ID($assert), ID($cover), ID($assume), ID($check)))
 				formal_database.insert(cell);
+			// the frontend's formal cells are ESCAPED types (`\$sva`, `\$past`,
+			// ...: addCell with the literal "\\$sva"), not the builtin
+			// ID($sva) spelling; match both
+			// (a builtin $fair / $live is a LOWERED liveness constraint, not a
+			// placeholder: sva2check emits them; sim just cannot evaluate them)
+			if (cell->type.in(ID($sva), ID($sampled), ID($rose), ID($fell), ID($past), ID($stable), ID($changed)) ||
+					cell->type.in("\\$sva", "\\$sampled", "\\$rose", "\\$fell", "\\$past", "\\$stable", "\\$changed"))
+				shared->unlowered.push_back(stringf("%s.%s (%s)", hiername().c_str(), log_id(cell), log_id(cell->type)));
 
 			if (cell->type == ID($initstate))
 				initstate_database.insert(cell);
@@ -415,6 +429,14 @@ struct SimInstance
 					zinit(val);
 				zinit(mem.data);
 			}
+		}
+
+		if (parent == nullptr && !shared->unlowered.empty()) {
+			for (auto &u : shared->unlowered)
+				log("sim: unlowered formal cell %s\n", u.c_str());
+			if (!shared->allow_unlowered)
+				log_error("sim: refusing a design with %d unlowered formal cell(s) ($sva/$past/...): run sva2check first, "
+						"or pass -allow-unlowered (they read x; register v3 B1).\n", GetSize(shared->unlowered));
 		}
 	}
 
@@ -654,8 +676,8 @@ struct SimInstance
 		// Uncompiled SVA builtins keep reading x (their documented "loud"
 		// behavior); they are meaningless without sva2check and must not
 		// hard-error the time-0 evaluation sweep.
-		if (cell->type.in(ID($sva), ID($fair), ID($sampled), ID($rose),
-				ID($fell), ID($past), ID($stable), ID($changed)))
+		if (cell->type.in(ID($sva), ID($fair), ID($sampled), ID($rose), ID($fell), ID($past), ID($stable), ID($changed)) ||
+				cell->type.in("\\$sva", "\\$fair", "\\$sampled", "\\$rose", "\\$fell", "\\$past", "\\$stable", "\\$changed"))
 			return;
 
 		if (cell->type.in(ID($finish), ID($stop)))
@@ -1072,12 +1094,23 @@ struct SimInstance
 				if (is_assume && en == State::S1 && a != State::S1)
 					log("Assumption %s.%s (%s) failed.\n", hiername(), cell, label);
 
-				if (!is_cover && !is_assume && en == State::S1 && a != State::S1) {
-					log_cell_w_hierarchy("Failed assertion", cell);
-					if (shared->serious_asserts)
-						log_error("Assertion %s.%s (%s) failed.\n", hiername(), cell, label);
+				if (!is_cover && !is_assume && en == State::S1) {
+					bool known = a == State::S0 || a == State::S1;
+					if (known)
+						shared->check_known[cell] = true;
 					else
-						log_warning("Assertion %s.%s (%s) failed.\n", hiername(), cell, label);
+						shared->check_known.insert(std::make_pair(cell, false));
+					if (a != State::S1) {
+						// register v3 B2: an x-valued check is reported as such,
+						// never as an ordinary counterexample
+						const char *what = known ? "failed"
+								: "is x-valued (not a counterexample: an undriven or uninitialized input to the check)";
+						log_cell_w_hierarchy(known ? "Failed assertion" : "X-valued assertion", cell);
+						if (shared->serious_asserts)
+							log_error("Assertion %s.%s (%s) %s.\n", hiername(), cell, label, what);
+						else
+							log_warning("Assertion %s.%s (%s) %s.\n", hiername(), cell, label, what);
+					}
 				}
 			}
 		}
@@ -2909,6 +2942,13 @@ struct SimPass : public Pass {
 		log("        fail the simulation command if, in the course of simulating,\n");
 		log("        any of the asserts in the design fail\n");
 		log("\n");
+		log("    -allow-unlowered\n");
+		log("        simulate a design that still contains unlowered formal cells\n");
+		log("        ($sva, $past, ...; they read x).  Refused by default: run\n");
+		log("        sva2check first (register v3 B1).  An x-valued check is reported\n");
+		log("        as such, and checks that never evaluate to a known value are\n");
+		log("        summarized at the end (B2).\n");
+		log("\n");
 		log("    -fst-noinit\n");
 		log("        do not initialize latches and memories from an input FST or VCD file\n");
 		log("        (use the initial defined by the design instead)\n");
@@ -3082,6 +3122,10 @@ struct SimPass : public Pass {
 				worker.serious_asserts = true;
 				continue;
 			}
+			if (args[argidx] == "-allow-unlowered") {
+				worker.allow_unlowered = true;
+				continue;
+			}
 			if (args[argidx] == "-fst-noinit") {
 				worker.fst_noinit = true;
 				continue;
@@ -3159,6 +3203,20 @@ struct SimPass : public Pass {
 		}
 
 		worker.write_summary();
+
+		// register v3 B2: a check that never saw a known value was never
+		// really checked
+		std::vector<std::string> never;
+		for (auto &it : worker.check_known)
+			if (!it.second)
+				never.push_back(log_id(it.first));
+		if (!never.empty()) {
+			std::sort(never.begin(), never.end());
+			std::string list;
+			for (auto &n : never)
+				list += (list.empty() ? "" : ", ") + n;
+			log("sim: %d check(s) never evaluated to a known value: %s\n", GetSize(never), list.c_str());
+		}
 	}
 } SimPass;
 

@@ -177,6 +177,13 @@ which does not.
 - A proof whose compiled body is a constant prints as `PROVED(const)` in
   run_battery (tag `exact:const`): true, but not a statement about the
   circuit.
+- `sim` (B1/B2): a design that still carries unlowered formal cells
+  (`$sva`, `$past`, ...) is refused with the list printed first
+  (`-allow-unlowered` runs anyway; they read x); an x-valued check is
+  reported as "is x-valued (not a counterexample ...)" instead of
+  "failed"; the run ends with "N check(s) never evaluated to a known
+  value" when any check never saw 0/1 while enabled.  Pins:
+  tests/verilog/sim_refuse_unlowered.ys, sim_xvalued.ys.
 
 ## Circuit mutation leg (register v3 C3, `conformance/run_mutation.py`)
 

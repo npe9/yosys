@@ -1,0 +1,13 @@
+# Register v3 B1: `sim` refuses a design that still carries unlowered formal
+# cells ($sva trees the frontend emits for concurrent assertions) instead of
+# reading them as x and "failing" the assertion; -allow-unlowered runs anyway.
+# (one property tree is several $sva cells; the count is an implementation detail)
+logger -expect error "refusing a design with [0-9]+ unlowered formal cell" 1
+read_verilog -sv -formal <<EOT
+module m(input logic clk, input logic a, b);
+  p: assert property (@(posedge clk) a |-> ##1 b);
+endmodule
+EOT
+hierarchy -top m
+proc
+sim -clock clk -n 3

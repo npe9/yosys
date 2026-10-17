@@ -1,0 +1,16 @@
+# Register v3 B2: a check whose condition is x is reported as x-valued, not
+# as a counterexample, and the run ends with the never-known summary.
+logger -nowarn "is x-valued"
+logger -expect log "1 check\(s\) never evaluated to a known value: p" 1
+read_verilog -sv -formal <<EOT
+module m(input logic clk, output logic y);
+  logic q;   // never driven: x in simulation
+  assign y = q;
+  p: assert property (@(posedge clk) q);
+endmodule
+EOT
+hierarchy -top m
+sva2check
+proc
+async2sync
+sim -clock clk -n 3

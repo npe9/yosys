@@ -97,6 +97,14 @@ the frontend on two corpus files; open item).
   battery (`make test` / `test-sva`) as its entry ticket, and split
   further (frontend grammar vs lowering vs engines) only if a
   maintainer asks.
+- **Honesty hooks the branch offer must quote (register v3, 2026-10-17):**
+  every `$check` carries `(* sva_lowering = exact | approx:<kinds> |
+  placeholder:<why> | immediate | plain *)` and every verdict printer
+  shows it; `sva2check -exact` refuses approximations; the approximation
+  table (kind, what it misses, battery files) lives in
+  `tests/sva_battery/README.md`; the independent LRM model
+  `tests/sva_pbt` lists the known single-monitor divergences (F2-F6,
+  F10) that per-attempt tracking still has to fix.
 - **Status:** planned; documented as the high-risk/high-value endgame.
 
 ### 4. `lsp` — editor diagnostics server

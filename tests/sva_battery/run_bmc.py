@@ -26,6 +26,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import run_ic3  # lowering_tags()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 YOSYS = os.environ.get("YOSYS", os.path.join(ROOT, "third_party/yosys/build/yosys"))
 SMTBMC = os.environ.get("SMTBMC", os.path.join(os.path.dirname(YOSYS), "yosys-smtbmc"))
@@ -220,24 +223,26 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
     sline("DONE")
 
     print("%s: %d properties checked (bound %d):" % (label, len(exp), bound))
+    tags = run_ic3.lowering_tags(yosys, [path], top)
+    lt = lambda name: " [lowering=%s]" % tags.get(name, "untagged")
     ok = True
     for name in sorted(set(verdicts) - set(exp)):
         v = verdicts[name]
-        print("  %-9s %s (no expectation)" % ("cex@%d" % v[1] if v[0] == "cex" else "holds", name))
+        print("  %-9s %s (no expectation)%s" % ("cex@%d" % v[1] if v[0] == "cex" else "holds", name, lt(name)))
     for name in sorted(exp):
         kind, n = exp[name]
         if name in skipped:
             # write_smt2 dropped the liveness-flavored $check: no assertion
             # in the SMT, so this leg has nothing to check (ic3 leg decides)
-            print("  skipped   %s (liveness $check not SMT-encodable, ic3-only)"
-                  % name)
+            print("  skipped   %s (liveness $check not SMT-encodable, ic3-only)%s"
+                  % (name, lt(name)))
             continue
         if kind == "dis" and n is None:
             # liveness-class expectation (s_until/s_eventually family): the
             # bmc leg checks the safety half only, the F-half is ic3-only
             # (write_smt2 skips the liveness legs) -- not a mismatch, just
             # not bmc-checkable
-            print("  skipped   %s (liveness DIS, ic3-only)" % name)
+            print("  skipped   %s (liveness DIS, ic3-only)%s" % (name, lt(name)))
             continue
         v = verdicts.get(name)
         if v is None:
@@ -245,11 +250,11 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
             ok = False
             continue
         if kind == "proved" and v[0] == "proved":
-            print("  proved    %s (temporal induction)" % name)
+            print("  proved    %s (temporal induction)%s" % (name, lt(name)))
         elif kind == "proved" and v[0] == "holds":
-            print("  holds     %s (no CEX to step %d)" % (name, v[1]))
+            print("  holds     %s (no CEX to step %d)%s" % (name, v[1], lt(name)))
         elif kind == "dis" and v[0] == "cex" and (n is None or v[1] == n):
-            print("  cex@%d    %s (as expected)" % (v[1], name))
+            print("  cex@%d    %s (as expected)%s" % (v[1], name, lt(name)))
         else:
             print("  MISMATCH  %s: expected %s%s, got %s" %
                   (name, kind.upper(), " @%d" % n if n is not None else "", v))

@@ -73,6 +73,7 @@
 
 #include "kernel/yosys.h"
 #include <cstdio>
+#include <algorithm>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -160,6 +161,38 @@ struct SvaCompiler {
 	bool split_ranges = false;
 	int split_budget = 64;
 	bool in_split = false;   // re-entry guard: seq_end stays merged while set
+
+	// --- lowering provenance (register v3 A3/B3) ------------------------
+	// Every documented approximation taken while compiling the current
+	// check is recorded by kind (the kind names are stable: they are the
+	// rows of the approximation table in tests/sva_battery/README.md),
+	// warned about once per check and kind with the check's name, and
+	// written to the $check as (* sva_lowering = "approx:k1,k2" *) so
+	// every verdict printer can show it next to PROVED/DIS.  With -exact
+	// an approximation is an error instead of a warning.
+	std::string check_name;
+	bool exact_mode = false;
+	std::vector<std::string> approx_kinds;
+	void approx(const std::string &kind, const std::string &where)
+	{
+		if (exact_mode)
+			log_error("sva2check: -exact: %s needs the '%s' approximation (%s).\n",
+					check_name.c_str(), kind.c_str(), where.c_str());
+		if (std::find(approx_kinds.begin(), approx_kinds.end(), kind) != approx_kinds.end())
+			return;
+		approx_kinds.push_back(kind);
+		log_warning("sva2check: %s: lowered with approximation '%s' (%s).\n",
+				check_name.c_str(), kind.c_str(), where.c_str());
+	}
+	std::string lowering_tag() const
+	{
+		if (approx_kinds.empty())
+			return "exact";
+		std::string t = "approx:";
+		for (size_t i = 0; i < approx_kinds.size(); i++)
+			t += (i ? "," : "") + approx_kinds[i];
+		return t;
+	}
 	struct SlotFile {
 		int width = 0;
 		std::vector<Wire *> q;                        // slot registers
@@ -355,6 +388,12 @@ struct SvaCompiler {
 
 	SigSpec reg(SigSpec d, const char *role)
 	{
+		// a compile-time age bit that can never be hot stays the constant
+		// 0 (monitor registers carry no init attribute, so the fold also
+		// keeps a never-hot age from reading free at step 0 without
+		// -init-zero); the hot-age count in local_read relies on it
+		if (strcmp(role, "age") == 0 && d.is_fully_const() && d.as_const().is_fully_zero())
+			return Const(0, d.size());
 		Wire *q = wn(role, d.size());
 		mod->addDff(NEW_ID, clk, strcmp(role, "past") == 0 ? d : dis_gate(d), q, clk_pos);
 		return q;
@@ -1046,8 +1085,14 @@ struct SvaCompiler {
 		for (int k = 1; k <= hi; k++) {
 			cur = age_tick(cur);
 			if (k >= lo)
-				for (int j = 0; j < nslots; j++)
-					acc = sigset(acc, j, mod->Or(NEW_ID, acc[j], cur[j]));
+				for (int j = 0; j < nslots; j++) {
+					// fold constant-0 bits so the compile-time hotness of
+					// the window stays visible (see reg() for role "age")
+					if (acc[j] == State::S0)
+						acc = sigset(acc, j, cur[j]);
+					else if (cur[j] != State::S0)
+						acc = sigset(acc, j, mod->Or(NEW_ID, acc[j], cur[j]));
+				}
 		}
 		return acc;
 	}
@@ -1118,6 +1163,17 @@ struct SvaCompiler {
 				v = mod->Mux(NEW_ID, v, chain[k], age[k]);
 			read_cache[xw] = {slot_epoch, v};
 			return v;
+		}
+		{
+			// more than one age can be at this read at compile time: the
+			// lowest hot age wins (violations visible only to a younger
+			// overlapping attempt can be missed)
+			int hot = 0;
+			for (auto bit : age)
+				if (bit.wire != nullptr || bit.data != State::S0)
+					hot++;
+			if (hot > 1)
+				approx("locals-lowest-hot-age", "local " + std::string(log_id(xw)));
 		}
 		SlotFile &sf = slotfiles[xw];
 		if (sf.q.empty()) {
@@ -1731,6 +1787,8 @@ struct SvaCompiler {
 							r = orN({r, e.end});
 						return r;
 					}
+					if (tailu)
+						approx("locals-merged-window", "## at " + std::string(log_id(n)));
 				}
 			}
 
@@ -1810,6 +1868,7 @@ struct SvaCompiler {
 			if (body_cell && sva_op(body_cell) != "true") {
 				if (tree_uses_locals(body_cell))
 					log_error("sva2check: local variables in a non-contiguous repetition are not supported in %s.\n", log_id(n));
+				approx("noncons-rep-seq-body-merged", std::string(op) + " at " + log_id(n));
 				bsig = seq_end(body_cell, Const(1, 1), gate);
 			} else {
 				bsig = andN({reduce1(body), gate_now(gate)});
@@ -1861,6 +1920,7 @@ struct SvaCompiler {
 						// saturated top age on an unbounded property: the
 						// slot may have been recycled by a newer attempt,
 						// so fall back to the saturated time-0-based count
+						approx("noncons-rep-unbounded-top-age", std::string(op) + " at " + log_id(n));
 						diff = mod->Mux(NEW_ID, SigSpec(cw), Const((1 << aw) - 1, aw), SigSpec(ovw));
 					} else {
 						SigSpec ad = addr_onehot(k);
@@ -1885,6 +1945,8 @@ struct SvaCompiler {
 				SigSpec idle = mod->Not(NEW_ID, bsig);
 				return andN({idle, gate_now(gate), any});
 			}
+			if (!every_tick && hi >= 0)
+				approx("noncons-rep-merged-counter", std::string(op) + " at " + log_id(n));
 			int cap = std::max(m, 1);
 			int w = 1;
 			while ((1 << w) <= cap) w++;
@@ -2063,6 +2125,8 @@ struct SvaCompiler {
 			if (!slots_mode && child(0)) {
 				end = seq_end_fm(child(0), start, gate).first;
 			} else {
+				if (child(0))
+					approx("first-match-locals-shared-slots", "first_match at " + std::string(log_id(n)));
 				end = seq_dispatch(port(0), child(0), start, gate);
 			}
 			if (GetSize(ports) >= 2) {
@@ -2220,10 +2284,13 @@ struct SvaCompiler {
 			int span = hi - lo + 1;
 			if (span > fm_budget) {
 				// splitting would blow up: .first degrades to .any
+				approx("first-match-any", "split budget at " + std::string(log_id(n)));
 				SigSpec e = seq_dispatch(port(ti), child(ti), t_any, gate);
 				return std::make_pair(e, any);
 			}
 			fm_budget -= span;
+			if (hi > lo)
+				approx("first-match-overlap-window", "## at " + std::string(log_id(n)));
 			// .first: per-offset tail compiles; end_k survives only if no
 			// earlier offset produced an end at or before it for this
 			// attempt.  An earlier offset's end sits at most (hi-lo) +
@@ -2232,6 +2299,7 @@ struct SvaCompiler {
 			// other attempts -- documented approximation).
 			int w = (hi - lo) + (child(ti) ? seq_max_len(child(ti)) : 1);
 			if (w < 0 || w > 64) {
+				approx("first-match-any", "window at " + std::string(log_id(n)));
 				SigSpec e = seq_dispatch(port(ti), child(ti), t_any, gate);
 				return std::make_pair(e, any);
 			}
@@ -2261,8 +2329,11 @@ struct SvaCompiler {
 			// approximation for overlapping attempts)
 			int la = child(0) ? seq_max_len(child(0)) : 1;
 			int lb = child(1) ? seq_max_len(child(1)) : 1;
-			if (la < 0 || la > 64 || lb < 0 || lb > 64)
+			if (la < 0 || la > 64 || lb < 0 || lb > 64) {
+				approx("first-match-any", "or at " + std::string(log_id(n)));
 				return std::make_pair(any, any);
+			}
+			approx("first-match-overlap-window", "or at " + std::string(log_id(n)));
 			SigSpec a_ever = a.second;
 			for (int j = 1; j <= lb; j++)
 				a_ever = orN({a_ever, delay(a.second, j, "fmo")});
@@ -2276,6 +2347,7 @@ struct SvaCompiler {
 		if (op == "and" || op == "intersect") {
 			// earliest common end is not derivable from the operands'
 			// earliest ends; approximate .first by .any (documented)
+			approx("first-match-any", op + " at " + std::string(log_id(n)));
 			auto a = sub_fm(0);
 			auto b = sub_fm(1);
 			SigSpec both = mod->And(NEW_ID, a.second, b.second);
@@ -2322,14 +2394,21 @@ struct SvaCompiler {
 				SigSpec any = rep_chain_end(child(0), port(0), start, gate, std::max(m, 1), hi);
 				return std::make_pair(first, any);
 			}
+			approx("first-match-any", "unbounded repetition at " + std::string(log_id(n)));
 			return leaf();  // unbounded run: approximate
 		}
 		if (op == "true" || op == "inside" || op == "weq" || op == "wne" ||
-				op == "meq" || op == "assign" || op == "[->]" || op == "[=]" ||
-				op == "within" || op == "##[*]" || op == "##[+]" || op == "seq_match")
+				op == "meq" || op == "assign")
+			return leaf();  // boolean leaves: exact
+		if (op == "[->]" || op == "[=]" || op == "within" || op == "##[*]" ||
+				op == "##[+]" || op == "seq_match") {
+			approx("first-match-any", op + " at " + std::string(log_id(n)));
 			return leaf();
-		if (Cell *decl = decl_by_name(op))
+		}
+		if (decl_by_name(op)) {
+			approx("first-match-any", "instance body " + op);
 			return leaf();  // instance body: approximate (documented)
+		}
 		return leaf();
 	}
 
@@ -2433,6 +2512,8 @@ struct SvaCompiler {
 	// semantics: q completes only together with p.
 	SigSpec until_fail(SigSpec p, SigSpec q, SigSpec start, bool with)
 	{
+		if (!(start.is_fully_const() && start.as_const() == Const(1, 1)))
+			approx("until-merged-attempts", with ? "until_with" : "until");
 		SigSpec active = feedback([=](SigSpec qq) {
 			return orN({start, qq});
 		}, "until_active", 1);
@@ -2687,8 +2768,10 @@ struct SvaCompiler {
 			// property carries the same completion obligation as strong.
 			// Compiling it strongly is sound for PDR/ic3 and conservative
 			// for finite simulation.
-			if (child(0) && is_seq_op(sva_op(child(0))))
+			if (child(0) && is_seq_op(sva_op(child(0)))) {
+				approx("weak-as-strong", "weak at " + std::string(log_id(n)));
 				return strong_seq_fail(child(0), start);
+			}
 			return prop_dispatch(port(0), child(0), start);
 		}
 		if (op == "always" || op == "s_always") {
@@ -3162,7 +3245,7 @@ struct Sva2CheckPass : public Pass {
 	void help() override
 	{
 		log("\n");
-		log("    sva2check [-expose_bad] [selection]\n");
+		log("    sva2check [-expose_bad] [-exact] [selection]\n");
 		log("\n");
 		log("Compile the $sva property trees under assert-flavor $check cells into\n");
 		log("synchronous monitor hardware (single-clock spec subset: ## delays and\n");
@@ -3184,6 +3267,13 @@ struct Sva2CheckPass : public Pass {
 		log("operand lowers the same way through a pending-bit monitor\n");
 		log("(A = !pend || b, bad = pend && !b).\n");
 		log("\n");
+		log("Every $check the pass touches gets (* sva_lowering = ... *): \"exact\",\n");
+		log("\"approx:<kind>[,<kind>]\" naming each documented approximation taken\n");
+		log("(each is also a warning with the check's name), \"placeholder:<why>\"\n");
+		log("for a skipped check whose A port is still the frontend placeholder,\n");
+		log("\"immediate\" / \"plain\" for non-temporal checks the frontend already\n");
+		log("compiled.  With -exact, taking an approximation is an error.\n");
+		log("\n");
 		log("With -expose_bad, additionally create a module output port per\n");
 		log("converted check named bad_<check> driven by EN && !A, for AIGER\n");
 		log("export to external model checkers.\n");
@@ -3195,10 +3285,15 @@ struct Sva2CheckPass : public Pass {
 		log_header(design, "Executing SVA2CHECK pass (compile $sva trees into $check cells).\n");
 
 		bool expose_bad = false;
+		bool exact_mode = false;
 		std::vector<std::string> sub_args;
 		for (auto &arg : args) {
 			if (arg == "-expose_bad") {
 				expose_bad = true;
+				continue;
+			}
+			if (arg == "-exact") {
+				exact_mode = true;
 				continue;
 			}
 			sub_args.push_back(arg);
@@ -3278,10 +3373,13 @@ struct Sva2CheckPass : public Pass {
 				if (flavor != "assert" && flavor != "assume" && flavor != "restrict") {
 					unsupported++;
 					log("Skipping %s/%s: flavor %s not supported.\n", log_id(mod), log_id(cell), flavor.c_str());
+					cell->attributes[ID(sva_lowering)] = Const("placeholder:flavor " + flavor);
 					continue;
 				}
 
 				SvaCompiler comp(mod, SigSpec(), true, stringf("$sva%s", log_id(cell)), &decls);
+				comp.check_name = log_id(cell);
+				comp.exact_mode = exact_mode;
 
 				SigSpec aport = cell->getPort(ID(A));
 				Cell *topcell = aport.size() == 1 ? comp.find_sva_driver(aport[0]) : nullptr;
@@ -3307,6 +3405,9 @@ struct Sva2CheckPass : public Pass {
 					// silently left EVERY temporal check in the module as an
 					// unconnected placeholder -- 22 of 159 OpenTitan prim
 					// files, ~half their checks.)
+					if (!cell->attributes.count(ID(sva_lowering)))
+						cell->attributes[ID(sva_lowering)] = Const(std::string(
+								cell->getParam(ID::TRG_ENABLE).as_bool() ? "plain" : "immediate"));
 					continue;
 				}
 
@@ -3339,6 +3440,7 @@ struct Sva2CheckPass : public Pass {
 				if (!spec || sva_op(spec) != "spec") {
 					unsupported++;
 					log("Skipping %s/%s: property is not a $sva spec.\n", log_id(mod), log_id(cell));
+					cell->attributes[ID(sva_lowering)] = Const(std::string("placeholder:not a spec"));
 					continue;
 				}
 				for (auto &t : chain) {
@@ -3418,6 +3520,7 @@ struct Sva2CheckPass : public Pass {
 				if (bad || (!body && body_sig.empty() && body_const.empty())) {
 					unsupported++;
 					log("Skipping %s/%s: malformed spec.\n", log_id(mod), log_id(cell));
+					cell->attributes[ID(sva_lowering)] = Const(std::string("placeholder:malformed spec"));
 					continue;
 				}
 
@@ -3426,6 +3529,7 @@ struct Sva2CheckPass : public Pass {
 				if (clop == "no_clock" || clksig.empty() || !clksig[0].is_wire()) {
 					unsupported++;
 					log("Skipping %s/%s: no usable sampling clock.\n", log_id(mod), log_id(cell));
+					cell->attributes[ID(sva_lowering)] = Const(std::string("placeholder:no sampling clock"));
 					continue;
 				}
 				comp.clk = clksig[0];
@@ -3445,7 +3549,11 @@ struct Sva2CheckPass : public Pass {
 					// for the true body, and the false body is degenerate.
 					// the frontend pads $sva const ports to 32 bits;
 					// the boolean value is the low bit
-					cell->setPort(ID(A), SigSpec(body_const[0]));
+					SigSpec ca = SigSpec(body_const[0]);
+					if (disable && sva_op(disable) == "disable_iff")
+						ca = mod->Or(NEW_ID, comp.reduce1(disable->getPort(ID(A))), ca);
+					cell->setPort(ID(A), ca);
+					cell->attributes[ID(sva_lowering)] = Const(std::string("exact"));
 					converted++;
 					break;
 				}
@@ -3716,6 +3824,7 @@ struct Sva2CheckPass : public Pass {
 					log("sva2check: %s: multi-clock property; $check left unclocked (checked at every step).\n", log_id(cell));
 				}
 				cell->attributes[ID(sva2check)] = Const(1, 1);
+				cell->attributes[ID(sva_lowering)] = Const(comp.lowering_tag());
 
 				if (strong_until) {
 					if (comp.multiclock)

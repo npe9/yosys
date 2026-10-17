@@ -1636,6 +1636,13 @@ struct Ic3Pass : Pass
 		else
 			log("ic3: registers without \\init attribute have a free initial state.\n");
 
+		// lowering provenance from sva2check (register v3 A3): printed
+		// next to every verdict so no PROVED hides an approximation
+		auto lowering_tag = [](RTLIL::Cell *c) -> std::string {
+			if (!c->attributes.count(ID(sva_lowering)))
+				return std::string(" [lowering=untagged]");
+			return " [lowering=" + c->attributes.at(ID(sva_lowering)).decode_string() + "]";
+		};
 		int n_proved = 0, n_disproved = 0, n_undecided = 0;
 		for (auto cell : props) {
 			std::string name = cell->name.unescape();
@@ -1654,10 +1661,10 @@ struct Ic3Pass : Pass
 			int result = solver.prove(cell, depth);
 
 			if (result == 0) {
-				log("ic3: %s: proved\n", name.c_str());
+				log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());
 				n_proved++;
 			} else if (result == 1) {
-				log("ic3: %s: disproved (depth %d)\n", name.c_str(), depth);
+				log("ic3: %s: disproved (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
 				n_disproved++;
 				if (!cex_prefix.empty()) {
 					std::string safe = name;
@@ -1667,7 +1674,7 @@ struct Ic3Pass : Pass
 					solver.export_cex(cell, stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), depth);
 				}
 			} else {
-				log("ic3: %s: undecided\n", name.c_str());
+				log("ic3: %s: undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
 				n_undecided++;
 			}
 
@@ -1707,13 +1714,13 @@ struct Ic3Pass : Pass
 			int result = solver.prove_liveness(cell, depth, cex_file);
 
 			if (result == 0) {
-				log("ic3: %s: proved\n", name.c_str());
+				log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());
 				n_proved++;
 			} else if (result == 1) {
-				log("ic3: %s: disproved (depth %d)\n", name.c_str(), depth);
+				log("ic3: %s: disproved (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
 				n_disproved++;
 			} else {
-				log("ic3: %s: undecided\n", name.c_str());
+				log("ic3: %s: undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
 				n_undecided++;
 			}
 

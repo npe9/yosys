@@ -62,6 +62,48 @@ bound). `DIS @N` = counterexample at step N, where
 environment (proved soundness: an assume+assert pair on the same
 expression proves the engine honors the assumption).
 
+## Lowering provenance (`sva_lowering` tags)
+
+`sva2check` writes `(* sva_lowering = "..." *)` on every `$check` it
+touches, and every verdict printer in this directory (`run_ic3.py`,
+`run_bmc.py`, `prove.py`, `run_battery.py`) prints it as
+`[lowering=...]` next to the verdict, so a PROVED never hides the way
+the property was compiled.  `run_battery.py` ends with a histogram of
+the tags over all expectations; the gate is that no line says
+`untagged`.
+
+| tag | meaning |
+|---|---|
+| `exact` | compiled by the documented single-monitor lowering with no approximation taken |
+| `approx:<kind>[,<kind>]` | one or more of the approximations below was taken; each is also a warning naming the check |
+| `placeholder:<why>` | the check was skipped (cover flavor, no sampling clock, malformed/non-`$sva` spec); its `A` port is still the frontend placeholder and no engine may trust it |
+| `immediate` / `plain` | a non-temporal check the frontend already compiled (immediate assertion / clocked plain expression) |
+
+`sva2check -exact` turns every approximation into an error.  The
+approximation kinds, what they can miss, and the battery files that
+depend on them (from `sva2check -exact` over every `t*.sv`, 2026-10-17):
+
+| kind | where | what can be missed | battery files |
+|---|---|---|---|
+| `first-match-overlap-window` | `first_match` over a ranged `##[lo:hi]` or `or` | an earlier parse end that belongs to ANOTHER overlapping attempt (beyond the static window) suppresses this attempt's `.first` | tfeat1, tfeat4 |
+| `first-match-any` | `first_match` over `and`/`intersect`, unbounded repetition, `[->]`/`[=]`, `within`, an instance body, or when the split budget is spent | `.first` degrades to the existential `.any` (later matches count) | none |
+| `first-match-locals-shared-slots` | `first_match` of a sequence with local variables | locals read from the shared slot file, not per parse | none |
+| `locals-lowest-hot-age` | a local-variable read at a point several attempt ages can reach | the lowest hot age wins; violations visible only to a younger overlapping attempt are missed | none (the age fold keeps linear sequences one-hot) |
+| `locals-merged-window` | ranged `##` whose tail reads locals and could not be split per offset | tail compiled once over the merged window | none |
+| `noncons-rep-merged-counter` | `[->m:n]`/`[=m:n]` with a finite bound inside a `##` chain, outside the anchored per-attempt path | the merged counter only checks `k >= m` (upper bound vacuous) | none |
+| `noncons-rep-seq-body-merged` | `[->]`/`[=]` over a SEQUENCE body (beyond the LRM's Boolean form) | occurrence ends of overlapping body attempts merge | tnoncons1 |
+| `noncons-rep-unbounded-top-age` | anchored `[->]`/`[=]` in an unbounded property | the saturated top age falls back to the time-0 count | none |
+| `until-merged-attempts` | `until`/`until_with` not at the property root (pulse start) | a `q` seen by an earlier attempt does not close the attempt starting now; one monitor merges them | t8 |
+| `weak-as-strong` | `weak(seq)` as a property | compiled strongly: sound for model checking, conservative at the end of a finite simulation trace | tfeat1, twithin |
+
+Not in this table because they are bugs, not documented approximations:
+the single-monitor divergences F2-F6 and F10 listed in
+`tests/sva_pbt/README.md` (non-consecutive repetition ends, `##0` with
+goto, sequence properties firing late or hidden by a neighbouring
+attempt, bounded `s_eventually`, `or`/`implies` deciding early).  Their
+fix is per-attempt tracking (register v3 D5 / C0), after which this table
+shrinks with it.
+
 ## File classes
 
 - `t*.sv` — the green battery. Run all: `for f in t*.sv; do ...`.

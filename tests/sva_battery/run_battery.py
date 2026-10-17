@@ -70,6 +70,11 @@ def ic3_timeout(path):
     return 90
 
 
+# path -> {property: sva_lowering tag} as the ic3 leg logged it (A3: every
+# verdict line of the battery carries its tag; none may say "untagged")
+LOWERING = {}
+
+
 def run_ic3(path):
     proc = subprocess.run(
         [sys.executable, os.path.join(HERE, "run_ic3.py"), path,
@@ -82,15 +87,27 @@ def run_ic3(path):
     results = {}
     for line in blob.splitlines():
         name, status, depth = None, None, None
-        m = re.search(r"ic3: (\S+): (proved|disproved|undecided)(?: \(depth (\d+)\))?", line)
+        m = re.search(r"ic3: (\S+): (proved|disproved|undecided)(?: \(depth (\d+)\))?"
+                      r"(?: \[lowering=([^\]]+)\])?", line)
         if m:
             name, status, depth = m.group(1), m.group(2), m.group(3)
+            tagname = m.group(1).lstrip("\\")
+            if tagname.startswith("bad_"):
+                tagname = tagname[4:]
+            LOWERING.setdefault(path, {}).setdefault(tagname, m.group(4) or "untagged")
         else:
-            m = re.match(r"\s*(proved|disproved|undecided)\s+(\S+)(?: \(frame (\d+)\))?", line)
+            m = re.match(r"\s*(proved|disproved|undecided)\s+(\S+)(?: \(frame (\d+)\))?"
+                         r"(?: \[lowering=([^\]]+)\])?", line)
             if m:
                 status, name, depth = m.group(1), m.group(2), m.group(3)
                 if status == "disproved" and depth:
                     depth = int(depth) - 1  # frame N+1 -> depth N
+                tagname = name.lstrip("\\")
+                if tagname.startswith("bad_"):
+                    tagname = tagname[4:]
+                if tagname.endswith("$live"):
+                    tagname = tagname[:-5]
+                LOWERING.setdefault(path, {}).setdefault(tagname, m.group(4) or "untagged")
         if name is None:
             continue
         # cell names arrive escaped (\bad_ok) and sva2check prefixes
@@ -171,6 +188,9 @@ KNOWN_EDGES = {
 }
 
 
+TAG_HIST = {}
+
+
 def main():
     files = sorted(glob.glob(os.path.join(HERE, "t*.sv")))
     n_props = 0
@@ -185,6 +205,14 @@ def main():
                 file_failures.append(f"{rel}: {msg}")
         failures.extend(file_failures)
         print(f"{rel}: {'ok' if not file_failures else 'ISSUES'} ({len(exp)} properties)", flush=True)
+        tags = LOWERING.get(path, {})
+        for name, (kind, n) in sorted(exp.items()):
+            verdict = "PROVED" if kind == "proved" else ("DIS@%d" % n if n is not None else "DIS")
+            print(f"  {verdict:9s} {name} [lowering={tags.get(name, 'untagged')}]", flush=True)
+            TAG_HIST[tags.get(name, 'untagged')] = TAG_HIST.get(tags.get(name, 'untagged'), 0) + 1
+    print("\nlowering tags over the expectations:")
+    for tag, c in sorted(TAG_HIST.items(), key=lambda kv: -kv[1]):
+        print(f"  {c:4d}  {tag}")
     stress = sorted(os.path.basename(p) for p in
                     glob.glob(os.path.join(HERE, "x*.sv")))
     print(f"\ngreen leg: {len(files)} files, {n_props} properties")

@@ -415,11 +415,13 @@ def prove_file(path, args, workdir):
         if name not in verdicts:
             verdicts[name] = (v, step, engine, None)
     ok = True
+    ltags = run_ic3.lowering_tags(YOSYS, [path], args.top, args.include)
     for name, (v, step, engine, el) in sorted(verdicts.items()):
         tag = {"proved": "PROVED", "holds": "holds-to-bound",
                "undecided": "UNDECIDED"}.get(v, v)
-        print("  %-16s %-14s (%s%s)" % (tag, name, engine,
-                                        ", %.1fs" % el if el is not None else ""))
+        print("  %-16s %-14s (%s%s) [lowering=%s]" % (tag, name, engine,
+                                        ", %.1fs" % el if el is not None else "",
+                                        ltags.get(name, "untagged")))
     for name in sorted(set(exp) - set(verdicts)):
         print("  MISSING          %s" % name)
         ok = False

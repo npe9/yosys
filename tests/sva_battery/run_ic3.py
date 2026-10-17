@@ -77,6 +77,42 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
+IC3_LINE = re.compile(r"ic3: (\S+): (proved|disproved|undecided)(?: \(depth (\d+)\))?"
+                      r"(?: \[lowering=([^\]]+)\])?")
+
+
+def lowering_tags(yosys, files, top="", include=(), timeout=120):
+    """name -> sva_lowering tag of every $check after sva2check, from a
+    `dump t:$check` of the same read + hierarchy + sva2check as the engines
+    run (register v3 A3).  Drivers whose engine output carries no tag (the
+    smtbmc leg) print these; the ic3 leg prints the tag ic3 logs itself."""
+    inc = " ".join("-I" + d for d in include)
+    script = "read_verilog -sv -formal %s %s\nhierarchy -check%s\nsva2check\ndump t:$check\n" % (
+        inc, " ".join(files), (" -top " + top) if top else "")
+    try:
+        p = subprocess.run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" -p "$2"', "y", yosys, script],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {}
+    tags, cur = {}, None
+    for line in p.stdout.splitlines():
+        m = re.match(r'\s*attribute \\sva_lowering "([^"]*)"', line)
+        if m:
+            cur = m.group(1)
+            continue
+        m = re.match(r'\s*cell \$check \\?(\S+)', line)
+        if m:
+            name = m.group(1)
+            if name.startswith("bad_"):
+                name = name[4:]
+            tags[name] = cur or "untagged"
+            cur = None
+            continue
+        if line.strip() and not line.startswith(" "):
+            cur = None
+    return tags
+
+
 def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
     label = os.path.basename(path) if isinstance(path, str) else os.path.basename(path[0])
     files = path if isinstance(path, list) else [path]
@@ -111,9 +147,11 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
 
     conv = re.search(r"Converted (\d+) \$check cells, (\d+) unsupported", blob)
     results = {}
-    for m in re.finditer(r"ic3: (\S+): (proved|disproved|undecided)(?: \(depth (\d+)\))?", blob):
+    tags = {}
+    for m in IC3_LINE.finditer(blob):
         name, status, depth = m.group(1), m.group(2), m.group(3)
         results["bad_" + name] = (status, int(depth) if depth else None)
+        tags["bad_" + name] = m.group(4) or "untagged"
 
     summary = re.search(r"ic3: (\d+) properties: proved=(\d+) disproved=(\d+) undecided=(\d+)", blob)
     if not summary:
@@ -127,7 +165,7 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
     for name in sorted(results):
         status, depth = results[name]
         extra = f" (frame {depth + 1})" if depth is not None else ""
-        print(f"  {status:10s} {name}{extra}", flush=True)
+        print(f"  {status:10s} {name}{extra} [lowering={tags.get(name, 'untagged')}]", flush=True)
     return results
 
 

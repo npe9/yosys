@@ -3251,7 +3251,7 @@ struct Sva2CheckPass : public Pass {
 				if (flavor != "assert" && flavor != "assume" && flavor != "restrict") {
 					unsupported++;
 					log("Skipping %s/%s: flavor %s not supported.\n", log_id(mod), log_id(cell), flavor.c_str());
-					{ again = false; break; }
+					continue;
 				}
 
 				SvaCompiler comp(mod, SigSpec(), true, stringf("$sva%s", log_id(cell)), &decls);
@@ -3275,7 +3275,12 @@ struct Sva2CheckPass : public Pass {
 					// Plain expression property (no temporal operators): the
 					// $check EN/A form from the frontend is already final;
 					// async2sync/chformal lower edge-triggered TRG forms.
-					{ again = false; break; }
+					// (This used to `break` out of the module loop, so any
+					// immediate assertion that happened to be visited first
+					// silently left EVERY temporal check in the module as an
+					// unconnected placeholder -- 22 of 159 OpenTitan prim
+					// files, ~half their checks.)
+					continue;
 				}
 
 				// Unwrap property instances: assert property (p(args)) has no
@@ -3307,7 +3312,7 @@ struct Sva2CheckPass : public Pass {
 				if (!spec || sva_op(spec) != "spec") {
 					unsupported++;
 					log("Skipping %s/%s: property is not a $sva spec.\n", log_id(mod), log_id(cell));
-					{ again = false; break; }
+					continue;
 				}
 				for (auto &t : chain) {
 					auto &f = std::get<1>(t);
@@ -3333,7 +3338,7 @@ struct Sva2CheckPass : public Pass {
 					for (auto port : comp.ports_of(spec)) {
 						SigSpec sp = spec->getPort(port);
 						if (sp.empty())
-							{ again = false; break; }
+							{ bad = true; break; }
 						if (sp.is_fully_const()) {
 							// constant property body (e.g. ... 1'b1): the
 							// violation condition is its complement; a
@@ -3386,7 +3391,7 @@ struct Sva2CheckPass : public Pass {
 				if (bad || (!body && body_sig.empty() && body_const.empty())) {
 					unsupported++;
 					log("Skipping %s/%s: malformed spec.\n", log_id(mod), log_id(cell));
-					{ again = false; break; }
+					continue;
 				}
 
 				std::string clop = clock ? sva_op(clock) : "no_clock";
@@ -3394,7 +3399,7 @@ struct Sva2CheckPass : public Pass {
 				if (clop == "no_clock" || clksig.empty() || !clksig[0].is_wire()) {
 					unsupported++;
 					log("Skipping %s/%s: no usable sampling clock.\n", log_id(mod), log_id(cell));
-					{ again = false; break; }
+					continue;
 				}
 				comp.clk = clksig[0];
 				comp.clk_pos = clop != "negedge";

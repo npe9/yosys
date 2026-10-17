@@ -39,4 +39,13 @@ test:
 		--out $$(mktemp -d /tmp/xprop_gate.XXXXXX)
 	python3 run_lsp.py
 
-.PHONY: test
+# Circuit-mutation leg (register v3 C3): baseline ic3 verdict per check,
+# then single mutations of the circuit cells in each check's cone; a PROVED
+# check no mutant disproves is SURVIVED (the triage list).  xmut.sv's
+# per-class positive controls are checked on every run.  Separate target:
+# minutes, not seconds.  The driver lives in the sv-yosys workspace
+# (conformance/), four levels up from this directory in that checkout.
+mutate:
+	python3 ../../../../conformance/run_mutation.py --battery --jobs 4
+
+.PHONY: test mutate

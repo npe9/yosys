@@ -131,6 +131,61 @@ dut from a sibling file are the documented "missing dut" edge in
 run_battery.py: standalone they now fail `hierarchy -check` instead of
 reaching "no summary".
 
+## System functions inside concurrent assertions, and two-state `===`
+
+Until 2026-10-17 every `$f(...)` call inside a property expression that
+was not `$past`/`$rose`/`$fell`/`$stable`/`$changed`/`$sampled` became a
+`$sva` call cell whose output wire nothing ever drove: `!$isunknown(x)`
+(OpenTitan's `ASSERT_KNOWN`), `$countones(x) <= 1`, `$size(x) == 4` were
+verdicts on a free 1-bit wire (DIS @0, no circuit in the cone; the
+mutation leg found 202 such OpenTitan disproofs).  Now the frontend
+compiles them: `$isunknown` is constant 0 (two-state semantics, with a
+warning per call; this applies to every `-formal` consumer, `sim`
+included), `$countones`/`$onehot`/`$onehot0` are a popcount,
+`$bits`/`$size`/`$clog2` fold, anything else is an error ("would become an
+undriven placeholder").  `tsysf.sv` pins all of them with independent
+disproofs.  A check whose compiled body is a constant (ASSERT_KNOWN, a
+tautology the frontend folded) carries `sva_lowering = exact:const`: it
+proves nothing about the circuit, and the mutation leg classes it FREE.
+
+Separately, `sva2check` folds `$eqx`/`$nex` against a constant with an x or
+z bit to 0/1 (`fold_x_compares`, one warning per module): the formal
+engines read an x constant as 0, so `a === 4'bxxxx` had meant `a == 0`.
+This changes the meaning of user `===`/`!==` against x constants in every
+flow that runs `sva2check`; four-state comparisons belong to `sim -xprop`,
+which does not.
+
+## Circuit mutation leg (register v3 C3, `conformance/run_mutation.py`)
+
+"Prove and disprove every assertion by changing the behaviour of the
+circuit, and see whether it is caught."  For every check the leg takes
+the full ic3 verdict as the baseline, then applies single mutations
+(yosys `mutate`: invert / stick-at / conditional-invert one output bit of
+one cell) to the CIRCUIT cells in the check's fan-in cone and re-runs a
+bounded engine.  Circuit = the input cone of the design's registers,
+latches, memories and output ports minus the cells sva2check created;
+the assertion's own Boolean layer (the `==`, `!`, `||` of the property
+expression, feeding nothing but the check) is glue, not circuit, because
+mutating it changes the property rather than the design and would
+"catch" a tautology.
+
+Classes: a PROVED check is CAUGHT when a mutant in its cone disproves it,
+SURVIVED when at least three mutants ran in its cone and none did (a
+tautology, a vacuous proof, or a lowering hole: the list to triage),
+UNDER-MUTATED below three, FREE when no circuit cell feeds it (inputs
+only, or constant-folded).  A DIS check is HEALED@K when a mutant makes
+its counterexample vanish within K steps, MOVED when only the depth
+changes, STUCK@K otherwise, FREE-DIS when nothing in the circuit feeds
+it.  A mutant that heals every disproved check of a file that carries
+assumptions is an assumption kill (unsatisfiable environment), labelled
+and not counted.  `xmut.sv` is the positive control: one property per
+class, checked on every `--battery` run (`// MUT: <class>` comments).
+
+A kill shows the verdict is sensitive to the design logic through the
+lowering; it does not show the lowering is LRM-correct (the oracle legs'
+job).  This leg finds fakes, not wrong answers.  `make mutate` runs it
+over the battery; the corpus runs are in `conformance/runs/mutation_*`.
+
 ## File classes
 
 - `t*.sv` — the green battery. Run all: `for f in t*.sv; do ...`.

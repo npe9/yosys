@@ -71,6 +71,7 @@
 // level (every tick is an attempt start) or an antecedent-end pulse for
 // spawned consequents.  The $check gets EN=1'b1, A = disable || !fail.
 
+#include "kernel/sigtools.h"
 #include "kernel/yosys.h"
 #include <cstdio>
 #include <algorithm>
@@ -3288,6 +3289,104 @@ struct Sva2CheckPass : public Pass {
 		log("\n");
 	}
 
+	// Two-state formal semantics for case-equality against x/z constants.
+	// The frontend lowers `$isunknown(e)` (OpenTitan's ASSERT_KNOWN) to a
+	// `$countbits(e, 'x, 'z) > 0`, i.e. `$eqx(bit, 1'bx)` per bit.  The
+	// formal engines have no x: satgen (ic3, sat) and write_smt2 read an x
+	// constant bit as 0, so `$eqx(bit, 1'bx)` became `bit == 0` and every
+	// ASSERT_KNOWN on a zero-initialised signal was "disproved at depth 0"
+	// (found by the circuit-mutation leg, register v3 C3: 202 OpenTitan
+	// disproofs with no circuit in their cone).  In a two-state model no
+	// signal ever case-equals a constant with an x or z bit: fold $eqx to
+	// 0 and $nex to 1, once, loudly.  `sim -xprop` keeps four-state
+	// semantics because it does not run this pass.
+	static void fold_x_compares(RTLIL::Module *mod)
+	{
+		std::vector<RTLIL::Cell *> dead;
+		int n = 0;
+		for (auto cell : mod->cells()) {
+			if (!cell->type.in(ID($eqx), ID($nex)))
+				continue;
+			bool has_xz = false;
+			for (auto port : {ID::A, ID::B})
+				for (auto bit : cell->getPort(port))
+					if (bit.wire == nullptr && (bit.data == RTLIL::State::Sx || bit.data == RTLIL::State::Sz))
+						has_xz = true;
+			if (!has_xz)
+				continue;
+			SigSpec y = cell->getPort(ID::Y);
+			RTLIL::Const val(cell->type == ID($eqx) ? RTLIL::State::S0 : RTLIL::State::S1, GetSize(y));
+			mod->connect(y, val);
+			dead.push_back(cell);
+			n++;
+		}
+		for (auto cell : dead)
+			mod->remove(cell);
+		if (n)
+			log_warning("%s: folded %d case-equality compare(s) against an x/z constant to a constant "
+					"(two-state formal semantics: `$isunknown` is never true; `sim -xprop` keeps four-state).\n",
+					log_id(mod), n);
+	}
+
+	// Does `sig` evaluate to a constant through its combinational drivers?
+	// A small local evaluator: constants, inverters of constants, and
+	// and/or gates with a dominant constant input (`dis || 1`, the shape a
+	// disable iff leaves around a constant body).  Conservative: anything
+	// it cannot see through is "not constant".
+	static bool const_cone(RTLIL::Module *mod, SigSpec sig)
+	{
+		// module-level `connect`s (a wire tied to a constant, as the
+		// frontend's folded $isunknown and fold_x_compares leave behind)
+		// are what SigMap resolves; follow cells from there
+		SigMap sm(mod);
+		return const_cone_rec(mod, sm, sig, 0);
+	}
+
+	static bool const_cone_rec(RTLIL::Module *mod, SigMap &sm, SigSpec sig, int depth)
+	{
+		sig = sm(sig);
+		if (sig.is_fully_const())
+			return true;
+		if (depth > 16)
+			return false;
+		if (GetSize(sig) != 1) {
+			// the frontend pads $sva operands to 32 bits ({31'0, x}): a
+			// vector is constant when every bit is
+			for (auto b : sig)
+				if (!const_cone_rec(mod, sm, SigSpec(b), depth + 1))
+					return false;
+			return true;
+		}
+		SigBit bit = sig[0];
+		RTLIL::Cell *drv = nullptr;
+		for (auto cell : mod->cells())
+			for (auto &conn : cell->connections())
+				if (cell->output(conn.first))
+					for (auto b : sm(conn.second))
+						if (b == bit)
+							drv = cell;
+		if (!drv)
+			return false;
+		if (drv->type.in(ID($not), ID($logic_not), ID($reduce_bool), ID($reduce_or), ID($reduce_and)))
+			return const_cone_rec(mod, sm, drv->getPort(ID::A), depth + 1);
+		if (drv->type.in(ID($or), ID($logic_or), ID($and), ID($logic_and))) {
+			bool is_or = drv->type.in(ID($or), ID($logic_or));
+			SigSpec a = sm(drv->getPort(ID::A)), b = sm(drv->getPort(ID::B));
+			bool ca = const_cone_rec(mod, sm, a, depth + 1), cb = const_cone_rec(mod, sm, b, depth + 1);
+			if (ca && cb)
+				return true;
+			// a dominant constant on one side decides the gate
+			for (auto s : {a, b})
+				if (GetSize(s) == 1 && s.is_fully_const()) {
+					bool v = s[0].data == RTLIL::State::S1;
+					if ((is_or && v) || (!is_or && !v))
+						return true;
+				}
+			return false;
+		}
+		return false;
+	}
+
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		log_header(design, "Executing SVA2CHECK pass (compile $sva trees into $check cells).\n");
@@ -3312,6 +3411,8 @@ struct Sva2CheckPass : public Pass {
 
 		for (auto mod : design->selected_modules())
 		{
+			fold_x_compares(mod);
+
 			// named sequence/property/let declarations visible to instances
 			dict<std::string, Cell *> decls;
 			for (auto cell : mod->cells())
@@ -3563,7 +3664,8 @@ struct Sva2CheckPass : public Pass {
 					if (disable && sva_op(disable) == "disable_iff")
 						ca = mod->Or(NEW_ID, comp.reduce1(disable->getPort(ID(A))), ca);
 					cell->setPort(ID(A), ca);
-					cell->attributes[ID(sva_lowering)] = Const(std::string("exact"));
+					// the body IS a constant here (see above): say so in the provenance
+					cell->attributes[ID(sva_lowering)] = Const(std::string("exact:const"));
 					converted++;
 					break;
 				}
@@ -3862,7 +3964,16 @@ struct Sva2CheckPass : public Pass {
 					log("sva2check: %s: multi-clock property; $check left unclocked (checked at every step).\n", log_id(cell));
 				}
 				cell->attributes[ID(sva2check)] = Const(1, 1);
-				cell->attributes[ID(sva_lowering)] = Const(comp.lowering_tag());
+				{
+					// a check whose compiled condition is a constant (ASSERT_KNOWN
+					// under two-state semantics, `r || !r`, a body the frontend
+					// folded) proves nothing about the circuit: say so in the
+					// provenance, where every verdict printer shows it
+					std::string tag = comp.lowering_tag();
+					if (const_cone(mod, cell->getPort(ID::A)))
+						tag += ":const";
+					cell->attributes[ID(sva_lowering)] = Const(tag);
+				}
 
 				if (strong_until) {
 					if (comp.multiclock)

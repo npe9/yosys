@@ -2570,6 +2570,99 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				is_signed = sign_hint;
 				return SigSpec(ywire);
 			}
+			if (keep_sva_cells && str.size() >= 2 && str[1] == '$') {
+				// A system function inside a concurrent-assertion expression.
+				// Until register v3 C3 (2026-10-17) every such call became a
+				// `$sva` call cell whose Y wire nothing ever drove: sva2check
+				// only compiles $sva cells it reaches as sequence/property
+				// operands, so `!$isunknown(x)` (OpenTitan's ASSERT_KNOWN),
+				// `$countones(x) <= 1` and `$size(x) == 4` were verdicts on a
+				// free 1-bit wire (DIS @0 with no circuit in the cone).  The
+				// circuit-mutation leg found 202 such disproofs.  Compile the
+				// ones with a two-state RTLIL meaning here; refuse the rest.
+				if (str == "\\$isunknown") {
+					if (GetSize(children) != 1)
+						input_error("System function %s got %d arguments, expected 1.\n",
+								RTLIL::unescape_id(str), int(GetSize(children)));
+					children[0]->genRTLIL();   // elaborate the argument (width errors etc.)
+					log_file_warning(location.to_loc(),
+							"$isunknown in a concurrent assertion is constant 0 (two-state semantics for every "
+							"-formal consumer, sim included; ASSERT_KNOWN holds trivially).\n");
+					is_signed = false;
+					return RTLIL::SigSpec(RTLIL::State::S0);
+				}
+				if (str == "\\$countones" || str == "\\$onehot" || str == "\\$onehot0") {
+					if (GetSize(children) != 1)
+						input_error("System function %s got %d arguments, expected 1.\n",
+								RTLIL::unescape_id(str), int(GetSize(children)));
+					RTLIL::SigSpec arg = children[0]->genRTLIL();
+					int n = GetSize(arg);
+					int cw = 1;
+					while ((1 << cw) <= n)
+						cw++;
+					// popcount: a balanced adder tree over the bits
+					std::vector<RTLIL::SigSpec> terms;
+					for (int i = 0; i < n; i++)
+						terms.push_back(RTLIL::SigSpec(arg[i]));
+					while (GetSize(terms) > 1) {
+						std::vector<RTLIL::SigSpec> next;
+						for (int i = 0; i + 1 < GetSize(terms); i += 2) {
+							RTLIL::Wire *w = current_module->addWire(NEW_ID, cw);
+							set_src_attr(w, this);
+							RTLIL::Cell *add = current_module->addAdd(NEW_ID, terms[i], terms[i + 1], w, false);
+							set_src_attr(add, this);
+							next.push_back(RTLIL::SigSpec(w));
+						}
+						if (GetSize(terms) % 2)
+							next.push_back(terms.back());
+						terms = next;
+					}
+					RTLIL::SigSpec cnt = terms.empty() ? RTLIL::SigSpec(0, cw) : terms[0];
+					if (GetSize(cnt) < cw)
+						cnt.extend_u0(cw, false);
+					is_signed = false;
+					if (str == "\\$countones")
+						return cnt;
+					RTLIL::Wire *y = current_module->addWire(NEW_ID, 1);
+					set_src_attr(y, this);
+					RTLIL::Cell *cmp = (str == "\\$onehot")
+							? current_module->addEq(NEW_ID, cnt, RTLIL::SigSpec(1, cw), y, false)
+							: current_module->addLe(NEW_ID, cnt, RTLIL::SigSpec(1, cw), y, false);
+					set_src_attr(cmp, this);
+					return RTLIL::SigSpec(y);
+				}
+				if (str == "\\$bits" || str == "\\$size") {
+					// elaboration-time width of a packed expression: genrtlil
+					// can still compute it (simplify's fold does not run inside
+					// property expressions)
+					if (GetSize(children) != 1)
+						input_error("System function %s inside a concurrent assertion needs exactly one argument.\n",
+								RTLIL::unescape_id(str));
+					int w = 0;
+					bool sg = false;
+					children[0]->detectSignWidth(w, sg);
+					is_signed = false;
+					return RTLIL::SigSpec(w, 32);
+				}
+				if (str == "\\$clog2") {
+					if (GetSize(children) != 1)
+						input_error("System function %s got %d arguments, expected 1.\n",
+								RTLIL::unescape_id(str), int(GetSize(children)));
+					RTLIL::SigSpec a = children[0]->genRTLIL();
+					if (!a.is_fully_const())
+						input_error("System function $clog2 inside a concurrent assertion needs a constant argument.\n");
+					RTLIL::Const c = a.as_const();
+					int v = 0;
+					while (c.as_int() > (1 << v) && v < 31)
+						v++;
+					is_signed = false;
+					return RTLIL::SigSpec(c.as_int() <= 1 ? 0 : v, 32);
+				}
+				// No silent success: an unsupported system function inside a
+				// property must not become a free wire.
+				input_error("System function %s is not supported inside a concurrent assertion "
+						"(it would become an undriven placeholder).\n", RTLIL::unescape_id(str));
+			}
 			if (str.size() < 2 || str[1] != '$') {
 			if (!keep_sva_cells)
 				return RTLIL::SigSpec(RTLIL::State::S1);

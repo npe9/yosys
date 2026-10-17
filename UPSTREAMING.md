@@ -105,6 +105,14 @@ the frontend on two corpus files; open item).
   `tests/sva_battery/README.md`; the independent LRM model
   `tests/sva_pbt` lists the known single-monitor divergences (F2-F6,
   F10) that per-attempt tracking still has to fix.
+- **Circuit-mutation evidence (register v3 C3, 2026-10-17):** the branch
+  offer quotes `conformance/run_mutation.py`'s per-assertion table (a
+  proof is CAUGHT when a mutation of the circuit in its cone disproves it,
+  FREE when no circuit feeds it); the leg found that every system function
+  inside a concurrent assertion had been an undriven `$sva` call cell
+  (ASSERT_KNOWN, `$countones(x) <= 1`, `$size(x) == 4` were verdicts on a
+  free wire), fixed in genrtlil; a constant-body check is tagged
+  `exact:const` so no verdict printer calls it a proof about the circuit.
 - **Read policy (register v3 B4, 2026-10-17):** the fork's frontend
   leniencies are errors by default and live behind `read_verilog
   -permissive` / `hierarchy -check -permissive`, which warn per

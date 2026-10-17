@@ -1,0 +1,17 @@
+# A bare reference to a named property/sequence inside an assertion is the
+# hook sva2check resolves by name, not an implicit net: a strict read must
+# not warn about it nor mark the module sv_degraded (found when register v3
+# B5's refusal rejected the battery's t10-style files).
+logger -expect warning "parsed into .sva cells" 1
+logger -expect-no-warnings
+read_verilog -sv -formal <<EOT
+module m(input logic clk, input logic a, input logic b);
+  sequence s_ab; a ##1 b; endsequence
+  property p_ab; @(posedge clk) a |-> s_ab; endproperty
+  chk: assert property (p_ab);
+endmodule
+EOT
+hierarchy -check -top m
+select -assert-mod-count 0 A:sv_degraded A:sv_permissive %u
+sva2check
+select -assert-count 1 t:$check

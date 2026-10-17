@@ -42,7 +42,7 @@ async2sync
 opt_clean
 memory
 opt_clean
-{extra_mem}{deletes}
+{extra_mem}{guard}{deletes}
 setundef -init -zero
 write_smt2 -wires {smt}
 """
@@ -114,7 +114,7 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
         smt = os.path.join(tempfile.gettempdir(), "bmc_%d.smt2" % os.getpid())
         ys = os.path.join(tempfile.gettempdir(), "bmc_%d.ys" % os.getpid())
         with open(ys, "w") as fh:
-            fh.write(PREP.format(flags=run_ic3.read_flags(path), files=path, top=" -top " + top if top else "",
+            fh.write(PREP.format(guard=run_ic3.degraded_guard(path), flags=run_ic3.read_flags(path), files=path, top=" -top " + top if top else "",
                                  deletes=deletes, smt=smt,
                                  extra_a2s=extra_a2s, extra_mem=extra_mem))
         p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" "$2"', "y", yosys, ys],

@@ -1,0 +1,16 @@
+# Register v3 B5: with -allow-degraded the degradation list is still printed
+# first and the verdicts follow.
+logger -expect log "design carries sv_degraded" 1
+logger -expect log "ic3: p: proved" 1
+read_verilog -sv -formal -permissive <<EOT
+`default_nettype none
+module m(input wire clk, output wire y);
+  assign y = undeclared_sig;
+  p: assert property (@(posedge clk) y || !y);
+endmodule
+EOT
+hierarchy -check -top m
+sva2check
+proc
+async2sync
+ic3 -check-cells -init-zero -allow-degraded

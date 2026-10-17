@@ -3483,6 +3483,13 @@ struct Sva2CheckPass : public Pass {
 					unsupported++;
 					log("Skipping %s/%s: flavor %s not supported.\n", log_id(mod), log_id(cell), flavor.c_str());
 					cell->attributes[ID(sva_lowering)] = Const("placeholder:flavor " + flavor);
+					// B5/B1: no $sva placeholder may reach a backend.  A cover
+					// that is not checked is "never reached": tie its
+					// condition to 0 so the spec tree is unreferenced (the
+					// end-of-pass cleanup drops it) and write_smt2 / sim see a
+					// plain $cover; the tag says it was not checked.
+					if (flavor == "cover")
+						cell->setPort(ID::A, Const(0, 1));
 					continue;
 				}
 

@@ -45,6 +45,9 @@ using namespace AST_INTERNAL;
 // when the stem names a sequence declaration (checked in simplify) the
 // method wire is lowered by the sva2check pass, so the autowire path
 // stays quiet for it.
+// SVA local variables assigned in match items, per module (see AST_SVA)
+static dict<RTLIL::Module *, pool<std::string>> sva_local_names;
+
 static bool is_sequence_method_name(const std::string &str)
 {
 	for (const char *suf : {".triggered", ".matched"}) {
@@ -1753,7 +1756,24 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				set_src_attr(wire, this);
 				wire->name = str;
 
-				if (!is_sequence_method_name(str)) {
+				// a bare reference to a named sequence/property/let declaration
+				// inside an assertion is the hook sva2check resolves by name
+				// (decl_by_name): the wire is by design, not an implicit net,
+				// so it is neither a warning nor a degradation (the battery's
+				// t10-style files were marked sv_degraded for it, and B5's
+				// refusal then rejected them)
+				bool sva_decl_ref = keep_sva_cells && sva_local_names.count(current_module) &&
+						sva_local_names.at(current_module).count(str);
+				if (keep_sva_cells && current_ast_mod && !sva_decl_ref) {
+					for (auto &ch : current_ast_mod->children)
+						if (ch && ch->type == AST_SVA && (ch->str == "sequence_decl" || ch->str == "property_decl" ||
+								ch->str == "let_decl") && !ch->children.empty() && ch->children[0] &&
+								ch->children[0]->str == str) {
+							sva_decl_ref = true;
+							break;
+						}
+				}
+				if (!is_sequence_method_name(str) && !sva_decl_ref) {
 					if (flag_autowire)
 						// upstream's own leniency under `default_nettype wire`;
 						// dotted names included: interface-port members
@@ -2723,6 +2743,14 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				warned = true;
 				log_file_warning(location.to_loc(), "SVA temporal operators are parsed into $sva cells. The assert $check uses a placeholder, not a full cycle-accurate evaluator.\n");
 			}
+
+			// `(e, w = expr)`: the match-item target is a local variable of the
+			// assertion (the fork accepts it undeclared, as the battery does);
+			// record it so the identifier path does not treat its wire as an
+			// implicit net (which marked the module sv_degraded on a strict
+			// read, and B5's refusal then rejected the file)
+			if (str == "assign" && !children.empty() && children[0] && children[0]->type == AST_IDENTIFIER)
+				sva_local_names[current_module].insert(children[0]->str);
 
 			auto child_sig = [&](AstNode *child) -> RTLIL::SigSpec {
 				if (!child)

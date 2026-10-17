@@ -1489,6 +1489,10 @@ struct Ic3Pass : Pass
 		log("        also enumerate $check cells (default behavior; kept for\n");
 		log("        compatibility with the sva2check flow)\n");
 		log("\n");
+		log("    -allow-degraded\n");
+		log("        run on a design whose modules carry sv_degraded / sv_permissive\n");
+		log("        (printed first either way; refused by default: register v3 B5)\n");
+		log("\n");
 		log("    -init-zero\n");
 		log("        force all registers to a zero initial state\n");
 		log("\n");
@@ -1527,6 +1531,7 @@ struct Ic3Pass : Pass
 		std::string cex_prefix;
 		bool check_cells = false;
 		bool init_zero = false;
+		bool allow_degraded = false;
 		bool verbose = false;
 		int max_frames = 1000;
 		int kind_max = 8;
@@ -1543,6 +1548,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-check-cells") {
 				check_cells = true;
+				continue;
+			}
+			if (args[argidx] == "-allow-degraded") {
+				allow_degraded = true;
 				continue;
 			}
 			if (args[argidx] == "-init-zero") {
@@ -1589,7 +1598,32 @@ struct Ic3Pass : Pass
 		}
 		(void) check_cells;
 
+		// Register v3 B5: a verdict on a degraded design is not evidence.
+		// The frontend marks every module read with -permissive
+		// (* sv_permissive *) and every module where a leniency fired
+		// (* sv_degraded = "<reason> @file:line; ..." *).  Print them first;
+		// refuse unless the caller says -allow-degraded (the ladder and the
+		// mutation leg measure degraded files knowingly).
+		{
+			int n_deg = 0;
+			for (auto mod : design->modules()) {
+				if (mod->attributes.count(ID(sv_degraded))) {
+					log("ic3: design carries sv_degraded: %s: %s\n", log_id(mod),
+							mod->attributes.at(ID(sv_degraded)).decode_string().c_str());
+					n_deg++;
+				} else if (mod->attributes.count(ID(sv_permissive))) {
+					log("ic3: design carries sv_permissive: %s (read with -permissive)\n", log_id(mod));
+					n_deg++;
+				}
+			}
+			if (n_deg && !allow_degraded)
+				log_error("ic3: refusing a design that carries sv_degraded/sv_permissive modules "
+						"(%d): verdicts on a degraded design are not evidence; pass -allow-degraded "
+						"to run anyway.\n", n_deg);
+		}
+
 		std::vector<RTLIL::Cell*> props;
+		std::vector<RTLIL::Cell*> covers;
 		std::vector<RTLIL::Cell*> live_props;
 		std::vector<RTLIL::Cell*> assumes;
 		std::vector<RTLIL::Cell*> fairs;
@@ -1619,9 +1653,20 @@ struct Ic3Pass : Pass
 					assumes.push_back(cell);
 				else if (flavor == "liveness" || flavor == "live")
 					live_props.push_back(cell);
+				else if (flavor == "cover")
+					covers.push_back(cell);
 				else
 					log_warning("ic3: skipping %s.%s (flavor %s)\n", log_id(module), log_id(cell), flavor.c_str());
+			} else if (cell->type == ID($cover)) {
+				covers.push_back(cell);
 			}
+		}
+		// Register v3 B5: covers are not checked by this engine (D4 is
+		// reachability); say so per cover instead of silence
+		for (auto cell : covers) {
+			std::string tag = cell->attributes.count(ID(sva_lowering))
+					? cell->attributes.at(ID(sva_lowering)).decode_string() : "untagged";
+			log("ic3: %s: cover not checked [lowering=%s]\n", cell->name.unescape().c_str(), tag.c_str());
 		}
 
 		if (props.empty() && live_props.empty()) {

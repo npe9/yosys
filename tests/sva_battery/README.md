@@ -126,7 +126,11 @@ strictly.  A file that documents a leniency it relies on carries
 `// READ-FLAGS: -permissive` (run_ic3/run_bmc/prove honour it; today
 only `tfix_b.sv`, for a conditional `disable` that the frontend
 ignores).  The LSP lints with `-permissive` (an editor wants
-diagnostics, not a hard stop).  The `*_tb.sv` files that instantiate a
+diagnostics, not a hard stop).  A bare reference to a named
+sequence/property/let inside an assertion is the wire sva2check resolves
+by name, and an undeclared local assigned in a match item (`(e, w = x)`)
+is the assertion's local variable: neither is an implicit-net warning nor
+a degradation (tests/verilog/sva_decl_ref_not_degraded.ys; tc1/tp7b).  The `*_tb.sv` files that instantiate a
 dut from a sibling file are the documented "missing dut" edge in
 run_battery.py: standalone they now fail `hierarchy -check` instead of
 reaching "no summary".
@@ -154,6 +158,25 @@ engines read an x constant as 0, so `a === 4'bxxxx` had meant `a == 0`.
 This changes the meaning of user `===`/`!==` against x constants in every
 flow that runs `sva2check`; four-state comparisons belong to `sim -xprop`,
 which does not.
+
+## Verdict hygiene (register v3 B5)
+
+- `ic3` refuses a design whose modules carry `sv_degraded` /
+  `sv_permissive` (the frontend's `-permissive` marks) and prints the
+  list first either way; `-allow-degraded` runs anyway.  The drivers pass
+  it only for a file that documents its leniency (`// READ-FLAGS:
+  -permissive`); the smtbmc leg guards with `select -assert-mod-count 0
+  A:sv_degraded A:sv_permissive %u`.  The ladder and the mutation leg
+  measure degraded files knowingly (`-allow-degraded`; the ladder's CLEAN
+  columns are the headline).  Pins: tests/verilog/ic3_refuse_degraded.ys,
+  ic3_allow_degraded.ys.
+- A cover property is reported per cover as `not-checked` (ic3 line
+  `cover not checked [lowering=placeholder:flavor cover]`), never folded
+  into a proved count; the battery expectation is `// NOT-CHECKED`
+  (`tb5_cover.sv`).  D4 turns this into reachability.
+- A proof whose compiled body is a constant prints as `PROVED(const)` in
+  run_battery (tag `exact:const`): true, but not a statement about the
+  circuit.
 
 ## Circuit mutation leg (register v3 C3, `conformance/run_mutation.py`)
 

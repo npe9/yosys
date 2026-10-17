@@ -129,7 +129,7 @@ def replay_confirm(yosys, path, top, include, witness, settle_engine,
         # assert rounds don't matter: check cells are logic sinks, so the
         # undeleted design evolves identically under the same inputs.
         extra_a2s, extra_mem = run_bmc.prep_extras(path)
-        script = run_bmc.PREP.format(flags=run_ic3.read_flags(path), files=path,
+        script = run_bmc.PREP.format(guard=run_ic3.degraded_guard(path), flags=run_ic3.read_flags(path), files=path,
                                      top=" -top " + top if top else "",
                                      deletes="", smt=os.devnull,
                                      extra_a2s=extra_a2s, extra_mem=extra_mem)
@@ -139,7 +139,7 @@ def replay_confirm(yosys, path, top, include, witness, settle_engine,
         script = run_ic3.PREP.format(flags=run_ic3.read_flags(path), inc=inc, files=path,
                                      top=" -top " + top if top else "",
                                      extra_a2s=extra_a2s, extra_mem=extra_mem,
-                                     engine=run_ic3.ENGINE + bmc + ctg)
+                                     engine=run_ic3.engine_for(path) + bmc + ctg)
     script += "sim -r %s -summary %s -vcd %s\n" % (witness, summary, vcd)
     ys = os.path.join(cexdir, "replay_%s.ys" % safe_name(label))
     with open(ys, "w") as fh:
@@ -238,7 +238,7 @@ class Ic3Lane:
         self.done = False
         inc = " ".join("-I" + d for d in include)
         extra_a2s, extra_mem, bmc, ctg = run_ic3.prep_extras(path)
-        engine = run_ic3.ENGINE + bmc + ctg
+        engine = run_ic3.engine_for(path) + bmc + ctg
         if cex_prefix:
             os.makedirs(os.path.dirname(cex_prefix) or ".", exist_ok=True)
             engine += " -cex " + cex_prefix

@@ -47,6 +47,23 @@ opt_clean
 ENGINE = "ic3 -check-cells -init-zero"
 
 
+def engine_for(path):
+    """The engine line for a file: a file that documents a leniency it relies
+    on (`// READ-FLAGS: -permissive`) runs with -allow-degraded, and ic3
+    prints the degradation list first; any other degraded design is
+    refused (register v3 B5)."""
+    return ENGINE + (" -allow-degraded" if "-permissive" in read_flags(path) else "")
+
+
+def degraded_guard(path):
+    """Script line for engines without their own refusal (the smtbmc leg):
+    assert that no module carries sv_degraded / sv_permissive, unless the
+    file asked for -permissive."""
+    if "-permissive" in read_flags(path):
+        return ""
+    return "select -assert-mod-count 0 A:sv_degraded A:sv_permissive %u\n"
+
+
 def read_flags(path):
     """Extra read_verilog flags from a `// READ-FLAGS: ...` pragma (e.g.
     `-permissive` for a file that documents a frontend leniency it relies
@@ -93,6 +110,8 @@ def run(cmd, **kw):
 
 IC3_LINE = re.compile(r"ic3: (\S+): (proved|disproved|undecided)(?: \(depth (\d+)\))?"
                       r"(?: \[lowering=([^\]]+)\])?")
+COVER_LINE = re.compile(r"ic3: (\S+): cover not checked(?: \[lowering=([^\]]+)\])?")
+DEGRADED_LINE = re.compile(r"ic3: design carries (sv_degraded|sv_permissive): (.*)")
 
 
 def lowering_tags(yosys, files, top="", include=(), timeout=120):
@@ -132,7 +151,7 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
     files = path if isinstance(path, list) else [path]
     inc = " ".join("-I" + d for d in inc_dirs)
     extra_a2s, extra_mem, bmc, ctg = prep_extras(files[0])
-    engine = ENGINE + bmc + ctg
+    engine = engine_for(files[-1]) + bmc + ctg
     if cex_prefix:
         # disproved properties additionally write <prefix><prop>.yw
         # witnesses (replay: same prep + `sim -r <w> -vcd trace.vcd`)
@@ -160,6 +179,12 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
         return None
 
     conv = re.search(r"Converted (\d+) \$check cells, (\d+) unsupported", blob)
+    # B5: the degradation list comes first, covers are listed as not checked
+    for m in DEGRADED_LINE.finditer(blob):
+        print(f"{label}: design carries {m.group(1)}: {m.group(2)}", flush=True)
+    covers = {}
+    for m in COVER_LINE.finditer(blob):
+        covers["bad_" + m.group(1).lstrip("\\")] = m.group(2) or "untagged"
     results = {}
     tags = {}
     for m in IC3_LINE.finditer(blob):
@@ -180,6 +205,8 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
         status, depth = results[name]
         extra = f" (frame {depth + 1})" if depth is not None else ""
         print(f"  {status:10s} {name}{extra} [lowering={tags.get(name, 'untagged')}]", flush=True)
+    for name in sorted(covers):
+        print(f"  {'not-checked':10s} {name} [lowering={covers[name]}]", flush=True)
     return results
 
 

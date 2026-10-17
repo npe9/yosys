@@ -1,0 +1,20 @@
+# register v3 B4: the read mode travels with the module.  A module read
+# with -permissive (here: an unknown type name, a degradation) must still
+# derive its $paramod -- during hierarchy, after a later STRICT read reset
+# the global -- as permissive, carrying (* sv_permissive *) and
+# (* sv_degraded *).
+read_verilog -sv -permissive <<EOT
+module leaf #(parameter int W = 4) (input logic [W-1:0] d, output logic [W-1:0] q);
+  unknown_t tmp;
+  assign tmp = d[0];
+  assign q = d ^ {W{tmp}};
+endmodule
+EOT
+read_verilog -sv <<EOT
+module top(input logic [7:0] d, output logic [7:0] q);
+  leaf #(.W(8)) u (.d(d), .q(q));
+endmodule
+EOT
+hierarchy -top top
+select -assert-mod-count 1 A:sv_permissive
+select -assert-mod-count 1 A:sv_degraded

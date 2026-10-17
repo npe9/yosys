@@ -1198,6 +1198,16 @@ static bool param_has_no_default(const AstNode* param) {
 
 static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool defer, std::unique_ptr<AstNode> original_ast = NULL, bool quiet = false)
 {
+	// The read mode travels with the module AST: a module read with
+	// `-permissive` is derived ($paramod) long after its read_verilog, by
+	// the hierarchy pass, possibly after a strict read reset the global.
+	// AST::process tags the module node; restore the flag for the
+	// duration of this elaboration.
+	struct ModeGuard {
+		bool saved;
+		ModeGuard(bool v) : saved(flag_permissive) { if (v) flag_permissive = true; }
+		~ModeGuard() { flag_permissive = saved; }
+	} mode_guard(ast->attributes.count(IdString("\\sv_permissive")) > 0);
 	log_assert(current_scope.empty());
 	log_assert(ast->type == AST_MODULE || ast->type == AST_INTERFACE);
 
@@ -1610,6 +1620,8 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 
 			if (flag_icells && child->str.compare(0, 2, "\\$") == 0)
 				child->str = child->str.substr(1);
+			if (flag_permissive)
+				child->attributes[IdString("\\sv_permissive")] = AstNode::mkconst_int(child->location, 1, false);
 
 			bool defer_local = defer;
 			if (!defer_local)

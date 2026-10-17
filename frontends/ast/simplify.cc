@@ -1650,20 +1650,36 @@ static bool eval_known_int(AstNode *expr, const dict<std::string, int> &known, i
 	return true;
 }
 
-// Same as eval_known_int, but also requires the result to be fully defined:
-// x/z bits would silently read back as 0 through asInt and could make a case
-// arm look (un)matched when it is not.
-static bool eval_known_int_def(AstNode *expr, const dict<std::string, int> &known, int &out)
+// Evaluate an expression under the known blocking-assignment values to a
+// fully defined constant node (nullptr if that is not possible).
+static std::unique_ptr<AstNode> eval_known_const(AstNode *expr, const dict<std::string, int> &known)
 {
 	if (!expr)
-		return false;
+		return nullptr;
 	auto copy = expr->clone();
 	subst_known_reads(copy.get(), known, false);
 	while (copy->simplify(true, 1, -1, false)) { }
 	if (copy->type != AST_CONSTANT || !copy->bits_only_01())
-		return false;
-	out = copy->asInt(true);
-	return true;
+		return nullptr;
+	return copy;
+}
+
+// Does a case item match the selector?  Both are fully defined constants;
+// they are compared at the case statement's overall width and signedness
+// (IEEE 1800 12.5: extend to the widest operand, signed only if every
+// operand is signed) -- never as raw ints, which sign-extended a 4-bit
+// unsigned `1111` selector to -1 and dropped the matching `15` arm
+// (upstream tests/verilog/unreachable_case_sign.ys, tests/simple/process.v).
+static bool const_case_item_match(AstNode *case_stmt, AstNode *sel, AstNode *item)
+{
+	int width = -1;
+	bool is_signed = true;
+	case_stmt->detectSignWidth(width, is_signed);
+	width = std::max(width, std::max(GetSize(sel->bits), GetSize(item->bits)));
+	RTLIL::Const a = sel->bitsAsConst(width, is_signed);
+	RTLIL::Const b = item->bitsAsConst(width, is_signed);
+	RTLIL::Const match = RTLIL::const_eq(a, b, is_signed, is_signed, 1);
+	return match.size() == 1 && match.front() == RTLIL::State::S1;
 }
 
 static bool erase_uncond_disable(std::vector<std::unique_ptr<AstNode>> &stmts, const std::string &name, dict<std::string, int> &known)
@@ -1693,8 +1709,8 @@ static bool erase_uncond_disable(std::vector<std::unique_ptr<AstNode>> &stmts, c
 			// case matches compares each pattern with a boolean, not with the dummy selector.
 			if (stmt->str == "\\matches")
 				continue;
-			int sel = 0;
-			if (!eval_known_int_def(stmt->children[0].get(), known, sel))
+			auto sel = eval_known_const(stmt->children[0].get(), known);
+			if (!sel)
 				continue;
 			// Resolving which arm runs is only sound when every non-default
 			// compare is a fully defined constant; in `case (1'b1) ...` style
@@ -1710,8 +1726,7 @@ static bool erase_uncond_disable(std::vector<std::unique_ptr<AstNode>> &stmts, c
 				for (auto &ch : arm->children) {
 					if (!ch || ch->type == AST_BLOCK || ch->type == AST_DEFAULT)
 						continue;
-					int cmp = 0;
-					if (!eval_known_int_def(ch.get(), known, cmp)) {
+					if (!eval_known_const(ch.get(), known)) {
 						resolvable = false;
 						break;
 					}
@@ -1739,8 +1754,8 @@ static bool erase_uncond_disable(std::vector<std::unique_ptr<AstNode>> &stmts, c
 					else if (ch->type == AST_DEFAULT)
 						is_default = true;
 					else {
-						int cmp = 0;
-						if (eval_known_int_def(ch.get(), known, cmp) && cmp == sel)
+						auto item = eval_known_const(ch.get(), known);
+						if (item && const_case_item_match(stmt, sel.get(), item.get()))
 							arm_match = true;
 					}
 				}
@@ -2334,8 +2349,8 @@ static void apply_force_override(std::vector<std::unique_ptr<AstNode>> &stmts, d
 				i++;
 				continue;
 			}
-			int sel = 0;
-			if (!eval_known_int_def(stmt->children[0].get(), known, sel)) {
+			auto sel = eval_known_const(stmt->children[0].get(), known);
+			if (!sel) {
 				AstNode *then_blk = nullptr;
 				AstNode *else_blk = nullptr;
 				for (size_t c = 1; c < stmt->children.size(); c++) {
@@ -2446,12 +2461,12 @@ static void apply_force_override(std::vector<std::unique_ptr<AstNode>> &stmts, d
 					else if (ch->type == AST_DEFAULT)
 						is_default = true;
 					else {
-						int cmp = 0;
-						if (!eval_known_int_def(ch.get(), known, cmp)) {
+						auto item = eval_known_const(ch.get(), known);
+						if (!item) {
 							resolvable = false;
 							break;
 						}
-						if (cmp == sel)
+						if (const_case_item_match(stmt, sel.get(), item.get()))
 							arm_match = true;
 					}
 				}
@@ -8212,8 +8227,14 @@ skip_memory_write:;
 			if (current_scope.count(str) == 0)
 				str = try_pop_module_prefix();
 			if (current_scope.count(str) == 0 || current_scope[str]->type != AST_TASK) {
+				// IEEE 1800 20.10 elaboration severity tasks are known to
+				// genrtlil (dropped there); do not report them as
+				// unresolved -- upstream's cells_sim libraries use $fatal
+				// and their tests expect a warning-free elaboration.
+				bool severity_task = str == "\\$fatal" || str == "\\$error" || str == "\\$warning" || str == "\\$info" ||
+						str == "$fatal" || str == "$error" || str == "$warning" || str == "$info";
 				static bool warned = false;
-				if (!warned) {
+				if (!warned && !severity_task) {
 					warned = true;
 					log_file_warning(location.to_loc(), "Unresolved task `%s'; later unresolved tasks are ignored.\n", str.c_str());
 				}

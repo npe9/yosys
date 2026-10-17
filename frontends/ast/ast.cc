@@ -1131,8 +1131,12 @@ double AstNode::asReal(bool is_signed)
 
 RTLIL::Const AstNode::realAsConst(int width)
 {
-	// IEEE 1800 6.12.2: real-to-integer conversion truncates toward zero.
-	double v = std::trunc(realvalue);
+	// IEEE 1800-2017 6.12.2: real numbers are converted to integers by
+	// ROUNDING to the nearest integer (ties away from zero), not by
+	// truncation; only $rtoi truncates.  (A previous fork revision
+	// truncated here, which upstream tests/simple/realexpr.v catches:
+	// 123.45 + 0.2 -> 124, not 123.)
+	double v = round(realvalue);
 	RTLIL::Const result;
 	if (!std::isfinite(v)) {
 		result = std::vector<RTLIL::State>(width, RTLIL::State::Sx);

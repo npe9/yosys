@@ -36,7 +36,27 @@ pushed to `fork/upstream/<chunk>`.
   selects); `tests/svtypes` green.
 - **Value:** smallest possible correctness PR in the series; open it
   first.  Found 2026-10-16 via the Keccak-f[1600] known-answer test.
-- **Status:** fix landed on the fork; chunk not yet materialized.
+- **Status:** fix landed on the fork (fedb3a9f0); chunk not yet materialized.
+
+### 0b. Fork-vs-upstream parity (2026-10-16 session 1, second commit)
+Running upstream's own suite (`make vanilla-test`) against the fork
+found six fork regressions, all fixed and all covered by EXISTING
+upstream tests (so the chunk-3 branch now passes them unchanged):
+`tests/simple/{dynslice,partsel,sign_part_assign,memory,process,
+realexpr,operators}.v`, `sat/counters-repeat.ys`,
+`various/dynamic_part_select.ys`, `svtypes/struct_dynamic_range.ys`,
+`verilog/unreachable_case_sign.ys`, `svinterfaces/{load_and_derive,
+resolve_types}.ys`.  Fork-only root causes (nothing to upstream):
+binop2rtlil operand signs, the force/disable passes' case-arm compare,
+real->int truncation, `ref` keyword, lexer typedef lookahead vs
+interface ports.  Remaining fork-only failures are the deliberate
+error->warning relaxations listed in PLAN.md (policy decision pending:
+errors by default + `read_verilog -permissive` for the sweeps) and one
+documented semantic delta (`smt2_fair_cells.ys`: $fair is skipped with
+a warning instead of erroring; the fork test expectation should change
+with the branch offer).  Known residual delta: arithmetic/comparison
+cells still use the fork's matched-sign rule (per-operand signs crash
+the frontend on two corpus files; open item).
   (The companion parameter-array fixes from the same session --
   multi-dimensional `localparam int R [5][5]` folds and dynamic-index
   reads via `$shiftx` -- depend on the fork's unpacked parameter-array

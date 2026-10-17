@@ -782,6 +782,7 @@
 %token TOK_x "'x'"
 %token TOK_z "'z'"
 
+%type <string_t> module_name_id
 %type <ast_t> range range_or_multirange non_opt_range non_opt_multirange param_unpacked param_packed wire_name_dims timing_event timing_events
 %type <ast_t> wire_type expr basic_expr concat_list assignment_pattern_list member_pattern_list rvalue lvalue lvalue_concat_list non_io_wire_type io_wire_type alias_lvalues match_filter type_operand opt_type_cast
 %type <string_t> opt_label opt_sva_label tok_prim_wrapper hierarchical_id hierarchical_type_id integral_number
@@ -975,10 +976,16 @@ hierarchical_type_id:
 	| TOK_LPAREN TOK_USER_TYPE TOK_RPAREN	{ $$ = std::move($2); }		// non-standard grammar
 	;
 
+// `ref` is a contextual keyword (tf-port direction); a module may be
+// named `ref`, so accept the token as a plain identifier here.
+module_name_id:
+	TOK_ID { $$ = std::move($1); } |
+	TOK_REF { $$ = std::make_unique<std::string>("\\ref"); };
+
 module:
 	attr TOK_MODULE {
 		extra->enterTypeScope();
-	} TOK_ID {
+	} module_name_id {
 		extra->do_not_require_port_stubs = false;
 		AstNode* mod = extra->pushChild(std::make_unique<AstNode>(@$, AST_MODULE));
 		extra->current_ast_mod = mod;
@@ -1209,7 +1216,38 @@ module_arg:
 			if (ch && ch->type == AST_WIRETYPE)
 				iface_type = ch->str;
 		}
-		if (!iface_type.empty() && extra->interface_names.count(iface_type)) {
+		// A type name that is not declared anywhere in this compilation
+		// unit (no typedef on the user-type stack, no package type) on a
+		// DIRECTIONLESS port is an interface port whose interface lives in
+		// another file (upstream semantics; `hierarchy -libdir` loads it on
+		// demand).  The lexer's typedef lookahead turns every `ident ident`
+		// into a user type, so without this `module m (iface intf)` became
+		// a plain wire and the interface connection was lost
+		// (tests/svinterfaces load_and_derive, resolve_types).  Directed
+		// ports keep the missing-package-typedef leniency.
+		bool type_known = false;
+		if (!iface_type.empty()) {
+			for (auto &m : extra->user_type_stack)
+				if (m.count(iface_type))
+					type_known = true;
+			if (extra->pkg_user_types.count(iface_type))
+				type_known = true;
+			// wildcard-imported package types are registered only under
+			// their qualified name (\pkg::name); `import pkg::*` makes the
+			// bare name a data type, not an interface
+			if (!type_known && iface_type.size() > 1) {
+				std::string bare = iface_type.substr(1);
+				for (auto &kv : extra->pkg_user_types) {
+					size_t pos = kv.first.rfind("::");
+					if (pos != std::string::npos && kv.first.substr(pos + 2) == bare) {
+						type_known = true;
+						break;
+					}
+				}
+			}
+		}
+		if (!iface_type.empty() && (extra->interface_names.count(iface_type) ||
+				(!type_known && !node->is_input && !node->is_output))) {
 			// IEEE 1800-2009 25.3: a port whose type is an interface is an interface port.
 			node->type = AST_INTERFACEPORT;
 			node->is_input = false;

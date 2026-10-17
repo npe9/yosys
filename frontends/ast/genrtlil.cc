@@ -130,12 +130,28 @@ static RTLIL::SigSpec binop2rtlil(AstNode *that, IdString type, int result_width
 		cell->attributes[attr.first] = attr.second->asAttrConst();
 	}
 
-	// Arithmetic and comparison cells share one sign. A shift count is
-	// unsigned; an arithmetic shift takes its sign from the data operand.
+	// Operand signedness.  A fork revision derived ONE shared sign for
+	// arithmetic/comparison cells (matched_sign) and forced both shift
+	// operands unsigned.  The shift half was wrong in two ways: $shift/
+	// $shiftx take a SIGNED offset (negative = shift left), so forcing B
+	// unsigned turned the negated offset of every dynamic part-select
+	// write into a huge count and the write vanished (tests/simple
+	// dynslice/partsel/sign_part_assign/memory, sat/counters-repeat,
+	// various/dynamic_part_select); and a logical shift must still
+	// sign-extend a signed A to the result width before shifting
+	// (s1 >> s2 with s1 = -2 gave 3, not 63; tests/simple/operators.v).
+	// Shifts therefore follow upstream (per-operand).  The matched_sign
+	// rule for the remaining cells is kept for now: switching those to
+	// per-operand signs as upstream does crashes the frontend (stack
+	// overflow) on axi4-fvip/AXI4_STREAM and caliptra fv_montmultiplier
+	// -- see PLAN.md 2026-10-16, open item.
 	bool a_signed, b_signed;
 	if (type == ID($shl) || type == ID($shr) || type == ID($sshl) || type == ID($sshr)) {
-		a_signed = that->children[0]->is_signed && (type == ID($sshl) || type == ID($sshr));
+		a_signed = that->children[0]->is_signed;
 		b_signed = false;
+	} else if (type == ID($shift) || type == ID($shiftx)) {
+		a_signed = that->children[0]->is_signed;
+		b_signed = that->children[1]->is_signed;
 	} else {
 		bool matched_sign = that->children[0]->is_signed && that->children[1]->is_signed;
 		a_signed = b_signed = matched_sign;

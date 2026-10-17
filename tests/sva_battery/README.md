@@ -146,8 +146,9 @@ mutation leg found 202 such OpenTitan disproofs).  Now the frontend
 compiles them: `$isunknown` is constant 0 (two-state semantics, with a
 warning per call; this applies to every `-formal` consumer, `sim`
 included), `$countones`/`$onehot`/`$onehot0` are a popcount,
-`$bits`/`$size`/`$clog2` fold, anything else is an error ("would become an
-undriven placeholder").  `tsysf.sv` pins all of them with independent
+`$bits`/`$size`/`$clog2` and `$high`/`$low`/`$left`/`$right` of a declared
+vector fold, anything else is an error ("would become an undriven
+placeholder").  `tsysf.sv` pins all of them with independent
 disproofs.  A check whose compiled body is a constant (ASSERT_KNOWN, a
 tautology the frontend folded) carries `sva_lowering = exact:const`: it
 proves nothing about the circuit, and the mutation leg classes it FREE.

@@ -2664,6 +2664,25 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 					is_signed = false;
 					return RTLIL::SigSpec(w, 32);
 				}
+				if (str == "\\$high" || str == "\\$low" || str == "\\$left" || str == "\\$right") {
+					// bounds of a declared packed vector (register v3 D8: these
+					// used to be undriven placeholders, then loud errors)
+					AstNode *arg = GetSize(children) == 1 ? children[0].get() : nullptr;
+					AstNode *decl = (arg && arg->type == AST_IDENTIFIER) ? arg->id2ast : nullptr;
+					AstNode *rng = (decl && !decl->children.empty() && decl->children[0] &&
+							decl->children[0]->type == AST_RANGE && decl->children[0]->range_valid)
+							? decl->children[0].get() : nullptr;
+					if (!rng)
+						input_error("System function %s inside a concurrent assertion needs a declared packed "
+								"vector as its (only) argument.\n", RTLIL::unescape_id(str));
+					int l = rng->range_left, r = rng->range_right;
+					if (rng->range_swapped)   // declared [lo:hi]: the AST keeps it normalized
+						std::swap(l, r);
+					int v = str == "\\$high" ? std::max(l, r) : str == "\\$low" ? std::min(l, r)
+							: str == "\\$left" ? l : r;
+					is_signed = true;
+					return RTLIL::SigSpec(RTLIL::Const(v, 32));
+				}
 				if (str == "\\$clog2") {
 					if (GetSize(children) != 1)
 						input_error("System function %s got %d arguments, expected 1.\n",

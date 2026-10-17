@@ -25,4 +25,12 @@ module xmut(input logic clk, input logic a, input logic b);
   p_dis:  assert property (@(posedge clk) ctr != 4'd15);              // DIS @15  MUT: HEALED
   // disproved on inputs alone: nothing in the circuit can heal it
   p_dis_free: assert property (@(posedge clk) a |-> b);               // DIS @0  MUT: FREE-DIS
+  // equivalence filter: a tautology sampling only the top bit of an 8-bit
+  // counter.  A mutant of a low bit changes big[7] only after >= 2^7 steps,
+  // beyond the bound: NOCHANGE for this check; a mutant of big[7]'s own
+  // cells is observable and survives as a tautology does.  Either class is
+  // honest; what the leg must never say is CAUGHT.
+  logic [7:0] big;
+  always_ff @(posedge clk) big <= big + 8'd1;
+  p_big:  assert property (@(posedge clk) big[7] |-> (big[7] || !big[6])); // PROVED  MUT: SURVIVED|NOCHANGE
 endmodule

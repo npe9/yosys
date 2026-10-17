@@ -200,16 +200,26 @@ mutating it changes the property rather than the design and would
 "catch" a tautology.
 
 Classes: a PROVED check is CAUGHT when a mutant in its cone disproves it,
-SURVIVED when at least three mutants ran in its cone and none did (a
+SURVIVED when at least three mutants ran in its cone, none disproved it,
+and at least one was OBSERVABLE at the bits the check samples (a
 tautology, a vacuous proof, or a lowering hole: the list to triage),
-UNDER-MUTATED below three, FREE when no circuit cell feeds it (inputs
-only, or constant-folded).  A DIS check is HEALED@K when a mutant makes
+NOCHANGE@K when every surviving mutant was invisible to it (the
+equivalence filter: gold/gate copies of the frozen lowered design, the
+original ports dropped, the sampled circuit bits exposed per bit, `miter
+-equiv` + bounded BMC; a mutant that changes none of them within K cannot
+be caught by that check, whatever it does elsewhere), UNDER-MUTATED below
+three, FREE when no circuit cell feeds it (inputs only, or
+constant-folded).  The lowered design is frozen as RTLIL once per file
+after the prep's flatten + opt_clean; every mutant, cone and miter run
+reads that file, so names are stable by construction.  A DIS check is HEALED@K when a mutant makes
 its counterexample vanish within K steps, MOVED when only the depth
 changes, STUCK@K otherwise, FREE-DIS when nothing in the circuit feeds
 it.  A mutant that heals every disproved check of a file that carries
 assumptions is an assumption kill (unsatisfiable environment), labelled
 and not counted.  `xmut.sv` is the positive control: one property per
-class, checked on every `--battery` run (`// MUT: <class>` comments).
+class, checked on every `--battery` run (`// MUT: <class>` comments;
+`p_big` pins the equivalence filter: a tautology sampling two bits of an
+8-bit counter is NOCHANGE for every low-bit mutant).
 
 A kill shows the verdict is sensitive to the design logic through the
 lowering; it does not show the lowering is LRM-correct (the oracle legs'

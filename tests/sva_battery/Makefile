@@ -48,4 +48,14 @@ test:
 mutate:
 	python3 ../../../../conformance/run_mutation.py --battery --jobs 4
 
-.PHONY: test mutate
+# Expectation provenance (register v3 C4): every PROVED / DIS @N
+# expectation checked against the independent reference model of the
+# property-based tester (../sva_pbt/ref_sva.py): ic3's own counterexample
+# replayed (replay-confirmed), random traces sampled (model-sampled), or
+# `unsupported` -- a hand-only expectation, the listed debt.  An `LRM @N`
+# note on an expectation line documents a known engine divergence.
+# Exits nonzero on any REFUTED line.  Separate target: minutes.
+oracle:
+	python3 oracle.py --traces 60
+
+.PHONY: test mutate oracle

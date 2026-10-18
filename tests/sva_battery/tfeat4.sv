@@ -26,5 +26,5 @@ module tfeat4(input logic clk);
   // The strong-expiry deadline is static (max offset 2 -> timeout one tick
   // after the truncated end), so the failure clocks at 13, not 12.
   p_fms_ok:  assert property (@(posedge clk) a |=> first_match(b ##[1:2] c) ##0 (ctr == 8'd12)); // PROVED
-  p_fms_bad: assert property (@(posedge clk) a |=> first_match(b ##[1:2] c) ##0 (ctr == 8'd13)); // DIS @13 (frame 14: static strong expiry)
+  p_fms_bad: assert property (@(posedge clk) a |=> first_match(b ##[1:2] c) ##0 (ctr == 8'd13)); // DIS @13 (frame 14: static strong expiry; LRM @12 on ic3's witness: first_match ends at the c tick and ctr!=13 decides there, known class F5 / register D5)
 endmodule

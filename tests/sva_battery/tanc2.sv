@@ -15,11 +15,14 @@ module tanc2 (input logic clk);
   assign b3 = (ctr == 3'd2) || (ctr == 3'd3) || (ctr == 3'd6);
   assign c  = (ctr == 3'd5);
 
-  // b at 2,3,4: exact [->2] ends at ctr 3; the !b[*0:$] tail needs tick 4
-  // to be !b, but b@4 blocks it -> no [=2] end at all -> vacuous.  The
-  // old >= counter treated ctr 4 as an end of the [->2] part (3rd
-  // occurrence, k >= 2) and matched [=2] from ctr 5 on.
-  p_blk: assert property (@(posedge clk) a ##1 b[=2] |-> 1'b0);  // PROVED
+  // b at 2,3,4: exact [->2] ends at ctr 3, and b[=2] = b[->2] ##1
+  // !b[*0:$] ends THERE too (the [*0] case, LRM 16.9.2); b@4 only cuts the
+  // later ends.  So the antecedent matches at ctr 3 and the property
+  // fails.  This expectation used to read PROVED, written against the
+  // monitor that required a !b tick after the last occurrence; the C4
+  // oracle (oracle.py, the independent ref_sva model) refuted it
+  // (2026-10-18) and ic3 had been proving a false property.
+  p_blk: assert property (@(posedge clk) a ##1 b[=2] |-> 1'b0);  // DIS @3
 
   // positive control: b at 2,3,6; exact [->2] ends at ctr 3, idle 4.., so
   // [=2] ends at 4 with c at 5 completing -> match -> violation.

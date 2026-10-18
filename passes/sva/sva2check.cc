@@ -1938,17 +1938,27 @@ struct SvaCompiler {
 						}
 						diff = mod->Sub(NEW_ID, SigSpec(cw), snap);
 					}
-					SigSpec inrange = mod->Ge(NEW_ID, diff,
-							Const(op == "[->]" ? m - 1 : m, aw));
+					// diff = occurrences strictly before this tick.
+					// [->m:n] ends AT an occurrence: b now and
+					// diff in [m-1, n-1].  [=m:n] = [->m:n] ##1
+					// !b[*0:$] (LRM 16.9.2); the [*0] case ends at the
+					// occurrence itself, the rest at a later !b tick
+					// with diff in [m, n].
+					SigSpec g_in = mod->Ge(NEW_ID, diff, Const(m - 1, aw));
 					if (hi >= 0)
-						inrange = mod->And(NEW_ID, inrange, mod->Le(NEW_ID, diff,
-								Const(op == "[->]" ? hi - 1 : hi, aw)));
-					any = mod->Or(NEW_ID, any, mod->And(NEW_ID, age[k], inrange));
+						g_in = mod->And(NEW_ID, g_in, mod->Le(NEW_ID, diff, Const(hi - 1, aw)));
+					SigSpec goto_k = mod->And(NEW_ID, bsig, g_in);
+					SigSpec hit = goto_k;
+					if (op == "[=]") {
+						SigSpec i_in = mod->Ge(NEW_ID, diff, Const(m, aw));
+						if (hi >= 0)
+							i_in = mod->And(NEW_ID, i_in, mod->Le(NEW_ID, diff, Const(hi, aw)));
+						hit = mod->Or(NEW_ID, goto_k,
+								andN({mod->Not(NEW_ID, bsig), gate_now(gate), i_in}));
+					}
+					any = mod->Or(NEW_ID, any, mod->And(NEW_ID, age[k], hit));
 				}
-				if (op == "[->]")
-					return andN({bsig, any});
-				SigSpec idle = mod->Not(NEW_ID, bsig);
-				return andN({idle, gate_now(gate), any});
+				return any;
 			}
 			if (!every_tick && hi >= 0)
 				approx("noncons-rep-merged-counter", std::string(op) + " at " + log_id(n));
@@ -1984,11 +1994,19 @@ struct SvaCompiler {
 			// (k >= m matches the LRM [->m:$] form) and at the property
 			// root (attempts every tick collapse the upper bound away).
 			SigSpec enough = mod->Ge(NEW_ID, cnt, Const(m > 0 ? m - 1 : 0, w));
+			SigSpec at_occ = andN({bsig, enough});
 			if (op == "[->]")
-				return andN({bsig, enough});
+				return at_occ;
+			// [=m:n] = [->m:n] ##1 !b[*0:$] (LRM 16.9.2): the empty !b
+			// run ends the match AT the m-th occurrence (register v3 C4:
+			// the battery oracle found ic3 proving `a ##1 b[=2] |-> 0`
+			// while the antecedent matches), and every later !b tick
+			// with cnt >= m ends it too
 			SigSpec idle = mod->Not(NEW_ID, bsig);
 			SigSpec enough_d = mod->Ge(NEW_ID, cnt, Const(m, w));
-			return andN({idle, gate_now(gate), enough_d});
+			SigSpec tail = andN({idle, gate_now(gate), enough_d});
+			// (b[=0] = !b[*0:$] never ends at a b tick)
+			return m > 0 ? mod->Or(NEW_ID, at_occ, tail) : tail;
 		}
 
 		if (op == "throughout") {
@@ -3052,7 +3070,7 @@ struct SvaCompiler {
 		if (op == "[->]")
 			return 1;
 		if (op == "[=]")
-			return 2;
+			return 1;   // [*0] tail: ends at the last occurrence, like [->]
 		if (op == "throughout" || op == "clocked" || op == "first_match" ||
 				op == "seq_match" || op == "within") {
 			Cell *b = child(1);

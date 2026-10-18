@@ -21,8 +21,13 @@ module t7 (input logic clk);
   p_rng_b:    assert property (@(posedge clk) lvl[*2:4] |-> (ctr <= 8'd7)); // DIS @8
   p_goto_ok:  assert property (@(posedge clk) p3[->2] |-> (ctr >= 8'd7));   // DIS @259
   p_goto_b:   assert property (@(posedge clk) p3[->2] |-> (ctr >= 8'd8));   // DIS @7
-  p_eq_ok:    assert property (@(posedge clk) p3[=2] |-> (ctr >= 8'd8));    // DIS @256
-  p_eq_b:     assert property (@(posedge clk) p3[=2] |-> (ctr >= 8'd9));    // DIS @8
+  // p3 at ctr 3, 7, 11, ...: p3[=2] ends at the 2nd occurrence (ctr 7,
+  // the [*0] case of the !p3 tail, LRM 16.9.2) and at the !p3 ticks after
+  // it.  Both fail at 7 (ctr 7 < 8).  These read DIS @256 / DIS @8 until
+  // the C4 oracle refuted them (2026-10-18): the monitor skipped the end
+  // at the occurrence itself.
+  p_eq_ok:    assert property (@(posedge clk) p3[=2] |-> (ctr >= 8'd8));    // DIS @7
+  p_eq_b:     assert property (@(posedge clk) p3[=2] |-> (ctr >= 8'd9));    // DIS @7
   p_unb_ok:   assert property (@(posedge clk) (ctr==3) ##[*] (ctr==200) |-> (ctr == 8'd200)); // PROVED
   p_unb_b:    assert property (@(posedge clk) (ctr==3) ##[*] (ctr==200) |-> (ctr == 8'd199)); // DIS @200
   p_ssq_ok:   assert property (@(posedge clk) (p3 ##[0:4] p3) |-> (ctr >= 8'd3)); // PROVED

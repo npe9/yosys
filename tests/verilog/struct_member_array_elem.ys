@@ -1,0 +1,46 @@
+# register v3 D10 (second shape): a struct member that is itself a packed
+# array of a struct type (OpenTitan's generated multireg `mreg_t [N:0] x`
+# inside reg2hw_t / hw2reg_t).  `s.x[i].q` used to autowire a
+# hierarchical-looking name (constant i: silent 0; dynamic i: "Hierarchical
+# prefix did not resolve"); `s.x[i]` had no outer dimension.  Every
+# formulation is proved against the hand-computed bit positions.
+read_verilog -sv <<EOT
+// OpenTitan multireg shape: struct member that is a packed array of structs
+package rp;
+  typedef struct packed { logic q; logic [1:0] d; } mreg_t;
+  typedef struct packed { logic [1:0] hi; mreg_t [3:0] en; logic [3:0] other; } reg2hw_t;
+  typedef struct packed { mreg_t [3:0] en; } hw2reg_t;
+endpackage
+module m(input rp::reg2hw_t reg2hw, input logic [1:0] sel, input logic [1:0] k,
+         output logic y, output logic yr, output logic yd, output logic ydr,
+         output logic [3:0] o, output logic [11:0] whole, output logic [2:0] el, output logic [2:0] elr,
+         output logic [1:0] dd, output logic [1:0] ddr, output logic db, output logic dbr,
+         output logic [3:0] en_q, output logic [3:0] en_qr, output rp::hw2reg_t hw2reg, output logic [11:0] hwr);
+  // reg2hw layout: hi [17:16], en [15:4] (element i at [4+3i+2 : 4+3i]), other [3:0]
+  assign y  = reg2hw.en[2].q;      assign yr  = reg2hw[4+3*2+2];
+  assign yd = reg2hw.en[sel].q;    assign ydr = reg2hw[4+3*sel+2];
+  assign o = reg2hw.other;
+  assign whole = reg2hw.en;
+  assign el = reg2hw.en[1];        assign elr = reg2hw[9:7];
+  assign dd = reg2hw.en[sel].d;    assign ddr = reg2hw[4+3*sel +: 2];
+  assign db = reg2hw.en[sel].d[k[0]]; assign dbr = reg2hw[4+3*sel+k[0]];
+  always_comb begin
+    for (int i = 0; i < 4; i++) en_q[i] = reg2hw.en[i].q;
+  end
+  assign en_qr = {reg2hw[15], reg2hw[12], reg2hw[9], reg2hw[6]};
+  // write side
+  always_comb begin
+    hw2reg = '0;
+    for (int i = 0; i < 4; i++) hw2reg.en[i].d = i[1:0];
+    hw2reg.en[sel].q = 1'b1;
+  end
+  assign hwr = hw2reg;
+endmodule
+EOT
+hierarchy -top m
+proc
+flatten
+select -assert-none w:reg2hw.en[2].q
+sat -verify -prove y yr -prove yd ydr -prove el elr -prove dd ddr -prove db dbr -prove en_q en_qr
+sat -verify -set reg2hw 18'b10_011_110_001_000_0101 -set sel 2 -set k 1 -prove y 1'b1 -prove o 4'b0101 -prove whole 12'b011_110_001_000 -prove el 3'b001 -prove dd 2'b10 -prove db 1'b1 -prove en_q 4'b0100
+sat -verify -set sel 2 -prove hwr 12'b011_110_001_000

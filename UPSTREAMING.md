@@ -77,6 +77,27 @@ the frontend on two corpus files; open item).
 - **Status:** landed on the fork (0bd82fcad, 203653d5d); chunk not yet
   materialized.  Small and independent: open right after `typedef-dims`.
 
+### 0d. `struct-arrays` — packed arrays of packed structs lose their element dimension
+- **Files:** `frontends/ast/simplify.cc` (make_packed_struct takes the
+  declaration's packed dimensions; the custom-type member branch marks an
+  array-of-struct member with `sv_elem_range`/`sv_elem_type` and
+  size_packed_struct records [N][E]; the AST_PREFIX `W[idx].member` rewrite
+  covers packed-array wires and struct-member arrays, nested member paths
+  and a select on the member via make_index_range; the rewritten node
+  carries the member's type for $bits/$size), `kernel/constids.inc`
+  (four ids), `tests/verilog/struct_packed_array_member.ys`,
+  `tests/verilog/struct_member_array_elem.ys`,
+  `tests/verilog/struct_array_elem_member_select.ys`.
+- **Reproduces on stock main (yosys-main worktree):** `resp_t [3:0] resps;`
+  is a 5-bit wire (the outer dimension is dropped) and `resps[2].ready`
+  autowires a hierarchical-looking name (silent constant); `reg2hw.en[2].q`
+  on a struct member `mreg_t [3:0] en` autowires the same way, and a
+  dynamic index errors "Index in generate block prefix syntax is not
+  constant".  Found 2026-10-17 via pulp axi (`mst_resps_i[sel].ar_ready`)
+  and OpenTitan's generated multiregs (31 IP files, register v3 D10).
+- **Status:** landed on the fork; chunk not yet materialized.  Independent
+  of 0/0c; the memory (`st_t W [3:0]`) half of the rewrite predates it.
+
 ### 1. `cdc-sdc` — structural CDC analysis + SDC subset frontend
 - **Files:** `passes/cmds/cdc.cc`, `passes/cmds/read_sdc.cc`,
   `passes/cmds/sdc_constraints.h`, `tests/verilog/cdc_cases.{sv,sdc,ys}`,

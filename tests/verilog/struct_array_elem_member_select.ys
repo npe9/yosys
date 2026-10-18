@@ -1,0 +1,35 @@
+# register v3 D10 (third shape): a select on the member of an array element
+# (`slots[k].key[1]`, `.key[0][c +: 4]`, `.ver[3:1]`, `.key[c][7]`, a write
+# `ws[0].key[1][c +: 2] = ...`) and the array-query functions on an element
+# member ($bits(slots[k].key[1]) is the member's type, not the wire's).
+# OpenTitan keymgr_dpe_ctrl writes `key_slots_d[sel].key[j][cnt*W +: W]`.
+read_verilog -sv <<EOT
+module m(input logic [1:0] k, input logic [1:0] c, input logic [62:0] raw,
+         output logic [31:0] a, b, cc, e, output logic [7:0] r1, r1r, output logic [3:0] r2, r2r, output logic [2:0] r3, r3r, output logic r4, r4r,
+         output logic [20:0] w, wr);
+  // slot: valid [20], key[1] [19:12], key[0] [11:4], ver [3:0]; slots[i] at [21i+20 : 21i]
+  typedef struct packed { logic valid; logic [1:0][7:0] key; logic [3:0] ver; } slot_t;
+  slot_t [2:0] slots;
+  assign slots = raw;
+  assign a = $bits(slots[1].key);     // 16
+  assign b = $bits(slots[k].key[1]);  // 8
+  assign cc = $size(slots[0].key);    // 2
+  assign e = $bits(slots[0].ver);     // 4
+  assign r1 = slots[k].key[1];         assign r1r = raw[21*k + 12 +: 8];
+  assign r2 = slots[k].key[0][c +: 4]; assign r2r = raw[21*k + 4 + c +: 4];
+  assign r3 = slots[2].ver[3:1];       assign r3r = raw[42 + 1 +: 3];
+  assign r4 = slots[k].key[c[0]][7];   assign r4r = raw[21*k + 4 + 8*c[0] + 7];
+  slot_t [0:0] ws;
+  always_comb begin
+    ws = '0;
+    ws[0].key[1][c +: 2] = 2'b11;
+    ws[0].valid = 1'b1;
+  end
+  assign w = ws;
+  assign wr = (21'd1 << 20) | (21'd3 << (12 + c));
+endmodule
+EOT
+hierarchy -top m
+proc
+flatten
+sat -verify -prove r1 r1r -prove r2 r2r -prove r3 r3r -prove r4 r4r -prove w wr -prove a 32'd16 -prove b 32'd8 -prove cc 32'd2 -prove e 32'd4

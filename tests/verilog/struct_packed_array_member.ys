@@ -1,0 +1,57 @@
+# register v3 D10: a packed array of a packed struct typedef (`st_t [3:0] x`)
+# used to lose its outer dimension (the wire was one element wide) and a
+# member select on an element (`x[i].m`) was flattened into a hierarchical
+# name that autowired: a silent constant-0 read.
+read_verilog -sv <<EOT
+module m(input logic [1:0] sel, input logic [1:0] k,
+         output logic y, output logic [3:0] z, output logic yd, output logic [3:0] zd,
+         output logic yr, output logic [3:0] zr, output logic ydr, output logic [3:0] zdr,
+         output logic [4:0] el, output logic [4:0] elr, output logic [19:0] all,
+         output logic b, output logic br, output logic [1:0] bs, output logic [1:0] bsr,
+         output logic nx, output logic [2:0] ny, output logic nxr, output logic [2:0] nyr,
+         output logic [1:0] w, output logic [1:0] wr);
+  typedef struct packed { logic ready; logic [3:0] data; } resp_t;
+  resp_t [3:0] resps;
+  assign resps = {resp_t'{ready: 1'b0, data: 4'd4}, resp_t'{ready: 1'b1, data: 4'd3},
+                  resp_t'{ready: 1'b0, data: 4'd2}, resp_t'{ready: 1'b1, data: 4'd1}};
+  // constant element index
+  assign y  = resps[2].ready;  assign z  = resps[1].data;
+  assign yr = resps[2][4];     assign zr = resps[1][3:0];
+  // dynamic element index
+  assign yd = resps[sel].ready;  assign zd = resps[sel].data;
+  assign ydr = resps[sel][4];    assign zdr = resps[sel][3:0];
+  // whole element and whole array
+  assign el = resps[sel];  assign elr = all[sel*5 +: 5];  assign all = resps;
+  // select on the member: bit, slice, dynamic bit
+  assign b  = resps[3].data[2];      assign br = resps[3][2];
+  assign bs = resps[sel].data[k[0] +: 2]; assign bsr = resps[sel][k[0] +: 2];
+  // nested struct member path, member with a non-zero declared lsb
+  typedef struct packed { logic [6:4] hi; logic x; } inner_t;
+  typedef struct packed { inner_t in; logic [1:0] tag; } outer_t;
+  outer_t [1:0] outs;
+  assign outs = {outer_t'{in: '{hi: 3'd5, x: 1'b1}, tag: 2'd2}, outer_t'{in: '{hi: 3'd6, x: 1'b0}, tag: 2'd1}};
+  assign nx = outs[1].in.x;  assign ny = outs[sel[0]].in.hi;
+  assign nxr = outs[1][2];   assign nyr = outs[sel[0]][5:3];
+  // element member select as a write target
+  resp_t [1:0] wres;
+  always_comb begin
+    wres = '0;
+    wres[1].data[1:0] = sel;
+    wres[sel[0]].ready = 1'b1;
+  end
+  assign w = wres[1].data[1:0];
+  assign wr = wres[1][1:0];
+endmodule
+EOT
+hierarchy -top m
+proc
+flatten
+select -assert-count 1 w:resps
+select -assert-none w:resps[2].ready
+select -assert-none w:resps[sel].ready
+# element 3 is the first (MSB) item of the concatenation: resps[2] = {1, 3}, resps[1] = {0, 2}
+sat -verify -prove y 1'b1 -prove z 4'd2 -prove yr 1'b1 -prove zr 4'd2 -prove b 1'b1 -prove nx 1'b1 -prove nxr 1'b1
+sat -verify -prove yd ydr -prove zd zdr -prove el elr -prove bs bsr -prove ny nyr -prove w wr
+sat -verify -set sel 2 -prove yd 1'b1 -prove zd 4'd3 -prove el 5'b10011
+sat -verify -set sel 1 -set k 1 -prove bs 2'b01 -prove ny 3'd5
+sat -verify -set sel 3 -prove w 2'b11 -prove wres 10'b10011_00000

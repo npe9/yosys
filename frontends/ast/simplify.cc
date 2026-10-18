@@ -982,7 +982,18 @@ static int size_packed_struct(AstNode *snode, int base_offset)
 	snode->range_right = base_offset;
 	snode->range_left = base_offset + width - 1;
 	snode->range_valid = true;
-	snode->dimensions.push_back({ 0, width, false });
+	if (snode->attributes.count(ID(sv_elem_range))) {
+		// a struct member that is a packed array of a struct type
+		// (`mreg_t [3:0] en;`): the N element copies are laid out
+		// above; record the outer dimension so `s.en[i]` is one
+		// element and `s.en[i].q` (AST_PREFIX rewrite) is its member
+		AstNode *r = snode->attributes.at(ID(sv_elem_range)).get();
+		int n = std::abs(r->range_left - r->range_right) + 1;
+		snode->dimensions.clear();
+		snode->dimensions.push_back({ std::min(r->range_left, r->range_right), n, r->range_left < r->range_right });
+		snode->dimensions.push_back({ 0, width / n, false });
+	} else
+		snode->dimensions.push_back({ 0, width, false });
 
 	return width;
 }
@@ -1170,7 +1181,14 @@ static AstNode *resolve_wiretype_struct(AstNode *decl_node)
 	return nullptr;
 }
 
-std::unique_ptr<AstNode> make_packed_struct(AstNode *template_node, std::string &name, decltype(AstNode::attributes) &attributes)
+static void prepend_ranges(std::unique_ptr<AstNode> &range, AstNode *range_add);
+
+// packed_dims: the declaration's own packed dimensions for a packed array
+// of the struct (`st_t [3:0] x`): the wire becomes the multirange
+// [3:0][E-1:0], so `x[i]` is one element and `x[i].m` (rewritten below in
+// the AST_PREFIX branch) is that element's member bits; without it the
+// outer dimension was silently dropped and the wire was one element wide.
+std::unique_ptr<AstNode> make_packed_struct(AstNode *template_node, std::string &name, decltype(AstNode::attributes) &attributes, AstNode *packed_dims = nullptr)
 {
 	// create a wire for the packed struct
 	auto loc = template_node->location;
@@ -1181,6 +1199,10 @@ std::unique_ptr<AstNode> make_packed_struct(AstNode *template_node, std::string 
 	wnode->is_signed = template_node->is_signed;
 	for (auto &pair : attributes) {
 		wnode->set_attribute(pair.first, pair.second->clone());
+	}
+	if (packed_dims) {
+		prepend_ranges(wnode->children[0], packed_dims);
+		wnode->range_valid = false;
 	}
 	// resolve packed dimension
 	while (wnode->simplify(true, 1, -1, false)) {}
@@ -5071,7 +5093,11 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 			if (!str.empty() && str[0] == '\\' && (template_node->type == AST_STRUCT || template_node->type == AST_UNION)) {
 				// replace instance with wire representing the packed structure
-				newNode = make_packed_struct(template_node.get(), str, attributes);
+				AstNode *packed_dims = nullptr;
+				if (type == AST_WIRE && GetSize(children) > 1 && children[1] &&
+						(children[1]->type == AST_RANGE || children[1]->type == AST_MULTIRANGE))
+					packed_dims = children[1].get();
+				newNode = make_packed_struct(template_node.get(), str, attributes, packed_dims);
 				newNode->set_attribute(ID::wiretype, mkconst_str(newNode->location, resolved_type_node->str));
 				// add original input/output attribute to resolved wire
 				newNode->is_input = this->is_input;
@@ -5137,6 +5163,19 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					for (int i = 0; i < n; i++)
 						for (auto &m : member_copies)
 							newNode->children.push_back(m->clone());
+					if (newNode->type == AST_UNION && n > 1)
+						// the copies of a union's members all sit at
+						// offset 0, so the array would be one element
+						// wide: refuse rather than lay it out wrong
+						input_error("Packed array of a union type as a struct member (`%s') is not supported.\n", str.c_str());
+					if (packed->type == AST_RANGE) {
+						// single outer dimension: size_packed_struct
+						// records [N][E] from sv_elem_range, and the
+						// AST_PREFIX rewrite of `s.x[i].m` reads the
+						// element type's member offsets from sv_elem_type
+						newNode->set_attribute(ID(sv_elem_range), packed->clone());
+						newNode->set_attribute(ID(sv_elem_type), template_node->clone());
+					}
 				} else {
 					auto& packed = children[1];
 					if (newNode->children.empty())
@@ -5200,40 +5239,92 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		log_assert(!is_custom_type);
 	}
 
-	// element member select on an unpacked array of a packed struct/union:
-	// W[idx].member -> W[idx][member_range]; the indexed-word paths for
-	// reads (multidimensional range) and writes (memory write port) already
-	// handle the rewritten form. Must run before the constant-prefix
-	// flattening below, which would otherwise turn this into a
-	// hierarchical-looking `W[0].member` identifier that silently autowires.
+	// element member select on an array of a packed struct/union, unpacked
+	// (`st_t W [3:0]`, a memory) or packed (`st_t [3:0] W`, a multirange
+	// wire): W[idx].member -> W[idx][member_range]; the indexed-word paths
+	// for reads (multidimensional range) and writes (memory write port,
+	// packed part-select) already handle the rewritten form. A nested
+	// member path (`W[idx].a.b`) descends the struct; a select on the
+	// member (`W[idx].data[k]`, `[hi:lo]`, `[k +: n]`) is offset into the
+	// member's bits. Must run before the constant-prefix flattening below,
+	// which would otherwise turn this into a hierarchical-looking
+	// `W[0].member` identifier that silently autowires.
 	if (type == AST_PREFIX && GetSize(children) == 2 && children[1]->type == AST_IDENTIFIER &&
-			current_scope.count(str) && current_scope.at(str)->type == AST_MEMORY) {
-		AstNode *stype = resolve_wiretype_struct(current_scope.at(str));
+			current_scope.count(str) &&
+			(current_scope.at(str)->type == AST_MEMORY ||
+			 (current_scope.at(str)->type == AST_WIRE && GetSize(current_scope.at(str)->dimensions) > 1) ||
+			 ((current_scope.at(str)->type == AST_STRUCT || current_scope.at(str)->type == AST_UNION) &&
+			  current_scope.at(str)->attributes.count(ID(sv_elem_type))))) {
+		AstNode *decl = current_scope.at(str);
+		// a struct member array (`s.x[i].m`) carries its element type; the
+		// identifier keeps the member path and the struct-member
+		// resolution below turns the element-relative range into bits of
+		// the struct wire
+		AstNode *stype = decl->attributes.count(ID(sv_elem_type)) ? decl->attributes.at(ID(sv_elem_type)).get()
+				: resolve_wiretype_struct(decl);
 		if (stype && stype->range_valid) {
 			std::string mname = children[1]->str;
 			if (!mname.empty() && mname[0] == '\\')
 				mname = mname.substr(1);
-			AstNode *item = nullptr;
-			for (auto &cand : stype->children) {
-				std::string cname = cand->str;
-				if (!cname.empty() && cname[0] == '\\')
-					cname = cname.substr(1);
-				if (cname == mname) {
-					item = cand.get();
-					break;
+			AstNode *item = stype;
+			size_t pos = 0;
+			while (item && pos <= mname.size()) {
+				size_t dot = mname.find('.', pos);
+				std::string seg = mname.substr(pos, dot == std::string::npos ? std::string::npos : dot - pos);
+				AstNode *next = nullptr;
+				for (auto &cand : item->children) {
+					std::string cname = cand->str;
+					if (!cname.empty() && cname[0] == '\\')
+						cname = cname.substr(1);
+					if (cname == seg) {
+						next = cand.get();
+						break;
+					}
 				}
+				item = next;
+				if (dot == std::string::npos)
+					break;
+				pos = dot + 1;
 			}
 			if (item && item->range_valid) {
+				AstNode *msel = children[1]->children.empty() ? nullptr : children[1]->children[0].get();
+				int ndims = GetSize(item->dimensions);
+				int sel_dims = msel ? (msel->type == AST_MULTIRANGE ? GetSize(msel->children) : 1) : 0;
+				if (msel && (children[1]->children.size() != 1 || (msel->type != AST_RANGE && msel->type != AST_MULTIRANGE) ||
+						ndims < 1 || sel_dims > ndims))
+					input_error("Unsupported select on member `%s' of array element `%s'.\n", mname.c_str(), str.c_str());
 				newNode = std::make_unique<AstNode>(location, AST_IDENTIFIER);
 				newNode->str = str;
+				// the expression has the member's type: $bits/$size and
+				// friends read it from here (the range below is bits of W)
+				newNode->set_attribute(ID(sv_elem_member), item->clone());
+				newNode->set_attribute(ID(sv_elem_member_sel), mkconst_int(location, sel_dims, true));
 				// shape mirrors a parsed `W[idx][member_bits]` access:
 				// one MULTIRANGE child, split downstream into unpacked
 				// index + packed member range (memory read/write paths)
 				auto mr = std::make_unique<AstNode>(location, AST_MULTIRANGE);
 				mr->children.push_back(std::make_unique<AstNode>(location, AST_RANGE, children[0]->clone()));
-				mr->children.push_back(std::make_unique<AstNode>(location, AST_RANGE,
-						mkconst_int(location, item->range_left, true),
-						mkconst_int(location, item->range_right, true)));
+				if (msel) {
+					// a select on the member (`.key[j]`, `.data[hi:lo]`,
+					// `.key[j][c +: w]`): the member is indexed like a
+					// packed array of its own dimensions, then shifted
+					// to the element's bit space
+					auto tmp = std::make_unique<AstNode>(location, AST_IDENTIFIER, msel->clone());
+					tmp->str = str;
+					auto rel = tmp->make_index_range(item, false);
+					int off = item->range_right;
+					for (auto &b : rel->children) {
+						if (b->type == AST_CONSTANT)
+							b = mkconst_int(location, b->integer + off, true);
+						else if (off != 0)
+							b = std::make_unique<AstNode>(location, AST_ADD, std::move(b), mkconst_int(location, off, true));
+					}
+					mr->children.push_back(std::move(rel));
+				} else {
+					mr->children.push_back(std::make_unique<AstNode>(location, AST_RANGE,
+							mkconst_int(location, item->range_left, true),
+							mkconst_int(location, item->range_right, true)));
+				}
 				newNode->children.push_back(std::move(mr));
 				goto apply_newNode;
 			}
@@ -5517,6 +5608,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					newNode->str = sname;
 					// save type and original number of dimensions for $size() etc.
 					newNode->set_attribute(ID::wiretype, item_node->clone());
+					// an element member select `s.x[i].m` keeps the member's type
+					for (auto id : {ID(sv_elem_member), ID(sv_elem_member_sel)})
+						if (attributes.count(id))
+							newNode->set_attribute(id, attributes.at(id)->clone());
 					if (!item_node->dimensions.empty() && children.size() > 0) {
 						if (children[0]->type == AST_RANGE)
 							newNode->integer = 1;
@@ -7871,7 +7966,15 @@ skip_memory_write:;
 							id_ast = item_node;
 
 						// The dimension of the original array expression is saved in the 'integer' field
-						dim += buf->integer;
+						int sel_dims = buf->integer;
+						if (buf->attributes.count(ID(sv_elem_member))) {
+							// element member select `W[i].m` (rewritten into
+							// a range on W): the expression has the member's
+							// type, indexed once more if the member was
+							id_ast = buf->attributes.at(ID(sv_elem_member)).get();
+							sel_dims = buf->attributes.at(ID(sv_elem_member_sel))->integer;
+						}
+						dim += sel_dims;
 
 						int dims = GetSize(id_ast->dimensions);
 						// TODO: IEEE Std 1800-2017 20.7: "If the first argument to an array query function would cause $dimensions to return 0

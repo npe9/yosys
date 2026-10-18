@@ -1811,7 +1811,33 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 							break;
 						}
 				}
+				// register v3 D14: two implicit-name shapes are never an
+				// interface member or a net the user meant -- a package-
+				// qualified name (`pkg::P.m`: a failed package/member
+				// resolution) and an element member select of a declared
+				// wire or memory (`w[2].m`: D10) -- and each read a silent
+				// constant on a strict read.  They are degradations, not
+				// warnings.
+				bool never_implicit = false;
 				if (!is_sequence_method_name(str) && !sva_decl_ref) {
+					if (str.find("::") != std::string::npos)
+						never_implicit = true;
+					size_t lb = str.find('[');
+					if (!never_implicit && lb != std::string::npos && lb > 1 && str.find("].", lb) != std::string::npos) {
+						std::string base = str.substr(0, lb);
+						// the module's own declarations (the scope map can be
+						// cleared by this point)
+						if (current_ast_mod)
+							for (auto &ch : current_ast_mod->children)
+								if (ch && (ch->type == AST_WIRE || ch->type == AST_MEMORY) && ch->str == base) {
+									never_implicit = true;
+									break;
+								}
+					}
+				}
+				if (never_implicit)
+					degrade(location.to_loc(), "Identifier `%s' did not resolve (a package-qualified or element-member name is never an implicit net).\n", str.c_str());
+				else if (!is_sequence_method_name(str) && !sva_decl_ref) {
 					if (flag_autowire)
 						// upstream's own leniency under `default_nettype wire`;
 						// dotted names included: interface-port members

@@ -1,0 +1,10 @@
+# Register v3 D14: a package-qualified identifier that does not resolve
+# (`cp::NOPE`, or a struct parameter member before D13) is never an
+# implicit net; a strict read used to autowire it with only a warning.
+logger -expect error "never an implicit net" 1
+read_verilog -sv <<EOT
+package cp; localparam int Q = 1; endpackage
+module m(output logic a);
+  assign a = cp::NOPE;
+endmodule
+EOT

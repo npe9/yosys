@@ -1,0 +1,9 @@
+# Register v3 D14 boundary: an interface-member style name (`p.sig`) stays
+# upstream's implicit-net warning under `default_nettype wire`; hierarchy
+# resolves interface ports later.
+logger -expect warning "is implicitly declared" 1
+read_verilog -sv <<EOT
+module m(output logic c);
+  assign c = intf_port.sig;
+endmodule
+EOT

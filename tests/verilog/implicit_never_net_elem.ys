@@ -1,0 +1,11 @@
+# Register v3 D14: an element member select of a declared wire that does
+# not resolve (`w[1].foo` on a plain vector; the D10 shapes before D10) is
+# never an implicit net; a strict read used to autowire it.
+logger -expect error "never an implicit net" 1
+read_verilog -sv <<EOT
+module m(output logic b);
+  logic [3:0] w;
+  assign w = 4'b1010;
+  assign b = w[1].foo;
+endmodule
+EOT

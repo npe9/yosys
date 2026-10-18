@@ -417,12 +417,21 @@ def prove_file(path, args, workdir):
             verdicts[name] = (v, step, engine, None)
     ok = True
     ltags = run_ic3.lowering_tags(YOSYS, [path], args.top, args.include)
+    n_const = 0
     for name, (v, step, engine, el) in sorted(verdicts.items()):
         tag = {"proved": "PROVED", "holds": "holds-to-bound",
                "undecided": "UNDECIDED"}.get(v, v)
+        # register v3 B5: a proof of a constant-folded body (`exact:const`)
+        # proves nothing about the design; it gets its own label, as in
+        # run_battery.py, and its own count
+        if v == "proved" and ltags.get(name, "").endswith(":const"):
+            tag = "PROVED(const)"
+            n_const += 1
         print("  %-16s %-14s (%s%s) [lowering=%s]" % (tag, name, engine,
                                         ", %.1fs" % el if el is not None else "",
                                         ltags.get(name, "untagged")))
+    if n_const:
+        print("  (%d of the proofs are PROVED(const): the property body folded to a constant)" % n_const)
     for name in sorted(set(exp) - set(verdicts)):
         print("  MISSING          %s" % name)
         ok = False

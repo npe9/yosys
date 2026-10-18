@@ -1483,7 +1483,11 @@ static void rename_in_package_stmts(AstNode *pkg)
 	std::function<void(std::unique_ptr<AstNode>&)> rename =
 		[&rename, &idents, pkg](std::unique_ptr<AstNode>& node) {
 			for (auto& child : node->children) {
-				if (!child->str.empty() && idents.count(child->str))
+				// an already-qualified name (`config_pkg::cfg_t`, also the
+				// name of a typedef cloned in from an imported package)
+				// is not this package's to prefix again (register v3 D13:
+				// `build_config_pkg::config_pkg::cva6_cfg_t`)
+				if (!child->str.empty() && idents.count(child->str) && child->str.find("::") == std::string::npos)
 					child->str = pkg->str + "::" + child->str.substr(1);
 				rename(child);
 			}

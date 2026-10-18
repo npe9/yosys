@@ -1,0 +1,45 @@
+# register v3 D13: constant functions that take and return packed structs
+# (cva6 build_config, hpdcache hpdcacheBuildConfig).  Member reads of a
+# struct argument, member writes, a named assignment pattern whose values
+# are arguments, and the result used to size a cast in a derived module.
+# Before: "Constant function did not evaluate; using constant 0", so every
+# `CFG.XLEN'(x)` cast was zero-sized.
+read_verilog -sv <<EOT
+package cfg_pkg;
+  typedef struct packed { logic [31:0] XLEN; bit En; logic [3:0] tag; int nr; } cfg_t;
+  typedef struct packed { logic [31:0] XLEN; logic [3:0] t; } user_t;
+  function automatic cfg_t build_m(user_t u);   // member by member
+    bit is64 = (u.XLEN == 64);   // initialized local (lowered as `initial`)
+    cfg_t c;
+    c.XLEN = u.XLEN;
+    c.En = is64;
+    c.nr = -3;                   // signed `int` member on the left
+    c.tag = u.t + 4'd1;
+    c.tag[3] = 1'b1;
+    return c;
+  endfunction
+  function automatic cfg_t build_p(int x, logic [3:0] t);   // named pattern
+    cfg_t c;
+    c = '{tag: t, XLEN: x, En: x == 32, nr: 7};
+    return c;
+  endfunction
+  localparam user_t U64 = '{XLEN: 64, t: 4'd2};
+  localparam cfg_t DEF = '{XLEN: 32, En: 1'b0, tag: 4'd0, nr: 0};
+endpackage
+module m #(parameter cfg_pkg::cfg_t C = cfg_pkg::DEF) (output logic [63:0] a, b, output logic [68:0] whole);
+  assign a = C.XLEN'(1) << (C.XLEN - 1);
+  assign b = C.XLEN'(3);
+  assign whole = C;
+endmodule
+module top(output logic [63:0] a1, b1, a2, b2, output logic [68:0] w1, w2);
+  m #(.C(cfg_pkg::build_m(cfg_pkg::U64))) u1 (.a(a1), .b(b1), .whole(w1));
+  m #(.C(cfg_pkg::build_p(32, 4'd5))) u2 (.a(a2), .b(b2), .whole(w2));
+endmodule
+EOT
+# whole = {XLEN, En, tag, nr}: u1 {64, 1, 4'b1011, -3} = 8916352106493, u2 {32, 1, 5, 7} = 4488240824327
+hierarchy -top top
+proc
+flatten
+opt
+sat -verify -prove a1 64'h8000000000000000 -prove b1 64'd3 -prove w1 69'd8916352106493
+sat -verify -prove a2 64'h0000000080000000 -prove b2 64'd3 -prove w2 69'd4488240824327

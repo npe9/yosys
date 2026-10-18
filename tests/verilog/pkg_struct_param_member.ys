@@ -1,0 +1,29 @@
+# register v3 D13: member reads of a struct-typed package parameter.
+# (1) a cast in the assignment pattern (`unsigned'(W)`, `bit'(1)`,
+#     `128'({...})`) left the whole value unmaterialized: in-package reads
+#     autowired or read 0 (the cva6 user config).
+# (2) `pkg::P.member` from a module was never registered: it autowired with
+#     only a warning on a strict read (a silent constant).
+read_verilog -sv <<EOT
+package cp;
+  localparam W = 64;
+  typedef struct packed { int unsigned XLEN; int unsigned VLEN; bit En; logic [1:0][63:0] base; } t_t;
+  localparam t_t C = '{VLEN: unsigned'(39), XLEN: unsigned'(W), En: bit'(1), base: 128'({64'h5, 64'h7})};
+  localparam int unsigned X = C.XLEN;
+  localparam bit E = C.En;
+endpackage
+module m(output logic [31:0] a, v, x, output logic e, ei, output logic [63:0] b0, b1);
+  assign a = cp::C.XLEN;
+  assign v = cp::C.VLEN;
+  assign e = cp::C.En;
+  assign b0 = cp::C.base[0];
+  assign b1 = cp::C.base[1];
+  assign x = cp::X;
+  assign ei = cp::E;
+endmodule
+EOT
+hierarchy -top m
+proc
+opt
+select -assert-none w:cp::*
+sat -verify -prove a 32'd64 -prove v 32'd39 -prove e 1'b1 -prove b0 64'h7 -prove b1 64'h5 -prove x 32'd64 -prove ei 1'b1

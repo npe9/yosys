@@ -4415,6 +4415,24 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				while (!children[0]->basic_prep && children[0]->simplify(false, stage, -1, false))
 					did_something = true;
 				AstNode *pat = children[0].get();
+				// a parameter value is a constant expression: fold each
+				// element (`unsigned'(W)`, `bit'(0)`, `1024'({...})`), keeping
+				// its member key -- folding replaces the node (register v3
+				// D13: one cast left the whole cva6 user config unmaterialized
+				// and every member read garbage)
+				for (auto &el : pat->children) {
+					if (!el || el->type == AST_CONSTANT)
+						continue;
+					std::vector<std::pair<RTLIL::IdString, std::unique_ptr<AstNode>>> keys;
+					for (auto id : {ID(sv_member), ID(sv_typekey)})
+						if (el->attributes.count(id))
+							keys.emplace_back(id, el->attributes.at(id)->clone());
+					while (el->simplify(true, stage, -1, false)) { }
+					for (auto &k : keys)
+						if (!el->attributes.count(k.first))
+							el->set_attribute(k.first, std::move(k.second));
+					did_something = true;
+				}
 				bool all_const = true, named = false;
 				for (auto &el : pat->children) {
 					all_const = all_const && el->type == AST_CONSTANT;
@@ -5583,6 +5601,29 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	}
 
 	if (type == AST_IDENTIFIER && !basic_prep) {
+		// `pkg::P.member` on a struct-typed package parameter: the members
+		// were registered in the package under `P.member` only; register
+		// them under the qualified name the module sees (register v3 D13:
+		// cva6 `cva6_config_pkg::cva6_cfg.XLEN` autowired, a silent 0)
+		if (!str.empty() && str[0] == '\\' && !current_scope.count(str) && str.find("::") != std::string::npos) {
+			size_t q = str.rfind("::");
+			size_t dot = str.find('.', q);
+			if (dot != std::string::npos) {
+				std::string pname = str.substr(0, dot);
+				if (current_scope.count(pname)) {
+					AstNode *pn = current_scope.at(pname);
+					if ((pn->type == AST_PARAMETER || pn->type == AST_LOCALPARAM) && pn->attributes.count(ID::wiretype)) {
+						// the type is the struct node or its (qualified) name
+						AstNode *st = resolve_wiretype_struct(pn);
+						if (st && (st->type == AST_STRUCT || st->type == AST_UNION)) {
+							if (!st->range_valid)
+								size_packed_struct(st, 0);
+							add_members_to_scope(st, pname);
+						}
+					}
+				}
+			}
+		}
 		// check if a plausible struct member sss.mmmm
 		if (!str.empty() && str[0] == '\\' && current_scope.count(str)) {
 			auto item_node = current_scope[str];
@@ -8404,8 +8445,11 @@ skip_memory_write:;
 			bool all_args_const = true;
 			for (auto& child : children) {
 				while (child->simplify(true, 1, -1, false)) { }
-				if (child->type != AST_CONSTANT && child->type != AST_REALVALUE)
+				if (child->type != AST_CONSTANT && child->type != AST_REALVALUE) {
 					all_args_const = false;
+					if (getenv("SVA_DEBUG_FCALL"))
+						child->dumpAst(nullptr, "nonconst-arg> ");
+				}
 			}
 
 			if (all_args_const) {
@@ -10065,9 +10109,66 @@ bool AstNode::is_simple_const_expr()
 	return true;
 }
 
+// Replace a node by a constant, keeping the assignment-pattern keys
+// (`'{XLEN: x}`: the member name rides on the value node as sv_member /
+// sv_typekey; substituting a function argument for `x` must not drop it)
+static void replace_keep_pattern_keys(AstNode *node, std::unique_ptr<AstNode> newNode)
+{
+	for (auto id : {ID(sv_member), ID(sv_typekey)})
+		if (node->attributes.count(id))
+			newNode->set_attribute(id, node->attributes.at(id)->clone());
+	newNode->cloneInto(*node);
+}
+
 // helper function for AstNode::eval_const_function()
 bool AstNode::replace_variables(std::map<std::string, AstNode::varinfo_t> &variables, AstNode *fcall, bool must_succeed)
 {
+	// a member of a struct-typed variable (`cfg.XLEN`, `u.a.b`): the member
+	// was registered in the function's scope when the variable's type was
+	// resolved; read its bits out of the base variable (register v3 D13:
+	// config-building constant functions take and return structs)
+	if (type == AST_IDENTIFIER && !variables.count(str) && str.find('.') != std::string::npos && current_scope.count(str)) {
+		AstNode *item = current_scope.at(str);
+		// the base is the longest dotted prefix that is a function variable
+		// (generated names embed the source file name, which has dots)
+		std::string base;
+		for (size_t pos = str.rfind('.'); pos != std::string::npos && pos > 0; pos = str.rfind('.', pos - 1))
+			if (variables.count(str.substr(0, pos))) {
+				base = str.substr(0, pos);
+				break;
+			}
+		if ((item->type == AST_STRUCT_ITEM || item->type == AST_STRUCT || item->type == AST_UNION) &&
+				item->range_valid && !base.empty()) {
+			int offset = item->range_right, width = item->range_left - item->range_right + 1;
+			if (!children.empty()) {
+				if (children.size() != 1 || children.at(0)->type != AST_RANGE) {
+					if (!must_succeed)
+						return false;
+					input_error("Unsupported select on struct member in constant function\n%s: ...called from here.\n",
+							fcall->loc_string().c_str());
+				}
+				if (!children.at(0)->replace_variables(variables, fcall, must_succeed))
+					return false;
+				while (children.at(0)->simplify(true, 1, -1, false)) { }
+				if (!children.at(0)->range_valid || item->dimensions.size() != 1 || item->dimensions[0].range_swapped) {
+					if (!must_succeed)
+						return false;
+					input_error("Non-constant range\n%s: ... called from here.\n", fcall->loc_string().c_str());
+				}
+				int lo = min(children.at(0)->range_left, children.at(0)->range_right);
+				width = std::abs(children.at(0)->range_left - children.at(0)->range_right) + 1;
+				offset += lo - item->dimensions[0].range_right;
+			}
+			const varinfo_t &v = variables.at(base);
+			offset -= v.offset;
+			std::vector<RTLIL::State> new_bits;
+			for (int i = 0; i < width; i++)
+				new_bits.push_back(offset + i >= 0 && offset + i < v.val.size() ? v.val[offset + i] : RTLIL::State::Sx);
+			auto newNode = mkconst_bits(location, new_bits, item->is_signed);
+			replace_keep_pattern_keys(this, std::move(newNode));
+			return true;
+		}
+	}
 	if (type == AST_IDENTIFIER && variables.count(str)) {
 		int offset = variables.at(str).offset, width = variables.at(str).val.size();
 		if (!children.empty()) {
@@ -10098,7 +10199,7 @@ bool AstNode::replace_variables(std::map<std::string, AstNode::varinfo_t> &varia
 		for (int i = 0; i < width; i++)
 			new_bits.push_back(val[offset+i]);
 		auto newNode = mkconst_bits(location, new_bits, variables.at(str).is_signed);
-		newNode->cloneInto(*this);
+		replace_keep_pattern_keys(this, std::move(newNode));
 		return true;
 	}
 
@@ -10211,6 +10312,53 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 
 		if (stmt->type == AST_ASSIGN_EQ)
 		{
+			// a named assignment pattern to a struct variable: put the
+			// values in member order now, before substitution and folding
+			// replace the value nodes (and with them their member keys);
+			// packed below once every value is constant (register v3 D13)
+			if (stmt->children.at(1)->type == AST_ASSIGN_PATTERN && stmt->children.at(0)->type == AST_IDENTIFIER &&
+					stmt->children.at(0)->children.empty()) {
+				AstNode *lhs = stmt->children.at(0).get();
+				AstNode *decl = lhs->id2ast ? lhs->id2ast : (current_scope.count(lhs->str) ? current_scope.at(lhs->str) : nullptr);
+				AstNode *st = decl ? resolve_wiretype_struct(decl) : nullptr;
+				AstNode *pat = stmt->children.at(1).get();
+				auto bare = [](std::string n) { return (!n.empty() && n[0] == '\\') ? n.substr(1) : n; };
+				bool named = !pat->children.empty();
+				for (auto &ch : pat->children)
+					if (!ch || !ch->attributes.count(ID(sv_member)))
+						named = false;
+				if (st && st->type == AST_STRUCT && named) {
+					dict<std::string, std::unique_ptr<AstNode>> by_name;
+					for (auto &ch : pat->children)
+						by_name[bare(ch->attributes.at(ID(sv_member))->str)] = std::move(ch);
+					std::vector<std::unique_ptr<AstNode>> ordered;
+					bool ok = true;
+					for (auto &it : st->children) {
+						if (!it || !(it->type == AST_STRUCT_ITEM || it->type == AST_STRUCT || it->type == AST_UNION))
+							continue;
+						std::string n = bare(it->str);
+						if (!by_name.count(n)) {
+							ok = false;
+							break;
+						}
+						ordered.push_back(std::move(by_name.at(n)));
+						by_name.erase(n);
+					}
+					if (ok && by_name.empty()) {
+						for (auto &ch : ordered)
+							ch->attributes.erase(ID(sv_member));
+						pat->children = std::move(ordered);
+					} else {
+						// a missing or unknown key: leave it to the general
+						// pattern path (which reports it); restore what we can
+						pat->children.clear();
+						for (auto &ch : ordered)
+							if (ch) pat->children.push_back(std::move(ch));
+						for (auto &kv : by_name)
+							pat->children.push_back(std::move(kv.second));
+					}
+				}
+			}
 			if (stmt->children.at(0)->type == AST_IDENTIFIER && stmt->children.at(0)->children.size() != 0 &&
 					stmt->children.at(0)->children.at(0)->type == AST_RANGE)
 				if (!stmt->children.at(0)->children.at(0)->replace_variables(variables, fcall, must_succeed))
@@ -10222,6 +10370,51 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			if (stmt->type != AST_ASSIGN_EQ)
 				continue;
 
+			// an assignment pattern of constants to a struct variable
+			// (`c = '{XLEN: x, En: 1}` in a config-building function):
+			// pack it MSB-first in member order (register v3 D13)
+			if (stmt->children.at(1)->type == AST_ASSIGN_PATTERN && stmt->children.at(0)->type == AST_IDENTIFIER &&
+					stmt->children.at(0)->children.empty() && stmt->children.at(0)->id2ast) {
+				AstNode *st = resolve_wiretype_struct(stmt->children.at(0)->id2ast);
+				AstNode *pat = stmt->children.at(1).get();
+				std::vector<AstNode*> items;
+				if (st && st->type == AST_STRUCT)
+					for (auto &it : st->children)
+						if (it && it->range_valid && (it->type == AST_STRUCT_ITEM || it->type == AST_STRUCT || it->type == AST_UNION))
+							items.push_back(it.get());
+				bool ok = !items.empty() && GetSize(items) == GetSize(pat->children);
+				for (auto &ch : pat->children)
+					if (!ch || ch->type != AST_CONSTANT)
+						ok = false;
+				if (ok) {
+					auto bare = [](std::string n) { return (!n.empty() && n[0] == '\\') ? n.substr(1) : n; };
+					dict<std::string, AstNode*> by_name;
+					bool named = true;
+					for (auto &ch : pat->children) {
+						if (!ch->attributes.count(ID(sv_member)))
+							named = false;
+						else
+							by_name[bare(ch->attributes.at(ID(sv_member))->str)] = ch.get();
+					}
+					std::vector<RTLIL::State> bits;
+					// struct items are MSB first; build LSB first from the back
+					for (int i = GetSize(items) - 1; i >= 0 && ok; i--) {
+						AstNode *val = named ? (by_name.count(bare(items[i]->str)) ? by_name.at(bare(items[i]->str)) : nullptr)
+								: pat->children[i].get();
+						if (!val) {
+							ok = false;
+							break;
+						}
+						int w = items[i]->range_left - items[i]->range_right + 1;
+						RTLIL::Const c = val->bitsAsConst(w);
+						for (int b = 0; b < w; b++)
+							bits.push_back(c[b]);
+					}
+					if (ok)
+						stmt->children[1] = mkconst_bits(stmt->location, bits, false);
+				}
+			}
+
 			if (stmt->children.at(1)->type != AST_CONSTANT) {
 				if (!must_succeed)
 					goto finished;
@@ -10229,6 +10422,14 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 						fcall->loc_string().c_str());
 			}
 
+			// a signed struct member on the left (`cfg.NrTriggers = ...`
+			// with an `int` member) is wrapped as $signed(base[range]); the
+			// sign does not matter to a store
+			if (stmt->children.at(0)->type == AST_TO_SIGNED && stmt->children.at(0)->children.size() == 1 &&
+					stmt->children.at(0)->children.at(0)->type == AST_IDENTIFIER) {
+				auto inner = std::move(stmt->children.at(0)->children.at(0));
+				stmt->children.at(0) = std::move(inner);
+			}
 			if (stmt->children.at(0)->type != AST_IDENTIFIER) {
 				if (!must_succeed)
 					goto finished;
@@ -10271,6 +10472,12 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 				}
 				int offset = min(range->range_left, range->range_right);
 				int width = std::abs(range->range_left - range->range_right) + 1;
+				// a struct member on the left (`cfg.XLEN = ...`): simplify
+				// rewrote it into a member-relative range on the base
+				// variable, with the member in the wiretype attribute
+				// (genrtlil adds the same base offset)
+				if (AstNode *mn = stmt->children.at(0)->get_struct_member())
+					offset += mn->range_right;
 				varinfo_t &v = variables[stmt->children.at(0)->str];
 				RTLIL::Const r = stmt->children.at(1)->bitsAsConst(v.val.size());
 				for (int i = 0; i < width; i++) {
@@ -10434,6 +10641,30 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			continue;
 		}
 
+		// a function-local `bit x = expr;` reaches here as the declaration
+		// plus `initial x <= expr;`: inside a function it is an ordinary
+		// assignment, executed in place (register v3 D13: cva6 build_config
+		// opens with such declarations)
+		if (stmt->type == AST_INITIAL)
+		{
+			std::vector<std::unique_ptr<AstNode>> body;
+			std::function<void(AstNode *)> lower = [&](AstNode *n) {
+				if (n->type == AST_ASSIGN_LE)
+					n->type = AST_ASSIGN_EQ;
+				for (auto &c : n->children)
+					if (c && (c->type == AST_BLOCK || c->type == AST_ASSIGN_LE))
+						lower(c.get());
+			};
+			for (auto &c : stmt->children) {
+				lower(c.get());
+				body.push_back(std::move(c));
+			}
+			block->children.erase(block->children.begin());
+			block->children.insert(block->children.begin(), std::make_move_iterator(body.begin()), std::make_move_iterator(body.end()));
+			block->fixup_hierarchy_flags();
+			continue;
+		}
+
 		if (stmt->type == AST_BLOCK)
 		{
 			if (!stmt->str.empty())
@@ -10451,6 +10682,8 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 		}
 
 		// log("C\n");
+		if (getenv("SVA_DEBUG_FCALL"))
+			stmt->dumpAst(nullptr, "unsupported> ");
 		if (!must_succeed)
 			goto finished;
 		stmt->input_error("Unsupported language construct in constant function\n%s: ... called from here.\n",

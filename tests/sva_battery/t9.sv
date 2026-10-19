@@ -24,8 +24,14 @@ module t9 (input logic clk);
     @(posedge clk) (a, v = ctr) |=> (ctr == v + 8'd2);
   endproperty
 
+  // (a ##2 b) intersect (c ##1 b) never matches: both operands start at
+  // the same tick, and a (ctr 10) and c (ctr 11) are never high together,
+  // so p_int_ok and p_int_b hold vacuously (LRM 16.9.6).  p_int_b was
+  // expected DIS @12, which encoded the cross-attempt pairing fixed in
+  // register v3 C1 (2026-10-19): attempt 10's a ##2 b end at 12 paired with
+  // attempt 11's c ##1 b end at 12.
   p_int_ok:   assert property (@(posedge clk) (a ##2 b) intersect (c ##1 b) |-> (ctr == 8'd12)); // PROVED
-  p_int_b:    assert property (@(posedge clk) (a ##2 b) intersect (c ##1 b) |-> (ctr == 8'd13)); // DIS @12
+  p_int_b:    assert property (@(posedge clk) (a ##2 b) intersect (c ##1 b) |-> (ctr == 8'd13)); // PROVED
   p_seq_ok:   assert property (@(posedge clk) s_impl(a, c) |-> (ctr == 8'd11));  // PROVED
   p_seq_b:    assert property (@(posedge clk) s_impl(a, c) |-> (ctr == 8'd10));  // DIS @11
   p_prop_ok:  assert property (p_impl(a));                                       // PROVED

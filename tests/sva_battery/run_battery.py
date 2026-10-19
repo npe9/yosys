@@ -213,7 +213,8 @@ TAG_HIST = {}
 
 
 def main():
-    files = sorted(glob.glob(os.path.join(HERE, "t*.sv")))
+    # a file subset for iterating on new pins; the gate runs them all
+    files = [os.path.abspath(f) for f in sys.argv[1:]] or sorted(glob.glob(os.path.join(HERE, "t*.sv")))
     n_props = 0
     failures = []
     for path in files:

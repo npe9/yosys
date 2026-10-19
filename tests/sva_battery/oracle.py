@@ -504,6 +504,35 @@ def inline_named(text, decls, depth=0):
     return " ".join(out)
 
 
+def initial_checks(src):
+    """True if an initial block holds a concurrent check or expect."""
+    src = re.sub(r'"(?:\\.|[^"\\])*"', '""', src)
+    src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
+    src = re.sub(r"//[^\n]*", "", src)
+    toks = re.findall(r"\b(?:initial|begin|end|property|expect)\b|;", src)
+    i = 0
+    while i < len(toks):
+        if toks[i] != "initial":
+            i += 1
+            continue
+        j, depth = i + 1, 0
+        while j < len(toks):
+            t = toks[j]
+            if t in ("property", "expect"):
+                return True
+            if t == "begin":
+                depth += 1
+            elif t == "end":
+                depth -= 1
+                if depth <= 0:
+                    break
+            elif t == ";" and depth == 0:
+                break
+            j += 1
+        i = j + 1
+    return False
+
+
 def scan(path):
     """-> list of dict(name, kind, clock, top: N, parser) for the
     single-line assertions/assumptions of the file; unsupported ones carry
@@ -520,6 +549,11 @@ def scan(path):
     file_why = None
     if re.search(r"\bdefault\s+disable\s+iff\b", src):
         file_why = "default disable iff"
+    # a concurrent check inside an initial block is ONE attempt (LRM
+    # 16.15.6); the scanner reads every labeled line as an always-on
+    # check, so an initial assumption would over-constrain the sampling
+    elif initial_checks(src):
+        file_why = "concurrent check in an initial block (single attempt)"
     for ln, line in enumerate(lines):
         m = ASSERT_RE.match(line)
         if not m:

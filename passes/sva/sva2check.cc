@@ -388,6 +388,16 @@ struct SvaCompiler {
 		return q;
 	}
 
+	// e has fired at or after the last tick st was high (same tick
+	// counts); st resets it.  Meaningful with one attempt in flight.
+	SigSpec since(SigSpec e, SigSpec st)
+	{
+		Wire *q = wn("seen", 1);
+		SigSpec cur = orN({e, andN({mod->Not(NEW_ID, st), SigSpec(q)})});
+		mod->addDff(NEW_ID, clk, dis_gate(cur), q, clk_pos);
+		return cur;
+	}
+
 	SigSpec reg(SigSpec d, const char *role)
 	{
 		// a compile-time age bit that can never be hot stays the constant
@@ -2122,55 +2132,103 @@ struct SvaCompiler {
 			return orN({a_end, b_end});
 		}
 
-		if (op == "intersect") {
-			// both operands must match with the same start and the same end
-			SigSpec a_end = seq_dispatch(port(0), child(0), start, gate);
-			SigSpec b_end = seq_dispatch(port(1), child(1), start, gate);
-			return mod->And(NEW_ID, a_end, b_end);
-		}
-
-		if (op == "and") {
-			// sequence and: both operands match from the same start
-			// tick; the composite ends at the later of the two end
-			// ticks (LRM 16.7.3-style common-start union -- the same
-			// delayed-end idiom as `within`).  a's end at t completes
-			// the pair iff b matched at or before t (same-tick counts)
-			// and vice versa; a matched end too early for the sibling
-			// never fires because the sibling's end hasn't happened.
-			SigSpec a_end = seq_dispatch(port(0), child(0), start, gate);
-			SigSpec b_end = seq_dispatch(port(1), child(1), start, gate);
+		if (op == "intersect" || op == "and" || op == "within") {
+			// Binary sequence operators pair one parse of each operand
+			// FROM THE SAME ATTEMPT (LRM 16.9.5, 16.9.6, 16.9.10).  The
+			// operand end signals are merged over every attempt in
+			// flight, so pairing them directly let one attempt's end
+			// complete another attempt's pair: `(t==3||t==4) |-> ((x ##1
+			// 1) intersect (y ##[0:1] 1))`, `... (y within (x ##2 1))` and
+			// `... ((a ##1 1) and (b ##1 1))` were PROVED with the
+			// earlier attempt unmatchable (register v3 C1, found through
+			// the LRM Figure 16-7 transcription, 2026-10-19).
+			//   both operands fixed-length: an end's start tick is
+			//     determined by its length, so shifting one operand's
+			//     end to the other's is exact;
+			//   otherwise: rotating copies -- copy i takes the attempts
+			//     at ticks with phase == i, as many copies as an
+			//     attempt's longest span, so each copy has one attempt in
+			//     flight and pairs only its own parses.  Slot mode
+			//     (locals), multi-clock islands and spans > 16 keep the
+			//     merged pairing, tagged.
 			Cell *ac = child(0), *bc = child(1);
-			int la = ac ? seq_max_len(ac) : 1;
-			int lb = bc ? seq_max_len(bc) : 1;
-			if (la < 0 || la > 64 || lb < 0 || lb > 64)
-				log_error("sva2check: 'and' over an unbounded sequence in %s.\n", log_id(n));
-			// a's end can be t only while t is within la of the start,
-			// so "b matched by t" reaches la ticks back; symmetric.
-			SigSpec a_ever = a_end;
-			for (int j = 1; j <= lb; j++)
-				a_ever = orN({a_ever, delay(a_end, j, "sand")});
-			SigSpec b_ever = b_end;
-			for (int j = 1; j <= la; j++)
-				b_ever = orN({b_ever, delay(b_end, j, "sand")});
-			return orN({andN({a_end, b_ever}), andN({b_end, a_ever})});
-		}
-
-		if (op == "within") {
-			// a within b  ==  (1[*0:$] ##1 a ##1 1[*0:$]) intersect b
-			// (LRM 16.9.10): b matches and a matches some subinterval.
-			// a may start at ANY tick of b's span, so dispatch a at each
-			// admissible offset; b's end tick is the composite's end.
-			Cell *bc = child(1);
-			int len = bc ? seq_max_len(bc) : 1;
-			if (len < 0 || len > 32)
-				log_error("sva2check: within over an unbounded sequence in %s.\n", log_id(n));
-			SigSpec b_end = seq_dispatch(port(1), bc, start, gate);
-			SigSpec r = Const(0, 1);
-			for (int k = 0; k <= len; k++) {
-				SigSpec a_start = k == 0 ? start : delay(start, k, "within");
-				SigSpec a_end = seq_dispatch(port(0), child(0), a_start, gate);
+			int la = ac ? seq_max_len(ac) : 1, lb = bc ? seq_max_len(bc) : 1;
+			int ma = ac ? seq_min_len(ac) : 1, mb = bc ? seq_min_len(bc) : 1;
+			// `and` needs both operands bounded, `within` its container;
+			// `intersect` / `within` with an unbounded other operand keep
+			// the merged pairing (tagged): a long parse of the unbounded
+			// side from an earlier attempt would reach into a copy's next
+			// attempt
+			bool bounded = la >= 0 && la <= 64 && lb >= 0 && lb <= 64;
+			if ((op == "and" && !bounded) || (op == "within" && (lb < 0 || lb > 64)))
+				log_error("sva2check: '%s' over an unbounded sequence in %s.\n", op.c_str(), log_id(n));
+			auto a_from = [&](SigSpec st) { return seq_dispatch(port(0), ac, st, gate); };
+			auto b_from = [&](SigSpec st) { return seq_dispatch(port(1), bc, st, gate); };
+			bool fixed = bounded && ma == la && mb == lb;
+			if (fixed) {
+				if (op == "intersect")
+					return la == lb ? mod->And(NEW_ID, a_from(start), b_from(start)) : SigSpec(Const(0, 1));
+				if (op == "and") {
+					SigSpec a_end = a_from(start), b_end = b_from(start);
+					return la >= lb ? andN({a_end, delay(b_end, la - lb, "sand")})
+							: andN({b_end, delay(a_end, lb - la, "sand")});
+				}
+				// within: a starts at offset k of b's span and ends by
+				// b's end, k = 0 .. lb-la; at b's end t, a's end was
+				// lb-la-k ticks ago
+				SigSpec b_end = b_from(start), any = Const(0, 1);
+				for (int k = 0; k <= lb - la; k++)
+					any = orN({any, delay(a_from(k == 0 ? start : delay(start, k, "within")), lb - la - k, "within")});
+				return andN({b_end, any});
+			}
+			// within: a's parses may start anywhere in b's span and run
+			// la-1 ticks further
+			int span = op == "within" ? lb + la - 1 : std::max(la, lb);
+			auto pair_one = [&](SigSpec st) -> SigSpec {
+				if (op == "intersect")
+					return mod->And(NEW_ID, a_from(st), b_from(st));
+				if (op == "and") {
+					SigSpec a_end = a_from(st), b_end = b_from(st);
+					SigSpec a_seen = since(a_end, st), b_seen = since(b_end, st);
+					return orN({andN({a_end, b_seen}), andN({b_end, a_seen})});
+				}
+				SigSpec a_end = Const(0, 1);
+				for (int k = 0; k < lb; k++)
+					a_end = orN({a_end, a_from(k == 0 ? st : delay(st, k, "within"))});
+				return andN({b_from(st), since(a_end, st)});
+			};
+			if (bounded && span > 1 && !(slots_mode || island_mode || in_island || span > 16)) {
+				int w = 1;
+				while ((1 << w) < span) w++;
+				Wire *ph = wn("att_phase", w);
+				SigSpec wrap = mod->Eq(NEW_ID, SigSpec(ph), Const(span - 1, w));
+				SigSpec nxt = mod->Mux(NEW_ID, mod->Add(NEW_ID, SigSpec(ph), Const(1, w)), Const(0, w), wrap);
+				mod->addDff(NEW_ID, clk, nxt.extract(0, w), ph, clk_pos);
+				SigSpec r = Const(0, 1);
+				for (int i = 0; i < span; i++)
+					r = orN({r, pair_one(andN({start, mod->Eq(NEW_ID, SigSpec(ph), Const(i, w))}))});
+				return r;
+			}
+			// the merged pairing (pre-C1), tagged: exact for one attempt
+			// in flight, otherwise an end may pair across attempts
+			if (span > 1 || !bounded)
+				approx("seq-binop-merged-attempts", op + " at " + std::string(log_id(n)));
+			if (op == "intersect")
+				return mod->And(NEW_ID, a_from(start), b_from(start));
+			if (op == "and") {
+				SigSpec a_end = a_from(start), b_end = b_from(start);
+				SigSpec a_ever = a_end, b_ever = b_end;
+				for (int j = 1; j <= lb; j++)
+					a_ever = orN({a_ever, delay(a_end, j, "sand")});
+				for (int j = 1; j <= la; j++)
+					b_ever = orN({b_ever, delay(b_end, j, "sand")});
+				return orN({andN({a_end, b_ever}), andN({b_end, a_ever})});
+			}
+			SigSpec b_end = b_from(start), r = Const(0, 1);
+			for (int k = 0; k <= lb; k++) {
+				SigSpec a_end = a_from(k == 0 ? start : delay(start, k, "within"));
 				SigSpec any = a_end;
-				for (int j = 1; j <= len - k; j++)
+				for (int j = 1; j <= lb - k; j++)
 					any = orN({any, delay(a_end, j, "within")});
 				r = orN({r, andN({b_end, any})});
 			}
@@ -2795,7 +2853,7 @@ struct SvaCompiler {
 				// 'not' of a bounded sequence is a safety property: it
 				// fails exactly when the sequence matches.  Unbounded
 				// sequences stay rejected (their complement is liveness).
-				if (is_seq_op(sva_op(child(0))) && seq_max_len(child(0)) >= 0 && seq_max_len(child(0)) <= 64)
+				if (seq_shaped(child(0)) && seq_max_len(child(0)) >= 0 && seq_max_len(child(0)) <= 64)
 					return seq_end(child(0), start, Const(1, 1));
 				log_error("sva2check: 'not' of a temporal property in %s is not a safety property.\n", log_id(n));
 			}
@@ -2964,6 +3022,26 @@ struct SvaCompiler {
 
 		log_error("sva2check: unsupported property operator '%s' in %s.\n", op.c_str(), log_id(n));
 		return SigSpec();
+	}
+
+	// A sequence in property position: a sequence operator, or an
+	// and/or whose operands are all sequences or Boolean leaves (the
+	// frontend gives `a and b` one op for the property and the sequence
+	// reading; with sequence operands the two coincide, LRM 16.13.4 /
+	// 16.9.5: `not (te1 and te2)` fails exactly when the sequence
+	// `te1 and te2` matches).
+	bool seq_shaped(Cell *n)
+	{
+		if (!n) return true;
+		std::string op = sva_op(n);
+		if (is_seq_op(op)) return true;
+		if (op != "and" && op != "or") return false;
+		for (auto &p : ports_of(n)) {
+			SigSpec s = n->getPort(p);
+			Cell *c = len_child(s);
+			if (c && !seq_shaped(c)) return false;
+		}
+		return true;
 	}
 
 	static bool is_seq_op(const std::string &op)
@@ -3326,9 +3404,9 @@ struct SvaCompiler {
 		// C1).  Exact form: deadline+1 rotating monitor copies; copy i
 		// starts only the attempts at ticks with phase == i, so it has one
 		// attempt in flight and every end inside that attempt's window is
-		// its own.  A fixed-length sequence has a one-tick window and is
-		// exact already; slot mode (locals) and windows > 16 keep the
-		// merged form, tagged.
+		// its own.  A fixed-length sequence has a one-tick window (below)
+		// and is exact already; slot mode (locals) and windows > 16 keep
+		// the merged form, tagged.
 		// (multi-clock islands also keep it: the rotating copies on the
 		// island clock took tmcdom1 from 27 s to > 10 min in ic3)
 		if (deadline > 0 && minl != len && (slots_mode || island_mode || in_island || deadline + 1 > 16 || getenv("SVA_MERGED_STRONG"))) {
@@ -3346,15 +3424,25 @@ struct SvaCompiler {
 				SigSpec start_i = andN({start, mod->Eq(NEW_ID, SigSpec(ph), Const(i, w))});
 				SigSpec end_i = seq_end(n, start_i, Const(1, 1));
 				SigSpec any_i = Const(0, 1);
-				for (int k = 0; k <= deadline; k++)
+				for (int k = 0; k <= len - std::max(minl, 1); k++)
 					any_i = orN({any_i, k == 0 ? end_i : delay(end_i, k, "strong_win")});
 				fail = orN({fail, andN({delay(start_i, deadline, "strong_expire"), mod->Not(NEW_ID, any_i)})});
 			}
 			return fail;
 		}
+		// Checked at the attempt's deadline s+len-1: its non-empty ends
+		// lie in [s+max(minl,1)-1, s+len-1], i.e. 0 .. len-max(minl,1)
+		// ticks back (an empty match never satisfies a sequence property,
+		// LRM 16.12.1: `d[*0]` has no window and always fails).  The window
+		// used to reach `deadline` ticks back, into ends of EARLIER
+		// attempts: `(t==2||t==3) |-> (b ##1 1)` was PROVED with b low at
+		// 3, the attempt at 2's end at 3 excusing the attempt at 3 -- a
+		// fixed-length sequence consequent after any passing attempt
+		// (register v3 C1, found through the LRM Figure 16-7 transcription,
+		// 2026-10-19).
 		SigSpec end = seq_end(n, start, Const(1, 1));
 		SigSpec any = Const(0, 1);
-		for (int k = 0; k <= deadline; k++)
+		for (int k = 0; k <= len - std::max(minl, 1); k++)
 			any = orN({any, k == 0 ? end : delay(end, k, "strong_win")});
 		return andN({delay(start, deadline, "strong_expire"), mod->Not(NEW_ID, any)});
 	}
@@ -3868,6 +3956,25 @@ struct Sva2CheckPass : public Pass {
 					}
 				}
 
+				// A concurrent assertion in an initial block, and `expect`
+				// (LRM 16.15.6, 16.18), is ONE attempt, at the first clock
+				// tick.  The frontend marks it like an initial immediate
+				// check (TRG_ENABLE, no trigger), and async2sync then gated
+				// the compiled A with $initstate: only step 0 was checked,
+				// so `initial assert property (@(posedge clk) a ##1 b)` never
+				// saw its failure at step 1 (and ic3 read $initstate as 0, so
+				// even `a` was PROVED; register v3 C1, 2026-10-19).  Compile
+				// it as an ordinary clocked check whose only attempt starts
+				// in the initial state.
+				bool once = cell->getParam(ID::TRG_ENABLE).as_bool() && cell->getParam(ID::TRG_WIDTH).as_int() == 0;
+				SigSpec root = Const(1, 1);
+				if (once) {
+					if (liveness || tresp)
+						log_error("sva2check: unbounded eventually in an initial-block check %s is not supported.\n", log_id(cell));
+					root = mod->Initstate(NEW_ID);
+					cell->setParam(ID::TRG_ENABLE, State::S0);
+				}
+
 				SigSpec fail;
 				SigSpec new_a;
 				bool strong_until = false;
@@ -4043,7 +4150,7 @@ struct Sva2CheckPass : public Pass {
 								log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(body));
 							comp.init_slots(l);
 						}
-						fail = comp.prop_dispatch(SigSpec(), body, Const(1, 1));
+						fail = comp.prop_dispatch(SigSpec(), body, root);
 						if (!had_slots && comp.slots_mode) {
 							// slot state is per-property: do not leak it into
 							// the next $check of this module
@@ -4073,7 +4180,7 @@ struct Sva2CheckPass : public Pass {
 								log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(dbody));
 							comp.init_slots(l);
 						}
-						fail = comp.prop_dispatch(body_sig, nullptr, Const(1, 1));
+						fail = comp.prop_dispatch(body_sig, nullptr, root);
 						if (!had_slots && comp.slots_mode) {
 							comp.slots_mode = false;
 							comp.nslots = 0;
@@ -4082,7 +4189,7 @@ struct Sva2CheckPass : public Pass {
 							comp.pending_wr.clear();
 						}
 					} else {
-						fail = mod->Not(NEW_ID, comp.reduce1(body_sig));
+						fail = mod->And(NEW_ID, root, mod->Not(NEW_ID, comp.reduce1(body_sig)));
 					}
 					new_a = mod->Not(NEW_ID, fail);
 				}
@@ -4094,6 +4201,9 @@ struct Sva2CheckPass : public Pass {
 					new_a = mod->Or(NEW_ID, dsig, new_a);
 				}
 
+				if (once && (strong_until || fairness))
+					log_error("sva2check: %s in an initial-block check %s is not supported.\n",
+							strong_until ? "s_until" : "a fairness assumption", log_id(cell));
 				cell->setPort(ID(EN), SigSpec(State::S1));
 				cell->setPort(ID(A), new_a);
 				if (liveness)

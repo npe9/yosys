@@ -1598,6 +1598,33 @@ struct Ic3Pass : Pass
 		}
 		(void) check_cells;
 
+		// $initstate is 1 in the initial state only.  async2sync gates
+		// every initial-block check with it (`initial assert property`,
+		// `expect`, `initial assume`); SatGen sets it from setInitState(),
+		// which this engine never calls (its frames are not time steps), so
+		// it read as constant 0 at every step and each such assert was
+		// PROVED vacuously -- `initial assert property (@(posedge clk) a)`
+		// with a free input a (register v3 C1, 2026-10-19; the SMT BMC
+		// lane gave cex@0).  Model it as a state bit: Y = !n with n = 0
+		// initially (an init attribute, and what -init-zero forces) and 1
+		// from the next step on.
+		{
+			std::vector<RTLIL::Cell *> inits;
+			for (auto cell : module->cells())
+				if (cell->type == ID($initstate))
+					inits.push_back(cell);
+			for (auto cell : inits) {
+				RTLIL::SigSpec y = cell->getPort(ID::Y);
+				RTLIL::Wire *n = module->addWire(NEW_ID);
+				n->attributes[ID::init] = RTLIL::Const(0, 1);
+				module->addFf(NEW_ID, RTLIL::State::S1, n);
+				module->remove(cell);
+				module->addNot(NEW_ID, n, y);
+			}
+			if (!inits.empty())
+				log("ic3: modelling %d $initstate cell(s) as an initial-state register.\n", GetSize(inits));
+		}
+
 		// Register v3 B5: a verdict on a degraded design is not evidence.
 		// The frontend marks every module read with -permissive
 		// (* sv_permissive *) and every module where a leniency fired

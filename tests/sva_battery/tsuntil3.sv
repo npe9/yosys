@@ -25,6 +25,13 @@
 // LRM step is 3 (4 with the deadline-based sequence lowering), the
 // framework reports frame 7 -- step kept unpinned until per-attempt
 // tracking (register v3 D5) lands.
+// 2026-10-19 expectation corrected (register v3 C1): the fail_p formula
+// above ORs in b(t-2)&&c(t-1), the PREVIOUS attempt's completion -- the
+// strong_seq_fail end window reached back into earlier attempts.  p =
+// (b ##1 c) holds at t only if b(t) && c(t+1), i.e. at ctr 2 alone, so
+// the attempt at ctr 3 (q low, p false) fails: p2 is DIS (LRM step 3,
+// engine 4).  p3 stays DIS for the same reason.  (oracle.py cannot check
+// this file: s_until is outside its grammar.)
 module tsuntil3 (input logic clk);
   logic [2:0] ctr = 0;
   logic a, b, c, d, e;
@@ -35,7 +42,7 @@ module tsuntil3 (input logic clk);
   assign d = (ctr == 3'd1);
   assign e = 1'b0;
   p1: assert property (@(posedge clk) (b ##1 c) s_until a); // DIS @1
-  p2: assert property (@(posedge clk) (b ##1 c) s_until ((ctr <= 3'd2) || (ctr >= 3'd5))); // PROVED
+  p2: assert property (@(posedge clk) (b ##1 c) s_until ((ctr <= 3'd2) || (ctr >= 3'd5))); // DIS @4 (LRM @3: q and b are low at ctr 3; the engine reports at p's deadline, known class F5 / register D5)
   p3: assert property (@(posedge clk) (b ##1 c) s_until ((ctr <= 3'd2) || a || (ctr == 3'd6))); // DIS
   p4: assert property (@(posedge clk) (d |-> ##[0:1] e) s_until a); // DIS @2
   p5: assert property (@(posedge clk) (b ##2 c) s_until a); // DIS @2

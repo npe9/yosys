@@ -68,7 +68,7 @@ failures/` holds the repros after a run.
 | F2 | `b[=n] \|-> q` | the match ending exactly at the n-th `b` is not considered (needs a later non-b step) | 16.9.2: `b[=n]` = `b[->n] ##1 !b[*0:$]`, empty tail included |
 | F3 | `(e) ##0 b[->n]` as property | fires at a step where a match exists | 16.9.2 |
 | F4 | `c ##[0:1] r` as property | sim never fires on failing traces (BMC does find the cex) | 16.12.1 |
-| F5 | `a[*1:2]` as property | sim fires one step late and never for the last step's attempt | 16.12.1 |
+| F5 | `a[*1:2]` as property | sim fires one step late and never for the last step's attempt | 16.12.1 -- 2026-10-19 (register v3 D5): fixed for assume/restrict by default (the late form let traces slip past assumptions) and for asserts under `sva2check -early` / env `SVA_EARLY=1` (one monitor copy per attempt slot; ~100x on ic3 proofs, so not the assert default).  `SVA_EARLY=1` pbt, 3 seeds x 60: 7 cases fixed, 0 regressions |
 | F6 | `s_eventually[m:n] <temporal>` | sim never fires when every alternative fails (BMC does) | 16.12.14 |
 | F7 | `disable iff (c) (nexttime[1] p)` | FIXED (same day): the condition was only ORed into the final check; it now clears every monitor state register while true (in-flight attempts abandoned, nothing arms on a disabled step) | 16.15 |
 | F8 | `always[1:1] p` at the last trace step | sim reports the pending obligation as a failure | weak at trace end (convention; low) |

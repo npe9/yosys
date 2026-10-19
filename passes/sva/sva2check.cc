@@ -174,6 +174,12 @@ struct SvaCompiler {
 	// an approximation is an error instead of a warning.
 	std::string check_name;
 	bool exact_mode = false;
+	// report a sequence failure at the tick its last thread dies (LRM)
+	// rather than at its deadline: on for assume/restrict (the late form
+	// accepts prefixes the LRM already rejects -> spurious counterexamples),
+	// opt-in for asserts (-early: same verdicts, LRM failure ticks, but
+	// one monitor copy per attempt slot -- ~100x on ic3 proofs)
+	bool early_fail = false;
 	std::vector<std::string> approx_kinds;
 	void approx(const std::string &kind, const std::string &where)
 	{
@@ -380,11 +386,24 @@ struct SvaCompiler {
 		return mod->Mux(NEW_ID, d, Const(0, d.size()), dis);
 	}
 
+	// Monitor registers created while ff_log is set are recorded with
+	// their next-state input (register v3 D5, early failure): `safe` ones
+	// are pulse delays and flags whose all-zero next state means no
+	// thread survives; counters, slot files and feedback state can sit at
+	// zero while a thread still waits, and disable the early check.
+	std::vector<std::pair<SigSpec, bool>> *ff_log = nullptr;
+	Cell *ffd(SigSpec d, SigSpec q, bool safe)
+	{
+		if (ff_log)
+			ff_log->push_back({d, safe});
+		return mod->addDff(NEW_ID, clk, d, q, clk_pos);
+	}
+
 	// State register with next-state function fed back from Q.
 	SigSpec feedback(const std::function<SigSpec(SigSpec)> &f, const char *role, int width)
 	{
 		Wire *q = wn(role, width);
-		mod->addDff(NEW_ID, clk, dis_gate(f(q)), q, clk_pos);
+		ffd(dis_gate(f(q)), q, false);
 		return q;
 	}
 
@@ -394,7 +413,7 @@ struct SvaCompiler {
 	{
 		Wire *q = wn("seen", 1);
 		SigSpec cur = orN({e, andN({mod->Not(NEW_ID, st), SigSpec(q)})});
-		mod->addDff(NEW_ID, clk, dis_gate(cur), q, clk_pos);
+		ffd(dis_gate(cur), q, true);
 		return cur;
 	}
 
@@ -407,7 +426,7 @@ struct SvaCompiler {
 		if (strcmp(role, "age") == 0 && d.is_fully_const() && d.as_const().is_fully_zero())
 			return Const(0, d.size());
 		Wire *q = wn(role, d.size());
-		mod->addDff(NEW_ID, clk, strcmp(role, "past") == 0 ? d : dis_gate(d), q, clk_pos);
+		ffd(strcmp(role, "past") == 0 ? d : dis_gate(d), q, true);
 		return q;
 	}
 
@@ -1145,7 +1164,7 @@ struct SvaCompiler {
 			Wire *pq = wn("phase", w);
 			SigSpec inc = mod->Add(NEW_ID, pq, Const(1, w));
 			SigSpec next = mod->Mux(NEW_ID, inc, Const(0, w), mod->Eq(NEW_ID, pq, Const(nslots - 1, w)));
-			mod->addDff(NEW_ID, clk, next, pq, clk_pos);
+			ffd(next, pq, false);
 			phase = pq;
 		} else {
 			phase = Const(0, 1);
@@ -1302,7 +1321,7 @@ struct SvaCompiler {
 			if (sf.dff[k])
 				sf.dff[k]->setPort(ID(D), next);
 			else
-				sf.dff[k] = mod->addDff(NEW_ID, clk, next, sf.q[k], clk_pos);
+				sf.dff[k] = ffd(next, sf.q[k], false);
 		}
 		pending_wr[xw] = {we, e};
 		slot_epoch++;
@@ -1370,7 +1389,7 @@ struct SvaCompiler {
 			if (sf.dff[k])
 				sf.dff[k]->setPort(ID(D), next);
 			else
-				sf.dff[k] = mod->addDff(NEW_ID, clk, next, sf.q[k], clk_pos);
+				sf.dff[k] = ffd(next, sf.q[k], false);
 		}
 		pending_wr[xw] = {we, expr};
 		slot_epoch++;
@@ -1956,13 +1975,12 @@ struct SvaCompiler {
 				while ((1 << aw) <= std::max(nslots, hi + 1)) aw++;
 				Wire *cw = wn("anc_cnt", aw);
 				SigSpec csum = mod->Add(NEW_ID, SigSpec(cw), SigSpec(bsig));
-				mod->addDff(NEW_ID, clk, csum, cw, clk_pos);
+				ffd(csum, cw, false);
 				Wire *ovw = wn("anc_ovf", 1);
-				mod->addDff(NEW_ID, clk,
-						mod->Or(NEW_ID, SigSpec(ovw),
+				ffd(mod->Or(NEW_ID, SigSpec(ovw),
 							mod->And(NEW_ID, SigSpec(bsig),
 								mod->Eq(NEW_ID, SigSpec(cw), Const((1 << aw) - 1, aw)))),
-						ovw, clk_pos);
+						ovw, false);
 				Wire *sw = wn("anc_snap", aw);
 				slot_snapshot_write(sw, start, SigSpec(cw));
 				SlotFile &sf = slotfiles[sw];
@@ -2018,11 +2036,11 @@ struct SvaCompiler {
 			// merged existentially, so counting starts at the first start
 			Wire *started_w = wn("rep_started");
 			Wire *cnt_w = wn("rep_cnt", w);
-			mod->addDff(NEW_ID, clk, orN({start, started_w}), started_w, clk_pos);
+			ffd(orN({start, started_w}), started_w, false);
 			SigSpec sum = mod->Add(NEW_ID, cnt_w, SigSpec(bsig));
 			SigSpec sat = mod->Eq(NEW_ID, cnt_w, Const(cap, w));
 			SigSpec capped = mod->Mux(NEW_ID, sum, Const(cap, w), sat);
-			mod->addDff(NEW_ID, clk, mod->Mux(NEW_ID, Const(0, w), capped, orN({start, started_w})), cnt_w, clk_pos);
+			ffd(mod->Mux(NEW_ID, Const(0, w), capped, orN({start, started_w})), cnt_w, false);
 			SigSpec cnt = cnt_w;
 			// cnt counts occurrence ends strictly before this tick.  A
 			// concurrent assertion starts an attempt at EVERY tick and the
@@ -3409,9 +3427,24 @@ struct SvaCompiler {
 		// the merged form, tagged.
 		// (multi-clock islands also keep it: the rotating copies on the
 		// island clock took tmcdom1 from 27 s to > 10 min in ic3)
-		if (deadline > 0 && minl != len && (slots_mode || island_mode || in_island || deadline + 1 > 16 || getenv("SVA_MERGED_STRONG"))) {
+		// Early failure (register v3 D5): an attempt fails at the first
+		// tick no thread of it survives (LRM: Fig 16-12 "at clock tick 9
+		// ... thereby failing"), not at its deadline -- the deadline-only
+		// check was one or more ticks late (PBT class F5) and let a short
+		// trace slip past a sequence ASSUMPTION.  Each copy runs one
+		// attempt; while ff_log records its monitor registers, "no end yet
+		// and every register's next state is 0" means no end can come
+		// (start_i stays low until the copy's next attempt).  Copies whose
+		// monitor holds counters or slot state (which can be 0 while a
+		// thread waits) keep the deadline check only.  Fixed-length
+		// sequences take the copies too: their verdict was already exact,
+		// their failure tick was not.
+		bool merged_modes = slots_mode || island_mode || in_island || deadline + 1 > 16 || getenv("SVA_MERGED_STRONG");
+		if (early_fail && deadline > 0 && merged_modes)
+			approx("late-failure-tick", std::string(log_id(n)));
+		if (deadline > 0 && minl != len && merged_modes) {
 			approx("strong-seq-merged-attempts", std::string(log_id(n)));
-		} else if (deadline > 0 && minl != len) {
+		} else if (deadline > 0 && !merged_modes && (minl != len || early_fail)) {
 			int copies = deadline + 1;
 			int w = 1;
 			while ((1 << w) < copies) w++;
@@ -3422,11 +3455,37 @@ struct SvaCompiler {
 			SigSpec fail = Const(0, 1);
 			for (int i = 0; i < copies; i++) {
 				SigSpec start_i = andN({start, mod->Eq(NEW_ID, SigSpec(ph), Const(i, w))});
+				std::vector<std::pair<SigSpec, bool>> log, *saved_log = ff_log;
+				ff_log = &log;
 				SigSpec end_i = seq_end(n, start_i, Const(1, 1));
-				SigSpec any_i = Const(0, 1);
-				for (int k = 0; k <= len - std::max(minl, 1); k++)
-					any_i = orN({any_i, k == 0 ? end_i : delay(end_i, k, "strong_win")});
-				fail = orN({fail, andN({delay(start_i, deadline, "strong_expire"), mod->Not(NEW_ID, any_i)})});
+				ff_log = saved_log;
+				bool early = early_fail && !log.empty();
+				for (auto &e : log)
+					early = early && e.second;
+				if (early_fail && !early && i == 0)
+					approx("late-failure-tick", std::string(log_id(n)));
+				SigSpec dl_i = delay(start_i, deadline, "strong_expire");
+				if (!early) {
+					// deadline check: this attempt's ends in its window
+					SigSpec any_i = Const(0, 1);
+					for (int k = 0; k <= len - std::max(minl, 1); k++)
+						any_i = orN({any_i, k == 0 ? end_i : delay(end_i, k, "strong_win")});
+					fail = orN({fail, andN({dl_i, mod->Not(NEW_ID, any_i)})});
+					continue;
+				}
+				SigSpec live = Const(0, 1);
+				for (auto &e : log)
+					live = orN({live, mod->ReduceOr(NEW_ID, e.first)});
+				// matched: an end since this copy's attempt started
+				// (same tick counts); act: the attempt is in flight
+				SigSpec matched = since(end_i, start_i);
+				Wire *act_q = wn("ssf_act", 1);
+				SigSpec act = orN({start_i, SigSpec(act_q)});
+				SigSpec open = andN({act, mod->Not(NEW_ID, matched)});
+				SigSpec dead = orN({dl_i, mod->Not(NEW_ID, live)});
+				SigSpec fail_i = andN({open, dead});
+				ffd(dis_gate(andN({open, mod->Not(NEW_ID, fail_i)})), act_q, true);
+				fail = orN({fail, fail_i});
 			}
 			return fail;
 		}
@@ -3454,7 +3513,7 @@ struct Sva2CheckPass : public Pass {
 	void help() override
 	{
 		log("\n");
-		log("    sva2check [-expose_bad] [-exact] [selection]\n");
+		log("    sva2check [-expose_bad] [-exact] [-early] [selection]\n");
 		log("\n");
 		log("Compile the $sva property trees under assert-flavor $check cells into\n");
 		log("synchronous monitor hardware (single-clock spec subset: ## delays and\n");
@@ -3482,6 +3541,13 @@ struct Sva2CheckPass : public Pass {
 		log("for a skipped check whose A port is still the frontend placeholder,\n");
 		log("\"immediate\" / \"plain\" for non-temporal checks the frontend already\n");
 		log("compiled.  With -exact, taking an approximation is an error.\n");
+		log("\n");
+		log("A sequence in property position fails at its deadline (its longest\n");
+		log("match length) by default.  Assume/restrict checks, and every check\n");
+		log("with -early, report the failure at the tick no thread of the attempt\n");
+		log("survives (the LRM's tick): the late form lets a short trace slip past\n");
+		log("an assumption.  -early on asserts changes no verdict, only failure\n");
+		log("ticks, and costs one monitor copy per attempt slot.\n");
 		log("\n");
 		log("With -expose_bad, additionally create a module output port per\n");
 		log("converted check named bad_<check> driven by EN && !A, for AIGER\n");
@@ -3593,6 +3659,7 @@ struct Sva2CheckPass : public Pass {
 
 		bool expose_bad = false;
 		bool exact_mode = false;
+		bool early_opt = false;
 		std::vector<std::string> sub_args;
 		for (auto &arg : args) {
 			if (arg == "-expose_bad") {
@@ -3601,6 +3668,10 @@ struct Sva2CheckPass : public Pass {
 			}
 			if (arg == "-exact") {
 				exact_mode = true;
+				continue;
+			}
+			if (arg == "-early") {
+				early_opt = true;
 				continue;
 			}
 			sub_args.push_back(arg);
@@ -3698,6 +3769,10 @@ struct Sva2CheckPass : public Pass {
 				if (getenv("SVA_DEBUG_OPS"))
 					log("sva2check-debug: check %s\n", log_id(cell));
 				comp.exact_mode = exact_mode;
+				{
+					std::string fl = cell->getParam(ID(FLAVOR)).decode_string();
+					comp.early_fail = early_opt || getenv("SVA_EARLY") || fl == "assume" || fl == "restrict";
+				}
 
 				SigSpec aport = cell->getPort(ID(A));
 				Cell *topcell = aport.size() == 1 ? comp.find_sva_driver(aport[0]) : nullptr;

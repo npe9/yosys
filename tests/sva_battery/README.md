@@ -97,8 +97,20 @@ positive control that shows each detector firing (`xapprox.sv`, plain /
 | `noncons-rep-unbounded-top-age` | anchored `[->]`/`[=]` in an unbounded property | the saturated top age falls back to the time-0 count | none | xapprox p_nc_loc |
 | `strong-seq-merged-attempts` | a variable-length sequence in property position (implication consequent, sequence property) in slot mode (locals), a multi-clock island, or with a window > 16 ticks (env `SVA_MERGED_STRONG=1` forces it) | one monitor serves overlapping attempts, so an end belonging to a LATER attempt inside this attempt's window excuses its miss | tfeat3, tfeat5, tmcdom1 (2026-10-19; `-exact` stops at a file's first approximation) | xapprox p_ssm (also on p_nc_loc, p_fm_loc: locals) |
 | `seq-binop-merged-attempts` | `and` / `intersect` / `within` with a variable-length operand in slot mode, a multi-clock island, or an attempt span > 16; `intersect` / `within` with an unbounded operand | operand ends are paired across overlapping attempts (one attempt's end completes another's pair) | none (2026-10-19) | xapprox p_binop |
+| `late-failure-tick` | an assume/restrict (or `-early`) sequence whose early failure cannot be built: slot mode (locals), multi-clock islands, windows > 16, or a monitor holding counters | the failure is reported at the deadline, not the LRM tick; for an assumption a short trace can slip past it (spurious counterexamples, never false proofs) | none (2026-10-19) | xapprox q_late |
 | `until-merged-attempts` | `until`/`until_with` not at the property root (pulse start) | a `q` seen by an earlier attempt does not close the attempt starting now; one monitor merges them | t8 | t8 p_utw_b |
 | `weak-as-strong` | `weak(seq)` as a property | compiled strongly: sound for model checking, conservative at the end of a finite simulation trace | tfeat1, twithin, tdeclclk | xapprox p_weak |
+
+Failure ticks (register v3 D5): a sequence in property position fails at
+its deadline (its longest match length) unless the check is an
+assume/restrict or sva2check runs with `-early` (pragma
+`// SVA2CHECK-FLAGS: -early`; env `SVA_EARLY=1` for test sweeps), which
+report the failure at the tick no thread of the attempt survives -- the
+LRM's tick.  Verdicts of asserts are the same either way (an attempt dead
+early also fails at its deadline); the early form costs one monitor copy
+per attempt slot.  Assumptions need it: the late form accepted prefixes the
+LRM already rejects (tassume_early.sv).  Expectations that differ carry an
+`LRM @N` note; tearly.sv pins the early ticks.
 
 The positive controls earned their keep immediately: no detector ever
 fired on a NAMED property, because `assert property (@(posedge clk) q)`

@@ -131,7 +131,7 @@ def run_ic3(path):
             name = name[4:]
         if name in results:
             continue
-        results[name] = (status, int(depth) if depth else None)
+        results[name] = (status, int(depth) if depth not in (None, "") else None)  # depth 0 is a depth
     return fold_live_legs(results), []
 
 

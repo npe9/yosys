@@ -3,7 +3,7 @@
 // here, by name, and `sva2check -exact` refuses the file.  Not a verdict
 // test (x* = stress, not gated on PROVED/DIS).  Run
 //   yosys -p 'read_verilog -sv -formal xapprox.sv; hierarchy -check; sva2check'
-// plain (9 kinds), with SVA_NOSPLIT=1 (adds locals-merged-window and
+// plain (10 kinds), with SVA_NOSPLIT=1 (adds locals-merged-window and
 // locals-lowest-hot-age) and with SVA_NOANC=1 (adds
 // noncons-rep-merged-counter in place of the anchored top-age kind).
 // until-merged-attempts is covered by t8.sv (p_utw_b).
@@ -41,4 +41,11 @@ module xapprox(input logic clk, a, b, c, input logic [3:0] d);
   p_ssm: assert property (@(posedge clk) a |-> (b ##[1:20] c));
   // seq-binop-merged-attempts: intersect with an unbounded operand
   p_binop: assert property (@(posedge clk) (b[=1] intersect (c ##[1:2] b)) |-> a);
+  // late-failure-tick: an assumption whose early failure cannot be built
+  // (slot mode: local variables) keeps its deadline tick
+  property q_lt;
+    logic [3:0] v;
+    (a, v = d) |-> ##1 (d == v) ##1 b;
+  endproperty
+  q_late: assume property (@(posedge clk) q_lt);
 endmodule

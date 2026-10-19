@@ -31,7 +31,7 @@ YOSYS = os.environ.get("YOSYS", os.path.join(os.path.dirname(ROOT), "build/yosys
 
 PREP = """read_verilog -sv -formal {flags} {inc} {files}
 hierarchy -check{top}
-sva2check
+sva2check{svaflags}
 proc
 async2sync
 {extra_a2s}flatten
@@ -62,6 +62,20 @@ def degraded_guard(path):
     if "-permissive" in read_flags(path):
         return ""
     return "select -assert-mod-count 0 A:sv_degraded A:sv_permissive %u\n"
+
+
+def sva_flags(path):
+    """Extra sva2check flags from a `// SVA2CHECK-FLAGS: ...` pragma (e.g.
+    `-early`: LRM failure ticks for asserts, at a monitor copy per attempt
+    slot)."""
+    try:
+        for line in open(path):
+            m = re.match(r'\s*//\s*SVA2CHECK-FLAGS:\s*(.+)', line)
+            if m:
+                return " " + m.group(1).strip()
+    except OSError:
+        pass
+    return ""
 
 
 def read_flags(path):
@@ -171,7 +185,7 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
         # disproved properties additionally write <prefix><prop>.yw
         # witnesses (replay: same prep + `sim -r <w> -vcd trace.vcd`)
         engine += " -cex " + cex_prefix
-    script = PREP.format(flags=read_flags(files[-1]), inc=inc, files=" ".join(files),
+    script = PREP.format(svaflags=sva_flags(files[-1]), flags=read_flags(files[-1]), inc=inc, files=" ".join(files),
                          top=" -top " + top if top else "",
                          extra_a2s=extra_a2s, extra_mem=extra_mem,
                          engine=engine)

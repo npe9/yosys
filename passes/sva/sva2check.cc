@@ -134,10 +134,6 @@ struct SvaCompiler {
 	// approximation -- violations visible only to younger overlapping
 	// attempts can be missed).
 	bool slots_mode = false;
-	// set by ensure_anc_slots when the ring covers the whole (bounded)
-	// property: every age, including the saturated top bit, reads an exact
-	// snapshot; false leaves the top age on the merged time-0 count
-	bool anc_bounded = false;
 	int nslots = 0;
 	SigSpec age;
 	SigSpec phase;   // runtime tick counter mod nslots (slot ring address base)
@@ -1025,32 +1021,6 @@ struct SvaCompiler {
 		return false;
 	}
 
-	// Does this subtree hold a nonconsecutive repetition ([->]/[=]) with a
-	// Boolean body?  Such elements need per-attempt occurrence counting
-	// (the anchored snapshot-counter path) when they sit inside a ## chain:
-	// per LRM F.3.4.2.3 b[->m:n] = (!b[*0:$] ##1 b)[*m:n] matches only when
-	// the running occurrence count k is in [m,n] (b[->m] = exactly m), and
-	// the merged-existential counter below is exact only at the property
-	// root (attempts every tick collapse the bound away).  Sequence-body
-	// repetitions (an extension beyond the LRM) keep the merged counter.
-	bool tree_has_anc_rep(Cell *n, pool<Cell *> &seen)
-	{
-		if (!n || !seen.insert(n).second)
-			return false;
-		std::string op = sva_op(n);
-		if (op == "[->]" || op == "[=]") {
-			Cell *bc = child_cell(n->getPort(ID(A)));
-			if (!bc || sva_op(bc) == "true")
-				return true;
-		}
-		for (auto port : ports_of(n)) {
-			Cell *c = child_cell(n->getPort(port));
-			if (c && tree_has_anc_rep(c, seen))
-				return true;
-		}
-		return false;
-	}
-
 	// true when the tree captures local variables OR reads one in an
 	// expression port (a wire targeted by an `assign` cell of this tree)
 	dict<Cell *, bool> tul_memo;
@@ -1146,7 +1116,6 @@ struct SvaCompiler {
 	void init_slots(int l)
 	{
 		slots_mode = true;
-		anc_bounded = false;
 		split_ranges = true;
 		// a 1-slot ring cannot represent an attempt age at all; use at
 		// least 2 so age ticking has somewhere to go
@@ -1324,74 +1293,6 @@ struct SvaCompiler {
 				sf.dff[k] = ffd(next, sf.q[k], false);
 		}
 		pending_wr[xw] = {we, e};
-		slot_epoch++;
-	}
-
-	// Enable the slot ring for anchored [->]/[=] counting when the tree
-	// holds a Boolean nonconsecutive repetition and nothing else already
-	// has.  Bounded properties size the ring to the property length so
-	// every read is exact; unbounded ones (e.g. an unbounded [->]
-	// element) take 8 slots -- matches within 7 ticks of their attempt
-	// stay exact, older attempts fall back to the merged time-0-based
-	// count, which over-supplies and stays sound.
-	void ensure_anc_slots(Cell *body)
-	{
-		if (slots_mode || !body)
-			return;
-		pool<Cell *> seen;
-		if (!tree_has_anc_rep(body, seen))
-			return;
-		int l = seq_max_len(body);
-		// 8 slots: matches within 7 ticks of their attempt are exact;
-		// larger rings make the mod-nslots phase counter dominate IC3
-		// convergence on free-running designs (measured: a 64-slot ring
-		// did not close proofs within minutes on a 30-state design)
-		init_slots(l >= 2 && l <= 128 ? l : 8);
-		anc_bounded = l >= 0 && l <= 128;
-	}
-
-	// Snapshot a value into the slot of every in-flight attempt age at
-	// `fire` (same addressing/strobing as capture_local); same-tick
-	// visible to reads through pending_wr.  Used by the anchored
-	// [->]/[=] counter: the element-start pulse stores the free-running
-	// occurrence counter so later ticks can subtract the per-attempt base.
-	void slot_snapshot_write(Wire *xw, SigSpec fire, SigSpec expr)
-	{
-		if (!slots_mode)
-			log_error("sva2check: internal: snapshot write outside slots mode.\n");
-		int w = expr.size();
-		SlotFile &sf = slotfiles[xw];
-		if (sf.q.empty()) {
-			sf.width = w;
-			sf.q.resize(nslots);
-			sf.dff.resize(nslots);
-			sf.wr.resize(nslots);
-			for (int k = 0; k < nslots; k++)
-				sf.q[k] = wn("slot", w);
-		}
-		if (sf.width != w)
-			log_error("sva2check: internal: snapshot %s re-written at a different width in %s.\n",
-					log_id(xw), log_id(mod));
-		std::vector<SigBit> we_b(nslots, Const(0, 1)[0]);
-		for (int k = 0; k < nslots; k++) {
-			SigSpec hot = andN({fire, age[k]});
-			SigSpec ad = addr_onehot(k);
-			for (int j = 0; j < nslots; j++)
-				we_b[j] = mod->Or(NEW_ID, we_b[j], mod->And(NEW_ID, hot, ad[j]));
-		}
-		SigSpec we = SigSpec(we_b);
-		for (int k = 0; k < nslots; k++)
-			sf.wr[k].push_back({we[k], expr});
-		for (int k = 0; k < nslots; k++) {
-			SigSpec next = sf.q[k];
-			for (auto &wr : sf.wr[k])
-				next = mod->Mux(NEW_ID, next, wr.second, wr.first);
-			if (sf.dff[k])
-				sf.dff[k]->setPort(ID(D), next);
-			else
-				sf.dff[k] = ffd(next, sf.q[k], false);
-		}
-		pending_wr[xw] = {we, expr};
 		slot_epoch++;
 	}
 
@@ -1925,11 +1826,12 @@ struct SvaCompiler {
 						r = orN({r, andN({start, gate_now(gate)})});
 					return r;
 				}
-				// [*m:$]: run of >= m; sub-sequence bodies fall back to the
-				// same run form only for boolean bodies, else bounded split
-				if (body_cell && sva_op(body_cell) != "true")
-					log_error("sva2check: unbounded repetition of a sequence in %s; bound it to <= 8.\n", log_id(n));
-				return rep_run_end(body_cell, body, start, gate, std::max(m, 1));
+				// [*m:$] / [*m:hi] past the chain budget: exact run-length
+				// set for boolean bodies; s[+] (= s[*1:$]) feeds copies back
+				if (body_cell && sva_op(body_cell) != "true" && !(hi < 0 && m <= 1))
+					log_error("sva2check: repetition [*%d:%s] of a sequence in %s; bound it to <= 8.\n",
+							m, hi < 0 ? "$" : std::to_string(hi).c_str(), log_id(n));
+				return rep_run_end(body_cell, body, start, gate, std::max(m, 1), hi);
 			}
 			// non-contiguous repetitions of a boolean element or a
 			// bounded sequence: the counter below counts OCCURRENCES.
@@ -1946,86 +1848,51 @@ struct SvaCompiler {
 			} else {
 				bsig = andN({reduce1(body), gate_now(gate)});
 			}
-			bool bool_body = !body_cell || sva_op(body_cell) == "true";
 			bool every_tick = start.is_fully_const() && start.as_const() == Const(1, 1);
-			if (bool_body && m > 0 && !every_tick && slots_mode && !island_mode &&
-					getenv("SVA_NOANC") == nullptr) {
-				// Anchored per-attempt counting.  Per LRM F.3.4.2.3
-				// b[->m:n] = (!b[*0:$] ##1 b)[*m:n]: the element matches
-				// only while the running occurrence count k is in [m,n]
-				// (b[->m] = exactly m; b[->m:$] = k >= m), because the
-				// repetition groups are consecutive in the b-sequence.
-				// The merged counter below only checks k >= m, which is
-				// exact at the property root (attempts every tick make
-				// the upper bound vacuous) but over-fires inside ## chains
-				// for bounded ranges and single-bound [->m].
-				//   C is a free-running mod-2^aw occurrence counter; the
-				// element-start pulse snapshots C into the attempt's slot;
-				// the per-attempt count at a later tick is C - snapshot.
-				// aw covers any window <= nslots ticks.  Each hot age is
-				// evaluated with its own snapshot and OR-ed: a parse of
-				// ANY admissible age completing the element ends it.
-				// aw covers any window count <= max(nslots, hi)+1 so the
-				// mod-2^aw subtraction is exact for snapshot windows; the
-				// time-0-based top-age fallback additionally saturates on
-				// the overflow sticky (all-ones reads as ">= any bound but
-				// > hi", i.e. over-supply for the lower test and
-				// upper-bound-exceeded for the range test)
-				int aw = 1;
-				while ((1 << aw) <= std::max(nslots, hi + 1)) aw++;
-				Wire *cw = wn("anc_cnt", aw);
-				SigSpec csum = mod->Add(NEW_ID, SigSpec(cw), SigSpec(bsig));
-				ffd(csum, cw, false);
-				Wire *ovw = wn("anc_ovf", 1);
-				ffd(mod->Or(NEW_ID, SigSpec(ovw),
-							mod->And(NEW_ID, SigSpec(bsig),
-								mod->Eq(NEW_ID, SigSpec(cw), Const((1 << aw) - 1, aw)))),
-						ovw, false);
-				Wire *sw = wn("anc_snap", aw);
-				slot_snapshot_write(sw, start, SigSpec(cw));
-				SlotFile &sf = slotfiles[sw];
-				auto pend = pending_wr.find(sw);
-				SigSpec any = Const(0, 1);
-				for (int k = 0; k < nslots; k++) {
-					SigSpec diff;
-					if (k == nslots - 1 && !anc_bounded) {
-						// saturated top age on an unbounded property: the
-						// slot may have been recycled by a newer attempt,
-						// so fall back to the saturated time-0-based count
-						approx("noncons-rep-unbounded-top-age", std::string(op) + " at " + log_id(n));
-						diff = mod->Mux(NEW_ID, SigSpec(cw), Const((1 << aw) - 1, aw), SigSpec(ovw));
-					} else {
-						SigSpec ad = addr_onehot(k);
-						SigSpec snap = Const(0, aw);
-						for (int j = 0; j < nslots; j++) {
-							SigSpec d = sf.q[j];
-							if (pend != pending_wr.end())
-								d = mod->Mux(NEW_ID, d, pend->second.second, pend->second.first[j]);
-							snap = mod->Mux(NEW_ID, snap, d, ad[j]);
-						}
-						diff = mod->Sub(NEW_ID, SigSpec(cw), snap);
-					}
-					// diff = occurrences strictly before this tick.
-					// [->m:n] ends AT an occurrence: b now and
-					// diff in [m-1, n-1].  [=m:n] = [->m:n] ##1
-					// !b[*0:$] (LRM 16.9.2); the [*0] case ends at the
-					// occurrence itself, the rest at a later !b tick
-					// with diff in [m, n].
-					SigSpec g_in = mod->Ge(NEW_ID, diff, Const(m - 1, aw));
-					if (hi >= 0)
-						g_in = mod->And(NEW_ID, g_in, mod->Le(NEW_ID, diff, Const(hi - 1, aw)));
-					SigSpec goto_k = mod->And(NEW_ID, bsig, g_in);
-					SigSpec hit = goto_k;
-					if (op == "[=]") {
-						SigSpec i_in = mod->Ge(NEW_ID, diff, Const(m, aw));
-						if (hi >= 0)
-							i_in = mod->And(NEW_ID, i_in, mod->Le(NEW_ID, diff, Const(hi, aw)));
-						hit = mod->Or(NEW_ID, goto_k,
-								andN({mod->Not(NEW_ID, bsig), gate_now(gate), i_in}));
-					}
-					any = mod->Or(NEW_ID, any, mod->And(NEW_ID, age[k], hit));
+			// Exact occurrence-count set (LRM 16.9.2: b[->m:n] =
+			// (!b[*0:$] ##1 b)[*m:n], b[=m:n] = b[->m:n] ##1 !b[*0:$]).
+			// In-flight attempts of the element differ only in how many
+			// occurrences each has seen, so bit c of the state says "some
+			// live attempt has seen c occurrences before this tick"; an
+			// attempt entering now has seen 0.  An occurrence moves every
+			// attempt up one count (counts past n leave; with no upper
+			// bound the top count saturates).  The ends are the union over
+			// attempts, like every other sequence end.  (The anchored
+			// snapshot ring this replaces read the slot of the attempt
+			// starting at the END tick instead of the one that entered the
+			// element, and its ring sizing took `s ##0 b[->n]` for bounded:
+			// both a false proof and a false disproof, tagged exact.)
+			int gk = std::max(m, 1);                   // goto ends: c+1 in [gk, hi]
+			int K = op == "[->]" ? (hi >= 0 ? hi : gk) - 1 : (hi >= 0 ? hi : std::max(m, 1));
+			if (K >= 0 && K <= 64) {
+				SigSpec g = gate_now(gate);
+				Wire *sw = wn("occ_set", K + 1);
+				std::vector<SigBit> cur;
+				for (int c = 0; c <= K; c++)
+					cur.push_back(c == 0 ? mod->Or(NEW_ID, SigSpec(sw, 0, 1), start)[0] : SigBit(sw, c));
+				auto any_in = [&](int lo, int hiq) {
+					SigSpec acc = Const(0, 1);
+					for (int c = std::max(lo, 0); c <= std::min(hiq, K); c++)
+						acc = orN({acc, SigSpec(cur[c])});
+					return acc;
+				};
+				SigSpec ends = andN({bsig, any_in(gk - 1, hi >= 0 ? hi - 1 : K)});
+				if (op == "[=]")
+					ends = orN({ends, andN({mod->Not(NEW_ID, bsig), g, any_in(m, K)})});
+				std::vector<SigBit> up;
+				for (int c = 0; c <= K; c++) {
+					SigSpec v = c == 0 ? SigSpec(Const(0, 1)) : SigSpec(cur[c - 1]);
+					if (c == K && hi < 0)
+						v = orN({v, SigSpec(cur[K])});
+					up.push_back(v[0]);
 				}
-				return any;
+				// an occurrence shifts; a non-occurrence tick keeps the set
+				// while the gate (throughout) holds and kills it otherwise
+				SigSpec keep = mod->Mux(NEW_ID, Const(0, K + 1), SigSpec(cur), g);
+				SigSpec nxt = mod->Mux(NEW_ID, keep, SigSpec(up), bsig);
+				// all-zero = no attempt pending in this element (safe)
+				ffd(dis_gate(nxt), sw, true);
+				return ends;
 			}
 			if (!every_tick && hi >= 0)
 				approx("noncons-rep-merged-counter", std::string(op) + " at " + log_id(n));
@@ -2572,33 +2439,49 @@ struct SvaCompiler {
 
 	// End pulse of a run of >= m consecutive matches of body (boolean body
 	// or true): run counter capped at m.
-	SigSpec rep_run_end(Cell *body_cell, SigSpec body, SigSpec start, SigSpec gate, int m)
+	SigSpec rep_run_end(Cell *body_cell, SigSpec body, SigSpec start, SigSpec gate, int m, int hi = -1)
 	{
 		if (body_cell) {
-			// sub-sequence run: iterate the fixed-point rep_end(t) =
-			// start | s_end(t) | (s_end | rep_cont)(t-1)
-			SigSpec s_end = seq_end(body_cell, andN({start, gate_now(gate)}), gate);
-			SigSpec cont = feedback([=](SigSpec q) {
-				return orN({delay(s_end, 1), q});
-			}, "rep_cont", 1);
-			return orN({andN({start, gate_now(gate)}), s_end, cont});
+			// sub-sequence run s[+]: the next copy starts the tick after a
+			// copy ends (s[*2] = s ##1 s), so copies are fed back into the
+			// body's start; ends merge across attempts like any sequence
+			// end.  (The old form OR-ed a never-cleared "a copy ended
+			// before" flag into the end: true forever after one match.)
+			if (tree_uses_locals(body_cell))
+				log_error("sva2check: local variables in an unbounded repetition of a sequence are not supported.\n");
+			Wire *qw = wn("rep_next", 1);
+			SigSpec e = seq_end(body_cell, orN({andN({start, gate_now(gate)}), SigSpec(qw)}), gate);
+			ffd(dis_gate(e), qw, true);
+			return e;
 		}
+		// Boolean run b[*m:hi] (hi < 0: unbounded) as an exact run-length
+		// set: bit c = some live attempt has c consecutive b's before this
+		// tick (an attempt entering now has 0).  b moves every attempt up
+		// one (lengths past hi leave; unbounded saturates at m-1), !b kills
+		// them all.  The end needs b now and a length c+1 in [m, hi].  (The
+		// old merged run counter ignored `start`: `t==5 ##1 c[*1:20]`
+		// matched at any c tick.)
 		SigSpec b = andN({reduce1(body), gate_now(gate)});
-		if (m <= 1)
-			return andN({b, orN({start, Const(1, 1)})}) ; // run>=1 end = b
-		int w = 1;
-		while ((1 << w) <= m) w++;
-		SigSpec run = feedback([=](SigSpec q) {
-			SigSpec sum = mod->Add(NEW_ID, q, SigSpec(b));
-			// saturate at m; compare the register (not the sum) so the
-			// increment cannot overflow the counter width
-			SigSpec sat = mod->Eq(NEW_ID, q, Const(m, w));
-			SigSpec capped = mod->Mux(NEW_ID, sum, Const(m, w), sat);
-			// b ? capped : 0 (a plain And would zero-extend b and
-			// clear the upper state bits)
-			return mod->Mux(NEW_ID, Const(0, w), capped, b);
-		}, "rep_run", w);
-		return andN({b, mod->Ge(NEW_ID, run, Const(m, w))});
+		m = std::max(m, 1);
+		int K = (hi >= 0 ? hi : m) - 1;
+		if (K > 64)
+			log_error("sva2check: consecutive repetition bound %d is too large (max 65).\n", hi);
+		Wire *sw = wn("run_set", K + 1);
+		std::vector<SigBit> cur;
+		for (int c = 0; c <= K; c++)
+			cur.push_back(c == 0 ? mod->Or(NEW_ID, SigSpec(sw, 0, 1), start)[0] : SigBit(sw, c));
+		SigSpec hit = Const(0, 1);
+		for (int c = m - 1; c <= K; c++)
+			hit = orN({hit, SigSpec(cur[c])});
+		std::vector<SigBit> up;
+		for (int c = 0; c <= K; c++) {
+			SigSpec v = c == 0 ? SigSpec(Const(0, 1)) : SigSpec(cur[c - 1]);
+			if (c == K && hi < 0)
+				v = orN({v, SigSpec(cur[K])});
+			up.push_back(v[0]);
+		}
+		ffd(dis_gate(mod->Mux(NEW_ID, Const(0, K + 1), SigSpec(up), b)), sw, true);
+		return andN({b, hit});
 	}
 
 	// Bounded consecutive repetition: chain hi copies of the body, the
@@ -3287,10 +3170,12 @@ struct SvaCompiler {
 			int ll = lhs ? seq_max_len(lhs) : (lead2 ? 1 : clen(0));
 			Cell *tail = child(ti);
 			int tl = tail ? seq_max_len(tail) : clen(ti);
-			if (ll < 0) return -1;
+			// an unbounded tail ([->n], [*m:$]) makes the whole ## unbounded
+			// (it used to clamp to 0, measuring `s ##0 b[->n]` as bounded)
+			if (ll < 0 || tl < 0) return -1;
 			// ticks: lhs spans ll (its last tick abuts the delay), the delay
 			// adds hi, the tail adds its own length minus the shared tick
-			return hi < 0 ? -1 : ll + hi + std::max(tl, 0) - 1;
+			return hi < 0 ? -1 : ll + hi + tl - 1;
 		}
 		if (op == "[*]" || op == "[+]") {
 			Cell *b = child(1);
@@ -3990,10 +3875,6 @@ struct Sva2CheckPass : public Pass {
 				}
 				comp.lower_sampled_value_cells(lowered_sv);
 				comp.lower_sequence_methods();
-				// anchored [->]/[=] counting needs the slot ring even
-				// without locals (bounded property only; unbounded keeps
-				// the merged counter, the documented approximation)
-				comp.ensure_anc_slots(body);
 
 				// v1 liveness: an unbounded eventually/s_eventually whose
 				// operand is a plain boolean expression is F p with p a

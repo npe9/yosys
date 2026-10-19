@@ -83,7 +83,7 @@ the tags over all expectations; the gate is that no line says
 approximation kinds, what they can miss, the battery files that depend
 on them (from `sva2check -exact` over every `t*.sv`, 2026-10-17) and the
 positive control that shows each detector firing (`xapprox.sv`, plain /
-`SVA_NOSPLIT=1` / `SVA_NOANC=1`; `t8.sv` for until):
+`SVA_NOSPLIT=1`; `t8.sv` for until):
 
 | kind | where | what can be missed | battery files | detector seen firing |
 |---|---|---|---|---|
@@ -92,9 +92,8 @@ positive control that shows each detector firing (`xapprox.sv`, plain /
 | `first-match-locals-shared-slots` | `first_match` of a sequence with local variables | locals read from the shared slot file, not per parse | none | xapprox p_fm_loc |
 | `locals-lowest-hot-age` | a local-variable read at a point several attempt ages can reach | the lowest hot age wins; violations visible only to a younger overlapping attempt are missed | none (the age fold keeps linear sequences one-hot; the per-offset split keeps ranged ones) | xapprox p_loc_win, p_fm_loc under SVA_NOSPLIT=1 |
 | `locals-merged-window` | ranged `##` whose tail is an `$sva` subtree reading locals and could not be split per offset | tail compiled once over the merged window | none | not observed: an expression tail reading a local shows up as `locals-lowest-hot-age` (the actual effect); an `$sva` tail that defeats the split was not constructed |
-| `noncons-rep-merged-counter` | `[->m:n]`/`[=m:n]` with a finite bound inside a `##` chain, outside the anchored per-attempt path | the merged counter only checks `k >= m` (upper bound vacuous) | none | xapprox p_nc_loc under SVA_NOANC=1 |
+| `noncons-rep-merged-counter` | `[->m:n]`/`[=m:n]` whose occurrence-count set would exceed 65 states (n > 64) | the merged counter only checks `k >= m` (upper bound vacuous) and counts from the first attempt | none | xapprox p_nc_big |
 | `noncons-rep-seq-body-merged` | `[->]`/`[=]` over a SEQUENCE body (beyond the LRM's Boolean form) | occurrence ends of overlapping body attempts merge | tnoncons1 | xapprox p_ncseq |
-| `noncons-rep-unbounded-top-age` | anchored `[->]`/`[=]` in an unbounded property | the saturated top age falls back to the time-0 count | none | xapprox p_nc_loc |
 | `strong-seq-merged-attempts` | a variable-length sequence in property position (implication consequent, sequence property) in slot mode (locals), a multi-clock island, or with a window > 16 ticks (env `SVA_MERGED_STRONG=1` forces it) | one monitor serves overlapping attempts, so an end belonging to a LATER attempt inside this attempt's window excuses its miss | tfeat3, tfeat5, tmcdom1 (2026-10-19; `-exact` stops at a file's first approximation) | xapprox p_ssm (also on p_nc_loc, p_fm_loc: locals) |
 | `seq-binop-merged-attempts` | `and` / `intersect` / `within` with a variable-length operand in slot mode, a multi-clock island, or an attempt span > 16; `intersect` / `within` with an unbounded operand | operand ends are paired across overlapping attempts (one attempt's end completes another's pair) | none (2026-10-19) | xapprox p_binop |
 | `late-failure-tick` | an assume/restrict (or `-early`) sequence whose early failure cannot be built: slot mode (locals), multi-clock islands, windows > 16, or a monitor holding counters | the failure is reported at the deadline, not the LRM tick; for an assumption a short trace can slip past it (spurious counterexamples, never false proofs) | none (2026-10-19) | xapprox q_late |

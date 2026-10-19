@@ -65,8 +65,8 @@ failures/` holds the repros after a run.
 | # | shape | framework behaviour | LRM |
 |---|---|---|---|
 | F1 | `p until_with q`, `p until q` | FIXED (same day): the `_with` obligation was not enforced, a failure at the attempt's own start step never fired, and a q seen by an earlier attempt masked a new one | 16.12.10 |
-| F2 | `b[=n] \|-> q` | the match ending exactly at the n-th `b` is not considered (needs a later non-b step) | 16.9.2: `b[=n]` = `b[->n] ##1 !b[*0:$]`, empty tail included |
-| F3 | `(e) ##0 b[->n]` as property | fires at a step where a match exists | 16.9.2 |
+| F2 | `b[=n] \|-> q` | the match ending exactly at the n-th `b` is not considered (needs a later non-b step) | 16.9.2: `b[=n]` = `b[->n] ##1 !b[*0:$]`, empty tail included -- FIXED (C4 oracle, `[=]` empty tail).  2026-10-19 (D5 slice 2): the per-attempt counters were also wrong for attempts starting after earlier occurrences (false proof / false disproof, tagged exact; tests/sva_battery/tnc_anchor.sv); [->]/[=] and Boolean runs now use exact live-count sets |
+| F3 | `(e) ##0 b[->n]` as property | fires at a step where a match exists | 16.9.2 -- 2026-10-19: an unbounded sequence in property position is refused loudly (the `##` length clamp used to measure `e ##0 b[->n]` as bounded, with a bogus deadline) |
 | F4 | `c ##[0:1] r` as property | sim never fires on failing traces (BMC does find the cex) | 16.12.1 |
 | F5 | `a[*1:2]` as property | sim fires one step late and never for the last step's attempt | 16.12.1 -- 2026-10-19 (register v3 D5): fixed for assume/restrict by default (the late form let traces slip past assumptions) and for asserts under `sva2check -early` / env `SVA_EARLY=1` (one monitor copy per attempt slot; ~100x on ic3 proofs, so not the assert default).  `SVA_EARLY=1` pbt, 3 seeds x 60: 7 cases fixed, 0 regressions |
 | F6 | `s_eventually[m:n] <temporal>` | sim never fires when every alternative fails (BMC does) | 16.12.14 |
@@ -82,7 +82,7 @@ are merged (`strong_seq_fail` ORs `end` over the deadline window with
 `start = 1'b1`): a later attempt's match hides an earlier attempt's
 failure (F4), the failure is only reported at the sequence's maximum
 length (F5, one step late / never for the last steps of a trace), and
-occurrence counters are shared (F2, F3).  The exact fix is per-attempt
+occurrence counters were shared (F2, F3; replaced by exact count sets on 2026-10-19).  The exact fix is per-attempt
 match tracking (ends tagged by match length, or the slot/age ring the
 local-variable machinery already has), register v3 item D5.  Until
 then `make pbt` is informative, not a gate: `pbt.py` exits nonzero on

@@ -4,8 +4,7 @@
 // test (x* = stress, not gated on PROVED/DIS).  Run
 //   yosys -p 'read_verilog -sv -formal xapprox.sv; hierarchy -check; sva2check'
 // plain (10 kinds), with SVA_NOSPLIT=1 (adds locals-merged-window and
-// locals-lowest-hot-age) and with SVA_NOANC=1 (adds
-// noncons-rep-merged-counter in place of the anchored top-age kind).
+// locals-lowest-hot-age).
 // until-merged-attempts is covered by t8.sv (p_utw_b).
 module xapprox(input logic clk, a, b, c, input logic [3:0] d);
   // first-match-any (`and` operand) + first-match-overlap-window (ranged delays)
@@ -18,13 +17,11 @@ module xapprox(input logic clk, a, b, c, input logic [3:0] d);
     (a, x = d) |-> first_match(##[1:3] (b && d == x));
   endproperty
   p_fm_loc: assert property (@(posedge clk) p_fml);
-  // noncons-rep-unbounded-top-age (anchored, default) /
-  // noncons-rep-merged-counter (SVA_NOANC=1): [->m] with a local
-  property p_ncl;
-    logic [3:0] x;
-    (a, x = d) |-> ##1 b[->2] ##1 (c && d == x);
-  endproperty
-  p_nc_loc: assert property (@(posedge clk) p_ncl);
+  // noncons-rep-merged-counter: a [->m:n] whose count set would exceed
+  // 65 states keeps the merged counter.  (A local read after an unbounded
+  // [->] -- this control's old shape -- is now refused: the ring read
+  // the wrong attempt's local.)
+  p_nc_big: assert property (@(posedge clk) (a ##1 b[->2:70]) |-> c);
   // locals-merged-window + locals-lowest-hot-age under SVA_NOSPLIT=1:
   // ranged delay whose tail reads the local
   property p_lw;

@@ -148,6 +148,7 @@ struct SvaCompiler {
 	// island-start pulse, stage k shifts once per consequent tick.  Island
 	// reads select the stage by the island age vector; writes are rejected.
 	bool island_mode = false;
+	bool in_island = false;   // compiling a multi-clock island's consequent
 	dict<Wire *, std::vector<Wire *>> island_chains;
 	// raw (un-spliced) gate expression set by `throughout`: re-spliced at
 	// the compile-time age current at each gate consumption point, so a
@@ -404,6 +405,20 @@ struct SvaCompiler {
 	{
 		for (int i = 0; i < k; i++)
 			s = reg(s, role);
+		return s;
+	}
+
+	// The token of a `##k` gap carried k ticks; inside `b throughout ...`
+	// (dyn_gate set) b must hold at every gap tick (LRM 16.9.9): the
+	// ticks strictly between the lhs end and the tail start.  Without a
+	// throughout gate this is plain delay().
+	SigSpec gap_delay(SigSpec s, int k, SigSpec gate, const char *role = "delay")
+	{
+		if (dyn_gate.empty())
+			return delay(s, k, role);
+		SigSpec g = gate_now(gate);
+		for (int i = 0; i < k; i++)
+			s = reg(i == 0 ? s : andN({s, g}), role);
 		return s;
 	}
 
@@ -1589,7 +1604,7 @@ struct SvaCompiler {
 					slot_epoch++;
 					pending_wr.clear();
 					auto te = seq_ends_split(child(lead2 ? 1 : 2), port(lead2 ? 1 : 2),
-							k == 0 ? le.end : delay(le.end, k, "dspl"), gate, depth + 1);
+							k == 0 ? le.end : gap_delay(le.end, k, gate, "dspl"), gate, depth + 1);
 					if (!te.second) { ok = false; break; }
 					for (auto &t : te.first)
 						r.push_back(SvaEnd{t.end, le.age + k + t.age});
@@ -1729,12 +1744,36 @@ struct SvaCompiler {
 					log_error("sva2check: non-constant ## delay in %s.\n", log_id(n));
 				lo = hi = k;
 			}
+			// Inside `b throughout (... ##k ...)` b must hold at EVERY tick
+			// of the match (LRM 16.9.9), the gap ticks between the lhs
+			// end and the tail start included; the elements gate their
+			// own ticks, the register chain carrying the token across the
+			// gap did not, so `g throughout (1 ##5 x)` was PROVED with g
+			// low inside the gap (register v3 C1, sv-tests 16.7).  When a
+			// throughout gate is active, the token leaving a gap tick
+			// must see the gate there.
+			bool gap_gate = !dyn_gate.empty();
+			SigSpec g_gap = gap_gate ? gate_now(gate) : SigSpec();
+			auto step = [&](SigSpec tok, bool at_gap) -> SigSpec {
+				return reg(at_gap && gap_gate ? andN({tok, g_gap}) : tok, "delay");
+			};
 			if (hi < 0) {
 				// unbounded: tail may start at any tick >= end + lo
-				SigSpec trig = feedback([=](SigSpec q) {
-					return orN({delay(s_end, lo), q});
-				}, "delay_trig", 1);
-				t_start = trig;
+				SigSpec d = s_end;
+				for (int k = 1; k <= lo; k++)
+					d = step(d, k > 1);
+				if (lo >= 1 && gap_gate) {
+					// waiting past end+lo: every waited tick is a gap tick
+					t_start = feedback([=](SigSpec q) {
+						return andN({orN({d, q}), g_gap});
+					}, "delay_trig", 1);
+					t_start = orN({d, t_start});
+				} else {
+					SigSpec dd = delay(s_end, lo);
+					t_start = feedback([=](SigSpec q) {
+						return orN({dd, q});
+					}, "delay_trig", 1);
+				}
 				if (slots_mode)
 					t_age = age_window(age, lo, nslots - 1);
 			} else if (hi <= 128) {
@@ -1742,7 +1781,7 @@ struct SvaCompiler {
 				t_start = lo == 0 ? s_end : Const(0, 1);
 				SigSpec tap = s_end;
 				for (int k = 1; k <= hi; k++) {
-					tap = reg(tap, "delay");
+					tap = step(tap, k > 1);
 					if (k >= lo)
 						t_start = orN({t_start, tap});
 				}
@@ -2704,8 +2743,11 @@ struct SvaCompiler {
 						}
 						SigSpec r;
 						{
-							if (cbc)
+							if (cbc) {
+								in_island = true;
 								r = strong_seq_fail(cbc, pulse);
+								in_island = false;
+							}
 							else {
 								static std::vector<Wire *> no_formals;
 								r = andN({pulse,
@@ -3003,12 +3045,30 @@ struct SvaCompiler {
 		mlen_memo[n] = r;
 		return r;
 	}
+	// A bare operand that names a sequence/property declaration (`a
+	// throughout seq`): the frontend leaves a plain identifier wire, so
+	// child_cell finds nothing and the length helpers used to assume 1 --
+	// a one-tick deadline, and `gnt throughout seq` failed at frame 1
+	// while the inline form proved (register v3 C1, sv-tests 16.7).
+	// For LENGTHS the declaration's body stands in (the lowering itself
+	// inlines through seq_dispatch with formals and scoping).
+	Cell *len_child(SigSpec s)
+	{
+		if (Cell *c = child_cell(s))
+			return c;
+		if (Cell *d = decl_for_wire(s)) {
+			auto dp = ports_of(d);
+			return dp.empty() ? nullptr : child_cell(d->getPort(dp[0]));
+		}
+		return nullptr;
+	}
+
 	int seq_min_len_raw(Cell *n)
 	{
 		std::string op = sva_op(n);
 		auto ports = ports_of(n);
 		auto child = [&](int i) -> Cell * {
-			return i < GetSize(ports) ? child_cell(n->getPort(ports[i])) : nullptr;
+			return i < GetSize(ports) ? len_child(n->getPort(ports[i])) : nullptr;
 		};
 		auto cmin = [&](int i) -> int {
 			Cell *c = child(i);
@@ -3087,7 +3147,7 @@ struct SvaCompiler {
 		std::string op = sva_op(n);
 		auto ports = ports_of(n);
 		auto child = [&](int i) -> Cell * {
-			return i < GetSize(ports) ? child_cell(n->getPort(ports[i])) : nullptr;
+			return i < GetSize(ports) ? len_child(n->getPort(ports[i])) : nullptr;
 		};
 		auto clen = [&](int i) -> int {
 			Cell *c = child(i);
@@ -3258,6 +3318,40 @@ struct SvaCompiler {
 		if (len < 0 || len > 64)
 			log_error("sva2check: sequence in %s used in property position has no finite bound (max %d ticks).\n", log_id(n), len);
 		int deadline = len - 1;
+		int minl = seq_min_len(n);
+		// A variable-length sequence: the window [t, t+deadline] of the
+		// attempt started at t also sees the ends of LATER attempts, which
+		// used to excuse its miss -- `g throughout (1 ##[1:3] x)` was
+		// PROVED with the attempt at g's low tick unmatchable (register v3
+		// C1).  Exact form: deadline+1 rotating monitor copies; copy i
+		// starts only the attempts at ticks with phase == i, so it has one
+		// attempt in flight and every end inside that attempt's window is
+		// its own.  A fixed-length sequence has a one-tick window and is
+		// exact already; slot mode (locals) and windows > 16 keep the
+		// merged form, tagged.
+		// (multi-clock islands also keep it: the rotating copies on the
+		// island clock took tmcdom1 from 27 s to > 10 min in ic3)
+		if (deadline > 0 && minl != len && (slots_mode || island_mode || in_island || deadline + 1 > 16 || getenv("SVA_MERGED_STRONG"))) {
+			approx("strong-seq-merged-attempts", std::string(log_id(n)));
+		} else if (deadline > 0 && minl != len) {
+			int copies = deadline + 1;
+			int w = 1;
+			while ((1 << w) < copies) w++;
+			Wire *ph = wn("ssf_phase", w);
+			SigSpec wrap = mod->Eq(NEW_ID, SigSpec(ph), Const(copies - 1, w));
+			SigSpec nxt = mod->Mux(NEW_ID, mod->Add(NEW_ID, SigSpec(ph), Const(1, w)), Const(0, w), wrap);
+			mod->addDff(NEW_ID, clk, nxt.extract(0, w), ph, clk_pos);
+			SigSpec fail = Const(0, 1);
+			for (int i = 0; i < copies; i++) {
+				SigSpec start_i = andN({start, mod->Eq(NEW_ID, SigSpec(ph), Const(i, w))});
+				SigSpec end_i = seq_end(n, start_i, Const(1, 1));
+				SigSpec any_i = Const(0, 1);
+				for (int k = 0; k <= deadline; k++)
+					any_i = orN({any_i, k == 0 ? end_i : delay(end_i, k, "strong_win")});
+				fail = orN({fail, andN({delay(start_i, deadline, "strong_expire"), mod->Not(NEW_ID, any_i)})});
+			}
+			return fail;
+		}
 		SigSpec end = seq_end(n, start, Const(1, 1));
 		SigSpec any = Const(0, 1);
 		for (int k = 0; k <= deadline; k++)
@@ -3553,7 +3647,15 @@ struct Sva2CheckPass : public Pass {
 				// along the chain.
 				Cell *spec = topcell;
 				std::vector<std::tuple<Cell *, std::vector<Wire *>, std::vector<SigSpec>>> chain;
-				while (sva_op(spec) != "spec") {
+				// a clocked SEQUENCE declaration used as the whole property
+				// (`sequence s; @(posedge clk) ...; endsequence  assert
+				// property (s);`, LRM 16.16 clock inference) ends the chain at
+				// its `clocked` node: clock + body, no disable -- the same
+				// shape the spec classification below reads (it was skipped
+				// as "not a spec" and ic3 printed a verdict on the
+				// placeholder; register v3 C1, sv-tests chapter 16)
+				auto is_spec = [&](Cell *c) { return sva_op(c) == "spec" || sva_op(c) == "clocked"; };
+				while (!is_spec(spec)) {
 					std::string sop = sva_op(spec);
 					if (sop == "sequence_decl" || sop == "property_decl" || sop == "let_decl") {
 						// bare name reference resolves straight to the decl
@@ -3573,7 +3675,32 @@ struct Sva2CheckPass : public Pass {
 					if (chain.size() > 64)
 						log_error("sva2check: recursive property instantiation involving %s.\n", log_id(cell));
 				}
-				if (!spec || sva_op(spec) != "spec") {
+				// the parser binds `@(posedge clk) a ##1 b` in a sequence
+				// declaration as ##(clocked(clk, a), b): the clock sits on
+				// the LEFTMOST element although it governs the whole
+				// sequence (LRM 16.16).  Walk the leftmost operands to that
+				// `clocked` node; its edge is the property clock and the
+				// whole tree the body (the inner `clocked` passes through
+				// when its clock equals the property clock).
+				Cell *hoist_clock = nullptr;
+				if (spec && !is_spec(spec)) {
+					Cell *c = spec;
+					for (int d = 0; c && d < 64; d++) {
+						std::string op = sva_op(c);
+						if (op == "clocked") {
+							auto cp = comp.ports_of(c);
+							Cell *edge = cp.empty() ? nullptr : comp.child_cell(c->getPort(cp[0]));
+							if (edge && (sva_op(edge) == "posedge" || sva_op(edge) == "negedge" || sva_op(edge) == "edge"))
+								hoist_clock = edge;
+							break;
+						}
+						if (op == "spec" || op == "sequence_decl" || op == "property_decl" || op.empty())
+							break;
+						auto cp = comp.ports_of(c);
+						c = cp.empty() ? nullptr : comp.child_cell(c->getPort(cp[0]));
+					}
+				}
+				if (!spec || (!is_spec(spec) && !hoist_clock)) {
 					unsupported++;
 					log("Skipping %s/%s: property is not a $sva spec.\n", log_id(mod), log_id(cell));
 					cell->attributes[ID(sva_lowering)] = Const(std::string("placeholder:not a spec"));
@@ -3596,7 +3723,7 @@ struct Sva2CheckPass : public Pass {
 				Cell *clock = nullptr, *disable = nullptr, *body = nullptr;
 				SigSpec body_sig, body_const;
 				bool bad = false;
-				for (int guard = 0; guard < 64; guard++) {
+				for (int guard = 0; guard < 64 && !hoist_clock; guard++) {
 					clock = nullptr, disable = nullptr, body = nullptr;
 					body_sig = SigSpec(), body_const = SigSpec();
 					bad = false;
@@ -3649,10 +3776,14 @@ struct Sva2CheckPass : public Pass {
 						break;
 					}
 					spec = next;
-					if (sva_op(spec) != "spec")
+					if (!is_spec(spec))
 						break;
 				}
 
+				if (hoist_clock) {
+					clock = hoist_clock;
+					body = spec;
+				}
 				if (bad || (!body && body_sig.empty() && body_const.empty())) {
 					unsupported++;
 					log("Skipping %s/%s: malformed spec.\n", log_id(mod), log_id(cell));

@@ -123,7 +123,7 @@ def run(cmd, **kw):
 
 IC3_LINE = re.compile(r"ic3: (\S+): (proved|disproved|undecided)(?: \(depth (\d+)\))?"
                       r"(?: \[lowering=([^\]]+)\])?")
-COVER_LINE = re.compile(r"ic3: (\S+): cover not checked(?: \[lowering=([^\]]+)\])?")
+COVER_LINE = re.compile(r"ic3: (\S+): (?:cover )?not checked(?: \[lowering=([^\]]+)\])?")
 DEGRADED_LINE = re.compile(r"ic3: design carries (sv_degraded|sv_permissive): (.*)")
 
 

@@ -1,0 +1,27 @@
+# Register v3 C1: an interface whose body is only its port list is a signal
+# bundle.  The empty-module heuristic used to mark it a blackbox, hierarchy
+# then skipped the instance, and a parent's `ip.p` stayed a 1-bit implicit
+# net instead of the interface's 8-bit signal (stock main too).  sv-tests
+# 16.10 *-uvm (`interface clk_gen_if(output bit [7:0] in, ...)`) fired a
+# correct local-variable property because of it.
+read_verilog -sv <<EOT
+interface if_ports(output bit [7:0] p);
+endinterface
+interface if_sigs;
+  bit [7:0] s;
+endinterface
+module ifp(input logic [7:0] a, output logic [7:0] yp, output logic [7:0] ys);
+  if_ports ip();
+  if_sigs  is();
+  assign ip.p = a;
+  assign is.s = a;
+  assign yp = ip.p;
+  assign ys = is.s;
+endmodule
+EOT
+hierarchy -top ifp
+proc
+flatten
+opt
+select -assert-count 1 w:ip.p
+sat -verify -prove yp a -prove ys a

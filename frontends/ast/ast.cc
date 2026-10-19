@@ -1256,7 +1256,13 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 
 		bool blackbox_module = flag_lib;
 
-		if (!blackbox_module && !flag_noblackbox) {
+		// An INTERFACE whose body is only its port list (`interface
+		// if(output bit [7:0] p); endinterface`) is a signal bundle, not a
+		// blackbox stub: boxing it made hierarchy skip the instance, so a
+		// parent's `ip.p` never became the interface's 8-bit signal and
+		// stayed a 1-bit implicit net (a silent wrong value; sv-tests
+		// 16.10 *-uvm, register v3 C1).  Interfaces are never auto-boxed.
+		if (!blackbox_module && !flag_noblackbox && ast->type != AST_INTERFACE) {
 			// A portless empty module is useless as a blackbox stub and
 			// would be excluded from the default design selection (boxed
 			// modules), so only portless-free logic below applies.

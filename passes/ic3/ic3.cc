@@ -1661,6 +1661,40 @@ struct Ic3Pass : Pass
 				covers.push_back(cell);
 			}
 		}
+		// A check sva2check could not lower carries a placeholder driver
+		// (sva_lowering = "placeholder:<why>"): any verdict on it is about
+		// the placeholder, not the property (a tautology was printed as
+		// disproved).  Asserts are reported not checked; an assumption
+		// that cannot be modelled makes every other verdict suspect, so it
+		// is refused unless -allow-degraded (register v3 C1).
+		auto placeholder = [](RTLIL::Cell *c) -> std::string {
+			if (!c->attributes.count(ID(sva_lowering)))
+				return "";
+			std::string t = c->attributes.at(ID(sva_lowering)).decode_string();
+			return t.compare(0, 12, "placeholder:") == 0 ? t : "";
+		};
+		for (auto *vec : {&props, &live_props}) {
+			std::vector<RTLIL::Cell *> keep;
+			for (auto cell : *vec) {
+				std::string t = placeholder(cell);
+				if (t.empty())
+					keep.push_back(cell);
+				else
+					log("ic3: %s: not checked [lowering=%s]\n", cell->name.unescape().c_str(), t.c_str());
+			}
+			*vec = keep;
+		}
+		for (auto cell : assumes) {
+			std::string t = placeholder(cell);
+			if (t.empty())
+				continue;
+			if (!allow_degraded)
+				log_error("ic3: assumption %s has no lowering [%s]; every verdict would rest on a placeholder "
+						"(pass -allow-degraded to proceed).\n", cell->name.unescape().c_str(), t.c_str());
+			log_warning("ic3: assumption %s has no lowering [%s]; verdicts below rest on a placeholder.\n",
+					cell->name.unescape().c_str(), t.c_str());
+		}
+
 		// Register v3 B5: covers are not checked by this engine (D4 is
 		// reachability); say so per cover instead of silence
 		for (auto cell : covers) {

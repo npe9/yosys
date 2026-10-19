@@ -569,13 +569,15 @@ def scan(path):
 
 
 # ------------------------------------------------------------------ instrumented design
-def instrument(src, shared, clock):
+def instrument(src, shared, clock, hist_width=None):
     """Copy of the source with the leaves and history registers added to the
     module that holds the assertions (the last `endmodule` before... the
     battery puts one design per file: we add to the last module)."""
     decl = ["", "  // ---- oracle.py instrumentation (leaves of the properties) ----"]
     for j, (expr, n) in enumerate(shared.history):
-        w = "$bits(%s)" % expr
+        # hist_width: a fixed width when $bits() cannot be evaluated at
+        # read time (interface members resolve only in hierarchy)
+        w = str(hist_width) if hist_width else "$bits(%s)" % expr
         prev = expr
         for d in range(1, n + 1):
             decl.append("  (* keep *) logic [%s-1:0] __oh_%d_%d = '0;" % (w, j, d))

@@ -98,6 +98,15 @@ the frontend on two corpus files; open item).
 - **Status:** landed on the fork; chunk not yet materialized.  Independent
   of 0/0c; the memory (`st_t W [3:0]`) half of the rewrite predates it.
 
+### 0e. `interface-bundle` — a port-only interface is not a blackbox
+- **Files:** `frontends/ast/ast.cc` (the empty-module auto-blackbox
+  heuristic skips AST_INTERFACE), `tests/verilog/interface_port_bundle.ys`.
+- **Reproduces on stock main:** `interface if_ports(output bit [7:0] p);
+  endinterface` instantiated as `if_ports ip();` and used as `ip.p` in the
+  parent: the interface is boxed, hierarchy skips it, `ip.p` stays a 1-bit
+  implicit net and `yp = ip.p` loses 7 bits (SAT-proved in the pin).
+- **Status:** landed on the fork; one hunk; independent.
+
 ### 1. `cdc-sdc` — structural CDC analysis + SDC subset frontend
 - **Files:** `passes/cmds/cdc.cc`, `passes/cmds/read_sdc.cc`,
   `passes/cmds/sdc_constraints.h`, `tests/verilog/cdc_cases.{sv,sdc,ys}`,

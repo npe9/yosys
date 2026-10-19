@@ -1,0 +1,32 @@
+# Register v3 C1: a check sva2check cannot lower keeps a placeholder driver
+# (sva_lowering = "placeholder:<why>").  ic3 used to print a verdict on it;
+# an assert is now reported not checked, and an assumption without a
+# lowering refuses the run (every verdict would rest on it).
+logger -expect log "p_none: not checked \[lowering=placeholder" 1
+logger -expect log "p_ok: proved" 1
+read_verilog -sv -formal <<EOT
+module noclk(input logic clk, input logic a);
+  p_ok:   assert property (@(posedge clk) a |-> a);
+  p_none: assert property (a |-> ##1 a);
+endmodule
+EOT
+hierarchy -top noclk
+proc
+sva2check
+async2sync
+flatten
+ic3 -check-cells -init-zero
+design -reset
+logger -expect error "assumption m_none has no lowering" 1
+read_verilog -sv -formal <<EOT
+module noclk_assume(input logic clk, input logic a);
+  p_ok:   assert property (@(posedge clk) a |-> a);
+  m_none: assume property (a |-> ##1 a);
+endmodule
+EOT
+hierarchy -top noclk_assume
+proc
+sva2check
+async2sync
+flatten
+ic3 -check-cells -init-zero

@@ -2811,14 +2811,22 @@ struct SvaCompiler {
 				if (!const_int(b->getPort(bp[0]), m))
 					log_error("sva2check: non-constant always bound in %s.\n", log_id(n));
 				SigSpec w;
-				if (bp.size() < 2) {
-					w = feedback([=](SigSpec q) {
-						return orN({delay(start, m, "always_lo"), q});
+				int hi = -1;
+				if (bp.size() >= 2 && !const_int(b->getPort(bp[1]), hi))
+					log_error("sva2check: non-constant always bound in %s.\n", log_id(n));
+				if (hi < 0 && op == "s_always")
+					log_error("sva2check: s_always needs a bounded range (LRM 16.12.11), not [m:$], in %s.\n", log_id(n));
+				if (hi < 0) {
+					// always [m:$]: every tick from start+m on.  feedback()
+					// returns the REGISTER, so the current tick's term is
+					// OR-ed back in (the bare register opened the window
+					// one tick late: `always [1:$]` checked from start+2)
+					SigSpec lo_now = delay(start, m, "always_lo");
+					SigSpec held = feedback([=](SigSpec q) {
+						return orN({lo_now, q});
 					}, "always_wlo", 1);
+					w = orN({lo_now, held});
 				} else {
-					int hi;
-					if (!const_int(b->getPort(bp[1]), hi))
-						log_error("sva2check: non-constant always bound in %s.\n", log_id(n));
 					w = Const(0, 1);
 					for (int k = m; k <= hi; k++)
 						w = orN({w, delay(start, k, "always_win")});
@@ -2898,6 +2906,8 @@ struct SvaCompiler {
 			int hi;
 			if (!const_int(b->getPort(bp[1]), hi))
 				log_error("sva2check: non-constant eventually bound in %s.\n", log_id(n));
+			if (hi < 0)
+				log_error("sva2check: unbounded %s [m:$] is liveness; give it a finite upper bound in %s.\n", op.c_str(), log_id(n));
 			// per-tick evaluation: each tick is its own attempt
 			SigSpec fail_p;
 			if (slots_mode) {
@@ -3192,6 +3202,7 @@ struct SvaCompiler {
 					// single-bound bounds cell (== [*N:N])
 					hi = lo;
 				}
+				if (hi < 0) return -1;  // [*m:$]
 				Cell *body = child(0);
 				int bl = body ? seq_max_len(body) : 1;
 				return hi * std::max(bl, 0);
@@ -3217,8 +3228,12 @@ struct SvaCompiler {
 			return b ? seq_max_len(b) : 1;
 		}
 		if (op == "intersect") {
+			// both operands must match with the same length, so one
+			// bounded operand bounds the intersection
 			int a = clen(0), b = clen(1);
-			if (a < 0 || b < 0) return -1;
+			if (a < 0 && b < 0) return -1;
+			if (a < 0) return b;
+			if (b < 0) return a;
 			return std::max(a, b);
 		}
 		// property operators: all operands start at the same tick except
@@ -3273,8 +3288,8 @@ struct SvaCompiler {
 				return bl;
 			auto bp = ports_of(b);
 			int hi;
-			if (GetSize(bp) < 2 || !const_int(b->getPort(bp[1]), hi))
-				return -1; // unbounded always/eventually
+			if (GetSize(bp) < 2 || !const_int(b->getPort(bp[1]), hi) || hi < 0)
+				return -1; // unbounded always/eventually ([m:$])
 			return hi + bl;
 		}
 		if (op == "until" || op == "until_with")

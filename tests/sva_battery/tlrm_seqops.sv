@@ -30,7 +30,7 @@ module tlrm_seqops(input logic clk);
   // 16-8 "there is only a single match at clock tick 12"
   f8_at12:  assert property (@(posedge clk) t == 8 |-> ((te1 ##[1:5] te2) intersect (te3 ##2 te4 ##2 te5)) ##0 t == 12); // PROVED
   f8_only:  assert property (@(posedge clk) t == 8 |-> not (((te1 ##[1:5] te2) intersect (te3 ##2 te4 ##2 te5)) ##0 t != 12)); // PROVED
-  f8_not13: assert property (@(posedge clk) t == 8 |-> ((te1 ##[1:5] te2) intersect (te3 ##2 te4 ##2 te5)) ##0 t == 13); // DIS @13 (the LRM states no tick; the bad prefix is complete at 12, where the only intersect match ends, but the reference model, like the engine, reports when the te1 ##[1:5] te2 window closes at 13)
+  f8_not13: assert property (@(posedge clk) t == 8 |-> ((te1 ##[1:5] te2) intersect (te3 ##2 te4 ##2 te5)) ##0 t == 13); // DIS @13 (LRM @12: the LRM states no tick, but the bad prefix is complete at 12, where the only intersect match ends -- te3 ##2 te4 ##2 te5 cannot end later; the engine reports when the te1 ##[1:5] te2 window closes, known class F5 / register D5)
   // 16-10 "The first sequence matches at clock tick 10, and the second
   // sequence matches at clock tick 12.  Therefore, two matches"
   f10_at10: assert property (@(posedge clk) t == 8 |-> ((te1 ##2 te2) or (te3 ##2 te4 ##2 te5)) ##0 t == 10); // PROVED

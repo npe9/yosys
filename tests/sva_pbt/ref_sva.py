@@ -141,10 +141,13 @@ def seq_match(s, tr, start, L):
         return ends, opn
     if k == "intersect":      # same start and same end
         e1, o1 = seq_match(s.a[0], tr, start, L); e2, o2 = seq_match(s.a[1], tr, start, L)
-        # a common end beyond L is still possible only if BOTH can still
-        # extend (or one can extend and the other already has an end
-        # that the first could reach -- conservatively: either open)
-        return e1 & e2, (o1 or o2)
+        # a common end at or beyond L needs BOTH operands to still be
+        # able to end there: an end of one operand before L is already in
+        # its end set, so it can only pair with an end of the other that
+        # is known too (LRM 16.9.6).  (This used to be `o1 or o2`, which
+        # left an attempt pending forever once one operand was exhausted:
+        # PBT s2_i27, oracle tdollar i_b, 2026-10-19.)
+        return e1 & e2, (o1 and o2)
     if k == "throughout":     # b throughout s: b at every step of the match
         b, sq = s.a
         ends, opn = seq_match(sq, tr, start, L)

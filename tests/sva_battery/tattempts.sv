@@ -22,7 +22,7 @@ module tattempts(input logic clk);
   ok_fixed: assert property (@(posedge clk) (t == 2 || t == 3) |-> (a ##1 1)); // PROVED
   p_and:    assert property (@(posedge clk) (t == 2 || t == 3) |-> ((a ##1 1) and (b ##1 1))); // DIS @4 (LRM @3: b ##1 1 has no parse from 3; the engine reports at the consequent deadline, known class F5 / register D5)
   ok_and:   assert property (@(posedge clk) (t == 2 || t == 3) |-> ((a ##1 1) and a)); // PROVED
-  p_isect:  assert property (@(posedge clk) (t == 3 || t == 4) |-> ((x ##1 1) intersect (y ##[0:1] 1))); // DIS @4 (the model too: x ##1 1 from 3 stays open until 4)
+  p_isect:  assert property (@(posedge clk) (t == 3 || t == 4) |-> ((x ##1 1) intersect (y ##[0:1] 1))); // DIS @4 (LRM @3: y is low at 3, so y ##[0:1] 1 has no parse and no intersection can exist; the engine reports at the consequent deadline, known class F5 / register D5)
   ok_isect: assert property (@(posedge clk) (t == 3 || t == 4) |-> ((x ##1 1) intersect (y2 ##[0:1] 1))); // PROVED
   p_within: assert property (@(posedge clk) (t == 4 || t == 5) |-> ((t == 4) within (xw ##2 1))); // DIS @7
   ok_within: assert property (@(posedge clk) (t == 3 || t == 4) |-> ((t == 4) within (x ##2 1))); // PROVED

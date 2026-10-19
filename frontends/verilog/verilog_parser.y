@@ -7251,6 +7251,12 @@ sva_bounds_tail:
 		$$ = mk_sva(@$, "bounds");
 	} |
 	TOK_COL expr {
+		// `$` (LRM 16.7/16.9.2: unbounded upper bound of a cycle delay or
+		// repetition range) lexes as an identifier; it used to become an
+		// implicit wire named `$` and fail sva2check as a non-constant
+		// bound.  sva2check reads an upper bound of -1 as unbounded.
+		if ($2->type == AST_IDENTIFIER && $2->str == "\\$" && $2->children.empty())
+			$2 = AstNode::mkconst_int($2->location, 0xffffffffu, true);
 		$$ = sva_add(mk_sva(@$, "bounds"), std::move($2));
 	};
 

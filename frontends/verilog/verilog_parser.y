@@ -3089,7 +3089,11 @@ single_param_decl_ident:
 		auto node = node_owned.get();
 		extra->ast_stack.back()->children.push_back(std::move(node_owned));
 		SET_AST_NODE_LOC(node, @1, @1);
-		(void)$2;
+		// unpacked dimensions (`localparam logic [7:0] M [4:6] = '{..}`):
+		// simplify turns them into the node's dimensions, which the
+		// array-read resolver and $low/$high/$size read
+		if ($2)
+			node->set_attribute(ID(sv_unpacked_dims), std::move($2));
 	};
 
 defparam_decl:

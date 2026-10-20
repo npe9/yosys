@@ -1851,6 +1851,7 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			}
 			else if (id2ast->type == AST_PARAMETER || id2ast->type == AST_LOCALPARAM || id2ast->type == AST_ENUM_ITEM) {
 				if (id2ast->children[0]->type != AST_CONSTANT) {
+					degrade(location.to_loc(), "Read of parameter `%s' did not fold to a constant (e.g. an unsupported select of a parameter array); it is read as an undriven wire.\n", str.c_str());
 					RTLIL::Wire *fallback = current_module->wire(str);
 					if (!fallback)
 						fallback = current_module->addWire(str, 32);

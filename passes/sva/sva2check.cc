@@ -2755,7 +2755,10 @@ struct SvaCompiler {
 			// early form at the tick the attempt dies (varies)
 			int len = seq_max_len(c);
 			if (len < 1) return -1;
-			if (early_fail && fixed_len(c) < 0) return -1;
+			// the early form (assume/restrict, -early) reports when the
+			// attempt dies -- even a fixed-length sequence can die before
+			// its deadline (tearly e_fixed), so no offset is fixed
+			if (early_fail && len > 1) return -1;
 			return len - 1;
 		}
 		if (decl_by_name(op))
@@ -3005,8 +3008,19 @@ struct SvaCompiler {
 			// operand resolves.  (The same-tick pairing used to combine
 			// different attempts: false counterexamples and missed
 			// failures -- PBT class F10.)
+			// operands in the deadline form even when the early form is
+			// requested: its failure tick varies per attempt and could not
+			// be aligned (pairing unaligned pulses can PROVE false things:
+			// tpalign_early p_or_bad).  The deadline form keeps every
+			// assert verdict; an assumption reports late (tagged; spurious
+			// counterexamples at worst, never false proofs).
+			bool saved_early = early_fail;
+			early_fail = false;
 			SigSpec f1 = sub(0), f2 = prop_dispatch(port(1), child(1), start);
 			int d1 = fail_off(child(0)), d2 = fail_off(child(1));
+			early_fail = saved_early;
+			if (saved_early && (d1 > 0 || d2 > 0))
+				approx("late-failure-tick", op + " operands at " + std::string(log_id(n)));
 			if (d1 < 0 || d2 < 0) {
 				if (d1 != 0 || d2 != 0)
 					approx("prop-binop-unaligned", op + " at " + std::string(log_id(n)));
@@ -3184,7 +3198,10 @@ struct SvaCompiler {
 				log_error("sva2check: non-constant eventually bound in %s.\n", log_id(n));
 			if (hi < 0)
 				log_error("sva2check: unbounded %s [m:$] is liveness; give it a finite upper bound in %s.\n", op.c_str(), log_id(n));
-			// per-tick evaluation: each tick is its own attempt
+			// per-tick evaluation: each tick is its own attempt; the operand
+			// in the deadline form (see the or / implies branch)
+			bool saved_early = early_fail;
+			early_fail = false;
 			SigSpec fail_p;
 			if (slots_mode) {
 				SigSpec saved_age = age;
@@ -3205,6 +3222,9 @@ struct SvaCompiler {
 			// (dp was taken as 0: a temporal p's failure for one tick was
 			// paired with another tick's -- PBT class F6.)
 			int dp = fail_off(child(1));
+			early_fail = saved_early;
+			if (saved_early && dp > 0)
+				approx("late-failure-tick", op + " operand at " + std::string(log_id(n)));
 			if (dp < 0) {
 				approx("eventually-unaligned", op + " at " + std::string(log_id(n)));
 				dp = 0;

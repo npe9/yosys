@@ -83,7 +83,7 @@ the tags over all expectations; the gate is that no line says
 approximation kinds, what they can miss, the battery files that depend
 on them (from `sva2check -exact` over every `t*.sv`, 2026-10-17) and the
 positive control that shows each detector firing (`xapprox.sv`, plain /
-`SVA_NOSPLIT=1`; `t8.sv` for until):
+`SVA_NOSPLIT=1`; the former `until-merged-attempts` kind is gone: one live bit is exact for a weak until, 2026-10-19):
 
 | kind | where | what can be missed | battery files | detector seen firing |
 |---|---|---|---|---|
@@ -100,7 +100,6 @@ positive control that shows each detector firing (`xapprox.sv`, plain /
 | `strong-seq-merged-attempts` | a variable-length sequence in property position (implication consequent, sequence property) in slot mode (locals), a multi-clock island, or with a window > 16 ticks (env `SVA_MERGED_STRONG=1` forces it) | one monitor serves overlapping attempts, so an end belonging to a LATER attempt inside this attempt's window excuses its miss | tfeat3, tfeat5, tmcdom1 (2026-10-19; `-exact` stops at a file's first approximation) | xapprox p_ssm (also on p_nc_loc, p_fm_loc: locals) |
 | `seq-binop-merged-attempts` | `and` / `intersect` / `within` with a variable-length operand in slot mode, a multi-clock island, or an attempt span > 16; `intersect` / `within` with an unbounded operand | operand ends are paired across overlapping attempts (one attempt's end completes another's pair) | none (2026-10-19) | xapprox p_binop |
 | `late-failure-tick` | an assume/restrict (or `-early`) sequence whose early failure cannot be built: slot mode (locals), multi-clock islands, windows > 16, or a monitor holding counters | the failure is reported at the deadline, not the LRM tick; for an assumption a short trace can slip past it (spurious counterexamples, never false proofs) | none (2026-10-19) | xapprox q_late |
-| `until-merged-attempts` | `until`/`until_with` not at the property root (pulse start) | a `q` seen by an earlier attempt does not close the attempt starting now; one monitor merges them | t8 | t8 p_utw_b |
 | `weak-as-strong` | `weak(seq)` as a property | compiled strongly: sound for model checking, conservative at the end of a finite simulation trace | tfeat1, twithin, tdeclclk | xapprox p_weak |
 
 Failure ticks (register v3 D5): a sequence in property position fails at

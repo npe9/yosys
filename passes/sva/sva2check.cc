@@ -2712,35 +2712,27 @@ struct SvaCompiler {
 	// semantics: q completes only together with p.
 	SigSpec until_fail(SigSpec p, SigSpec q, SigSpec start, bool with)
 	{
-		if (!(start.is_fully_const() && start.as_const() == Const(1, 1)))
-			approx("until-merged-attempts", with ? "until_with" : "until");
-		SigSpec active = feedback([=](SigSpec qq) {
-			return orN({start, qq});
-		}, "until_active", 1);
-		SigSpec q_seen = feedback([=](SigSpec qq) {
-			SigSpec hit = with ? andN({q, p}) : q;
-			// restart at each start, otherwise accumulate
-			return orN({andN({start, hit}), mod->And(NEW_ID, orN({qq, hit}), mod->Not(NEW_ID, start))});
-		}, "until_qseen", 1);
-		// until: at t either p holds (continue) or q holds (complete);
-		//        fail if neither and no q has been seen since the last start
-		// until_with: q completes only together with p (LRM 16.12.10: p
-		//        must hold AT the step q first holds too); fail if p fails
-		//        before such a q -- the q step itself is NOT exempt
-		// `active` is the registered state (attempts started earlier);
-		// the attempt starting at this very tick is live now as well,
-		// otherwise a failure at the start step can never fire (sva_pbt F1).
-		SigSpec act_now = orN({start, active});
-		SigSpec fail_now = with ? andN({act_now, mod->Not(NEW_ID, p)})
-		                        : andN({act_now, mod->Not(NEW_ID, p), mod->Not(NEW_ID, q)});
-		// A q seen by an EARLIER attempt does not complete the attempt
-		// that starts at this tick (the attempts overlap; one monitor
-		// merges them -- documented approximation for pulse starts).  At
-		// the property root, where an attempt starts every tick, this
-		// makes the monitor exact: `p until q` fires at every step with
-		// !p && !q and `p until_with q` at every step with !p.
-		SigSpec seen_eff = andN({q_seen, mod->Not(NEW_ID, start)});
-		return andN({fail_now, mod->Not(NEW_ID, seen_eff)});
+		// One live bit for all attempts in flight: every live attempt of
+		// a weak until sees the same future (p and q from now on), so
+		// they complete or fail together and the merged state is exact,
+		// for pulse starts as well as at the property root.  An attempt
+		// starting now is live now (a failure at its start tick fires,
+		// sva_pbt F1).
+		//   until:      q completes; !p && !q fails; p && !q continues
+		//   until_with: q && p completes; !p fails (the q step itself is
+		//               not exempt, LRM 16.12.10); p && !q continues
+		// Both continue exactly when p && !q.  (The old monitor's
+		// `active` latch never cleared, so an attempt that had already
+		// failed fired again at every later !p tick: extra failure ticks
+		// after the first, PBT SIM-STEP s1_i7 / s2_i39 / s3_i5; it was
+		// tagged until-merged-attempts.)
+		Wire *lw = wn("until_live", 1);
+		SigSpec live = orN({start, SigSpec(lw)});
+		SigSpec np = mod->Not(NEW_ID, p);
+		SigSpec fail = with ? andN({live, np}) : andN({live, np, mod->Not(NEW_ID, q)});
+		// all-zero = no attempt pending (safe for the early check)
+		ffd(dis_gate(andN({live, p, mod->Not(NEW_ID, q)})), lw, true);
+		return fail;
 	}
 
 	// The fixed failure offset of a property (register v3 F10): ticks from

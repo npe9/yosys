@@ -5,7 +5,6 @@
 //   yosys -p 'read_verilog -sv -formal xapprox.sv; hierarchy -check; sva2check'
 // plain (10 kinds), with SVA_NOSPLIT=1 (adds locals-merged-window and
 // locals-lowest-hot-age).
-// until-merged-attempts is covered by t8.sv (p_utw_b).
 module xapprox(input logic clk, a, b, c, input logic [3:0] d);
   // first-match-any (`and` operand) + first-match-overlap-window (ranged delays)
   p_fm_and: assert property (@(posedge clk) a |-> first_match((b ##[1:2] c) and (c ##[1:3] b)));

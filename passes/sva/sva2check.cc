@@ -1296,6 +1296,179 @@ struct SvaCompiler {
 		slot_epoch++;
 	}
 
+	// --- empty matches (LRM 16.9.2.1, register v3 E1) ----------------------
+	// An empty match has no tick: (empty ##n s) = ##(n-1) s and
+	// (s ##n empty) = s ##(n-1) `true for n > 0, and ##0 next to an empty
+	// match does not match.  Elements never emit an end for their empty
+	// match; every ## whose operand can match empty is rewritten once per
+	// module (before any check compiles) into the union of its nonempty
+	// parse and the shifted forms above.
+
+	// can the sequence rooted at c match empty?  [*0..], [=0..], [->0..],
+	// and `or` / `throughout` over such; a ## never does (n >= 1 shifts
+	// to ##(n-1) of the other side, which is nonempty or ##0-dead)
+	bool can_empty(Cell *c)
+	{
+		if (!c || c->type != "\\$sva")
+			return false;
+		std::string op = sva_op(c);
+		auto p = ports_of(c);
+		if (op == "[*]" || op == "[->]" || op == "[=]") {
+			int m = op == "[*]" ? 0 : 1;
+			Cell *b = p.size() >= 2 ? child_cell(c->getPort(p[1])) : nullptr;
+			if (b && sva_op(b) == "bounds") {
+				auto bp = ports_of(b);
+				if (bp.empty() || !const_int(b->getPort(bp[0]), m))
+					return false;
+			}
+			return m == 0;
+		}
+		if (op == "or" && p.size() >= 2)
+			return can_empty(child_cell(c->getPort(p[0]))) || can_empty(child_cell(c->getPort(p[1])));
+		if (op == "throughout" && p.size() >= 2)
+			return can_empty(child_cell(c->getPort(p[1])));
+		return false;
+	}
+
+	SigSpec sva_ref(Cell *c)
+	{
+		SigSpec s = c->getPort(ID(Y));
+		s.append(Const(0, 31));
+		return s;
+	}
+
+	Cell *new_sva(const std::string &op, std::vector<SigSpec> args, Cell *like)
+	{
+		Cell *c = mod->addCell(NEW_ID, "\\$sva");
+		c->setParam(ID(OP), Const(op));
+		c->setParam(ID(NARGS), Const(GetSize(args), 32));
+		static const IdString arg_ports[] = {ID(A), ID(B), ID(C), ID(D), ID(E)};
+		for (int i = 0; i < 5; i++) {
+			SigSpec a = i < GetSize(args) ? args[i] : SigSpec(Const(0, 32));
+			if (a.size() < 32)
+				a.append(Const(0, 32 - a.size()));
+			c->setPort(arg_ports[i], a);
+		}
+		Wire *y = mod->addWire(NEW_ID, 1);
+		c->setPort(ID(Y), y);
+		by_y[SigBit(y, 0)] = c;
+		if (like && like->has_attribute(ID::src))
+			c->attributes[ID::src] = like->attributes.at(ID::src);
+		return c;
+	}
+
+	// the cycle operand of a ## for [lo:hi] (hi < 0: $)
+	SigSpec mk_cyc(int lo, int hi, Cell *like)
+	{
+		if (lo == hi)
+			return Const(lo, 32);
+		return sva_ref(new_sva("bounds", {Const(lo, 32), Const(hi, 32)}, like));
+	}
+
+	// the nonempty matches of sequence operand s (s itself when it
+	// cannot match empty); empty SigSpec when it has none
+	SigSpec ne_seq(SigSpec s)
+	{
+		Cell *c = child_cell(s);
+		if (!c || !can_empty(c))
+			return s;
+		std::string op = sva_op(c);
+		auto p = ports_of(c);
+		if (op == "[*]" || op == "[->]" || op == "[=]") {
+			int hi = -1;
+			Cell *b = p.size() >= 2 ? child_cell(c->getPort(p[1])) : nullptr;
+			if (b && sva_op(b) == "bounds") {
+				auto bp = ports_of(b);
+				if (bp.size() < 2)
+					hi = 0;   // [*0]: the single bound
+				else if (!const_int(b->getPort(bp[1]), hi))
+					return s;
+			}
+			if (hi == 0)
+				return SigSpec();
+			// the count-set lowering of [->0:n] / [=0:n] already ends
+			// only at ticks (its [=] tail needs a !b tick); [*0:n] /
+			// [*] become [*1:n] / [*1:$]
+			if (op != "[*]")
+				return s;
+			Cell *nb = new_sva("bounds", {Const(1, 32), Const(hi, 32)}, c);
+			return sva_ref(new_sva("[*]", {c->getPort(p[0]), sva_ref(nb)}, c));
+		}
+		if (op == "or") {
+			SigSpec a = ne_seq(c->getPort(p[0])), b = ne_seq(c->getPort(p[1]));
+			if (a.empty()) return b;
+			if (b.empty()) return a;
+			return sva_ref(new_sva("or", {a, b}, c));
+		}
+		if (op == "throughout") {
+			SigSpec b = ne_seq(c->getPort(p[1]));
+			if (b.empty()) return b;
+			return sva_ref(new_sva("throughout", {c->getPort(p[0]), b}, c));
+		}
+		return s;
+	}
+
+	void rewrite_empty_delays()
+	{
+		std::vector<Cell *> work;
+		for (auto c : mod->cells())
+			if (c->type == "\\$sva" && sva_op(c) == "##")
+				work.push_back(c);
+		for (auto n : work) {
+			auto p = ports_of(n);
+			bool lead2 = GetSize(p) == 2;
+			SigSpec H = lead2 ? SigSpec() : n->getPort(p[0]);
+			SigSpec cyc = n->getPort(p[lead2 ? 0 : 1]);
+			SigSpec T = n->getPort(p[lead2 ? 1 : 2]);
+			bool hE = !lead2 && can_empty(child_cell(H));
+			bool tE = can_empty(child_cell(T));
+			if (!hE && !tE)
+				continue;
+			if (hE && tE)
+				log_error("sva2check: both operands of the ## at %s can match empty; not supported.\n", log_id(n));
+			int lo = 0, hi = -1;
+			Cell *cc = child_cell(cyc);
+			if (cc && (sva_op(cc) == "##[*]" || sva_op(cc) == "##[+]")) {
+				lo = sva_op(cc) == "##[+]" ? 1 : 0;
+			} else if (cc && sva_op(cc) == "bounds") {
+				auto bp = ports_of(cc);
+				if (bp.empty() || !const_int(cc->getPort(bp[0]), lo))
+					continue;
+				if (bp.size() < 2)
+					hi = lo;
+				else if (!const_int(cc->getPort(bp[1]), hi))
+					continue;
+			} else if (!cc && const_int(cyc, lo)) {
+				hi = lo;
+			} else {
+				continue;  // the lowering reports a malformed delay
+			}
+			std::vector<SigSpec> alts;
+			SigSpec Hn = hE ? ne_seq(H) : H, Tn = tE ? ne_seq(T) : T;
+			if ((lead2 || !Hn.empty()) && !Tn.empty())
+				alts.push_back(sva_ref(lead2 ? new_sva("##", {cyc, Tn}, n) : new_sva("##", {Hn, cyc, Tn}, n)));
+			if (hi < 0 || hi >= 1) {
+				SigSpec scyc = mk_cyc(std::max(lo, 1) - 1, hi < 0 ? -1 : hi - 1, n);
+				if (tE)   // (s ##k empty) = s ##(k-1) 1; a leading ##k = 1 ##k
+					alts.push_back(sva_ref(new_sva("##", {lead2 ? SigSpec(Const(1, 32)) : H, scyc, Const(1, 32)}, n)));
+				if (hE)   // (empty ##k s) = ##(k-1) s
+					alts.push_back(sva_ref(new_sva("##", {scyc, T}, n)));
+			}
+			// n becomes the union in place (its parents keep their port)
+			SigSpec a0 = alts.empty() ? SigSpec(Const(0, 32)) : alts[0];
+			SigSpec rest = alts.size() <= 1 ? a0 : alts[1];
+			for (size_t i = 2; i < alts.size(); i++)
+				rest = sva_ref(new_sva("or", {rest, alts[i]}, n));
+			n->setParam(ID(OP), Const(std::string("or")));
+			n->setParam(ID(NARGS), Const(2, 32));
+			n->setPort(ID(A), a0);
+			n->setPort(ID(B), rest);
+			n->setPort(ID(C), Const(0, 32));
+			n->setPort(ID(D), Const(0, 32));
+			n->setPort(ID(E), Const(0, 32));
+		}
+	}
+
 	// --- sequences ---------------------------------------------------------
 
 	// Compile a named declaration body (sequence/property/let) with actuals
@@ -1580,8 +1753,8 @@ struct SvaCompiler {
 			rep_chain_end(bc, n->getPort(ports[0]), start, gate, 1, hi, &per_copy);
 			split_budget -= hi;
 			std::vector<SvaEnd> r;
-			if (m == 0)
-				r.push_back(SvaEnd{andN({start, gate_now(gate)}), 0});
+			// no empty end: an empty match has no tick (LRM 16.9.2.1); the
+			// enclosing ## accounts for it (rewrite_empty_delays)
 			for (int c = std::max(m, 1); c <= hi; c++)
 				r.push_back(SvaEnd{per_copy[c - 1], c * bl - 1});
 			return finish({r, true});
@@ -1811,20 +1984,22 @@ struct SvaCompiler {
 			}
 			if (op == "[*]" || op == "[+]") {
 				if (m == 0 && hi < 0) {
-					// [*]: empty or any run length; the run state still
-					// matters for the upper bound only, so the end is
-					// "active at the start tick or at any run tick"
-					SigSpec run_end = rep_run_end(body_cell, body, start, gate, 1);
-					return orN({andN({start, gate_now(gate)}), run_end});
+					// [*] = [*0:$]: the nonempty runs.  The empty match has
+					// no tick of its own (LRM 16.9.2.1): an enclosing ##
+					// accounts for it (rewrite_empty_delays); an implication
+					// antecedent ignores it (|->) or starts the consequent at
+					// the attempt tick (|=>); a sequence property must not
+					// admit it (16.13.22).  It used to end AT the start tick,
+					// one tick late inside ## (`a ##1 x[*0:1] ##1 b` missed
+					// b at a+1).
+					return rep_run_end(body_cell, body, start, gate, 1);
 				}
 				if (hi >= 0 && hi <= 8) {
-					// bounded: chain hi copies, tap ends at >= m; [*0:N]
-					// also matches EMPTY at the start tick (rep_chain_end
-					// taps copies >= 1 only), so add that end explicitly
-					SigSpec r = rep_chain_end(body_cell, body, start, gate, m, hi);
-					if (m == 0)
-						r = orN({r, andN({start, gate_now(gate)})});
-					return r;
+					// bounded: chain hi copies, tap ends at >= max(m,1);
+					// [*0:N]'s empty match is handled as for [*] above
+					if (hi == 0)
+						return Const(0, 1);  // [*0]: only the empty match
+					return rep_chain_end(body_cell, body, start, gate, std::max(m, 1), hi);
 				}
 				// [*m:$] / [*m:hi] past the chain budget: exact run-length
 				// set for boolean bodies; s[+] (= s[*1:$]) feeds copies back
@@ -2018,6 +2193,8 @@ struct SvaCompiler {
 		}
 
 		if (op == "intersect" || op == "and" || op == "within") {
+			if (can_empty(child(0)) || can_empty(child(1)))
+				approx("empty-match-operand", op + " at " + std::string(log_id(n)));
 			// Binary sequence operators pair one parse of each operand
 			// FROM THE SAME ATTEMPT (LRM 16.9.5, 16.9.6, 16.9.10).  The
 			// operand end signals are merged over every attempt in
@@ -2121,6 +2298,8 @@ struct SvaCompiler {
 		}
 
 		if (op == "first_match") {
+			if (can_empty(child(0)))
+				approx("empty-match-operand", "first_match at " + std::string(log_id(n)));
 			// ( seq [, x = expr [, ...]] ): of all parses of an attempt,
 			// only the earliest-ending one survives (LRM 16.9.9); local
 			// variables sampled at that end.  Exact per-offset splitting
@@ -2596,6 +2775,11 @@ struct SvaCompiler {
 			SigSpec ant_end = seq_dispatch(port(0), child(0), start, Const(1, 1));
 			bool shift = op == "|=>" || op == "#=#";
 			SigSpec c_start = shift ? delay(ant_end, 1, "impl") : ant_end;
+			// an empty antecedent match: |-> ignores it (Annex F: the
+			// match is a nonempty prefix), |=> = (R ##1 1) |-> P checks P
+			// at the attempt tick itself (empty ##1 1 = 1)
+			if (shift && can_empty(child(0)))
+				c_start = orN({c_start, start});
 			// v1 multi-clock: a consequent rooted at a `clocked` node whose
 			// clock differs from the property clock compiles as its own
 			// monitor island on the inner clock.  The island start is
@@ -3308,8 +3492,18 @@ struct SvaCompiler {
 	// extra window term (a completion at the expiry tick) let a later
 	// attempt's completion excuse an earlier attempt's missed deadline --
 	// silently dropped violations, e.g. `a |-> ##1 !a` with a=1,1.
+	// LRM 16.13.22 (a): a sequence used as a property shall not admit an
+	// empty match.  (Its empty match used to count as a match at the
+	// attempt tick, e.g. `a |-> b[*0:1]` held with b low.)
+	void refuse_empty_prop(Cell *n)
+	{
+		if (can_empty(n))
+			log_error("sva2check: sequence in %s is used as a property but can match empty (LRM 16.13.22).\n", log_id(n));
+	}
+
 	SigSpec strong_seq_fail(Cell *n, SigSpec start)
 	{
+		refuse_empty_prop(n);
 		int len = seq_max_len(n);
 		if (len < 0 || len > 64)
 			log_error("sva2check: sequence in %s used in property position has no finite bound (max %d ticks).\n", log_id(n), len);
@@ -3597,6 +3791,10 @@ struct Sva2CheckPass : public Pass {
 						decls[nm] = cell;
 					}
 				}
+
+			// E1: ## next to an empty-capable operand, once per module and
+			// before the declaration-body scan so new cells are protected
+			SvaCompiler(mod, SigSpec(), true, "$probe", nullptr).rewrite_empty_delays();
 
 			// bodies of declarations are shared between instances: never
 			// drop them as part of a single check's consumed tree
@@ -4033,8 +4231,11 @@ struct Sva2CheckPass : public Pass {
 					// antecedent end (same shift as prop_fail); the open
 					// pulse must land on the obligation's first window tick
 					// so that a b there lies inside the window and clears
-					if (sva_op(body) == "|=>")
+					if (sva_op(body) == "|=>") {
 						open = comp.delay(open, 1, "impl");
+						if (comp.can_empty(comp.child_cell(body->getPort(ip[0]))))
+							open = comp.orN({open, Const(1, 1)});  // see prop_fail
+					}
 					SigSpec bsig = comp.resolve(tev->getPort(comp.ports_of(tev)[0]));
 					if (Cell *decl = comp.decl_for_wire(bsig))
 						log_error("sva2check: named declaration operand of unbounded %s is not supported in %s.\n",
@@ -4106,6 +4307,7 @@ struct Sva2CheckPass : public Pass {
 								pool<Cell *> seen;
 								if (comp.tree_has_locals(qc, seen))
 									log_error("sva2check: local variables in a s_until operand are not supported in %s.\n", log_id(body));
+								comp.refuse_empty_prop(qc);
 								su_q = comp.seq_end(qc, Const(1, 1), Const(1, 1));
 							}
 						}

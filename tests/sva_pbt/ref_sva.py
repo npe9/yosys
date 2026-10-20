@@ -109,18 +109,25 @@ def seq_match(s, tr, start, L):
         for e1 in ends1:
             for d in range(lo, hi + 1):
                 # LRM 16.9.2: s1 ##d s2 starts s2 at (end of s1) + d;
-                # ##0 overlaps the end step.  After an EMPTY s1 (ends at
-                # start-1) the same rule gives start + d - 1, except
-                # ##0 after an empty match, which starts s2 at start.
+                # ##0 overlaps the end step.  An EMPTY s1 ends at start-1,
+                # so the same rule gives start + d - 1.  LRM 16.9.2.1:
+                # (empty ##0 seq) and (seq ##0 empty) do not match, and
+                # (seq ##d empty) = seq ##(d-1) `true ends at s2start - 1.
+                # (This used to start s2 at `start` after an empty s1 with
+                # ##0, and to end (s1 ##d empty) at s1's end for every d.)
                 if e1 is EMPTY:
-                    s2start = start if d == 0 else start + d - 1
+                    if d == 0:
+                        continue
+                    s2start = start + d - 1
                 else:
                     s2start = e1 + d
                 ends2, open2 = seq_match(s2, tr, s2start, L)
                 for e2 in ends2:
                     if e2 is EMPTY:
-                        # empty s2: match ends where s1 ended (only legal for ##0)
-                        ends.add(e1 if e1 is not EMPTY else EMPTY)
+                        if d == 0:
+                            continue
+                        end = s2start - 1
+                        ends.add(end if end >= start else EMPTY)
                     else:
                         ends.add(e2)
                 if open2:
@@ -241,8 +248,14 @@ def prop_eval(p, tr, t, L):
         ends, opn = seq_match(sq, tr, t, L)
         res = T
         for e in ends:
+            # Annex F: (R |-> P) quantifies over NONEMPTY prefixes w^{0,j}
+            # tightly satisfying R, so an empty match of R is ignored;
+            # R |=> P = (R ##1 1) |-> P, and (empty ##1 1) = 1 puts P at
+            # the attempt tick (this evaluated P at t for |-> too)
+            if e is EMPTY and not nonov:
+                continue
             base = (t - 1) if e is EMPTY else e
-            st = base + 1 if nonov else (t if e is EMPTY else e)
+            st = base + 1 if nonov else e
             res = k_and(res, prop_eval(q, tr, st, L))
             if res is F: return F
         if opn and res is T:

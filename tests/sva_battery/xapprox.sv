@@ -25,6 +25,10 @@ module xapprox(input logic clk, a, b, c, input logic [3:0] d);
   // empty-match-operand: an and/intersect/within operand that can match
   // empty (the empty match of a ## operand is exact, E1)
   p_empty_op: assert property (@(posedge clk) (a ##1 (b and c[*0:2])) |-> c);
+  // prop-binop-unaligned / eventually-unaligned: an operand whose failure
+  // tick varies per attempt (until) cannot be aligned onto the other
+  p_or_unal: assert property (@(posedge clk) (a until b) or c);
+  p_ev_unal: assert property (@(posedge clk) a |-> s_eventually [1:2] (b until c));
   // locals-merged-window + locals-lowest-hot-age under SVA_NOSPLIT=1:
   // ranged delay whose tail reads the local
   property p_lw;

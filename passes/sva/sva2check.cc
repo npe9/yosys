@@ -2743,6 +2743,87 @@ struct SvaCompiler {
 		return andN({fail_now, mod->Not(NEW_ID, seen_eff)});
 	}
 
+	// The fixed failure offset of a property (register v3 F10): ticks from
+	// an attempt's start to the tick its failure is reported, when that is
+	// the same for every attempt; -1 when it varies.  Mirrors prop_fail.
+	int fail_off(Cell *c)
+	{
+		if (!c)
+			return 0;   // Boolean leaf: fails at its own tick
+		std::string op = sva_op(c);
+		auto p = ports_of(c);
+		auto ch = [&](int i) -> Cell * { return i < GetSize(p) ? child_cell(c->getPort(p[i])) : nullptr; };
+		auto fixed_len = [&](Cell *q) -> int {
+			if (!q) return 1;
+			int lo = seq_min_len(q), hi = seq_max_len(q);
+			return lo == hi && lo >= 1 ? lo : -1;
+		};
+		if (is_seq_op(op)) {
+			// strong_seq_fail: the deadline form reports at len-1; the
+			// early form at the tick the attempt dies (varies)
+			int len = seq_max_len(c);
+			if (len < 1) return -1;
+			if (early_fail && fixed_len(c) < 0) return -1;
+			return len - 1;
+		}
+		if (decl_by_name(op))
+			return -1;
+		if (op == "|->" || op == "|=>") {
+			int la = fixed_len(ch(0)), d = fail_off(ch(1));
+			if (la < 0 || d < 0 || (ch(1) && sva_op(ch(1)) == "clocked")) return -1;
+			return la - 1 + (op == "|=>") + d;
+		}
+		if (op == "or" || op == "implies" || op == "iff") {
+			int d1 = fail_off(ch(0)), d2 = fail_off(ch(1));
+			return d1 < 0 || d2 < 0 ? -1 : std::max(d1, d2);
+		}
+		if (op == "and") {
+			int d1 = fail_off(ch(0)), d2 = fail_off(ch(1));
+			return d1 >= 0 && d1 == d2 ? d1 : -1;
+		}
+		if (op == "not") {
+			if (!ch(0)) return 0;
+			int l = fixed_len(ch(0));
+			return seq_shaped(ch(0)) && l >= 1 ? l - 1 : -1;
+		}
+		if (op == "if")
+			return fail_off(ch(1));
+		if (op == "ifelse") {
+			int d1 = fail_off(ch(1)), d2 = fail_off(ch(2));
+			return d1 >= 0 && d1 == d2 ? d1 : -1;
+		}
+		if (op == "strong" || op == "weak")
+			return fail_off(ch(0));
+		if (op == "nexttime" || op == "s_nexttime") {
+			int k = 1, idx = 0;
+			if (GetSize(p) >= 2 && const_int(c->getPort(p[0]), k))
+				idx = 1;
+			int d = fail_off(ch(idx));
+			return d < 0 ? -1 : k + d;
+		}
+		if (op == "eventually" || op == "s_eventually") {
+			Cell *b = ch(0);
+			if (!b || sva_op(b) != "bounds") return -1;
+			auto bp = ports_of(b);
+			int hi;
+			if (bp.size() < 2 || !const_int(b->getPort(bp[1]), hi) || hi < 0) return -1;
+			int d = fail_off(ch(1));
+			return d < 0 ? -1 : hi + d;
+		}
+		if (op == "always" || op == "s_always") {
+			Cell *b = ch(0);
+			if (!b || sva_op(b) != "bounds") return -1;
+			auto bp = ports_of(b);
+			int lo, hi;
+			if (bp.size() < 2 || !const_int(b->getPort(bp[0]), lo) ||
+					!const_int(b->getPort(bp[1]), hi) || lo != hi)
+				return -1;
+			int d = fail_off(ch(1));
+			return d < 0 ? -1 : lo + d;
+		}
+		return -1;
+	}
+
 	SigSpec prop_fail(Cell *n, SigSpec start)
 	{
 		static int depth_ctr = 0;
@@ -2922,15 +3003,34 @@ struct SvaCompiler {
 			pending_wr = saved_pending;
 			return r;
 		}
-		if (op == "implies")
-			// fail = a && !b = !fail(a) && fail(b)
-			return mod->And(NEW_ID, mod->Not(NEW_ID, sub(0)), prop_dispatch(port(1), child(1), start));
-		if (op == "iff") {
-			SigSpec a = sub(0), b = prop_dispatch(port(1), child(1), start);
-			return orN({mod->And(NEW_ID, a, mod->Not(NEW_ID, b)), mod->And(NEW_ID, mod->Not(NEW_ID, a), b)});
+		if (op == "implies" || op == "iff" || op == "or") {
+			// The operand fail pulses are merged over attempts; an
+			// attempt's verdict needs BOTH operands of the SAME attempt,
+			// resolved at possibly different ticks (LRM 16.12.4).  When
+			// each operand reports at a fixed offset from its attempt
+			// start (fail_off), the earlier one is delayed onto the later
+			// and the pair is exact; the verdict lands when the later
+			// operand resolves.  (The same-tick pairing used to combine
+			// different attempts: false counterexamples and missed
+			// failures -- PBT class F10.)
+			SigSpec f1 = sub(0), f2 = prop_dispatch(port(1), child(1), start);
+			int d1 = fail_off(child(0)), d2 = fail_off(child(1));
+			if (d1 < 0 || d2 < 0) {
+				if (d1 != 0 || d2 != 0)
+					approx("prop-binop-unaligned", op + " at " + std::string(log_id(n)));
+				d1 = d2 = 0;
+			}
+			int D = std::max(d1, d2);
+			SigSpec a_f = delay(f1, D - d1, "pbin"), b_f = delay(f2, D - d2, "pbin");
+			if (op == "or")
+				return mod->And(NEW_ID, a_f, b_f);
+			// "holds" of an operand: its attempt reached its offset unfailed
+			SigSpec a_h = delay(andN({delay(start, d1, "pbin_st"), mod->Not(NEW_ID, f1)}), D - d1, "pbin");
+			if (op == "implies")
+				return mod->And(NEW_ID, a_h, b_f);
+			SigSpec b_h = delay(andN({delay(start, d2, "pbin_st"), mod->Not(NEW_ID, f2)}), D - d2, "pbin");
+			return orN({mod->And(NEW_ID, a_h, b_f), mod->And(NEW_ID, a_f, b_h)});
 		}
-		if (op == "or")
-			return mod->And(NEW_ID, sub(0), prop_dispatch(port(1), child(1), start));
 		if (op == "and")
 			return orN({sub(0), prop_dispatch(port(1), child(1), start)});
 		if (op == "not") {
@@ -3107,9 +3207,17 @@ struct SvaCompiler {
 			} else {
 				fail_p = prop_dispatch(port(1), child(1), Const(1, 1));
 			}
-			// fail at t = s+hi if p failed at every tick in [s+m, s+hi];
-			// the per-tick evaluation start is reintroduced by the delays
-			SigSpec r = delay(start, hi, "ev_expire");
+			// fail at t = s+hi+dp if p failed at every tick in [s+m, s+hi],
+			// where p's attempt at j reports at j+dp (fail_off); the
+			// per-tick evaluation start is reintroduced by the delays.
+			// (dp was taken as 0: a temporal p's failure for one tick was
+			// paired with another tick's -- PBT class F6.)
+			int dp = fail_off(child(1));
+			if (dp < 0) {
+				approx("eventually-unaligned", op + " at " + std::string(log_id(n)));
+				dp = 0;
+			}
+			SigSpec r = delay(start, hi + dp, "ev_expire");
 			for (int j = m; j <= hi; j++)
 				r = mod->And(NEW_ID, r, delay(fail_p, hi - j, "ev_win"));
 			return r;

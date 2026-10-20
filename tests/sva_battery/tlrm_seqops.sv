@@ -1,3 +1,4 @@
+// IC3-TIMEOUT: 300  (16 checks, ~100 s of ic3 CPU; the 90 s default only fit an idle machine)
 // IEEE 1800-2009 16.9.5-16.9.7, Figures 16-5, 16-6, 16-8, 16-10, 16-11
 // (and / intersect / or of sequences), transcribed for the battery
 // (register v3 C1, LRM-example half, 2026-10-19).  The trace is read off

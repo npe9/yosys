@@ -89,4 +89,15 @@ module tlrm_rep(input logic clk, input logic a, input logic b, input logic c);
   sequence e10r; @(posedge clk) st ##0 (b ##1 1'b1); endsequence
   e10_lr: assert property (@(posedge clk) e10l |-> e10r.triggered); // PROVED
   e10_rl: assert property (@(posedge clk) e10r |-> e10l.triggered); // PROVED
+
+  // "[*] is an equivalent representation of [*0:$]"
+  sequence e11l; @(posedge clk) st ##0 (a ##1 b [*] ##1 c); endsequence
+  sequence e11r; @(posedge clk) st ##0 (a ##1 b [*0:$] ##1 c); endsequence
+  e11_lr: assert property (@(posedge clk) e11l |-> e11r.triggered); // PROVED
+  e11_rl: assert property (@(posedge clk) e11r |-> e11l.triggered); // PROVED
+  // "seq[*n] is equivalent to seq[*n:n]"
+  sequence e12l; @(posedge clk) st ##0 ((a ##1 b) [*2]); endsequence
+  sequence e12r; @(posedge clk) st ##0 ((a ##1 b) [*2:2]); endsequence
+  e12_lr: assert property (@(posedge clk) e12l |-> e12r.triggered); // PROVED
+  e12_rl: assert property (@(posedge clk) e12r |-> e12l.triggered); // PROVED
 endmodule

@@ -4983,6 +4983,23 @@ struct Sva2CheckPass : public Pass {
 		}
 
 		log("Converted %d $check cells, %d unsupported.\n", converted, unsupported);
+		// say it as a warning, with names: a run whose checks were all
+		// skipped otherwise looks like a quiet success downstream
+		if (unsupported) {
+			std::vector<std::string> names;
+			for (auto mod : design->selected_modules())
+				for (auto cell : mod->cells())
+					if (cell->type == ID($check) && cell->has_attribute(ID(sva_lowering)) &&
+							cell->get_string_attribute(ID(sva_lowering)).rfind("placeholder", 0) == 0)
+						names.push_back(stringf("%s.%s (%s)", log_id(mod), log_id(cell),
+								cell->get_string_attribute(ID(sva_lowering)).c_str()));
+			std::string list;
+			for (int i = 0; i < GetSize(names) && i < 8; i++)
+				list += (i ? ", " : "") + names[i];
+			if (GetSize(names) > 8)
+				list += stringf(", ... (%d more)", GetSize(names) - 8);
+			log_warning("sva2check: %d check(s) NOT converted (not checked): %s\n", unsupported, list.c_str());
+		}
 	}
 } Sva2CheckPass;
 

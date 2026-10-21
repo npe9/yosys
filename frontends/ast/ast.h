@@ -402,6 +402,11 @@ namespace AST
 	struct AstModule : RTLIL::Module {
 		std::unique_ptr<AstNode> ast;
 		bool nolatches, nomeminit, nomem2reg, mem2reg, noblackbox, lib, nowb, noopt, icells, pwires, autowire;
+		// the read mode of the read_verilog that defined the module: a
+		// deferred derive (hierarchy) runs after LATER reads reset the
+		// globals -- a -formal module derived after a plain read folded
+		// every assertion to constant true (a false proof)
+		bool formal = false, svmode = false;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, bool mayfail) override;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, const dict<RTLIL::IdString, RTLIL::Module*> &interfaces, const dict<RTLIL::IdString, RTLIL::IdString> &modports, bool mayfail) override;
 		std::string derive_common(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, std::unique_ptr<AstNode>* new_ast_out, bool quiet = false);

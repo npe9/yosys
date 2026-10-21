@@ -2838,8 +2838,15 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 						"(it would become an undriven placeholder).\n", RTLIL::unescape_id(str));
 			}
 			if (str.size() < 2 || str[1] != '$') {
-			if (!keep_sva_cells)
+			if (!keep_sva_cells) {
+				// a property/sequence instance in a concurrent assertion read
+				// WITHOUT -formal used to become constant true: a silent
+				// false proof (stock yosys rejects the syntax outright)
+				degrade(location.to_loc(), "Concurrent assertion uses `%s' but the file was read without "
+						"`read_verilog -formal'; the property would be checked as constant true.\n",
+						RTLIL::unescape_id(str).c_str());
 				return RTLIL::SigSpec(RTLIL::State::S1);
+			}
 			RTLIL::Wire *ywire = current_module->addWire(NEW_ID, 1);
 				set_src_attr(ywire, this);
 				// No const-1 tie: the A port must be driven solely by this
@@ -2930,8 +2937,14 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				first_body = 1;
 			}
 
-			if (!keep_sva_cells)
+			if (!keep_sva_cells) {
+				// see the instance case above: without -formal every
+				// concurrent assertion folded to constant true
+				if (!is_decl)
+					degrade(location.to_loc(), "Concurrent assertion operator `%s' needs `read_verilog -formal'; "
+							"without it the property would be checked as constant true.\n", str.c_str());
 				return RTLIL::SigSpec(RTLIL::State::S1);
+			}
 
 			RTLIL::Wire *ywire = current_module->addWire(NEW_ID, 1);
 			set_src_attr(ywire, this);

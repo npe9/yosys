@@ -1,0 +1,8 @@
+# A concurrent assertion read WITHOUT -formal used to fold to constant true
+# (stock yosys rejects the syntax); it is a frontend degradation now.
+logger -expect error "needs `read_verilog -formal'" 1
+read_verilog -sv <<EOT
+module m (input logic clk, a, b);
+  ap: assert property (@(posedge clk) a |=> b);
+endmodule
+EOT

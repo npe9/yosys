@@ -1433,6 +1433,8 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 	module->icells = flag_icells;
 	module->pwires = flag_pwires;
 	module->autowire = flag_autowire;
+	module->formal = keep_sva_cells;
+	module->svmode = sv_mode_but_global_and_used_for_literally_one_condition;
 	module->fixup_ports();
 
 	if (flag_dump_rtlil) {
@@ -1561,8 +1563,13 @@ static void apply_binds(RTLIL::Design *design, AstNode *ast)
 		for (auto &b : it.second)
 			nast->children.push_back(std::move(b));
 		log("Re-elaborating `%s' with %d bound instance(s).\n", log_id(old->name), GetSize(it.second));
+		bool saved_formal = keep_sva_cells, saved_sv = sv_mode_but_global_and_used_for_literally_one_condition;
+		keep_sva_cells = am->formal;
+		sv_mode_but_global_and_used_for_literally_one_condition = am->svmode;
 		design->remove(old);
 		process_module(design, nast.get(), abstract, nullptr, false);
+		keep_sva_cells = saved_formal;
+		sv_mode_but_global_and_used_for_literally_one_condition = saved_sv;
 		current_ast_mod = nullptr;
 	}
 	std::string names;
@@ -2380,6 +2387,8 @@ RTLIL::Module *AstModule::clone() const
 	new_mod->icells = icells;
 	new_mod->pwires = pwires;
 	new_mod->autowire = autowire;
+	new_mod->formal = formal;
+	new_mod->svmode = svmode;
 
 	return new_mod;
 }
@@ -2402,6 +2411,8 @@ void AstModule::loadconfig() const
 	flag_icells = icells;
 	flag_pwires = pwires;
 	flag_autowire = autowire;
+	keep_sva_cells = formal;
+	sv_mode_but_global_and_used_for_literally_one_condition = svmode;
 }
 
 void AstNode::formatted_input_error(std::string_view format, std::string str) const

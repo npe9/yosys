@@ -945,6 +945,17 @@ struct HierarchyPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		// a `bind` whose target module was never read: its instances would
+		// silently vanish (frontends/ast/ast.cc apply_binds)
+		{
+			std::string pending = design->scratchpad_get_string("verilog.pending_binds");
+			// loud, not fatal: a property file read without its RTL (the
+			// conformance ladder reads caliptra's fv_* files standalone)
+			// legitimately has nothing to bind into
+			if (!pending.empty())
+				log_warning("bind target module(s) %s are not in the design: their bound instances are NOT attached.\n",
+						pending.c_str());
+		}
 		log_header(design, "Executing HIERARCHY pass (managing design hierarchy).\n");
 
 		bool flag_check = false;

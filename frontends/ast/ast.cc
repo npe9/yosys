@@ -1503,6 +1503,77 @@ static void rename_in_package_stmts(AstNode *pkg)
 			rename(item);
 }
 
+// IEEE 1800-2017 23.11 bind: instances tagged sv_bind_target by the parser
+// wait here until their target module's AST is seen (a later read_verilog
+// may define it).  Unresolved ones are listed in the design scratchpad;
+// `hierarchy` warns about every one still unattached, so a bound checker
+// never vanishes silently.
+static std::vector<std::unique_ptr<AstNode>> pending_binds;
+
+static std::string bind_target_of(const AstNode *n)
+{
+	auto it = n->attributes.find(ID(sv_bind_target));
+	return (it == n->attributes.end() || !it->second) ? std::string() : it->second->str;
+}
+
+static void apply_binds(RTLIL::Design *design, AstNode *ast)
+{
+	std::vector<std::unique_ptr<AstNode>> binds;
+	binds.swap(pending_binds);
+	auto take = [&](AstNode *scope) {
+		for (auto &c : scope->children)
+			if (c && c->type == AST_CELL && c->attributes.count(ID(sv_bind_target)))
+				binds.push_back(std::move(c));
+		scope->children.erase(std::remove(scope->children.begin(), scope->children.end(), nullptr), scope->children.end());
+	};
+	take(ast);
+	for (auto &child : ast->children)
+		if (child && (child->type == AST_MODULE || child->type == AST_INTERFACE))
+			take(child.get());
+	dict<std::string, std::vector<std::unique_ptr<AstNode>>> to_existing;
+	for (auto &b : binds) {
+		std::string tgt = bind_target_of(b.get());
+		if (tgt.find('.') != std::string::npos)
+			b->input_error("bind to the instance path `%s' is not supported (bind to a module name).\n", tgt.c_str());
+		AstNode *mod = nullptr;
+		for (auto &child : ast->children)
+			if (child && (child->type == AST_MODULE || child->type == AST_INTERFACE) && child->str == tgt)
+				mod = child.get();
+		if (mod) {
+			b->attributes.erase(ID(sv_bind_target));
+			mod->children.push_back(std::move(b));
+		} else if (dynamic_cast<AST::AstModule *>(design->module(tgt)) ||
+				dynamic_cast<AST::AstModule *>(design->module("$abstract" + tgt))) {
+			b->attributes.erase(ID(sv_bind_target));
+			to_existing[tgt].push_back(std::move(b));
+		} else {
+			pending_binds.push_back(std::move(b));
+		}
+	}
+	// a target elaborated by an earlier read_verilog: re-elaborate it from
+	// its stored AST with the bound instances added
+	for (auto &it : to_existing) {
+		bool abstract = design->module(it.first) == nullptr;
+		RTLIL::Module *old = design->module(abstract ? "$abstract" + it.first : it.first);
+		auto *am = dynamic_cast<AST::AstModule *>(old);
+		log_assert(am && am->ast);
+		std::unique_ptr<AstNode> nast = am->ast->clone();
+		for (auto &b : it.second)
+			nast->children.push_back(std::move(b));
+		log("Re-elaborating `%s' with %d bound instance(s).\n", log_id(old->name), GetSize(it.second));
+		design->remove(old);
+		process_module(design, nast.get(), abstract, nullptr, false);
+		current_ast_mod = nullptr;
+	}
+	std::string names;
+	for (auto &b : pending_binds)
+		names += (names.empty() ? "" : ", ") + RTLIL::unescape_id(bind_target_of(b.get()));
+	design->scratchpad_set_string("verilog.pending_binds", names);
+	if (!names.empty())
+		log_warning("bind target(s) %s not defined yet: the bound instances wait for a later read_verilog "
+				"(hierarchy reports them unattached if they are never defined).\n", names.c_str());
+}
+
 // create AstModule instances for all modules in the AST tree and add them to 'design'
 void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump_ast1, bool dump_ast2, bool no_dump_ptr, bool dump_vlog1, bool dump_vlog2, bool dump_rtlil,
 		bool nolatches, bool nomeminit, bool nomem2reg, bool mem2reg, bool noblackbox, bool lib, bool nowb, bool noopt, bool icells, bool pwires, bool nooverwrite, bool overwrite, bool defer, bool autowire)
@@ -1531,6 +1602,7 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 	ast->fixup_hierarchy_flags(true);
 
 	log_assert(current_ast->type == AST_DESIGN);
+	apply_binds(design, ast);
 	bool has_module = false;
 	for (const auto& child : current_ast->children)
 		if (child && (child->type == AST_MODULE || child->type == AST_INTERFACE))

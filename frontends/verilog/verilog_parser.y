@@ -77,6 +77,7 @@
 			dict<std::string, AstNode*> pkg_user_types;
 			std::vector<AstNode*> ast_stack;
 			std::unique_ptr<AstNode> astbuf1, astbuf2, astbuf3;
+			size_t bind_mark = 0;
 			AstNode* cell_hack;
 			AstNode* member_hack;
 			struct AstNode *current_function_or_task;
@@ -1722,14 +1723,26 @@ bind_name:
 	TOK_PKG_USER_TYPE { $$ = std::move($1); } |
 	TOK_SCOPED_ID { $$ = std::move($1); };
 
-// Elaborate the bound instance here. The target scope is not rewritten.
+// IEEE 1800-2017 23.11: the bound instances belong to the TARGET module
+// (their port expressions resolve there).  The parser tags each instance
+// with the target name (attribute sv_bind_target); AST::process moves it
+// into the target module's AST before that module is elaborated, re-
+// elaborating a target read by an earlier read_verilog.  (The instances
+// used to stay where the bind was written: at file level they became a
+// "global" appended to every later module -- duplicate cells -- or to
+// none, silently dropping the bound checker.)
 bind_stmt:
 	TOK_BIND bind_name bind_name {
 		extra->astbuf1 = std::make_unique<AstNode>(@$, AST_CELL);
 		extra->astbuf1->children.push_back(std::make_unique<AstNode>(@$, AST_CELLTYPE));
 		extra->astbuf1->children[0]->str = *$3;
+		extra->bind_mark = extra->ast_stack.back()->children.size();
 	} cell_parameter_list_opt cell_list TOK_SEMICOL {
 		(void)extra->astbuf1.reset();
+		auto &bound = extra->ast_stack.back()->children;
+		for (size_t i = extra->bind_mark; i < bound.size(); i++)
+			if (bound[i] && bound[i]->type == AST_CELL)
+				bound[i]->set_attribute(ID(sv_bind_target), AstNode::mkconst_str(@2, *$2));
 	};
 
 bind_target:

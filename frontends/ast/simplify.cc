@@ -4278,6 +4278,84 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				if (!child || child->type != AST_PARASET)
 					continue;
 				int my_pos = child->str.empty() ? pos++ : -1;
+				// an unpacked-array parameter passed through by name
+				// (`.PMPRstCfg(PMPRstCfg)`, ibex): carry its value as one
+				// flat constant, element 0 most significant; struct
+				// elements are materialized with the array's element type
+				// (it used to be overridden with 0)
+				if (!child->children.empty() && child->children[0]->type == AST_IDENTIFIER &&
+						child->children[0]->children.empty()) {
+					AstNode *src = child->children[0]->id2ast ? child->children[0]->id2ast :
+							current_scope.count(child->children[0]->str) ? current_scope.at(child->children[0]->str) : nullptr;
+					if (src && (src->type == AST_PARAMETER || src->type == AST_LOCALPARAM) &&
+							src->unpacked_dimensions > 0 && !src->children.empty()) {
+						// a default naming another array parameter: take its value
+						if (src->children[0]->type == AST_IDENTIFIER && src->children[0]->id2ast &&
+								(src->children[0]->id2ast->type == AST_PARAMETER || src->children[0]->id2ast->type == AST_LOCALPARAM) &&
+								!src->children[0]->id2ast->children.empty())
+							src->children[0] = src->children[0]->id2ast->children[0]->clone();
+						if (src->children[0]->type == AST_CONSTANT) {
+							child->children[0] = src->children[0]->clone();
+							did_something = true;
+							continue;
+						}
+						if (src->children[0]->type == AST_ASSIGN_PATTERN) {
+							AstNode *etype = src->attributes.count(ID::wiretype) ? src->attributes.at(ID::wiretype).get() : nullptr;
+							// an array's wiretype attribute is the element type's NAME
+							if (etype && etype->type != AST_STRUCT && etype->type != AST_UNION) {
+								std::string tn = etype->str;
+								etype = nullptr;
+								AstNode *td = current_scope.count(tn) ? current_scope.at(tn) : nullptr;
+								if (!td && current_ast_mod)
+									for (auto &c : current_ast_mod->children)
+										if (c && c->type == AST_TYPEDEF && c->str == tn)
+											td = c.get();
+								if (td && td->type == AST_TYPEDEF && !td->children.empty())
+									td = td->children[0].get();
+								if (td && (td->type == AST_STRUCT || td->type == AST_UNION))
+									etype = td;
+							}
+							int ew = etype ? etype->range_left - etype->range_right + 1
+									: (src->range_valid ? std::abs(src->range_left - src->range_right) + 1 : -1);
+							std::vector<RTLIL::State> flat;   // LSB first; built back to front
+							std::vector<std::vector<RTLIL::State>> elems;
+							bool ok = ew > 0;
+							std::function<void(AstNode*, int)> walk = [&](AstNode *n, int d) {
+								if (!ok)
+									return;
+								if (d < src->unpacked_dimensions) {
+									if (n->type != AST_ASSIGN_PATTERN) { ok = false; return; }
+									for (auto &c : n->children)
+										walk(c.get(), d + 1);
+									return;
+								}
+								std::unique_ptr<AstNode> leaf = n->clone();
+								if (leaf->type == AST_ASSIGN_PATTERN && etype) {
+									auto tmp = std::make_unique<AstNode>(n->location, AST_LOCALPARAM, std::move(leaf));
+									tmp->str = "\\$override_element";
+									auto st = etype->clone();
+									size_packed_struct(st.get(), 0);
+									tmp->set_attribute(ID::wiretype, std::move(st));
+									while (tmp->simplify(true, 1, -1, false)) { }
+									leaf = tmp->children[0]->clone();
+								} else {
+									while (leaf->simplify(true, 1, -1, false)) { }
+								}
+								if (leaf->type != AST_CONSTANT) { ok = false; return; }
+								elems.push_back(leaf->bitsAsConst(ew, leaf->is_signed).to_bits());
+							};
+							walk(src->children[0].get(), 0);
+							if (!ok || elems.empty())
+								input_error("Unpacked-array parameter %s passed to `%s' did not fold to constant elements.\n",
+										log_id(src->str), log_id(ctype));
+							for (int i = GetSize(elems) - 1; i >= 0; i--)
+								flat.insert(flat.end(), elems[i].begin(), elems[i].end());
+							child->children[0] = mkconst_bits(child->location, flat, false);
+							did_something = true;
+							continue;
+						}
+					}
+				}
 				if (child->children.empty() || child->children[0]->type != AST_ASSIGN_PATTERN)
 					continue;
 				auto stype = override_struct_type(ctype, child->str, my_pos);
@@ -5741,7 +5819,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	if (type == AST_PARAMETER || type == AST_LOCALPARAM || type == AST_ENUM_ITEM) {
 		// unpacked dimensions of a parameter array, recorded first (the
 		// wire convention): `[n]` is [0:n-1], `[l:r]` keeps its direction
-		if (attributes.count(ID(sv_unpacked_dims)) && dimensions.empty()) {
+		// (a struct-typed array already carries its packed dimension here:
+		// the unpacked ones go IN FRONT of it, as for wires -- they used to be
+		// skipped, so `P[1]` on `parameter c_t P [4]` read a bit)
+		if (attributes.count(ID(sv_unpacked_dims)) && unpacked_dimensions == 0) {
 			AstNode *un = attributes.at(ID(sv_unpacked_dims)).get();
 			std::vector<AstNode*> ranges;
 			if (un->type == AST_MULTIRANGE)
@@ -5766,9 +5847,82 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					all_valid = false;
 			}
 			if (all_valid) {
+				dims.insert(dims.end(), dimensions.begin(), dimensions.end());
 				dimensions = dims;
-				unpacked_dimensions = GetSize(dims);
+				unpacked_dimensions = GetSize(ranges);
 				attributes.erase(ID(sv_unpacked_dims));
+				did_something = true;
+			}
+		}
+		// unpacked-array parameter values that are not a literal pattern:
+		//  - a default naming another array parameter (`= ibex_pkg::PmpCfgRst`)
+		//    takes that parameter's pattern, so element reads fold;
+		//  - an instance override arrives (derive) as ONE flat constant,
+		//    element 0 in the most significant bits (see the AST_CELL
+		//    flattening): split it back into a pattern of elements.
+		// a replication pattern `'{N{v}}` (OpenTitan's RaclPolicySelVec
+		// default `'{NumRegs{0}}`): expand it to N elements so element reads
+		// and pass-through flattening see one child per element
+		if (unpacked_dimensions > 0 && !children.empty() && children[0]->type == AST_ASSIGN_PATTERN &&
+				children[0]->children.size() == 1 && children[0]->children[0]->type == AST_REPLICATE &&
+				children[0]->children[0]->children.size() == 2) {
+			AstNode *rep = children[0]->children[0].get();
+			auto cnt = rep->children[0]->clone();
+			while (cnt->simplify(true, stage, -1, false)) { }
+			if (cnt->type == AST_CONSTANT) {
+				int n = cnt->asInt(false);
+				AstNode *inner = rep->children[1].get();
+				std::vector<AstNode *> elems;
+				if (inner->type == AST_CONCAT)
+					for (auto &c : inner->children)
+						elems.push_back(c.get());
+				else
+					elems.push_back(inner);
+				if (n >= 1 && n <= (1 << 16) && !elems.empty()) {
+					auto pat = std::make_unique<AstNode>(children[0]->location, AST_ASSIGN_PATTERN);
+					for (int i = 0; i < n; i++)
+						for (auto e : elems)
+							pat->children.push_back(e->clone());
+					children[0] = std::move(pat);
+					did_something = true;
+				}
+			}
+		}
+		if (unpacked_dimensions > 0 && !children.empty() && children[0]->type == AST_IDENTIFIER &&
+				children[0]->children.empty()) {
+			AstNode *src = children[0]->id2ast ? children[0]->id2ast :
+					current_scope.count(children[0]->str) ? current_scope.at(children[0]->str) : nullptr;
+			if (src && src != this && (src->type == AST_PARAMETER || src->type == AST_LOCALPARAM) &&
+					!src->children.empty() && src->children[0]->type == AST_ASSIGN_PATTERN) {
+				children[0] = src->children[0]->clone();
+				did_something = true;
+			}
+		}
+		if (unpacked_dimensions > 0 && !children.empty() && children[0]->type == AST_CONSTANT &&
+				!children[0]->is_string) {
+			int count = 1;
+			for (int d = 0; d < unpacked_dimensions; d++)
+				count *= dimensions[d].range_width;
+			int total = GetSize(children[0]->bits);
+			if (count > 1 && total > 0 && total % count == 0) {
+				int ew = total / count;
+				std::vector<RTLIL::State> bits = children[0]->bits;
+				std::function<std::unique_ptr<AstNode>(int, int)> build = [&](int d, int first) -> std::unique_ptr<AstNode> {
+					// elements [first, first + span) in source order
+					if (d == unpacked_dimensions) {
+						int off = (count - 1 - first) * ew;
+						std::vector<RTLIL::State> v(bits.begin() + off, bits.begin() + off + ew);
+						return mkconst_bits(location, v, false);
+					}
+					int span = 1;
+					for (int k = d + 1; k < unpacked_dimensions; k++)
+						span *= dimensions[k].range_width;
+					auto pat = std::make_unique<AstNode>(location, AST_ASSIGN_PATTERN);
+					for (int i = 0; i < dimensions[d].range_width; i++)
+						pat->children.push_back(build(d + 1, first + i * span));
+					return pat;
+				};
+				children[0] = build(0, 0);
 				did_something = true;
 			}
 		}

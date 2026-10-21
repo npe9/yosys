@@ -227,6 +227,13 @@ class SmtLane:
                 os.killpg(self.proc.pid, 9)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                # macOS: EPERM when the group leader has already exited
+                # (a zombie group) -- kill the child itself instead
+                try:
+                    self.proc.kill()
+                except ProcessLookupError:
+                    pass
             self.proc.wait()
 
 
@@ -281,6 +288,13 @@ class Ic3Lane:
                 os.killpg(self.proc.pid, 9)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                # macOS: EPERM when the group leader has already exited
+                # (a zombie group) -- kill the child itself instead
+                try:
+                    self.proc.kill()
+                except ProcessLookupError:
+                    pass
             self.proc.wait()
 
 

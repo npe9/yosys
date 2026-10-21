@@ -507,6 +507,11 @@ struct SvaCompiler {
 			for (auto bit : y)
 				if (bit.is_wire() && expr_drv.count(bit.wire) && expr_drv[bit.wire] == cell)
 					expr_drv.erase(bit.wire);
+			// `done` is keyed by pointer: a later per-instance copy can be
+			// allocated at this freed address and would read as "already
+			// lowered" -- left as a raw $past (allocation-order dependent:
+			// tsvformal's BMC prep failed ~1 run in 8)
+			done.erase(cell);
 			mod->remove(cell);
 		}
 	}
@@ -669,10 +674,33 @@ struct SvaCompiler {
 		return andN({gate, reduce1(splice_expr(dyn_gate, *f, false))});
 	}
 
+	// A bound or count port.  Inside a declaration it may be a formal
+	// (`property p(v, r, timeout); v |-> ##[1:timeout] r;`, the AXI4 FVIP's
+	// handshake_max_wait): follow the active formal -> actual bindings, so
+	// the static analyses (seq_max_len, seq_min_len, can_empty, ...) see the
+	// instance's constant as the compile itself does after splicing.  A
+	// result that used a binding must not be memoized per cell
+	// (len_subst_hit).
+	bool len_subst_hit = false;
 	bool const_int(SigSpec s, int &v)
 	{
-		if (!s.is_fully_const())
-			return false;
+		pool<Wire *> seen;
+		while (!s.is_fully_const()) {
+			// unresolved: the answer may change under a later binding
+			len_subst_hit = true;
+			// the whole formal wire, possibly zero-padded above (the
+			// frontend pads a package declaration's ports to 32 bits)
+			Wire *w = s[0].is_wire() ? s[0].wire : nullptr;
+			if (!w || w->width > s.size() || SigSpec(w) != s.extract(0, w->width))
+				return false;
+			for (int i = w->width; i < s.size(); i++)
+				if (s[i] != State::S0)
+					return false;
+			if (!subst.count(w) || !seen.insert(w).second)
+				return false;
+			s = subst.at(w);
+			len_subst_hit = true;
+		}
 		v = s.as_int();
 		return true;
 	}
@@ -955,8 +983,15 @@ struct SvaCompiler {
 			nc->attributes = d->attributes;
 			Wire *ny = mod->addWire(NEW_ID, y.size());
 			nc->setPort(yp, ny);
-			for (auto &it : np)
+			for (auto &it : np) {
 				nc->setPort(it.first, it.second);
+				// an untyped formal takes its actual's width: an operand
+				// port that grew carries the width parameter with it (the
+				// internal cell checker rejected the copy otherwise)
+				IdString wp = it.first.str() + "_WIDTH";
+				if (it.first != yp && nc->hasParam(wp) && GetSize(it.second) != GetSize(d->getPort(it.first)))
+					nc->setParam(wp, GetSize(it.second));
+			}
 			SigSpec nsig = SigSpec(ny, 0, y.size());
 			emap[d] = nsig;
 			// register the copy so later splices (e.g. the use-site pass in
@@ -990,6 +1025,11 @@ struct SvaCompiler {
 				// like the frontend's argument padding
 				if (a.size() < p.size())
 					a.extend_u0(p.size(), false);
+				// and a wider one may be the frontend's zero padding (a
+				// package declaration's actuals are padded to 32 bits:
+				// `!aresetn` in the FVIP's exit_from_reset): drop it
+				while (a.size() > p.size() && a[a.size() - 1] == State::S0)
+					a.remove(a.size() - 1);
 				return a;
 			}
 			SigSpec q;
@@ -3382,6 +3422,10 @@ struct SvaCompiler {
 		if (!n) return true;
 		std::string op = sva_op(n);
 		if (is_seq_op(op)) return true;
+		// an instance of a sequence declaration is a sequence (`not
+		// (exclusive_write_read(...))`, the AXI4 FVIP)
+		if (Cell *d = decl_by_name(op))
+			return sva_op(d) == "sequence_decl";
 		if (op != "and" && op != "or") return false;
 		for (auto &p : ports_of(n)) {
 			SigSpec s = n->getPort(p);
@@ -3437,6 +3481,19 @@ struct SvaCompiler {
 	// unbounded.  Covers property operators and named instances so slot
 	// sizing sees through instance boundaries.  Memoized; a busy set turns
 	// recursive declarations into -1.
+	// Length of an instance body under the instance's own actuals (raw
+	// ports; const_int follows the chain through outer bindings).  A
+	// binding counts as a hit even when unused, so the per-cell memo of
+	// the instance never serves another instance's actuals.
+	void bind_len_actuals(SubstGuard &guard, Cell *inst, const std::vector<Wire *> &dformals)
+	{
+		auto ip = ports_of(inst);
+		for (int i = 0; i < GetSize(dformals) && i < GetSize(ip); i++)
+			guard.bind(dformals[i], inst->getPort(ip[i]));
+		if (!dformals.empty())
+			len_subst_hit = true;
+	}
+
 	dict<Cell *, int> len_memo;
 	pool<Cell *> len_busy;
 	int seq_max_len(Cell *n)
@@ -3447,9 +3504,13 @@ struct SvaCompiler {
 			return len_memo[n];
 		if (!len_busy.insert(n).second)
 			return -1;
+		bool outer_hit = len_subst_hit;
+		len_subst_hit = false;
 		int r = seq_max_len_raw(n);
 		len_busy.erase(n);
-		len_memo[n] = r;
+		if (!len_subst_hit)
+			len_memo[n] = r;
+		len_subst_hit = len_subst_hit || outer_hit;
 		return r;
 	}
 
@@ -3465,9 +3526,13 @@ struct SvaCompiler {
 			return mlen_memo[n];
 		if (!mlen_busy.insert(n).second)
 			return -1;
+		bool outer_hit = len_subst_hit;
+		len_subst_hit = false;
 		int r = seq_min_len_raw(n);
 		mlen_busy.erase(n);
-		mlen_memo[n] = r;
+		if (!len_subst_hit)
+			mlen_memo[n] = r;
+		len_subst_hit = len_subst_hit || outer_hit;
 		return r;
 	}
 	// A bare operand that names a sequence/property declaration (`a
@@ -3506,6 +3571,8 @@ struct SvaCompiler {
 			if (!lookup_decl(n, dbody, dformals, nullptr, &draw))
 				return 1;
 			dbody = dbody ? unwrap_spec(dbody, &bare) : nullptr;
+			SubstGuard guard(this);
+			bind_len_actuals(guard, n, dformals);
 			return dbody ? seq_min_len(dbody) : 1;
 		}
 		if (op == "true" || op == "inside" || op == "weq" || op == "wne")
@@ -3586,6 +3653,8 @@ struct SvaCompiler {
 			if (!lookup_decl(n, dbody, dformals, nullptr, &draw))
 				return 1;
 			dbody = dbody ? unwrap_spec(dbody, &bare) : nullptr;
+			SubstGuard guard(this);
+			bind_len_actuals(guard, n, dformals);
 			return dbody ? seq_max_len(dbody) : 1;
 		}
 		if (op == "true" || op == "inside" || op == "weq" || op == "wne")
@@ -4055,6 +4124,12 @@ struct Sva2CheckPass : public Pass {
 				std::vector<Cell *> stack;
 				for (auto &it : decls) {
 					Cell *decl = it.second;
+					// the declaration cell too: a bare-name reference
+					// (`assert property (p)`) puts it on the root chain,
+					// and dropping it with the first check's tree left the
+					// second reference to the same name on a deleted cell
+					// (dict::at abort, or "sva_op on non-$sva cell")
+					decl_bodies.insert(decl);
 					auto dp = SvaCompiler(mod, SigSpec(), true, "$probe", nullptr).ports_of(decl);
 					if (dp.empty())
 						continue;
@@ -4170,6 +4245,38 @@ struct Sva2CheckPass : public Pass {
 				// as "not a spec" and ic3 printed a verdict on the
 				// placeholder; register v3 C1, sv-tests chapter 16)
 				auto is_spec = [&](Cell *c) { return sva_op(c) == "spec" || sva_op(c) == "clocked"; };
+				// `assert property (disable iff (c) p(args))` with no clock of
+				// its own: the clock is the instance body's leading clock
+				// (LRM 16.16; the AXI4 FVIP's `disable iff (!ARESETn)
+				// csysreq_fall(CSYSREQ, CSYSACK)`, body `@(negedge csysreq)
+				// csysack`).  The wrapper's clock port says no_clock, so the
+				// chain walk never started: walk into the instance and keep
+				// the outer disable (an expression over module signals, not
+				// over the chain's formals).
+				Cell *outer_disable = nullptr;
+				if (sva_op(spec) == "spec") {
+					Cell *ck = nullptr, *ds = nullptr, *bd = nullptr;
+					bool ok = true;
+					for (auto port : comp.ports_of(spec)) {
+						SigSpec sp = spec->getPort(port);
+						if (sp.empty())
+							{ ok = false; break; }
+						Cell *drv = sp.is_fully_const() ? nullptr : comp.child_cell(sp);
+						std::string op = drv ? sva_op(drv) : "";
+						if (op == "no_clock" && !ck)
+							ck = drv;
+						else if ((op == "disable_iff" || op == "no_disable") && !ds)
+							ds = drv;
+						else if (drv && !bd)
+							bd = drv;
+						else
+							ok = false;
+					}
+					if (ok && ck && ds && bd && comp.decl_by_name(sva_op(bd))) {
+						outer_disable = ds;
+						spec = bd;
+					}
+				}
 				while (!is_spec(spec)) {
 					std::string sop = sva_op(spec);
 					if (sop == "sequence_decl" || sop == "property_decl" || sop == "let_decl") {
@@ -4211,8 +4318,32 @@ struct Sva2CheckPass : public Pass {
 						}
 						if (op == "spec" || op == "sequence_decl" || op == "property_decl" || op.empty())
 							break;
+						// a leading instance of a clocked, argument-free
+						// declaration (`sequence s_a; @(posedge clk) a;
+						// endsequence  assert property (s_a |-> b)`, LRM
+						// 16.16): its clock is the property's.  (With
+						// arguments the clock may be a formal, which this
+						// walk cannot bind: those stay unsupported.)
+						if (comp.decl_by_name(op)) {
+							Cell *dbody = nullptr;
+							std::vector<Wire *> dformals;
+							if (!comp.lookup_decl(c, dbody, dformals) || !dformals.empty())
+								break;
+							c = dbody;
+							continue;
+						}
 						auto cp = comp.ports_of(c);
-						c = cp.empty() ? nullptr : comp.child_cell(c->getPort(cp[0]));
+						if (cp.empty())
+							break;
+						SigSpec lead = c->getPort(cp[0]);
+						c = comp.child_cell(lead);
+						if (!c) {
+							// bare name `s_a`: an argument-free declaration
+							Cell *decl = comp.decl_for_wire(lead);
+							auto dp = decl ? comp.ports_of(decl) : std::vector<IdString>();
+							if (GetSize(dp) == 1 || (GetSize(dp) > 1 && decl->getPort(dp[1]).empty()))
+								c = comp.child_cell(decl->getPort(dp[0]));
+						}
 					}
 				}
 				if (!spec || (!is_spec(spec) && !hoist_clock)) {
@@ -4314,6 +4445,17 @@ struct Sva2CheckPass : public Pass {
 				if (hoist_clock) {
 					clock = hoist_clock;
 					body = spec;
+				}
+				if (outer_disable && sva_op(outer_disable) == "disable_iff") {
+					if (disable && sva_op(disable) == "disable_iff") {
+						// LRM 16.12: no disable iff inside a nested instance
+						unsupported++;
+						log("Skipping %s/%s: disable iff both outside and inside the property instance.\n",
+								log_id(mod), log_id(cell));
+						cell->attributes[ID(sva_lowering)] = Const(std::string("placeholder:nested disable iff"));
+						continue;
+					}
+					disable = outer_disable;
 				}
 				if (bad || (!body && body_sig.empty() && body_const.empty())) {
 					unsupported++;

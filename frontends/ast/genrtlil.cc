@@ -2787,8 +2787,35 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 						input_error("System function %s got %d arguments, expected 1.\n",
 								RTLIL::unescape_id(str), int(GetSize(children)));
 					RTLIL::SigSpec a = children[0]->genRTLIL();
-					if (!a.is_fully_const())
-						input_error("System function $clog2 inside a concurrent assertion needs a constant argument.\n");
+					if (!a.is_fully_const()) {
+						// A non-constant argument is usually a let/property
+						// formal (`let calc_max_size(w) = $clog2(w);`, the AXI4
+						// FVIP) whose actual is a parameter: the declaration body
+						// is elaborated once over the formal wire and the actual
+						// is spliced in later.  Lower it as a circuit, which opt
+						// folds to the constant once the actual is known:
+						// $clog2(a) = 1 + index of the top set bit of a-1, 0 for a <= 1.
+						int n = GetSize(a);
+						RTLIL::Wire *am1 = current_module->addWire(NEW_ID, n);
+						set_src_attr(am1, this);
+						set_src_attr(current_module->addSub(NEW_ID, a, RTLIL::SigSpec(1, n), am1, false), this);
+						RTLIL::Wire *le1 = current_module->addWire(NEW_ID, 1);
+						set_src_attr(le1, this);
+						set_src_attr(current_module->addLe(NEW_ID, a, RTLIL::SigSpec(1, n), le1, false), this);
+						RTLIL::SigSpec res(0, 32);
+						for (int i = 0; i < n; i++) {
+							RTLIL::Wire *m = current_module->addWire(NEW_ID, 32);
+							set_src_attr(m, this);
+							set_src_attr(current_module->addMux(NEW_ID, res, RTLIL::SigSpec(i + 1, 32),
+									RTLIL::SigSpec(am1, i), m), this);
+							res = m;
+						}
+						RTLIL::Wire *y = current_module->addWire(NEW_ID, 32);
+						set_src_attr(y, this);
+						set_src_attr(current_module->addMux(NEW_ID, res, RTLIL::SigSpec(0, 32), le1, y), this);
+						is_signed = false;
+						return RTLIL::SigSpec(y);
+					}
 					RTLIL::Const c = a.as_const();
 					int v = 0;
 					while (c.as_int() > (1 << v) && v < 31)

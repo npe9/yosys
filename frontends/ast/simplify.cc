@@ -457,6 +457,37 @@ static bool is_sequence_method_ref(const std::string &str)
 	return false;
 }
 
+// A bare reference to a sequence / property / let declaration
+// (`assert property (using_bus_type_correctly)`, the AXI4-Stream FVIP).  The
+// frontend leaves it as an identifier; its implicit wire is how sva2check
+// finds the declaration by name, so it is not an implicit NET and must not
+// trip `default_nettype none`.  Declarations in this module or in a package.
+static bool is_sva_decl_ref(const std::string &str)
+{
+	std::string name = (!str.empty() && str[0] == '\\') ? str.substr(1) : str;
+	auto match = [&](AstNode *scope) {
+		if (!scope)
+			return false;
+		for (auto &child : scope->children) {
+			if (!child || child->type != AST_SVA || child->children.empty() || !child->children[0])
+				continue;
+			if (child->str != "sequence_decl" && child->str != "property_decl" && child->str != "let_decl")
+				continue;
+			const std::string &dn = child->children[0]->str;
+			if (dn == name || dn == str)
+				return true;
+		}
+		return false;
+	};
+	if (match(current_ast_mod))
+		return true;
+	if (current_ast)
+		for (auto &node : current_ast->children)
+			if (node && node->type == AST_PACKAGE && match(node.get()))
+				return true;
+	return false;
+}
+
 static bool get_1d_unpacked_mem_info(AstNode *mem, int &elem_width, int &lo, int &hi, bool *struct_array = nullptr){
 	log_assert(mem->type == AST_MEMORY);
 	if (mem->children.size() != 2)
@@ -5797,7 +5828,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			}
 		}
 		if (current_scope.count(str) == 0) {
-			bool seq_meth = is_sequence_method_ref(str);
+			bool seq_meth = is_sequence_method_ref(str) || is_sva_decl_ref(str);
 			if (current_ast_mod == nullptr) {
 				input_error("Identifier `%s' is implicitly declared outside of a module.\n", str);
 			} else if (flag_autowire || str == "\\$global_clock" || seq_meth) {
@@ -7990,6 +8021,29 @@ skip_memory_write:;
 				return false;
 			}
 
+			if (str == "\\$isunbounded")
+			{
+				// IEEE 1800-2017 20.6.3: true iff the constant argument is `$`.
+				// `$` itself lexes as the identifier `\$`; any other argument
+				// must fold to a constant, which is bounded.
+				if (children.size() != 1)
+					input_error("System function %s got %d arguments, expected 1.\n",
+							RTLIL::unescape_id(str), int(children.size()));
+				if (children[0]->type == AST_IDENTIFIER && children[0]->str == "\\$" && children[0]->children.empty()) {
+					newNode = mkconst_int(location, 1, false, 1);
+					goto apply_newNode;
+				}
+				auto buf = children[0]->clone();
+				while (buf->simplify(true, stage, width_hint, sign_hint)) { }
+				if (buf->type == AST_CONSTANT || buf->type == AST_REALVALUE) {
+					newNode = mkconst_int(location, 0, false, 1);
+					goto apply_newNode;
+				}
+				if (stage > 1)
+					input_error("System function %s needs a constant argument (a parameter or `$').\n",
+							RTLIL::unescape_id(str));
+			}
+
 			if (str == "\\$clog2")
 			{
 				if (children.empty())
@@ -9398,6 +9452,19 @@ void AstNode::expand_genblock(const std::string &prefix)
 			prefix_node(child);
 			break;
 
+		// IEEE 1800-2017 23.6: a labelled assertion in a scope is named
+		// relative to it (symbol_in[1].wp, symbol_in[2].wp, ...), like the
+		// scope's wires and cells; unprefixed, every generate iteration
+		// produced the same $check cell name.
+		case AST_ASSERT:
+		case AST_ASSUME:
+		case AST_LIVE:
+		case AST_FAIR:
+		case AST_COVER:
+			if (!child->str.empty())
+				child->str = prefix_id(prefix, child->str);
+			break;
+
 		case AST_BLOCK:
 		case AST_GENBLOCK:
 			if (!child->str.empty())
@@ -9514,6 +9581,11 @@ void AstNode::expand_genblock(const std::string &prefix)
 					// expression argument.
 					if (!is_type && current_ast_mod == nullptr) {
 						input_error("Identifier `%s' is implicitly declared outside of a module.\n", child->str.c_str());
+					} else if (!is_type && is_sva_decl_ref(identifier_str)) {
+						// a declaration reference from inside a generate
+						// scope: no scope-prefixed wire (sva2check resolves
+						// the declaration by its bare name); simplify() gives
+						// it the module-level wire
 					} else if (!is_type) {
 						if (!(flag_autowire || identifier_str == "\\$global_clock")) {
 							if (!flag_permissive)

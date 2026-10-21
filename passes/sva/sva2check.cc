@@ -250,8 +250,8 @@ struct SvaCompiler {
 				SigSpec y = cell->getPort(ID(Y));
 				if (GetSize(y) >= 1 && y[0].is_wire())
 					unary_drv[y[0].wire] = cell;
-			} else if (cell->hasPort(ID(Y))) {
-				SigSpec y = cell->getPort(ID(Y));
+			} else if (cell->hasPort(ID(Y)) || cell->type.in(ID($memrd), ID($memrd_v2))) {
+				SigSpec y = cell->getPort(cell->hasPort(ID(Y)) ? ID(Y) : ID(DATA));
 				for (int i = 0; i < GetSize(y); i++)
 					if (y[i].is_wire()) {
 						expr_drv[y[i].wire] = cell;
@@ -452,12 +452,19 @@ struct SvaCompiler {
 	// block surrounds them) into register chains on this check's sampling
 	// clock.  `done` carries across checks of one module; cells no check
 	// claims are degraded to their data argument after the loop.
-	void lower_sampled_value_cells(pool<Cell *> &done)
+	// `templates` are cells whose argument reads a declaration's formal
+	// (`sequence g(a); $rose(a); endsequence`): lowering them registers the
+	// undriven formal wire, so every instance read a FREE value.  They stay
+	// as cells; inlining copies them with the actual spliced in
+	// (splice_expr), and the copies are lowered after the check compiles.
+	void lower_sampled_value_cells(pool<Cell *> &done, const pool<Cell *> &templates)
 	{
 		std::vector<Cell *> rm;
 		std::vector<Cell *> scan(mod->cells().begin(), mod->cells().end());
 		for (auto cell : scan) {
 			if (!cell->type.in("\\$past", "\\$rose", "\\$fell", "\\$stable", "\\$changed"))
+				continue;
+			if (templates.count(cell))
 				continue;
 			if (!done.insert(cell).second)
 				continue;
@@ -504,6 +511,72 @@ struct SvaCompiler {
 		}
 	}
 
+	// Sampled-value cells whose argument (through combinational expression
+	// cells, including nested sampled-value cells) reads a formal of some
+	// declaration: see lower_sampled_value_cells.
+	pool<Cell *> formal_sampled_value_cells()
+	{
+		pool<Cell *> r;
+		if (!decls)
+			return r;
+		pool<Wire *> formal_wires;
+		for (auto &it : *decls) {
+			auto dp = ports_of(it.second);
+			for (size_t i = 1; i < dp.size(); i++) {
+				SigSpec f = it.second->getPort(dp[i]);
+				for (auto bit : f)
+					if (bit.is_wire())
+						formal_wires.insert(bit.wire);
+			}
+		}
+		if (formal_wires.empty())
+			return r;
+		dict<Wire *, Cell *> drv;
+		for (auto c : mod->cells())
+			for (auto &conn : c->connections())
+				if (c->output(conn.first) || (conn.first == ID(Y) && c->type.str()[0] == '\\'))
+					for (auto bit : conn.second)
+						if (bit.is_wire())
+							drv[bit.wire] = c;
+		dict<Wire *, bool> memo;
+		std::function<bool(Wire *)> reads_formal = [&](Wire *w) -> bool {
+			if (formal_wires.count(w))
+				return true;
+			auto m = memo.find(w);
+			if (m != memo.end())
+				return m->second;
+			memo[w] = false;
+			bool res = false;
+			auto d = drv.find(w);
+			if (d != drv.end()) {
+				Cell *c = d->second;
+				bool sv = c->type.in("\\$past", "\\$rose", "\\$fell", "\\$stable", "\\$changed");
+				if (sv || (c->type.str()[0] == '$' && !c->type.in(ID($sva), ID($dff), ID($dffe),
+						ID($adff), ID($adffe), ID($sdff), ID($sdffe), ID($sr), ID($dlatch),
+						ID($check)) && (c->type.str().rfind("$mem", 0) != 0 || c->type.in(ID($memrd), ID($memrd_v2)))))
+					for (auto &conn : c->connections())
+						if (c->input(conn.first) || (sv && conn.first != ID(Y)))
+							for (auto bit : conn.second)
+								if (bit.is_wire() && reads_formal(bit.wire)) {
+									res = true;
+									break;
+								}
+			}
+			memo[w] = res;
+			return res;
+		};
+		for (auto c : mod->cells()) {
+			if (!c->type.in("\\$past", "\\$rose", "\\$fell", "\\$stable", "\\$changed"))
+				continue;
+			for (auto bit : c->getPort(ID(A)))
+				if (bit.is_wire() && reads_formal(bit.wire)) {
+					r.insert(c);
+					break;
+				}
+		}
+		return r;
+	}
+
 	// LRM 16.14.6 sequence methods: the frontend parses `s5.triggered` /
 	// `s5.matched` as a hierarchical identifier and leaves an undriven wire
 	// named after the method.  Drive every such wire whose stem names a
@@ -512,7 +585,10 @@ struct SvaCompiler {
 	// starting point of the match, and at a single clock matched coincides
 	// with triggered (its only extra effect is cross-clock
 	// synchronization), so one lowering serves both.
-	void lower_sequence_methods()
+	// `lowered` is shared by the per-check compilers of one module: a wire
+	// an earlier check connected is skipped here, not reported as driven
+	// (the warning fired once per later check on every method wire)
+	void lower_sequence_methods(pool<Wire *> &lowered)
 	{
 		if (!decls || decls->empty())
 			return;
@@ -529,6 +605,8 @@ struct SvaCompiler {
 					driven.insert(bit.wire);
 		std::vector<Wire *> scan(mod->wires().begin(), mod->wires().end());
 		for (Wire *w : scan) {
+			if (lowered.count(w))
+				continue;
 			std::string nm = w->name.str();
 			for (int m = 0; m < 2; m++) {
 				const char *suf = m ? ".matched" : ".triggered";
@@ -546,6 +624,7 @@ struct SvaCompiler {
 				}
 				mod->connect(w, inline_decl((*decls)[base], {}, false,
 						Const(1, 1), Const(1, 1)));
+				lowered.insert(w);
 				break;
 			}
 		}
@@ -705,6 +784,50 @@ struct SvaCompiler {
 		return by_y[s[0]];
 	}
 
+	// Root property instance `assert property (p(x, y))`: a copy of the
+	// $sva tree under c whose expression ports are spliced through the
+	// bound formals (subst), so the root compile sees no formal.  The root
+	// path used to bind formals in subst only, which resolve() applies to a
+	// BARE formal leaf: any expression over a formal (`!a`, `a && b`,
+	// `$rose(a)`, a disable or clock condition) read the undriven formal
+	// wire -- every such check was a verdict on a free input.
+	Cell *splice_tree(Cell *c, std::vector<Wire *> &formals, dict<Cell *, Cell *> &memo)
+	{
+		if (!c)
+			return nullptr;
+		auto m = memo.find(c);
+		if (m != memo.end())
+			return m->second;
+		Cell *nc = mod->addCell(NEW_ID, c->type);
+		nc->parameters = c->parameters;
+		nc->attributes = c->attributes;
+		memo[c] = nc;
+		SigSpec oy = c->getPort(ID(Y));
+		if (!oy.empty() && oy[0].is_wire()) {
+			Wire *ny = mod->addWire(NEW_ID, oy[0].wire->width);
+			nc->setPort(ID(Y), ny);
+			for (int i = 0; i < ny->width; i++)
+				by_y[SigBit(ny, i)] = nc;
+		}
+		for (auto &conn : c->connections()) {
+			if (conn.first == ID(Y))
+				continue;
+			SigSpec sp = conn.second;
+			Cell *ch = child_cell(sp);
+			if (ch) {
+				Cell *nch = splice_tree(ch, formals, memo);
+				SigSpec chy = ch->getPort(ID(Y)), nchy = nch->getPort(ID(Y));
+				SigSpec q;
+				for (auto bit : sp)
+					q.append(bit.is_wire() && !chy.empty() && bit.wire == chy[0].wire && !nchy.empty()
+							? SigBit(nchy[0].wire, bit.offset) : bit);
+				nc->setPort(conn.first, q);
+			} else
+				nc->setPort(conn.first, splice_expr(sp, formals, true));
+		}
+		return nc;
+	}
+
 	// Named declaration lookup by bare name.  Instance cells carry the
 	// callee name as OP (see lookup_decl below); bare references arrive as
 	// plain identifier wires instead.
@@ -792,16 +915,21 @@ struct SvaCompiler {
 			if (f)
 				formal_set.insert(f);
 		dict<Wire *, Wire *> &lmap = clone_lmap;
+		// a memory READ port is an expression of its address: copied like
+		// any expression cell when the address reads a formal / local
+		// (`mem[a]` with formal a read the undriven formal)
 		auto stop_type = [](IdString t) {
 			return t.in(ID($sva), ID($dff), ID($dffe), ID($adff), ID($adffe), ID($sdff),
 					ID($sdffe), ID($sr), ID($dlatch), ID($check), ID($print), ID($finish),
-					ID($stop)) || t.str().rfind("$mem", 0) == 0;
+					ID($stop)) || (t.str().rfind("$mem", 0) == 0 && !t.in(ID($memrd), ID($memrd_v2)));
 		};
 		dict<Cell *, SigSpec> emap;
 		pool<Cell *> etried;
 		std::function<SigSpec(SigSpec)> cexpr;
 		std::function<SigSpec(Cell *)> cexpr_cell = [&](Cell *d) -> SigSpec {
-			SigSpec y = d->getPort(ID(Y));
+			// a memory read port's output is DATA
+			IdString yp = d->type.in(ID($memrd), ID($memrd_v2)) ? ID(DATA) : ID(Y);
+			SigSpec y = d->getPort(yp);
 			if (y.empty())
 				return y;
 			if (emap.count(d))
@@ -813,7 +941,7 @@ struct SvaCompiler {
 			bool changed = false;
 			dict<IdString, SigSpec> np;
 			for (auto &conn : d->connections()) {
-				if (conn.first == ID(Y))
+				if (conn.first == yp)
 					continue;
 				SigSpec n = cexpr(conn.second);
 				if (n != conn.second)
@@ -826,7 +954,7 @@ struct SvaCompiler {
 			nc->parameters = d->parameters;
 			nc->attributes = d->attributes;
 			Wire *ny = mod->addWire(NEW_ID, y.size());
-			nc->setPort(ID(Y), ny);
+			nc->setPort(yp, ny);
 			for (auto &it : np)
 				nc->setPort(it.first, it.second);
 			SigSpec nsig = SigSpec(ny, 0, y.size());
@@ -890,7 +1018,7 @@ struct SvaCompiler {
 					} else {
 						Cell *d = expr_drv.count(w) ? expr_drv[w] : nullptr;
 						if (d) {
-							SigSpec y = d->getPort(ID(Y));
+							SigSpec y = d->getPort(d->type.in(ID($memrd), ID($memrd_v2)) ? ID(DATA) : ID(Y));
 							if (!y.empty() && y[0].wire == w && !stop_type(d->type)) {
 								SigSpec ny = cexpr_cell(d);
 								if (!ny.empty() && ny != y) {
@@ -3951,6 +4079,8 @@ struct Sva2CheckPass : public Pass {
 			}
 
 			pool<Cell *> lowered_sv;
+			pool<Wire *> lowered_methods;
+			pool<Cell *> sv_templates = SvaCompiler(mod, SigSpec(), true, "$probe", &decls).formal_sampled_value_cells();
 			pool<Cell *> done_checks;
 			// one $check per snapshot pass: processing it removes its
 			// consumed $sva tree, so a per-check fresh selected_cells()
@@ -4091,14 +4221,30 @@ struct Sva2CheckPass : public Pass {
 					cell->attributes[ID(sva_lowering)] = Const(std::string("placeholder:not a spec"));
 					continue;
 				}
+				// bind outermost first; an inner level's actuals are
+				// expressions over the outer formals, spliced through the
+				// outer bindings (single-step subst does not compose)
+				std::vector<Wire *> root_formals;
 				for (auto &t : chain) {
 					auto &f = std::get<1>(t);
 					auto &a = std::get<2>(t);
 					if (GetSize(f) != GetSize(a))
 						log_error("sva2check: instance of %s has %d actuals, declaration has %d formals.\n",
 								sva_op(std::get<0>(t)).c_str(), GetSize(a), GetSize(f));
+					std::vector<SigSpec> av;
 					for (int i = 0; i < GetSize(f); i++)
-						comp.subst[f[i]] = a[i];
+						av.push_back(root_formals.empty() ? a[i] : comp.splice_expr(a[i], root_formals, true));
+					for (int i = 0; i < GetSize(f); i++) {
+						comp.subst[f[i]] = av[i];
+						if (f[i])
+							root_formals.push_back(f[i]);
+					}
+				}
+				if (!root_formals.empty()) {
+					dict<Cell *, Cell *> memo;
+					spec = comp.splice_tree(spec, root_formals, memo);
+					if (hoist_clock)
+						hoist_clock = memo.count(hoist_clock) ? memo[hoist_clock] : hoist_clock;
 				}
 
 				// Classify spec arguments: clock cell, disable cell, body.
@@ -4210,8 +4356,8 @@ struct Sva2CheckPass : public Pass {
 					converted++;
 					break;
 				}
-				comp.lower_sampled_value_cells(lowered_sv);
-				comp.lower_sequence_methods();
+				comp.lower_sampled_value_cells(lowered_sv, sv_templates);
+				comp.lower_sequence_methods(lowered_methods);
 
 				// v1 liveness: an unbounded eventually/s_eventually whose
 				// operand is a plain boolean expression is F p with p a
@@ -4574,6 +4720,10 @@ struct Sva2CheckPass : public Pass {
 					mod->fixup_ports();
 				}
 
+				// copies of formal-reading sampled-value cells made while
+				// inlining this check: lower them on its clock
+				comp.lower_sampled_value_cells(lowered_sv, sv_templates);
+
 				// Drop the consumed $sva tree cells and their placeholder Y wires.
 				std::vector<Cell *> drop;
 				pool<Cell *> seen;
@@ -4667,6 +4817,12 @@ struct Sva2CheckPass : public Pass {
 						continue;
 					if (lowered_sv.count(cell))
 						continue;
+					if (sv_templates.count(cell)) {
+						// declaration-body template: only its per-instance
+						// copies are read
+						rm.push_back(cell);
+						continue;
+					}
 					if (!warned) {
 						warned = true;
 						log("Warning: sample-value function in a clockless context in %s; degraded to its data argument.\n", log_id(mod));

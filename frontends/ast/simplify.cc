@@ -1323,6 +1323,91 @@ static const RTLIL::Module* lookup_module(const std::string &name)
 	return simplify_design_context->module(name);
 }
 
+// The struct/union type of parameter `paraname` (or the pos-th parameter
+// when paraname is empty) of module `modname`, cloned; nullptr when it has
+// none or cannot be resolved.  An assignment pattern used as an instance
+// parameter override (`leaf #('{A:5, B:9})`, the AXI4 FVIP testbench's
+// `amba_axi4_protocol_checker #('{ID_WIDTH:4, ...})`) has no type in the
+// instantiating module: its type is the overridden parameter's.
+static std::unique_ptr<AstNode> override_struct_type(const std::string &modname, const std::string &paraname, int pos)
+{
+	// the elaborated module's stored ORIGINAL AST first (the copy in
+	// current_ast may already be simplified: its parameter type folded away)
+	AstNode *mast = nullptr;
+	{
+		const RTLIL::Module *m = lookup_module(modname);
+		if (!m)
+			m = lookup_module("$abstract" + modname);
+		auto *am = dynamic_cast<const AST::AstModule *>(m);
+		if (am && am->ast)
+			mast = am->ast.get();
+	}
+	if (!mast && current_ast)
+		for (auto &c : current_ast->children)
+			if (c && (c->type == AST_MODULE || c->type == AST_INTERFACE) && c->str == modname)
+				mast = c.get();
+	if (!mast)
+		return nullptr;
+	AstNode *param = nullptr;
+	int k = 0;
+	for (auto &c : mast->children)
+		if (c && c->type == AST_PARAMETER) {
+			if (paraname.empty() ? k == pos : c->str == paraname) {
+				param = c.get();
+				break;
+			}
+			k++;
+		}
+	if (!param)
+		return nullptr;
+	auto struct_of = [](AstNode *n) -> std::unique_ptr<AstNode> {
+		if (n && n->type == AST_TYPEDEF && !n->children.empty())
+			n = n->children[0].get();
+		if (n && (n->type == AST_STRUCT || n->type == AST_UNION))
+			return n->clone();
+		return nullptr;
+	};
+	if (param->attributes.count(ID::wiretype))
+		if (auto t = struct_of(param->attributes.at(ID::wiretype).get()))
+			return t;
+	std::string tname;
+	for (auto &c : param->children) {
+		if (c && (c->type == AST_STRUCT || c->type == AST_UNION))
+			return c->clone();
+		if (c && c->type == AST_WIRETYPE)
+			tname = c->str;
+	}
+	if (tname.empty())
+		return nullptr;
+	std::string bare = tname[0] == '\\' ? tname.substr(1) : tname;
+	// the module's own (and its appended package / compilation-unit) typedefs
+	for (auto &c : mast->children)
+		if (c && c->type == AST_TYPEDEF && c->str == tname)
+			return struct_of(c.get());
+	// imported: `import pkg::*` -> pkg::name, appended or in this file's packages
+	for (auto &imp : mast->children) {
+		if (!imp || imp->type != AST_IMPORT)
+			continue;
+		std::string q = imp->str + "::" + bare;
+		for (auto &c : mast->children)
+			if (c && c->type == AST_TYPEDEF && c->str == q)
+				return struct_of(c.get());
+		if (current_ast)
+			for (auto &pk : current_ast->children)
+				if (pk && pk->type == AST_PACKAGE && pk->str == imp->str)
+					for (auto &c : pk->children)
+						if (c && c->type == AST_TYPEDEF && c->str == tname)
+							return struct_of(c.get());
+		if (simplify_design_context)
+			for (auto &pk : simplify_design_context->verilog_packages)
+				if (pk && pk->str == imp->str)
+					for (auto &c : pk->children)
+						if (c && c->type == AST_TYPEDEF && c->str == tname)
+							return struct_of(c.get());
+	}
+	return nullptr;
+}
+
 // True when a parameter value is plain arithmetic over constants and
 // (possibly qualified) identifiers - safe to force-fold early when a
 // referencing module runs before the defining package's own fold pass.
@@ -4180,6 +4265,39 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	if (type == AST_CELL) {
 		bool lookup_suggested = false;
 
+		// an assignment-pattern override takes the overridden parameter's
+		// struct type: materialize it as a typed localparam would be (it
+		// used to fold to nothing and the derived module got cfg=32'0)
+		{
+			std::string ctype;
+			for (auto &child : children)
+				if (child && child->type == AST_CELLTYPE)
+					ctype = child->str;
+			int pos = 0;
+			for (auto &child : children) {
+				if (!child || child->type != AST_PARASET)
+					continue;
+				int my_pos = child->str.empty() ? pos++ : -1;
+				if (child->children.empty() || child->children[0]->type != AST_ASSIGN_PATTERN)
+					continue;
+				auto stype = override_struct_type(ctype, child->str, my_pos);
+				if (!stype)
+					input_error("Assignment pattern as the value of parameter %s of `%s' needs the parameter's struct type, "
+							"which could not be resolved.\n",
+							child->str.empty() ? stringf("#%d", my_pos + 1).c_str() : log_id(child->str), log_id(ctype));
+				size_packed_struct(stype.get(), 0);
+				auto tmp = std::make_unique<AstNode>(child->location, AST_LOCALPARAM, child->children[0]->clone());
+				tmp->str = "\\$override_pattern";
+				tmp->set_attribute(ID::wiretype, std::move(stype));
+				while (tmp->simplify(true, 1, -1, false)) { }
+				if (tmp->children.empty() || tmp->children[0]->type != AST_CONSTANT)
+					input_error("Assignment pattern as the value of parameter %s of `%s' did not fold to a constant.\n",
+							child->str.empty() ? stringf("#%d", my_pos + 1).c_str() : log_id(child->str), log_id(ctype));
+				child->children[0] = tmp->children[0]->clone();
+				did_something = true;
+			}
+		}
+
 		for (auto& child : children) {
 			// simplify any parameters to constants
 			if (child->type == AST_PARASET)
@@ -4407,10 +4525,23 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			// records the type name in an AST_WIRETYPE child; register the
 			// struct members the same way so member selects (cfg.ID_WIDTH)
 			// resolve and fold against the parameter's constant value
-			if (attributes.count(ID::wiretype) == 0)
+			// (a wiretype attribute that is only the type NAME -- set for a
+			// compilation-unit typedef -- is not a member map: resolve it too)
+			if (attributes.count(ID::wiretype) == 0 ||
+					(attributes.at(ID::wiretype)->type != AST_STRUCT && attributes.at(ID::wiretype)->type != AST_UNION))
 				for (auto &child : children)
 					if (child->type == AST_WIRETYPE) {
 						std::string tname = child->str;
+						// a compilation-unit typedef is appended to the
+						// module's children AFTER its declarations, so it is
+						// not in scope yet when an early parameter is
+						// simplified: a named pattern then had no member map
+						// and folded to 0 (`typedef struct ... c_t;` at file
+						// scope, `localparam c_t P = '{A:5, B:9}`)
+						if (current_scope.count(tname) == 0 && current_ast_mod)
+							for (auto &node : current_ast_mod->children)
+								if (node && node->type == AST_TYPEDEF && node->str == tname)
+									current_scope[tname] = node.get();
 						if (current_scope.count(tname) == 0 && current_ast)
 							for (auto &node : current_ast->children) {
 								if (!node)
@@ -4427,10 +4558,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 							if (resolved->type == AST_TYPEDEF && !resolved->children.empty())
 								resolved = resolved->children[0].get();
 							if (resolved->type == AST_STRUCT || resolved->type == AST_UNION) {
+								// size BEFORE cloning: a typedef not simplified
+								// yet (compilation-unit typedefs come after the
+								// module's own declarations) cloned unsized, and
+								// the pattern materialized into zero bits
+								size_packed_struct(resolved, 0);
 								set_attribute(ID::wiretype, resolved->clone());
 								// members registered from the typedef's own
 								// struct node (stable); see the note above
-								size_packed_struct(resolved, 0);
 								add_members_to_scope(resolved, str);
 							}
 						}
@@ -6363,6 +6498,16 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		int unroll_iters = 0;
 		while (1)
 		{
+			// a GENERATE loop elaborates a scope per iteration (cells,
+			// assertions): far heavier than a procedural one, and a runaway
+			// bound there is usually an unsigned expression that wrapped
+			// (`for (i = 1; i < MAX_PENDING-1; i++)` with an int unsigned 0:
+			// ~2^32 iterations, a 36 CPU-minute hang on the AXI4 FVIP)
+			if (type == AST_GENFOR && unroll_iters + 1 > (1 << 14)) {
+				input_error("Generate loop did not terminate after %d iterations "
+						"(a runaway bound? e.g. an unsigned parameter expression that wrapped below 0).\n", 1 << 14);
+				break;
+			}
 			if (++unroll_iters > (1 << 20)) {
 				// upstream has no cap at all (memory-init loops of several
 				// thousand iterations are routine); the fork's old 1024 cap

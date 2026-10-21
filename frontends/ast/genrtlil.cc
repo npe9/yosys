@@ -2496,6 +2496,15 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 							cell->parameters[paraname] = RTLIL::Const(tn);
 							continue;
 						}
+						// a parameter value that is not a constant used to
+						// become 0 silently (an assignment-pattern override
+						// gave the AXI4 FVIP checkers an all-zero cfg)
+						// (strict: an error; -permissive: a marked degradation
+						// keeping the old constant 0 -- e.g. an unpacked-array
+						// parameter passed through by name, `.PMPRstCfg
+						// (PMPRstCfg)` in ibex, is not carried yet)
+						degrade(location.to_loc(), "Value of parameter %s of cell %s did not fold to a constant; "
+								"it is overridden with 0.\n", log_id(paraname), log_id(cell));
 						cell->parameters[paraname] = RTLIL::Const(0);
 						continue;
 					}

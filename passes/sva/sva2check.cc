@@ -1958,7 +1958,11 @@ struct SvaCompiler {
 		if (op == "[*]" || op == "[+]" || op == "[->]" || op == "[=]") {
 			// repetition of a sequence element; bounds in port B ("bounds")
 			SigSpec body = port(0);
-			Cell *body_cell = child_cell(body);
+			// the ORIGINAL child: inside an inlined declaration port(0) is
+			// the clone stub's Y, and a stub's ports fill lazily from its
+			// original (seq_end on the stub read a missing port: abort on
+			// `sequence s; (a ##1 b)[*2]; endsequence`)
+			Cell *body_cell = child(0);
 			int m = op == "[*]" ? 0 : 1, hi = -1; // hi < 0 = unbounded
 			Cell *b = child(1);
 			if (b) {

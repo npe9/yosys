@@ -4177,7 +4177,7 @@ struct Sva2CheckPass : public Pass {
 					// emitted pre-compiled by the s_until split (<name>$live
 					// twin); not part of the assert/assume conversion loop
 					continue;
-				if (flavor != "assert" && flavor != "assume" && flavor != "restrict") {
+				if (flavor != "assert" && flavor != "assume" && flavor != "restrict" && flavor != "cover") {
 					unsupported++;
 					log("Skipping %s/%s: flavor %s not supported.\n", log_id(mod), log_id(cell), flavor.c_str());
 					cell->attributes[ID(sva_lowering)] = Const("placeholder:flavor " + flavor);
@@ -4661,6 +4661,74 @@ struct Sva2CheckPass : public Pass {
 					new_a = mod->Or(NEW_ID, mod->Not(NEW_ID, pend), b1);
 					fail = mod->Not(NEW_ID, new_a);
 					liveness = true;
+				} else if (flavor == "cover") {
+					// register v3 D4: `cover property (s)` / `cover sequence
+					// (s)` of a bounded sequence or a boolean.  A is the
+					// MATCH pulse of an attempt started at every tick (root);
+					// the engine reports the cover reached at the first
+					// step EN && A can hold, or proves it unreachable.  A
+					// property-operator body (|->, not, until, ...) has no
+					// cover lowering yet: loud skip, A tied to 0 as before.
+					Cell *sbody = body;
+					if (!sbody && !body_sig.empty())
+						if (Cell *d = comp.decl_for_wire(comp.resolve(body_sig))) {
+							auto dp = comp.ports_of(d);
+							sbody = dp.empty() ? nullptr : comp.child_cell(d->getPort(dp[0]));
+							if (!sbody) {
+								body_sig = d->getPort(dp[0]);   // a let / boolean declaration
+							}
+						}
+					std::string why;
+					// an instance of a PROPERTY declaration whose body is a
+					// sequence or a boolean (the AXI4 FVIP's
+					// `property valid_with_ready(v, r); v && r; endproperty`)
+					// covers like a sequence
+					auto cover_shaped = [&](Cell *c) {
+						if (comp.seq_shaped(c))
+							return true;
+						Cell *d = comp.decl_by_name(sva_op(c));
+						if (!d || sva_op(d) != "property_decl")
+							return false;
+						Cell *dbody = nullptr;
+						std::vector<Wire *> dformals;
+						SigSpec draw;
+						if (!comp.lookup_decl(c, dbody, dformals, nullptr, &draw))
+							return false;
+						if (!dbody)   // a bare boolean body (no $sva cell)
+							return !draw.empty();
+						SigSpec bare;
+						dbody = comp.unwrap_spec(dbody, &bare);
+						return dbody ? comp.seq_shaped(dbody) : !bare.empty();
+					};
+					if (sbody) {
+						pool<Cell *> seen;
+						int l = comp.seq_max_len(sbody);
+						if (!cover_shaped(sbody))
+							why = "cover of a property operator (" + sva_op(sbody) + ")";
+						else if (comp.tree_has_locals(sbody, seen))
+							why = "cover of a sequence with local variables";
+						else if (l < 0 || l > 64)
+							why = "cover of an unbounded sequence";
+					}
+					if (!why.empty()) {
+						unsupported++;
+						log("Skipping %s/%s: %s not supported.\n", log_id(mod), log_id(cell), why.c_str());
+						cell->attributes[ID(sva_lowering)] = Const("placeholder:" + why);
+						cell->setPort(ID::A, Const(0, 1));
+						continue;
+					}
+					SigSpec hit;
+					if (sbody) {
+						comp.refuse_empty_prop(sbody);
+						hit = comp.seq_end(sbody, root, Const(1, 1));
+						if (disable && sva_op(disable) == "disable_iff" && comp.seq_max_len(sbody) > 1)
+							comp.approx("cover-disable-at-match", std::string(log_id(cell)) +
+									": an attempt disabled before its match tick still counts");
+					} else {
+						hit = mod->And(NEW_ID, root, comp.reduce1(comp.resolve(body_sig)));
+					}
+					new_a = hit;
+					fail = hit;   // -expose_bad: the "event" is the cover hit
 				} else {
 					// v1.5 strong until: p s_until q == (p until q) && F q.
 					// The weak monitor keeps this $check, the F q
@@ -4783,7 +4851,9 @@ struct Sva2CheckPass : public Pass {
 				SigSpec dsig;
 				if (dop == "disable_iff") {
 					dsig = comp.reduce1(disable->getPort(ID(A)));
-					new_a = mod->Or(NEW_ID, dsig, new_a);
+					// an assertion holds while disabled; a cover is NOT hit
+					new_a = flavor == "cover" ? mod->And(NEW_ID, mod->Not(NEW_ID, dsig), new_a)
+							: mod->Or(NEW_ID, dsig, new_a);
 				}
 
 				if (once && (strong_until || fairness))

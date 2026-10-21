@@ -138,6 +138,9 @@ def run(cmd, **kw):
 IC3_LINE = re.compile(r"ic3: (\S+): (proved|disproved|undecided)(?: \(depth (\d+)\))?"
                       r"(?: \[lowering=([^\]]+)\])?")
 COVER_LINE = re.compile(r"ic3: (\S+): (?:cover )?not checked(?: \[lowering=([^\]]+)\])?")
+# register v3 D4: covers checked as reachability
+COVER_RESULT = re.compile(r"ic3: (\S+): cover (reached|unreachable|undecided)(?: \(depth (\d+)\))?"
+                          r"(?: \[lowering=([^\]]+)\])?")
 DEGRADED_LINE = re.compile(r"ic3: design carries (sv_degraded|sv_permissive): (.*)")
 
 
@@ -214,6 +217,10 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
     covers = {}
     for m in COVER_LINE.finditer(blob):
         covers["bad_" + m.group(1).lstrip("\\")] = m.group(2) or "untagged"
+    cover_res = {}
+    for m in COVER_RESULT.finditer(blob):
+        cover_res["bad_" + m.group(1).lstrip("\\")] = (m.group(2), int(m.group(3)) if m.group(3) else None,
+                                                          m.group(4) or "untagged")
     results = {}
     tags = {}
     for m in IC3_LINE.finditer(blob):
@@ -236,6 +243,10 @@ def check_one(yosys, path, top, inc_dirs, timeout, cex_prefix=None):
         print(f"  {status:10s} {name}{extra} [lowering={tags.get(name, 'untagged')}]", flush=True)
     for name in sorted(covers):
         print(f"  {'not-checked':10s} {name} [lowering={covers[name]}]", flush=True)
+    for name in sorted(cover_res):
+        status, depth, tag = cover_res[name]
+        extra = f" (frame {depth + 1})" if depth is not None else ""
+        print(f"  {status:10s} {name}{extra} [lowering={tag}]", flush=True)
     return results
 
 

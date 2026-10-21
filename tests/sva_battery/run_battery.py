@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 YOSYS = os.environ.get("YOSYS", os.path.join(ROOT, "build", "yosys"))
 
-EXPECT = re.compile(r"//\s*(PROVED|DIS|NOT-CHECKED)(?:\s*@(\d+))?")
+EXPECT = re.compile(r"//\s*(PROVED|DIS|NOT-CHECKED|REACHED|UNREACHABLE)(?:\s*@(\d+))?")
 
 
 def expectations(path):
@@ -47,7 +47,7 @@ def fold_live_legs(results):
         live = results.get(name + "$live")
         if live:
             legs.append(live)
-        if verdict[0] == "not-checked":
+        if verdict[0] in ("not-checked", "reached", "unreachable"):
             out[name] = verdict   # a cover: reported, never folded into a verdict
             continue
         status = "proved" if all(s == "proved" for s, _ in legs) else \
@@ -100,6 +100,14 @@ def run_ic3(path):
                 nm = nm[4:]
             results.setdefault(nm, ("not-checked", None))
             LOWERING.setdefault(path, {}).setdefault(nm, m.group(2) or "untagged")
+            continue
+        m = re.match(r"\s*(reached|unreachable)\s+(\S+)(?: \(frame (\d+)\))?(?: \[lowering=([^\]]+)\])?", line)
+        if m:
+            nm = m.group(2).lstrip("\\")
+            if nm.startswith("bad_"):
+                nm = nm[4:]
+            results[nm] = (m.group(1), int(m.group(3)) - 1 if m.group(3) else None)
+            LOWERING.setdefault(path, {}).setdefault(nm, m.group(4) or "untagged")
             continue
         m = re.search(r"ic3: (\S+): (proved|disproved|undecided)(?: \(depth (\d+)\))?"
                       r"(?: \[lowering=([^\]]+)\])?", line)
@@ -160,6 +168,13 @@ def check_ic3(path, exp):
         status, depth = got
         if kind == "not-checked" and status != "not-checked":
             bad.append(f"{name}: expected NOT-CHECKED (cover), ic3 says {status}")
+        if kind == "reached":
+            if status != "reached":
+                bad.append(f"{name}: expected REACHED, ic3 says {status}")
+            elif n is not None and depth != n:
+                bad.append(f"{name}: expected REACHED @{n}, ic3 reached at {depth}")
+        if kind == "unreachable" and status != "unreachable":
+            bad.append(f"{name}: expected UNREACHABLE, ic3 says {status} (depth {depth})")
         if kind == "proved" and status != "proved":
             bad.append(f"{name}: expected PROVED, ic3 says {status} (depth {depth})")
         elif kind == "dis":
@@ -233,7 +248,9 @@ def main():
             # B5: a constant-body proof (ASSERT_KNOWN under two-state, a
             # folded tautology) is not a proof about the circuit
             verdict = ("PROVED(const)" if tag.endswith(":const") else "PROVED") if kind == "proved" else \
-                      "NOT-CHECKED" if kind == "not-checked" else ("DIS@%d" % n if n is not None else "DIS")
+                      "NOT-CHECKED" if kind == "not-checked" else \
+                      ("REACHED@%d" % n if n is not None else "REACHED") if kind == "reached" else \
+                      "UNREACHABLE" if kind == "unreachable" else ("DIS@%d" % n if n is not None else "DIS")
             print(f"  {verdict:13s} {name} [lowering={tag}]", flush=True)
             TAG_HIST[tags.get(name, 'untagged')] = TAG_HIST.get(tags.get(name, 'untagged'), 0) + 1
     print("\nlowering tags over the expectations:")

@@ -1722,15 +1722,23 @@ struct Ic3Pass : Pass
 					cell->name.unescape().c_str(), t.c_str());
 		}
 
-		// Register v3 B5: covers are not checked by this engine (D4 is
-		// reachability); say so per cover instead of silence
-		for (auto cell : covers) {
-			std::string tag = cell->attributes.count(ID(sva_lowering))
-					? cell->attributes.at(ID(sva_lowering)).decode_string() : "untagged";
-			log("ic3: %s: cover not checked [lowering=%s]\n", cell->name.unescape().c_str(), tag.c_str());
+		// Covers that sva2check could not lower are said so; the rest are
+		// checked below as reachability (register v3 D4)
+		{
+			std::vector<RTLIL::Cell *> keep;
+			for (auto cell : covers) {
+				std::string t = placeholder(cell);
+				if (!t.empty()) {
+					std::string tag = cell->attributes.count(ID(sva_lowering))
+							? cell->attributes.at(ID(sva_lowering)).decode_string() : "untagged";
+					log("ic3: %s: cover not checked [lowering=%s]\n", cell->name.unescape().c_str(), tag.c_str());
+				} else
+					keep.push_back(cell);
+			}
+			covers = keep;
 		}
 
-		if (props.empty() && live_props.empty()) {
+		if (props.empty() && live_props.empty() && covers.empty()) {
 			log("ic3: no properties found in module %s.\n", log_id(module));
 			return;
 		}
@@ -1793,6 +1801,61 @@ struct Ic3Pass : Pass
 						solver.n_bad, solver.n_blockq, solver.n_gen, solver.n_init);
 			}
 		}
+
+		// Register v3 D4: a cover is REACHED iff EN && A holds in some
+		// reachable state of a step -- i.e. iff the assertion "A never
+		// holds" (A' = !A, same EN) is disproved; its counterexample step is
+		// the reach step, a proof means unreachable.  Assumptions constrain
+		// as for asserts.  Each cover is its own query.
+		int n_reached = 0, n_unreachable = 0, n_cover_undecided = 0;
+		for (auto cell : covers) {
+			std::string name = cell->name.unescape();
+			RTLIL::Wire *na = module->addWire(NEW_ID);
+			RTLIL::Cell *ncell = module->addNot(NEW_ID, cell->getPort(ID::A), na);
+			RTLIL::Cell *tmp;
+			if (cell->type == ID($check)) {
+				tmp = module->addCell(NEW_ID, ID($check));
+				tmp->parameters = cell->parameters;
+				tmp->setParam(ID(FLAVOR), std::string("assert"));
+				for (auto &conn : cell->connections())
+					tmp->setPort(conn.first, conn.second);
+				tmp->setPort(ID::A, na);
+			} else {
+				// $cover (chformal -lower / async2sync form)
+				tmp = module->addAssert(NEW_ID, na, cell->getPort(ID::EN));
+			}
+
+			Ic3Solver solver(module, init_zero, max_frames);
+			solver.assume_cells = assumes;
+			solver.fair_cells = fairs;
+			solver.kind_max = kind_max;
+			solver.bmc_max = bmc_max;
+			solver.ctg_depth_max = ctg_depth_max;
+			int depth = 0;
+			int result = solver.prove(tmp, depth);
+			if (result == 1) {
+				log("ic3: %s: cover reached (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
+				n_reached++;
+				if (!cex_prefix.empty()) {
+					std::string safe = name;
+					for (auto &ch : safe)
+						if (!isalnum((unsigned char)ch) && ch != '_' && ch != '-')
+							ch = '_';
+					solver.export_cex(tmp, stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), depth);
+				}
+			} else if (result == 0) {
+				log("ic3: %s: cover unreachable%s\n", name.c_str(), lowering_tag(cell).c_str());
+				n_unreachable++;
+			} else {
+				log("ic3: %s: cover undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
+				n_cover_undecided++;
+			}
+			module->remove(tmp);
+			module->remove(ncell);
+			module->remove({na});
+		}
+		if (!covers.empty())
+			log("ic3: covers: %d reached, %d unreachable, %d undecided.\n", n_reached, n_unreachable, n_cover_undecided);
 
 		for (auto cell : live_props) {
 			std::string name = cell->name.unescape();

@@ -1,0 +1,62 @@
+# A for-loop header with several declarations and step assignments
+# (`for (int i = 0, int j = 2; i < 3; i++, j--)`): the extra variables are
+# initialized once and stepped after each body. They used to be dropped:
+# in an always block the loop vanished (its real step sat where simplify
+# expects the body, "step is not a register"), in a function the extra
+# variable was left undriven.
+read_verilog -sv <<EOT
+typedef logic [3:0] n4_t;
+typedef enum logic [2:0] { A = 3'd1, B = 3'd4, C = 3'd6 } st_e;
+module top (input logic [2:0] s);
+  function automatic logic [3:0] f3(logic [2:0] sig);
+    logic [3:0] acc;
+    acc = 0;
+    for (int i = 0, n4_t t = 4'd1; i < 3; i += 1, t = t + 1) acc = acc + t;
+    return acc;
+  endfunction
+  logic [3:0] n1, n2, n3, ne, o3;
+  logic [2:0] rev;
+  always_comb begin
+    n1 = 0;
+    for (int i = 0; i < 3; i += 1) n1 = n1 + s[i];
+  end
+  always_comb begin
+    n2 = 0;
+    for (int i = 0, int j = 0; i < 3; i += 1, j = j + 1) n2 = n2 + s[j];
+  end
+  always_comb begin
+    rev = 0;
+    for (int i = 0, int j = 2; i < 3; i++, j--) rev[i] = s[j];
+  end
+  always_comb begin
+    ne = 0;
+    for (int i = 0, st_e t = t.first(); i < t.num(); i += 1, t = t.next())
+      ne = ne + t;
+  end
+  assign o3 = f3(s);
+  always_comb begin
+    assert (n2 == n1);
+    assert (rev == {s[0], s[1], s[2]});
+    assert (ne == 4'd11);
+    assert (o3 == 4'd6);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports
+design -reset
+logger -expect error "`continue' in a for-loop with more than one step assignment is not supported" 1
+read_verilog -sv <<EOT
+module c (input logic [2:0] s, output logic [3:0] n);
+  always_comb begin
+    n = 0;
+    for (int i = 0, int j = 0; i < 3; i++, j++) begin
+      if (s[i]) continue;
+      n = n + 1;
+    end
+  end
+endmodule
+EOT

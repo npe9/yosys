@@ -1,0 +1,32 @@
+# A PACKED multi-dim parameter with a positional assignment pattern
+# (OpenTitan prim_cipher_pkg PRINCE_SHIFT_ROWS64 `logic [15:0][3:0] =
+# '{4'hF, ...}`) never folded to a constant: every read degraded (strict:
+# prim_prince / sram_ctrl FAIL@parse).  Values cross-checked bit for bit
+# against Verilator 5.052.
+read_verilog -sv -formal <<EOT
+module pdim (input logic [15:0] a);
+  localparam logic [3:0][3:0]      P2 = '{4'h1, 4'h2, 4'h3, 4'h0};
+  localparam logic [1:0][2:0][3:0] P3 = '{'{4'h1, 4'h2, 4'h3}, '{4'h4, 4'h5, 4'h6}};
+  localparam logic [0:3][3:0]      PA = '{4'h1, 4'h2, 4'h3, 4'h0};
+  localparam logic [1:0][3:0]      PS = '{1, 2};
+  function automatic logic [15:0] shuf(logic [15:0] x, logic [3:0][3:0] sh);
+    logic [15:0] r;
+    for (int k = 0; k < 4; k++) r[k*4 +: 4] = x[sh[k]*4 +: 4];
+    return r;
+  endfunction
+  always_comb begin
+    assert (P2 == 16'h1230 && P2[3] == 4'h1 && P2[0] == 4'h0);
+    assert (P3 == 24'h123456 && P3[1][2] == 4'h1 && P3[0][0] == 4'h6);
+    assert (PA == 16'h1230 && PA[0] == 4'h1 && PA[3] == 4'h0);
+    assert (PS == 8'h12);
+    assert (shuf(a, P2) == {a[7:4], a[11:8], a[15:12], a[3:0]});
+  end
+endmodule
+EOT
+hierarchy -top pdim
+proc
+flatten
+opt
+async2sync
+chformal -lower
+sat -prove-asserts -verify

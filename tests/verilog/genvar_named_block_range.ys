@@ -1,0 +1,37 @@
+# A genvar used in a range inside a NAMED block in a generate loop was
+# degraded as "implicitly declared identifier from a missing package"
+# (frozen to 0; strict mode refused the file).  ~20 OpenTitan / Veer files
+# (prim_prince, prim_arbiter_fixed, el2_lsu_*) hit it; stock elaborates them.
+read_verilog -sv -formal <<EOT
+module gn2 (input logic [15:0] a, output logic [15:0] y);
+  logic [15:0] s [3];
+  assign s[0] = a;
+  for (genvar k = 1; k < 3; k++) begin : g
+    logic [15:0] t;
+    always_comb begin : p
+      t = ~s[k-1];
+    end
+    assign s[k] = t;
+  end
+  assign y = s[2] ^ s[1];
+  always_comb assert (y == 16'hffff);
+endmodule
+EOT
+hierarchy -top gn2
+proc
+flatten
+opt
+async2sync
+chformal -lower
+sat -prove-asserts -verify
+design -reset
+
+# a genuinely undeclared identifier in a range is still refused
+logger -expect error "Range bound uses implicitly declared identifier" 1
+read_verilog -sv <<EOT
+module gu (input logic [15:0] a, output logic [7:0] y);
+  always_comb begin : p
+    y = a[zz +: 8];
+  end
+endmodule
+EOT

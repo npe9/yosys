@@ -1,0 +1,32 @@
+# A `string` variable assigned only string literals is a vector as wide as
+# the longest literal; comparisons against those literals are exact.
+read_verilog -sv <<EOT
+module top (input logic a);
+  string tag = "ABC";
+  string s2;
+  always_comb begin
+    s2 = "XY";
+    if (a) s2 = "LONGER";
+  end
+  always_comb begin
+    assert (tag == "ABC");
+    assert ((s2 == "XY") == !a);
+    assert ((s2 == "LONGER") == a);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports
+design -reset
+# any other assignment keeps the degradation
+logger -expect error "Unknown identifier `\\string' used as type name" 1
+read_verilog -sv <<EOT
+module t3 (input logic a, output logic y);
+  string s3;
+  always_comb s3 = $sformatf("%0d", a);
+  assign y = a;
+endmodule
+EOT

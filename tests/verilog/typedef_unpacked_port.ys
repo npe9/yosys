@@ -1,0 +1,57 @@
+# A typedef'd element type on a port with a C-style unpacked dimension
+# (`st_t p [2]`) is an array of 2 elements, not a packed [2:2] range; and a
+# named assignment pattern whose value is a member access (`x.y[g].z.q`)
+# keeps its member key when the value is rewritten (OpenTitan i3c_target).
+# A packed dimension on a struct element type (`st_t [1:0] w [2]`) is kept,
+# for locals and ports alike.
+read_verilog -sv <<EOT
+package p;
+  typedef struct packed { logic [6:0] q; } r_t;
+  typedef struct packed { r_t group_addr; r_t targets; } g_t;
+  typedef struct packed { g_t [1:0] targ_group; } reg2hw_t;
+  typedef struct packed { logic [6:0] addr; logic addr_valid; logic [3:0] targets; } ga_t;
+  typedef logic [7:0] by_t;
+endpackage
+module child import p::*; (input reg2hw_t reg2hw_i, input logic [7:0] i,
+    output ga_t grp_addr_o [2], output by_t t_o [2]);
+  for (genvar g = 0; g < 2; g++) begin : gl
+    assign grp_addr_o[g] = '{
+      addr:       reg2hw_i.targ_group[g].group_addr.q,
+      addr_valid: |reg2hw_i.targ_group[g].targets.q[3:0],
+      targets:    reg2hw_i.targ_group[g].targets.q[3:0]
+    };
+    assign t_o[g] = i + g;
+  end
+endmodule
+module pk import p::*; (input logic [11:0] a, output ga_t [1:0] q_o [2]);
+  ga_t [1:0] w [2];
+  assign w[0] = {a, ~a};
+  assign w[1] = {~a, a};
+  assign q_o[0] = w[1];
+  assign q_o[1] = w[0];
+endmodule
+module top import p::*; (input reg2hw_t r, input logic [7:0] i, input logic [11:0] a);
+  ga_t [1:0] q [2];
+  pk upk (.a(a), .q_o(q));
+  ga_t ga [2];
+  by_t t [2];
+  child u (.reg2hw_i(r), .i(i), .grp_addr_o(ga), .t_o(t));
+  always_comb begin
+    assert (ga[0].addr == r.targ_group[0].group_addr.q);
+    assert (ga[1].addr == r.targ_group[1].group_addr.q);
+    assert (ga[1].targets == r.targ_group[1].targets.q[3:0]);
+    assert (ga[0].addr_valid == |r.targ_group[0].targets.q[3:0]);
+    assert (t[0] == i);
+    assert (t[1] == i + 8'd1);
+    assert (q[0] == {~a, a});
+    assert (q[1][1] == a);
+    assert (q[1][0] == ~a);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

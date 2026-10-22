@@ -1,0 +1,47 @@
+# Unpacked ports and arrays whose element type is a one-bit typedef or a
+# type parameter defaulting to `logic` (cva6 hpdcache `input hpdcache_req_t
+# core_req_i [N]`): the element is [0:0], not the unpacked range. A zero-size
+# port array (the default configuration) stays a wire (it crashed mem2reg).
+# A `default:` pattern on a whole unpacked array of structs fills elements.
+read_verilog -sv <<EOT
+module m #(parameter int N = 2, parameter type req_t = logic) (input req_t r_i [N], output req_t r_o [N]);
+  for (genvar i = 0; i < N; i++) begin : g
+    assign r_o[i] = r_i[i];
+  end
+endmodule
+module z #(parameter int N = 0, parameter type req_t = logic) (input req_t r_i [N], output logic y);
+  assign y = 1'b0;
+endmodule
+module top (input logic [7:0] a, input logic [7:0] b, input logic [3:0] c, input logic [2:0] d);
+  typedef logic [7:0] byte_t;
+  typedef logic bit_t;
+  typedef struct packed { logic [2:0] x; logic [4:0] y; } st_t;
+  localparam st_t D = '{x: 3'd5, y: 5'd9};
+  byte_t ri [2], ro [2];
+  bit_t bm [4];
+  st_t v [4];
+  assign ri[0] = a; assign ri[1] = b;
+  m #(.N(2), .req_t(byte_t)) u (.r_i(ri), .r_o(ro));
+  for (genvar i = 0; i < 4; i++) begin : gb
+    assign bm[i] = c[i];
+  end
+  always_comb begin
+    v = '{default: D};
+    v[1].x = d;
+  end
+  always_comb begin
+    assert (ro[0] == a);
+    assert (ro[1] == b);
+    assert ({bm[3], bm[2], bm[1], bm[0]} == c);
+    assert (v[0] == 8'ha9);
+    assert (v[3] == 8'ha9);
+    assert (v[1] == {d, 5'd9});
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

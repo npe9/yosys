@@ -286,6 +286,33 @@ static std::unique_ptr<AstNode> make_range(AstSrcLocType loc, int left, int righ
 // implicit 1-bit wire created for it. Such an identifier cannot decide a
 // range bound; find it so the bound can be replaced by a constant, like
 // other missing-package degradations in this frontend.
+// true when `name' (e.g. \\k) is declared somewhere in the module subtree
+// under that name or as the last component of a scoped name (\\g.p.k): a
+// genvar or a procedural loop variable referenced from a named block is
+// still bound to a transient autowire on the first simplify pass, before
+// generate expansion and block scoping resolve it (2026-10-22: a genvar in
+// `always_comb begin : p ... s[k-1]` inside a generate loop was degraded to
+// constant 0 -- ~20 OpenTitan / Veer files FAIL@parse; stock elaborates them)
+static bool name_declared_in(AstNode *node, const std::string &name, int depth = 0)
+{
+	if (!node || depth > 64)
+		return false;
+	if (node->type != AST_AUTOWIRE && node->type != AST_IDENTIFIER && !node->str.empty() &&
+			(node->type == AST_GENVAR || node->type == AST_WIRE || node->type == AST_LOCALPARAM ||
+			 node->type == AST_PARAMETER || node->type == AST_MEMORY)) {
+		const std::string &s = node->str;
+		if (s == name)
+			return true;
+		std::string tail = "." + name.substr(name[0] == '\\' ? 1 : 0);
+		if (s.size() > tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0)
+			return true;
+	}
+	for (auto &child : node->children)
+		if (name_declared_in(child.get(), name, depth + 1))
+			return true;
+	return false;
+}
+
 static AstNode *find_missing_autowire(AstNode *node, int depth = 0)
 {
 	if (node->type == AST_IDENTIFIER && node->id2ast) {
@@ -1205,6 +1232,10 @@ static AstNode *resolve_wiretype_struct(AstNode *decl_node)
 						td = inner.get();
 		}
 	AstNode *t = (td && td->type == AST_TYPEDEF && !td->children.empty()) ? td->children[0].get() : nullptr;
+	// a typedef'd packed array of a struct: element accesses see the
+	// element struct (its member copies repeat every member name)
+	if (t && (t->type == AST_STRUCT || t->type == AST_UNION) && t->attributes.count(ID(sv_elem_type)))
+		return t->attributes.at(ID(sv_elem_type)).get();
 	if (t && (t->type == AST_STRUCT || t->type == AST_UNION))
 		return t;
 	if (t && (t->type == AST_WIRE || t->type == AST_MEMORY))
@@ -1242,6 +1273,46 @@ std::unique_ptr<AstNode> make_packed_struct(AstNode *template_node, std::string 
 	// add all the struct members to scope under the wire's name
 	add_members_to_scope(template_node, name);
 	return wnode;
+}
+
+// Replace each `initial` (a local's declaration initializer) in an inlined
+// function or task body by its assignments, made blocking, in place.
+static void inline_function_initializers(std::vector<std::unique_ptr<AstNode>> &stmts)
+{
+	std::vector<std::unique_ptr<AstNode>> out;
+	for (auto &stmt : stmts) {
+		if (stmt && stmt->type == AST_INITIAL) {
+			std::vector<std::unique_ptr<AstNode>> body;
+			for (auto &c : stmt->children) {
+				if (c && c->type == AST_BLOCK && c->str.empty())
+					for (auto &g : c->children)
+						body.push_back(std::move(g));
+				else if (c)
+					body.push_back(std::move(c));
+			}
+			for (auto &b : body) {
+				if (b->type == AST_ASSIGN_LE)
+					b->type = AST_ASSIGN_EQ;
+			}
+			inline_function_initializers(body);
+			for (auto &b : body)
+				out.push_back(std::move(b));
+			continue;
+		}
+		if (stmt && stmt->type != AST_FUNCTION && stmt->type != AST_TASK)
+			for (auto &c : stmt->children)
+				if (c && (c->type == AST_BLOCK || c->type == AST_GENBLOCK)) {
+					inline_function_initializers(c->children);
+				} else if (c && (c->type == AST_COND || c->type == AST_CONDX || c->type == AST_CONDZ ||
+						c->type == AST_FOR || c->type == AST_WHILE || c->type == AST_REPEAT || c->type == AST_CASE)) {
+					std::vector<std::unique_ptr<AstNode>> one;
+					one.push_back(std::move(c));
+					inline_function_initializers(one);
+					c = std::move(one[0]);
+				}
+		out.push_back(std::move(stmt));
+	}
+	stmts.swap(out);
 }
 
 static void prepend_ranges(std::unique_ptr<AstNode> &range, AstNode *range_add)
@@ -2089,12 +2160,28 @@ static bool absorb_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
 		}
 		if (stmt->type == AST_FOR || stmt->type == AST_WHILE || stmt->type == AST_REPEAT) {
 			if (stmt->type == AST_FOR) {
+				// extra initializers run once before the loop, extra steps
+				// after each body (see the for-loop unroller)
+				std::vector<std::unique_ptr<AstNode>> extra_inits, extra_steps;
 				while (GetSize(stmt->children) > 1 && stmt->children[0] && stmt->children[1] &&
-						stmt->children[0]->type == AST_ASSIGN_EQ && stmt->children[1]->type == AST_ASSIGN_EQ)
+						stmt->children[0]->type == AST_ASSIGN_EQ && stmt->children[1]->type == AST_ASSIGN_EQ) {
+					extra_inits.push_back(std::move(stmt->children[1]));
 					stmt->children.erase(stmt->children.begin() + 1);
+				}
 				while (GetSize(stmt->children) > 4 && stmt->children[3] &&
-						stmt->children[3]->type != AST_BLOCK && stmt->children[3]->type != AST_GENBLOCK)
+						stmt->children[3]->type != AST_BLOCK && stmt->children[3]->type != AST_GENBLOCK) {
+					extra_steps.push_back(std::move(stmt->children[3]));
 					stmt->children.erase(stmt->children.begin() + 3);
+				}
+				if (GetSize(stmt->children) > 3 && stmt->children[3] && stmt->children[3]->type == AST_BLOCK)
+					for (auto &step : extra_steps)
+						stmt->children[3]->children.push_back(std::move(step));
+				if (!extra_inits.empty()) {
+					size_t n = extra_inits.size();
+					stmts.insert(stmts.begin() + i, std::make_move_iterator(extra_inits.begin()), std::make_move_iterator(extra_inits.end()));
+					i += n;
+					stmt = stmts[i].get();
+				}
 			}
 			int body_at = stmt->type == AST_FOR ? 3 : 1;
 			int cond_at = stmt->type == AST_FOR ? 1 : 0;
@@ -2856,8 +2943,26 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				}
 			}
 		};
+		// a variable outside the module's top level (a block local, e.g.
+		// an inlined function's for-init `StateEnumT t = t.first()`)
+		// is found through the scope; its enum is registered there too
+		auto scope_enum = [&]() {
+			if (enum_node || !current_scope.count(prefix))
+				return;
+			AstNode *d = current_scope.at(prefix);
+			if (!d || (d->type != AST_WIRE && d->type != AST_MEMORY) || !d->attributes.count(ID::enum_type))
+				return;
+			std::string ename = d->attributes.at(ID::enum_type)->str.c_str();
+			if (current_scope.count(ename) && current_scope.at(ename)->type == AST_ENUM)
+				enum_node = current_scope.at(ename);
+			if (enum_node && !base) {
+				base = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+				base->str = prefix;
+			}
+		};
 		scan_enum(current_ast_mod);
 		scan_enum(current_ast);
+		scope_enum();
 		// expr.method(): the receiver is the first argument, not a name prefix.
 		if (prefix.empty() && !children.empty()) {
 			AstNode *recv = children[0].get();
@@ -2867,6 +2972,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				enum_node = nullptr;
 				scan_enum(current_ast_mod);
 				scan_enum(current_ast);
+				scope_enum();
 			} else if (recv && recv->type == AST_CAST_SIZE && recv->children.size() >= 2) {
 				std::function<void(AstNode *)> find_ty = [&](AstNode *n) {
 					if (!n || !prefix.empty())
@@ -2881,6 +2987,77 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				enum_node = nullptr;
 				scan_enum(current_ast_mod);
 				scan_enum(current_ast);
+			}
+		}
+		// A block-local receiver (`begin : b st_e t; t = t.first(); ...`,
+		// a for-init `st_e t`) is renamed into scope only when its named
+		// block is expanded, after the block's statements were first
+		// simplified: leave the call for that later pass. An unresolved
+		// call that survives is still an error in genrtlil.
+		if (!enum_node && !prefix.empty() && !current_scope.count(prefix) && current_top_block &&
+				prefix.find('.') == std::string::npos) {
+			bool declared = false;
+			std::function<void(AstNode *)> find_decl = [&](AstNode *n) {
+				if (!n || declared)
+					return;
+				if ((n->type == AST_WIRE || n->type == AST_MEMORY) && n->str == prefix)
+					declared = true;
+				for (auto &c : n->children)
+					find_decl(c.get());
+			};
+			find_decl(current_top_block);
+			if (declared) {
+				recursion_counter--;
+				return false;
+			}
+		}
+		// The default elaboration of a module whose type parameter defaults
+		// to a plain vector (`parameter type StateEnumT = logic [W-1:0]`,
+		// OpenTitan prim_sparse_fsm_flop) calls enum methods on that
+		// vector. Treat the unoverridden type as the enumeration of all its
+		// values; a derived module has the real enum. Plain misuse on a
+		// non-parameter type still falls through to the error.
+		if (!enum_node && !prefix.empty() && enum_method != "name" && current_scope.count(prefix)) {
+			AstNode *d = current_scope.at(prefix);
+			AstNode *td = nullptr;
+			if (d && (d->type == AST_WIRE || d->type == AST_MEMORY) && d->attributes.count(ID::wiretype)) {
+				std::string tname = d->attributes.at(ID::wiretype)->str.c_str();
+				if (current_scope.count(tname) && current_scope.at(tname)->type == AST_TYPEDEF &&
+						current_scope.at(tname)->attributes.count(ID(type_param)))
+					td = current_scope.at(tname);
+			}
+			int w = (td && d->range_valid) ? std::abs(d->range_left - d->range_right) + 1 : -1;
+			if (td && w >= 1 && w <= 16) {
+				log_warning("%s: enum method `%s' on `%s', whose type parameter `%s' defaults to a %d-bit vector; "
+						"treating the type as the enumeration of all its values.\n",
+						location.to_string().c_str(), enum_method.c_str(), prefix.c_str() + 1, td->str.c_str() + 1, w);
+				int n = 1 << w;
+				std::unique_ptr<AstNode> result;
+				if (enum_method == "first" || enum_method == "last" || enum_method == "num") {
+					result = AstNode::mkconst_int(location, enum_method == "first" ? 0 : enum_method == "last" ? n - 1 : n, true);
+				} else {
+					int step = 1;
+					AstNode *step_node = on_expr ? (children.size() >= 2 ? children[1].get() : nullptr)
+							: (!children.empty() ? children[0].get() : nullptr);
+					if (step_node) {
+						while (step_node->simplify(true, stage, -1, false)) { }
+						if (step_node->type == AST_CONSTANT)
+							step = step_node->integer;
+					}
+					int delta = (((prev ? -step : step) % n) + n) % n;
+					auto recv = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+					recv->str = prefix;
+					auto sum = std::make_unique<AstNode>(location, AST_ADD,
+							std::make_unique<AstNode>(location, AST_TO_UNSIGNED, std::move(recv)),
+							AstNode::mkconst_int(location, delta, false, 32));
+					result = std::make_unique<AstNode>(location, AST_BIT_AND, std::move(sum),
+							AstNode::mkconst_int(location, n - 1, false, 32));
+				}
+				result->location = location;
+				result->cloneInto(*this);
+				fixup_hierarchy_flags();
+				recursion_counter--;
+				return true;
 			}
 		}
 		if (enum_node && (base || enum_method == "first" || enum_method == "last" || enum_method == "num")) {
@@ -3298,6 +3475,24 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 	}
 
+	// a bare identifier naming a 1-D unpacked array (parameter or memory),
+	// whose elements are the `inside` set members (IEEE 1800-2017 11.4.13)
+	auto inside_unpacked_array = [&](AstNode *member) -> AstNode * {
+		if (member->type != AST_IDENTIFIER || !member->children.empty())
+			return nullptr;
+		AstNode *decl = member->id2ast;
+		if (!decl && current_scope.count(member->str))
+			decl = current_scope.at(member->str);
+		if (!decl)
+			return nullptr;
+		bool is_param = decl->type == AST_PARAMETER || decl->type == AST_LOCALPARAM;
+		if (!(is_param || decl->type == AST_MEMORY) || decl->unpacked_dimensions != 1 ||
+				decl->dimensions.empty() || decl->dimensions[0].range_width < 1 ||
+				decl->dimensions[0].range_width > 4096)
+			return nullptr;
+		return decl;
+	};
+
 	// IEEE 1800-2009 11.4.13 set membership. The result is the OR of the
 	// comparisons; a range whose left bound is greater than its right bound is empty.
 	if (type == AST_SVA && str == "inside" && children.size() >= 2 && children[1] && children[1]->str == "set") {
@@ -3320,6 +3515,19 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					term = std::make_unique<AstNode>(location, AST_LOGIC_AND,
 							std::make_unique<AstNode>(location, AST_GE, lhs->clone(), std::move(lo)),
 							std::make_unique<AstNode>(location, AST_LE, lhs->clone(), std::move(hi)));
+			} else if (AstNode *arr = inside_unpacked_array(member.get())) {
+				// an unpacked array operand stands for its elements
+				// (`x inside {VALID}` with `localparam t VALID [N]`)
+				const auto &dim = arr->dimensions[0];
+				term = mkconst_int(location, 0, false);
+				for (int k = 0; k < dim.range_width; k++) {
+					auto elem = member->clone();
+					elem->children.push_back(std::make_unique<AstNode>(location, AST_RANGE,
+							mkconst_int(location, dim.range_right + k, true)));
+					while (elem->simplify(true, stage, -1, false)) { }
+					term = std::make_unique<AstNode>(location, AST_LOGIC_OR, std::move(term),
+							inside_eq(location, lhs.get(), std::move(elem)));
+				}
 			} else {
 				auto item = member->clone();
 				while (item->simplify(true, stage, -1, false)) { }
@@ -3407,6 +3615,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				port->type = AST_WIRE;
 			rewrite_unpacked_port_refs(this, port->str, w, port);
 		}
+		// a port that stays a memory (zero-size or non-constant dimension,
+		// e.g. a default configuration with zero requesters) is left a wire
+		// with its ranges, as a plain unpacked port is; a memory port
+		// crashed mem2reg
+		if (include_resolved)
+			for (auto &child : children)
+				if (child && child->port_id != 0 && child->type == AST_MEMORY)
+					child->type = AST_WIRE;
 		};
 
 	if (stage == 0)
@@ -5274,6 +5490,13 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 	// resolve types of wires
 	if (type == AST_WIRE || type == AST_MEMORY) {
+		// a typedef'd unpacked-array port (marked by the parser) resolves
+		// like an unpacked declaration; flatten_unpacked_ports(true) turns
+		// the memory back into a wide port wire after stage 1
+		if (type == AST_WIRE && is_custom_type && port_id != 0 && attributes.count(ID(sv_port_unpacked))) {
+			attributes.erase(ID(sv_port_unpacked));
+			type = AST_MEMORY;
+		}
 		if (is_custom_type) {
 			int wiretype_idx = -1;
 			for (int i = 0; i < GetSize(children); i++) {
@@ -5297,7 +5520,43 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			auto type_name = children[0]->str;
 			bool known_typedef = current_scope.count(type_name) && current_scope.at(type_name)->type == AST_TYPEDEF
 				&& !current_scope.at(type_name)->children.empty() && current_scope.at(type_name)->children[0];
-			if (!known_typedef) {
+			// A `string` variable (IEEE 1800-2017 6.16) that is only ever
+			// assigned string literals (typically a message tag) holds one
+			// of those values: model it as a vector as wide as the longest.
+			// Shorter literals zero-extend on the left, as literal operands
+			// do, so equality against them is exact. Any other assignment
+			// keeps the degradation below.
+			int string_width = -1;
+			if (!known_typedef && type_name == "\\string" && type == AST_WIRE && current_ast_mod && !str.empty()) {
+				bool only_literals = true;
+				int widest = 8;
+				std::function<void(AstNode *)> scan = [&](AstNode *n) {
+					if (!n || !only_literals)
+						return;
+					if ((n->type == AST_ASSIGN_EQ || n->type == AST_ASSIGN_LE || n->type == AST_ASSIGN) &&
+							n->children.size() >= 2 && n->children[0] && n->children[0]->type == AST_IDENTIFIER &&
+							n->children[0]->str == str) {
+						AstNode *rhs = n->children[1].get();
+						if (!n->children[0]->children.empty() || !rhs || rhs->type != AST_CONSTANT || !rhs->is_string)
+							only_literals = false;
+						else
+							widest = std::max(widest, GetSize(rhs->bits));
+					}
+					for (auto &c : n->children)
+						scan(c.get());
+				};
+				scan(current_ast_mod);
+				if (only_literals)
+					string_width = widest;
+			}
+			if (string_width > 0) {
+				is_custom_type = false;
+				children.erase(children.begin());
+				children.insert(children.begin(), make_range(location, string_width - 1, 0));
+				is_logic = true;
+				set_attribute(ID(sv_string), AstNode::mkconst_int(location, 1, false));
+				did_something = true;
+			} else if (!known_typedef) {
 				// The typedef often lives in a package this file did not elaborate.
 				// Keep any declared range and otherwise use a single logic bit.
 				degrade(location.to_loc(), "Unknown identifier `%s' used as type name; treating unresolved types as logic.\n", type_name.c_str());
@@ -5336,12 +5595,31 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 						size_packed_struct(template_node.get(), 0);
 					if (!template_node->range_valid)
 						input_error("Unsized struct/union type `%s' in unpacked array declaration.\n", type_name.c_str());
+					// [WIRETYPE, packed, unpacked...]: with more than one range
+					// the first is the packed dimension (`st_t [1:0] w [2]`),
+					// as in the generic path below
+					int first_unpacked = 1;
+					if (GetSize(children) > 2 && children[1] && children[1]->type == AST_RANGE) {
+						first_unpacked = 2;
+					} else if (GetSize(children) > 2 && children[1] && children[1]->type == AST_MULTIRANGE) {
+						input_error("Multiple packed dimensions on struct/union type `%s' in unpacked array declaration are not supported.\n", type_name.c_str());
+					}
+					int elem_w = std::abs(template_node->range_left - template_node->range_right) + 1;
 					newNode = std::make_unique<AstNode>(location, AST_MEMORY);
 					newNode->str = str;
 					newNode->is_logic = true;
 					newNode->port_id = port_id;
-					newNode->children.push_back(make_range(location, template_node->range_left, template_node->range_right));
-					for (int i = 1; i < GetSize(children); i++)
+					if (first_unpacked == 1)
+						newNode->children.push_back(make_range(location, template_node->range_left, template_node->range_right));
+					else {
+						// packed [n] x struct, shaped like `logic [n][w-1:0] m [..]`
+						// so `m[i][j]` selects a whole struct
+						auto multi = std::make_unique<AstNode>(location, AST_MULTIRANGE);
+						multi->children.push_back(children[1]->clone());
+						multi->children.push_back(make_range(location, elem_w - 1, 0));
+						newNode->children.push_back(std::move(multi));
+					}
+					for (int i = first_unpacked; i < GetSize(children); i++)
 						if (children[i] && (children[i]->type == AST_RANGE || children[i]->type == AST_MULTIRANGE))
 							newNode->children.push_back(children[i]->clone());
 					newNode->set_attribute(ID::wiretype, mkconst_str(newNode->location, resolved_type_node->str));
@@ -5363,7 +5641,22 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				if (type == AST_WIRE && GetSize(children) > 1 && children[1] &&
 						(children[1]->type == AST_RANGE || children[1]->type == AST_MULTIRANGE))
 					packed_dims = children[1].get();
-				newNode = make_packed_struct(template_node.get(), str, attributes, packed_dims);
+				// a typedef'd packed array of a struct (`typedef st_t [7:0]
+				// arr_t; arr_t x;`) is declared like `st_t [7:0] x`, so
+				// `x[i]` is an element and `x[i].m` its member
+				AstNode *struct_tmpl = template_node.get();
+				std::unique_ptr<AstNode> elem_dims;
+				if (struct_tmpl->attributes.count(ID(sv_elem_type)) && struct_tmpl->attributes.count(ID(sv_elem_range)) &&
+						struct_tmpl->attributes.at(ID(sv_elem_type))->range_valid) {
+					elem_dims = struct_tmpl->attributes.at(ID(sv_elem_range))->clone();
+					struct_tmpl = struct_tmpl->attributes.at(ID(sv_elem_type)).get();
+					if (packed_dims) {
+						auto merged = packed_dims->clone();
+						prepend_ranges(elem_dims, merged.get());
+					}
+					packed_dims = elem_dims.get();
+				}
+				newNode = make_packed_struct(struct_tmpl, str, attributes, packed_dims);
 				newNode->set_attribute(ID::wiretype, mkconst_str(newNode->location, resolved_type_node->str));
 				// add original input/output attribute to resolved wire
 				newNode->is_input = this->is_input;
@@ -5442,6 +5735,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 						newNode->set_attribute(ID(sv_elem_range), packed->clone());
 						newNode->set_attribute(ID(sv_elem_type), template_node->clone());
 					}
+					// a struct member is re-sized with its enclosing struct;
+					// a typedef (`typedef st_t [7:0] arr_t`) or a wire is
+					// not, and the clone still carries the one-element range
+					if (str.empty() || str[0] == '\\') {
+						newNode->range_valid = false;
+						newNode->dimensions.clear();
+						size_packed_struct(newNode.get(), 0);
+					}
 				} else {
 					auto& packed = children[1];
 					if (newNode->children.empty())
@@ -5454,6 +5755,12 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			// Add unpacked dimensions.
 			if (type == AST_MEMORY) {
 				auto& unpacked = children.back();
+				// a one-bit element type (`logic`) has no range child: give
+				// it [0:0] so the unpacked range does not land in the
+				// packed slot (a malformed memory that crashed mem2reg)
+				if (newNode->children.empty() || !newNode->children[0] ||
+						(newNode->children[0]->type != AST_RANGE && newNode->children[0]->type != AST_MULTIRANGE))
+					newNode->children.insert(newNode->children.begin(), make_range(location, 0, 0));
 				if (GetSize(newNode->children) < 2)
 					newNode->children.push_back(unpacked->clone());
 				else
@@ -5721,6 +6028,9 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			AstNode *missing = find_missing_autowire(child.get());
 			if (!missing)
 				continue;
+			if (missing->str.find("::") == std::string::npos && current_ast_mod &&
+					name_declared_in(current_ast_mod, missing->str))
+				continue;
 			degrade(child->location.to_loc(), "Range bound uses implicitly declared identifier `%s' from a missing package; using constant 0.\n", missing->str.c_str());
 			child = mkconst_int(child->location, 0, true);
 			fixup_hierarchy_flags();
@@ -5981,6 +6291,47 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					children[0] = std::move(pat);
 					did_something = true;
 				}
+			}
+		}
+		// a PACKED multi-dim parameter (`parameter logic [15:0][3:0] P =
+		// '{4'hF, 4'hA, ...}`, OpenTitan prim_cipher_pkg PRINCE_SHIFT_ROWS64)
+		// with a positional pattern: for a packed array that is the
+		// concatenation of the elements, leftmost element in the MSBs, each
+		// sized to the element width.  The pattern never folded to a
+		// constant (every read degraded: prim_prince, sram_ctrl FAIL@parse).
+		// Keyed / default patterns keep the loud path.
+		if (unpacked_dimensions == 0 && GetSize(dimensions) >= 2 && !children.empty() &&
+				children[0]->type == AST_ASSIGN_PATTERN) {
+			std::function<std::unique_ptr<AstNode>(AstNode *, int)> flat = [&](AstNode *pat, int d) -> std::unique_ptr<AstNode> {
+				if (d >= GetSize(dimensions) - 1 || pat->type != AST_ASSIGN_PATTERN)
+					return nullptr;
+				if (GetSize(pat->children) != dimensions[d].range_width)
+					return nullptr;
+				int ew = 1;
+				for (int i = d + 1; i < GetSize(dimensions); i++)
+					ew *= dimensions[i].range_width;
+				// AST_CONCAT keeps its children LSB first (reverse source
+				// order); a pattern lists them in source order
+				auto cat = std::make_unique<AstNode>(pat->location, AST_CONCAT);
+				for (auto it = pat->children.rbegin(); it != pat->children.rend(); ++it) {
+					auto &e = *it;
+					if (e->attributes.count(ID(sv_member)))
+						return nullptr;
+					std::unique_ptr<AstNode> v;
+					if (e->type == AST_ASSIGN_PATTERN) {
+						v = flat(e.get(), d + 1);
+						if (!v)
+							return nullptr;
+					} else
+						v = e->clone();
+					cat->children.push_back(std::make_unique<AstNode>(e->location, AST_CAST_SIZE,
+							mkconst_int(e->location, ew, true), std::move(v)));
+				}
+				return cat;
+			};
+			if (auto cat = flat(children[0].get(), 0)) {
+				children[0] = std::move(cat);
+				did_something = true;
 			}
 		}
 		// `'{default: v}` (possibly after explicit elements) for a 1-D
@@ -6663,11 +7014,24 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	// unroll for loops and generate-for blocks
 	if ((type == AST_GENFOR || type == AST_FOR) && children.size() != 0)
 	{
-		// Extra initializers and step assignments are not part of the unrolled index.
-		while (children.size() > 1 && children[0]->type == AST_ASSIGN_EQ && children[1]->type == AST_ASSIGN_EQ)
+		// Extra initializers and step assignments (`for (int i = 0, T t = a;
+		// ...; i++, t = f(t))`) are not part of the unrolled index: a
+		// procedural loop runs the extra initializers once before the
+		// first iteration and the extra steps after each body (they used
+		// to be dropped, leaving the extra variable undriven).
+		std::vector<std::unique_ptr<AstNode>> extra_inits, extra_steps;
+		while (children.size() > 1 && children[0]->type == AST_ASSIGN_EQ && children[1]->type == AST_ASSIGN_EQ) {
+			extra_inits.push_back(std::move(children[1]));
 			children.erase(children.begin() + 1);
-		while (children.size() > 4 && children[3]->type != AST_BLOCK && children[3]->type != AST_GENBLOCK)
+		}
+		while (children.size() > 4 && children[3]->type != AST_BLOCK && children[3]->type != AST_GENBLOCK) {
+			extra_steps.push_back(std::move(children[3]));
 			children.erase(children.begin() + 3);
+		}
+		if (type == AST_GENFOR) {
+			extra_inits.clear();
+			extra_steps.clear();
+		}
 
 		auto& init_ast = children[0];
 		auto& while_ast = children[1];
@@ -6771,6 +7135,8 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					current_block->children[current_block_idx].get() != current_block_child)
 				current_block_idx++;
 		}
+		for (auto &init : extra_inits)
+			current_block->children.insert(current_block->children.begin() + current_block_idx++, std::move(init));
 		size_t return_from = current_block_idx;
 		bool saw_iter_return = false;
 
@@ -6817,6 +7183,8 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			log_assert(body_ast->type == AST_GENBLOCK || body_ast->type == AST_BLOCK);
 			log_assert(!body_ast->str.empty());
 			buf = body_ast->clone();
+			for (auto &step : extra_steps)
+				buf->children.push_back(step->clone());
 
 			std::stringstream sstr;
 			sstr << buf->str << "[" << index << "].";
@@ -7553,7 +7921,12 @@ skip_memory_read:;
 			if (ch && (ch->attributes.count(ID(sv_member)) || ch->attributes.count(ID(sv_typekey))))
 				named = true;
 		AstNode *lhs_id = children[0].get();
-		if (named && lhs_id && lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
+		// a whole unpacked array of structs (`v = '{default: D}`) takes
+		// an array pattern; the struct members order only its elements
+		bool whole_array = lhs_id && lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
+				lhs_id->children.empty() &&
+				(lhs_id->id2ast->type == AST_MEMORY || lhs_id->id2ast->unpacked_dimensions > 0);
+		if (named && !whole_array && lhs_id && lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
 				lhs_id->id2ast->attributes.count(ID::wiretype)) {
 			AstNode *st = resolve_wiretype_struct(lhs_id->id2ast);
 			if (st && (st->type == AST_STRUCT || st->type == AST_UNION)) {
@@ -9293,6 +9666,14 @@ skip_memory_write:;
 			if (child->type != AST_WIRE && child->type != AST_MEMORY && child->type != AST_PARAMETER && child->type != AST_LOCALPARAM)
 				new_stmts.push_back(child->clone());
 
+		// A local's declaration initializer (`logic d = 1'b0;`) is parsed
+		// as an `initial` block; inlined, it would be hoisted to the module
+		// and act once at time zero, leaving the local x on every call
+		// (stock yosys rejects it as "Invalid nesting"). Run it in place as
+		// a blocking assignment (IEEE 1800-2017 13.4.2: an automatic
+		// function's variables are initialized on each call).
+		inline_function_initializers(new_stmts);
+
 		// return exits only the function. Later statements run on the other paths.
 		absorb_function_return(new_stmts);
 		strip_function_return(new_stmts);
@@ -9641,6 +10022,11 @@ apply_newNode:
 		log_assert(newNode != nullptr);
 		newNode->location.begin.filename = location.begin.filename;
 		newNode->location = location;
+		// assignment-pattern keys live on the value node; a value that is
+		// rewritten (e.g. a struct member access) must keep its key
+		for (auto key : {ID(sv_member), ID(sv_typekey), ID(sv_index)})
+			if (attributes.count(key) && !newNode->attributes.count(key))
+				newNode->attributes[key] = attributes.at(key)->clone();
 		newNode->cloneInto(*this);
 		fixup_hierarchy_flags();
 		did_something = true;

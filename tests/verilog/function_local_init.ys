@@ -1,0 +1,46 @@
+# A function local's declaration initializer runs on every call of an
+# inlined function (IEEE 1800-2017 13.4.2). It used to be hoisted to a
+# module-level initial, leaving the local x on each call (stock yosys
+# rejects it: "Invalid nesting of always blocks and/or initializations").
+read_verilog -sv <<EOT
+module top (input logic [2:0] s);
+  function automatic logic [3:0] add5(input logic [2:0] sig);
+    logic [3:0] k = 4'd5;
+    add5 = k + sig;
+  endfunction
+  function automatic logic not_one(logic [2:0] sig);
+    logic d = 1'b0;
+    d |= (sig == 3'd1);
+    return ~d;
+  endfunction
+  function automatic logic [3:0] nested(logic [2:0] sig);
+    logic [3:0] acc = 4'd1;
+    for (int i = 0; i < 3; i++) begin
+      logic [3:0] t = 4'd2;
+      if (sig[i]) acc = acc + t;
+    end
+    return acc;
+  endfunction
+  localparam logic [3:0] P = add5(3'd2);
+  logic [3:0] a_assign, a_comb, n_comb;
+  logic b_assign;
+  assign a_assign = add5(s);
+  assign b_assign = not_one(s);
+  always_comb begin
+    a_comb = add5(s);
+    n_comb = nested(s);
+  end
+  always_comb begin
+    assert (a_assign == 4'd5 + s);
+    assert (a_comb == 4'd5 + s);
+    assert (b_assign == (s != 3'd1));
+    assert (n_comb == 4'd1 + 4'd2 * (s[0] + s[1] + s[2]));
+    assert (P == 4'd7);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

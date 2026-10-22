@@ -1,0 +1,33 @@
+# Enum methods on a block-local enum variable (a for-init declaration in an
+# inlined function), and in the default elaboration of a module whose type
+# parameter defaults to a plain vector (OpenTitan prim_sparse_fsm_flop
+# `is_undefined_state`): the unoverridden type enumerates all its values.
+read_verilog -sv <<EOT
+module fl #(parameter int Width = 3, parameter type StateEnumT = logic [Width-1:0])
+    (input StateEnumT s, output logic u);
+  assign u = is_undefined_state(s);
+  function automatic logic is_undefined_state(StateEnumT sig);
+    logic is_defined = 1'b0;
+    for (int i = 0, StateEnumT t = t.first(); i < t.num(); i += 1, t = t.next()) begin
+      is_defined |= (sig === t);
+    end
+    return ~is_defined;
+  endfunction
+endmodule
+module top (input logic [2:0] s);
+  typedef enum logic [2:0] { A = 3'd1, B = 3'd4, C = 3'd6 } st_e;
+  logic u_enum, u_dflt;
+  fl #(.Width(3), .StateEnumT(st_e)) f (.s(st_e'(s)), .u(u_enum));
+  fl #(.Width(3)) g (.s(s), .u(u_dflt));
+  always_comb begin
+    assert (u_enum == !(s == 3'd1 || s == 3'd4 || s == 3'd6));
+    assert (u_dflt == 1'b0);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

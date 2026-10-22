@@ -1,0 +1,40 @@
+# A typedef'd packed array of a struct (`typedef e_t [3:0] arr_t`) is
+# N elements wide, not one (it used to resolve to the element width, so a
+# port or wire of that type silently dropped the upper elements), and
+# `x[i].member` selects the member of element i (OpenTitan otbn_mai
+# `ma_mod[0].word`).
+read_verilog -sv <<EOT
+package pk;
+  parameter int E = 3;
+  typedef struct packed { logic [E-1:0] a; logic [4:0] b; } e_t;
+  typedef e_t [3:0] arr_t;
+  typedef struct packed { logic h; arr_t f; logic [1:0] t; } s_t;
+endpackage
+module child import pk::*; (input arr_t x, output logic [7:0] y);
+  assign y = x[2];
+endmodule
+module top import pk::*; (input arr_t in_i, input s_t s);
+  arr_t m;
+  logic [7:0] y;
+  logic [31:0] f;
+  assign m = in_i;
+  assign f = in_i;
+  child u (.x(m), .y(y));
+  always_comb begin
+    assert ($bits(m) == 32);
+    assert (m[3] == f[31:24]);
+    assert (m[2:1] == f[23:8]);
+    assert (m[0].b == f[4:0]);
+    assert (m[3].a == f[31:29]);
+    assert (y == f[23:16]);
+    assert (s.f[1].b == s[14:10]);
+    assert (s.t == s[1:0]);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

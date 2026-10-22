@@ -1304,6 +1304,12 @@ module_arg:
 			// Unpacked array ports stay wires with an unpacked range child;
 			// the shared array-access machinery flattens them. Rewriting the
 			// port into an AST_MEMORY would drop its port-ness before RTLIL.
+			// With a type name the unpacked range would sit where a packed
+			// one goes; mark the port so type resolution reads it as an
+			// unpacked declaration (`st_t p [2]` is 2 elements, not packed
+			// [2:2]; `st_t [1:0] p [2]` keeps its packed dimension).
+			if (!iface_type.empty() && node->type != AST_INTERFACEPORT)
+				node->set_attribute(ID(sv_port_unpacked), AstNode::mkconst_int(@5, 1, false));
 			node->children.push_back(std::move($5));
 			node->fixup_hierarchy_flags();
 		}
@@ -4511,8 +4517,12 @@ for_init_extra:
 		wire->str = *$4;
 		wire->is_logic = true;
 		AstNode *parent = extra->ast_stack.at(extra->ast_stack.size() - 2);
+		// declared ahead of the loop, like the loop variable: its
+		// initializer runs before the first iteration
 		if (!parent->children.empty() && parent->children.back()->type == AST_BLOCK)
-			parent->children.back()->children.push_back(std::move(wire));
+			parent->children.back()->children.insert(parent->children.back()->children.begin(), std::move(wire));
+		else if (!parent->children.empty())
+			parent->children.insert(parent->children.end() - 1, std::move(wire));
 		else
 			parent->children.push_back(std::move(wire));
 		auto ident = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
@@ -4520,14 +4530,21 @@ for_init_extra:
 		extra->ast_stack.back()->children.push_back(std::make_unique<AstNode>(@$, AST_ASSIGN_EQ, std::move(ident), std::move($6)));
 	} |
 	for_init_extra TOK_COMMA integer_atom_type TOK_ID TOK_EQ expr {
+		// a variable (not a net) of the atom type's width, like the
+		// loop variable declared through non_io_wire_type
 		auto wire = std::make_unique<AstNode>(@$, AST_WIRE);
 		wire->str = *$4;
-		wire->range_left = $3 - 1;
-		wire->range_right = 0;
+		wire->is_logic = true;
 		wire->is_signed = true;
+		wire->children.push_back(std::make_unique<AstNode>(@3, AST_RANGE,
+				AstNode::mkconst_int(@3, $3 - 1, true), AstNode::mkconst_int(@3, 0, true)));
 		AstNode *parent = extra->ast_stack.at(extra->ast_stack.size() - 2);
+		// declared ahead of the loop, like the loop variable: its
+		// initializer runs before the first iteration
 		if (!parent->children.empty() && parent->children.back()->type == AST_BLOCK)
-			parent->children.back()->children.push_back(std::move(wire));
+			parent->children.back()->children.insert(parent->children.back()->children.begin(), std::move(wire));
+		else if (!parent->children.empty())
+			parent->children.insert(parent->children.end() - 1, std::move(wire));
 		else
 			parent->children.push_back(std::move(wire));
 		auto ident = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
@@ -4539,8 +4556,12 @@ for_init_extra:
 		wire->str = *$4;
 		extra->addWiretypeNode($3.get(), wire.get());
 		AstNode *parent = extra->ast_stack.at(extra->ast_stack.size() - 2);
+		// declared ahead of the loop, like the loop variable: its
+		// initializer runs before the first iteration
 		if (!parent->children.empty() && parent->children.back()->type == AST_BLOCK)
-			parent->children.back()->children.push_back(std::move(wire));
+			parent->children.back()->children.insert(parent->children.back()->children.begin(), std::move(wire));
+		else if (!parent->children.empty())
+			parent->children.insert(parent->children.end() - 1, std::move(wire));
 		else
 			parent->children.push_back(std::move(wire));
 		auto ident = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
@@ -4552,8 +4573,12 @@ for_init_extra:
 		wire->str = *$4;
 		extra->addWiretypeNode($3.get(), wire.get());
 		AstNode *parent = extra->ast_stack.at(extra->ast_stack.size() - 2);
+		// declared ahead of the loop, like the loop variable: its
+		// initializer runs before the first iteration
 		if (!parent->children.empty() && parent->children.back()->type == AST_BLOCK)
-			parent->children.back()->children.push_back(std::move(wire));
+			parent->children.back()->children.insert(parent->children.back()->children.begin(), std::move(wire));
+		else if (!parent->children.empty())
+			parent->children.insert(parent->children.end() - 1, std::move(wire));
 		else
 			parent->children.push_back(std::move(wire));
 		auto ident = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
@@ -5061,6 +5086,56 @@ behavioral_stmt:
 		SET_AST_NODE_LOC(extra->ast_stack.back(), @14, @14);
 		extra->ast_stack.pop_back();
 		SET_AST_NODE_LOC(extra->ast_stack.back(), @2, @14);
+		// `for (int i = 0, T t = a; i < n; i++, t = f(t))`: keep the loop
+		// node at [init, cond, step, body] (simplify resolves only the
+		// first three as the loop header). The extra initializers run once
+		// before the loop, the extra steps at the end of each body.
+		AstNode *loop = extra->ast_stack.back();
+		int nch = GetSize(loop->children);
+		int n_inits = 0;
+		while (1 + n_inits < nch - 1 && loop->children[1 + n_inits]->type == AST_ASSIGN_EQ)
+			n_inits++;
+		// [init, inits..., cond, step, steps..., body]
+		int step_at = 1 + n_inits + 1;
+		int n_steps = nch - 1 - step_at - 1;
+		if (n_inits > 0 || n_steps > 0) {
+			AstNode *body = loop->children.back().get();
+			if (n_steps > 0) {
+				std::function<bool(AstNode *)> has_continue = [&](AstNode *n) {
+					if (n->type == AST_TCALL && n->str == "\\continue")
+						return true;
+					if (n->type == AST_FOR || n->type == AST_WHILE || n->type == AST_REPEAT)
+						return false;
+					for (auto &c : n->children)
+						if (c && has_continue(c.get()))
+							return true;
+					return false;
+				};
+				if (has_continue(body))
+					err_at_loc(@2, "`continue' in a for-loop with more than one step assignment is not supported.");
+				for (int k = 0; k < n_steps; k++)
+					body->children.push_back(std::move(loop->children[step_at + 1 + k]));
+				loop->children.erase(loop->children.begin() + step_at + 1, loop->children.begin() + step_at + 1 + n_steps);
+			}
+			std::vector<std::unique_ptr<AstNode>> inits;
+			for (int k = 0; k < n_inits; k++)
+				inits.push_back(std::move(loop->children[1 + k]));
+			loop->children.erase(loop->children.begin() + 1, loop->children.begin() + 1 + n_inits);
+			// the loop's container: the $fordecl_block wrapper or the
+			// enclosing statement list
+			AstNode *parent = extra->ast_stack.at(extra->ast_stack.size() - 2);
+			AstNode *container = parent;
+			if (!parent->children.empty() && parent->children.back().get() != loop &&
+					parent->children.back()->type == AST_BLOCK && !parent->children.back()->children.empty() &&
+					parent->children.back()->children.back().get() == loop)
+				container = parent->children.back().get();
+			auto at = container->children.end() - 1;
+			log_assert(at->get() == loop);
+			for (auto &init : inits) {
+				init->set_in_param_flag(false);
+				at = container->children.insert(at, std::move(init)) + 1;
+			}
+		}
 		extra->ast_stack.pop_back();
 	} |
 	attr TOK_DO {

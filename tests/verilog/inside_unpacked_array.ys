@@ -1,0 +1,36 @@
+# An unpacked array in an `inside` set stands for its elements
+# (IEEE 1800-2017 11.4.13; OpenTitan bkdr_loader
+# `idx inside {BkdrValidTgts}` with `localparam bkdr_idx_e BkdrValidTgts [N]`).
+read_verilog -sv <<EOT
+package bp;
+  typedef enum logic [2:0] { A = 3'd0, B = 3'd2, C = 3'd5 } idx_e;
+  parameter int unsigned N = 3;
+  localparam idx_e Valid [N] = '{A, B, C};
+endpackage
+module top import bp::*; (input logic [2:0] s, input logic [2:0] w0, input logic [2:0] w1);
+  logic [2:0] mem [2];
+  logic in_p, in_m, in_mix, in_case;
+  assign mem[0] = w0;
+  assign mem[1] = w1;
+  assign in_p = idx_e'(s) inside {Valid};
+  assign in_m = s inside {mem};
+  assign in_mix = idx_e'(s) inside {idx_e'(3'd7), Valid};
+  always_comb begin
+    case (s) inside
+      Valid: in_case = 1'b1;
+      default: in_case = 1'b0;
+    endcase
+  end
+  always_comb begin
+    assert (in_p == (s == 3'd0 || s == 3'd2 || s == 3'd5));
+    assert (in_m == (s == w0 || s == w1));
+    assert (in_mix == (in_p || s == 3'd7));
+    assert (in_case == in_p);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

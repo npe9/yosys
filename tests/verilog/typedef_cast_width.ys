@@ -1,0 +1,35 @@
+# A cast to a package typedef (`st_e'(x)`) has the type's width. It was
+# normalized with mkconst_int(loc, 32, width): every such cast was 32 bits
+# ($bits 32, replication {2{st_e'(x)}} misplaced), and a one-bit typedef
+# (`typedef enum logic {...} dir_e;`, OpenTitan spi_device payload_dir_e)
+# had no width at all ("Static cast with non constant expression").
+read_verilog -sv <<EOT
+package p;
+  typedef enum logic [2:0] { A = 3'd1, B = 3'd4 } st_e;
+  typedef enum logic { In = 1'b0, Out = 1'b1 } dir_e;
+  typedef struct packed { logic [1:0] a; logic [2:0] b; } s_t;
+endpackage
+module top (input logic [2:0] x, input logic [1:0] q);
+  import p::*;
+  logic [7:0] rep;
+  logic [31:0] w3, w1, w5;
+  logic d;
+  assign rep = {2{st_e'(x)}};
+  assign w3 = $bits(st_e'(x));
+  assign w1 = $bits(dir_e'(q[1]));
+  assign w5 = $bits(s_t'(x));
+  assign d = dir_e'(q[1]);
+  always_comb begin
+    assert (rep == {2'b00, x, x});
+    assert (w3 == 3);
+    assert (w1 == 1);
+    assert (w5 == 5);
+    assert (d == q[1]);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

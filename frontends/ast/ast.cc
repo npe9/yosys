@@ -356,6 +356,14 @@ void AstNode::cloneInto(AstNode &other, std::unordered_map<const AstNode *, AstN
 	other.in_param = in_param;
 	// Keep in_lvalue_from_above and in_param_from_above untouched
 
+	// Assignment-pattern keys name the target's slot in its pattern, not
+	// the value: a value rewritten in place (a struct member access, an
+	// inlined function call) keeps its key unless the source has its own.
+	std::vector<std::pair<RTLIL::IdString, std::unique_ptr<AstNode>>> pattern_keys;
+	for (auto key : {ID(sv_member), ID(sv_typekey), ID(sv_index)})
+		if (other.attributes.count(key) && !attributes.count(key))
+			pattern_keys.emplace_back(key, std::move(other.attributes.at(key)));
+
 	other.delete_children();
 	if (clonemap) {
 		for (auto& child : this->children) {
@@ -369,6 +377,8 @@ void AstNode::cloneInto(AstNode &other, std::unordered_map<const AstNode *, AstN
 	}
 	for (auto& [key, val] : this->attributes)
 		other.attributes[key] = (val->clone());
+	for (auto &[key, val] : pattern_keys)
+		other.attributes[key] = std::move(val);
 	 // fixup to set flags on cloned children
 	other.fixup_hierarchy_flags();
 }

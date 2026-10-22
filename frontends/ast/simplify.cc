@@ -3935,6 +3935,15 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				// Find the package in the design
 				AstNode *package_node = nullptr;
 
+				// an import inside a package is prefixed with that package's
+				// name like its other declarations (`\\devp::regp`); package
+				// names have no `::`, so the imported package is the last part
+				{
+					size_t sep = child->str.rfind("::");
+					if (sep != std::string::npos)
+						child->str = "\\" + child->str.substr(sep + 2);
+				}
+
 				// First look in current_ast->children (for packages in same file)
 				if (current_ast != nullptr) {
 					for (auto &design_child : current_ast->children) {
@@ -5073,11 +5082,18 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			if (tmpl->type == AST_WIRE || tmpl->type == AST_ENUM) {
 				if (tmpl->children.size() > 0 && tmpl->children[0]->type == AST_RANGE)
 					width = range_width(this, tmpl->children[0].get());
+				else if (tmpl->range_valid)
+					width = std::abs(tmpl->range_left - tmpl->range_right) + 1;
+				else if (tmpl->children.empty() || tmpl->type == AST_ENUM)
+					// `typedef enum logic { ... } e;` / `typedef logic t;`: one bit
+					width = 1;
 			} else if (tmpl->type == AST_STRUCT || tmpl->type == AST_UNION) {
 				width = size_packed_struct(tmpl, 0);
 			}
 			if (width >= 1) {
-				children[0] = mkconst_int(children[0]->location, 32, width);
+				// the cast size is the type's width (this was
+				// mkconst_int(loc, 32, width): every such cast was 32 bits)
+				children[0] = mkconst_int(children[0]->location, width, true);
 				did_something = true;
 			}
 		}
@@ -8033,26 +8049,30 @@ skip_memory_read:;
 				lhs_id->children.empty() &&
 				(lhs_id->id2ast->type == AST_MEMORY || lhs_id->id2ast->unpacked_dimensions > 0);
 		if (named && !whole_array && lhs_id && lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
-				lhs_id->id2ast->attributes.count(ID::wiretype)) {
-			AstNode *st = resolve_wiretype_struct(lhs_id->id2ast);
+				(lhs_id->attributes.count(ID::wiretype) || lhs_id->id2ast->attributes.count(ID::wiretype))) {
+			// a member target (`assign hw2reg.tpm_cap = '{...}`, OpenTitan
+			// reg-top connections) is a slice of the struct wire by now; the
+			// member rewrite leaves the member's type on the identifier
+			AstNode *st = lhs_id->attributes.count(ID::wiretype) ? resolve_wiretype_struct(lhs_id)
+					: resolve_wiretype_struct(lhs_id->id2ast);
+			auto bare = [](std::string s) {
+				if (!s.empty() && s[0] == '\\')
+					s = s.substr(1);
+				return s;
+			};
+			auto lookup_struct = [&](const std::string &tname) -> AstNode * {
+				AstNode *td = current_scope.count(tname) ? current_scope.at(tname) : nullptr;
+				if (!td && current_ast) {
+					for (auto &node : current_ast->children)
+						if (node && node->type == AST_TYPEDEF && node->str == tname)
+							td = node.get();
+				}
+				if (td && td->type == AST_TYPEDEF && !td->children.empty() &&
+						(td->children[0]->type == AST_STRUCT || td->children[0]->type == AST_UNION))
+					return td->children[0].get();
+				return nullptr;
+			};
 			if (st && (st->type == AST_STRUCT || st->type == AST_UNION)) {
-				auto bare = [](std::string s) {
-					if (!s.empty() && s[0] == '\\')
-						s = s.substr(1);
-					return s;
-				};
-				auto lookup_struct = [&](const std::string &tname) -> AstNode * {
-					AstNode *td = current_scope.count(tname) ? current_scope.at(tname) : nullptr;
-					if (!td && current_ast) {
-						for (auto &node : current_ast->children)
-							if (node && node->type == AST_TYPEDEF && node->str == tname)
-								td = node.get();
-					}
-					if (td && td->type == AST_TYPEDEF && !td->children.empty() &&
-							(td->children[0]->type == AST_STRUCT || td->children[0]->type == AST_UNION))
-						return td->children[0].get();
-					return nullptr;
-				};
 				std::function<void(AstNode *, AstNode *)> order_pat = [&](AstNode *pattern, AstNode *stype) {
 					dict<std::string, AstNode*> by_name;
 					AstNode *fallback = nullptr;
@@ -8083,7 +8103,8 @@ skip_memory_read:;
 						if (!src) {
 							// IEEE 1800-2009 10.9: members without an assignment
 							// get the default value of their type.
-							degrade(item->location.to_loc(), "Named assignment pattern leaves member `%s' unassigned; using default value.\n", item->str.c_str());
+							degrade(item->location.to_loc(), "Named assignment pattern at %s leaves member `%s' unassigned; using default value.\n",
+									pattern->location.to_string().c_str(), item->str.c_str());
 							int member_width = 1;
 							if (item->range_valid)
 								member_width = std::abs(item->range_left - item->range_right) + 1;
@@ -9815,7 +9836,15 @@ skip_memory_write:;
 
 	replace_fcall_with_id:
 		if (type == AST_FCALL) {
+			// delete_children() also drops the attributes; a call that is
+			// the value of a named pattern element keeps its member key
+			std::vector<std::pair<RTLIL::IdString, std::unique_ptr<AstNode>>> pattern_keys;
+			for (auto key : {ID(sv_member), ID(sv_typekey), ID(sv_index)})
+				if (attributes.count(key))
+					pattern_keys.emplace_back(key, std::move(attributes.at(key)));
 			delete_children();
+			for (auto &[key, val] : pattern_keys)
+				attributes[key] = std::move(val);
 			type = AST_IDENTIFIER;
 			str = prefix_id(prefix, "$result");
 		}
@@ -10128,11 +10157,7 @@ apply_newNode:
 		log_assert(newNode != nullptr);
 		newNode->location.begin.filename = location.begin.filename;
 		newNode->location = location;
-		// assignment-pattern keys live on the value node; a value that is
-		// rewritten (e.g. a struct member access) must keep its key
-		for (auto key : {ID(sv_member), ID(sv_typekey), ID(sv_index)})
-			if (attributes.count(key) && !newNode->attributes.count(key))
-				newNode->attributes[key] = attributes.at(key)->clone();
+		// (cloneInto keeps this node's assignment-pattern key)
 		newNode->cloneInto(*this);
 		fixup_hierarchy_flags();
 		did_something = true;

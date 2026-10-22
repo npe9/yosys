@@ -1,0 +1,58 @@
+# A named assignment pattern whose value is a function call (OpenTitan
+# tlul_socket_1n `cmd_intg: tlul_pkg::get_bad_cmd_intg(tl_t_o)`): inlining
+# replaced the call with the result wire through delete_children(), which
+# also dropped the member key ("leaves member unassigned").
+# And a pattern assigned to a struct MEMBER (`assign hw2reg.tpm_cap =
+# '{...}`, OpenTitan spi_device) has the member's type, not the whole
+# struct's.
+read_verilog -sv <<EOT
+package p;
+  typedef struct packed { logic [3:0] a; logic [6:0] b; logic c; } u_t;
+  function automatic logic [6:0] badb(logic [3:0] x);
+    logic [6:0] t;
+    t = {3'b0, x};
+    return ~t;
+  endfunction
+endpackage
+module top (input logic [3:0] x);
+  p::u_t u, v;
+  assign u = '{ b: p::badb(x), a: x, c: 1'b1 };
+  always_comb v = '{ c: 1'b0, b: p::badb(~x), a: ~x };
+  always_comb begin
+    assert (u == {x, ~{3'b0, x}, 1'b1});
+    assert (v == {~x, ~{3'b0, ~x}, 1'b0});
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports
+design -reset
+read_verilog -sv <<EOT
+typedef struct packed { logic de; logic [3:0] d; } fld_t;
+typedef struct packed { fld_t rev; fld_t loc; } cap_t;
+typedef struct packed { logic [1:0] intr_state; cap_t tpm_cap; logic z; } h2r_t;
+module top (input logic [3:0] a, input logic [3:0] b);
+  h2r_t hw2reg;
+  assign hw2reg.intr_state = 2'b01;
+  assign hw2reg.z = 1'b0;
+  assign hw2reg.tpm_cap = '{
+    loc: '{ de: 1'b0, d: b },
+    rev: '{ de: 1'b1, d: a }
+  };
+  always_comb begin
+    assert (hw2reg.tpm_cap.rev.d == a);
+    assert (hw2reg.tpm_cap.rev.de == 1'b1);
+    assert (hw2reg.tpm_cap.loc.d == b);
+    assert (hw2reg.tpm_cap.loc.de == 1'b0);
+    assert (hw2reg == {2'b01, 1'b1, a, 1'b0, b, 1'b0});
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

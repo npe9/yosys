@@ -128,6 +128,11 @@ def check_covers(yosys, smtbmc, path, top, solver, bound, timeout):
     except subprocess.TimeoutExpired:
         print("%s: smtbmc cover pass timed out after %ds" % (label, timeout))
         return False
+    if p.returncode in (126, 127):
+        # the exec of smtbmc itself failed (e.g. no yosys-smtbmc next to a
+        # wrapper --yosys): an infrastructure error, not "not reached"
+        print("%s: cover pass: cannot run %s (exit %d)" % (label, smtbmc, p.returncode))
+        return False
     reached = {}
     for line in (p.stdout + p.stderr).splitlines():
         m = re.search(r"Reached cover statement in step (\d+) at \S+: (\S+)", line)

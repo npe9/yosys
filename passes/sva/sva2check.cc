@@ -40,12 +40,20 @@
 //     open = antecedent end (|=> delayed one tick onto the first window
 //     tick); FLAVOR "liveness", A = !pend || b (ic3: bad = pend && !b).
 //     Locals and named-decls reject as in v1
-//   v1 multi-clock: the direct consequent of |->/|=> may be a `clocked`
-//     sub-sequence on a different clock (optionally under strong/weak):
-//     it compiles as its own monitor island on the inner clock, started by
-//     the antecedent end/start pulse; the enclosing $check keeps EN=1'b1
-//     and carries no CLK attributes (checked at every formal step; use the
-//     clk2fflogic prep so both islands advance under interleaving semantics)
+//   multi-clock (requires -clk2fflogic and the clk2fflogic prep): the
+//     direct consequent of |->/|=> may be a `clocked` sub-sequence on a
+//     different clock (optionally under strong/weak): it compiles as its
+//     own monitor island on the inner clock.  The handoff and the island
+//     verdict run on global-clock FFs: an antecedent match is its step k-1
+//     value at an outer edge at k; |=> obligations wait for the next
+//     strictly later inner tick, |-> ones that coincide with an inner tick
+//     start there on a speculative island masked by whether the outer edge
+//     did coincide.  Cross-clock `s.matched` holds the source match until
+//     the next tick of the reading check's clock.  The enclosing $check
+//     keeps EN=1'b1 and carries no CLK attributes.
+//   -clk2fflogic: every verdict is gated on its clock edge with sampled
+//     (previous-step) values; without it each formal step is a tick of
+//     every clock (async2sync).
 // Rejected with a clear message: any other multi-clock element (mid-sequence
 //   or antecedent `clocked`, `clocked` under throughout/within/first_match,
 //   or_event/bare-identifier clocking events, instance bodies), unbounded
@@ -94,6 +102,30 @@ static SigSpec sigset(SigSpec s, int i, SigBit b)
 	for (int k = 0; k < s.size(); k++)
 		v.push_back(k == i ? b : s[k]);
 	return SigSpec(v);
+}
+
+// -clk2fflogic helpers: global-clock registers (a $ff steps every formal
+// step and clk2fflogic leaves it alone).  gclk_edge is the clock's active
+// edge at this step (the past copy's init keeps a clock that starts at its
+// active level from faking an edge at step 0, as clk2fflogic's own); gclk_past
+// is the previous step's value -- the LRM sampled value of a tick at this
+// step under clk2fflogic's step semantics.
+static SigSpec gclk_edge(Module *mod, SigBit ck, bool pos)
+{
+	Wire *pw = mod->addWire(NEW_ID);
+	pw->attributes[ID::init] = RTLIL::Const(pos ? State::S1 : State::S0, 1);
+	mod->addFf(NEW_ID, ck, pw);
+	SigSpec now = pos ? SigSpec(ck) : mod->Not(NEW_ID, ck);
+	SigSpec prev = pos ? mod->Not(NEW_ID, SigSpec(pw)) : SigSpec(pw);
+	return mod->And(NEW_ID, now, prev);
+}
+
+static SigSpec gclk_past(Module *mod, SigSpec d, State init)
+{
+	Wire *w = mod->addWire(NEW_ID, d.size());
+	w->attributes[ID::init] = Const(init, d.size());
+	mod->addFf(NEW_ID, d, w);
+	return w;
 }
 
 struct SvaCompiler {
@@ -176,6 +208,8 @@ struct SvaCompiler {
 	// opt-in for asserts (-early: same verdicts, LRM failure ticks, but
 	// one monitor copy per attempt slot -- ~100x on ic3 proofs)
 	bool early_fail = false;
+	// sva2check -clk2fflogic: verdicts gated on clock edges (see execute)
+	bool c2f = false;
 	std::vector<std::string> approx_kinds;
 	void approx(const std::string &kind, const std::string &where)
 	{
@@ -593,10 +627,69 @@ struct SvaCompiler {
 	// `lowered` is shared by the per-check compilers of one module: a wire
 	// an earlier check connected is skipped here, not reported as driven
 	// (the warning fired once per later check on every method wire)
-	void lower_sequence_methods(pool<Wire *> &lowered)
+	void lower_sequence_methods(pool<Wire *> &lowered, Cell *check_root)
 	{
-		if (!decls || decls->empty())
+		bool have_decls = decls && !decls->empty();
+		// candidates first: most modules have no method wire at all
+		std::vector<Wire *> scan;
+		for (auto w : mod->wires()) {
+			const std::string &nm = w->name.str();
+			if ((nm.size() > 8 && nm.compare(nm.size() - 8, 8, ".matched") == 0) ||
+					(nm.size() > 10 && nm.compare(nm.size() - 10, 10, ".triggered") == 0))
+				scan.push_back(w);
+		}
+		if (scan.empty())
 			return;
+		// wires the current check reads: its $sva tree's ports and their
+		// fanin through ordinary logic (`!q.matched` is a $not).  Built on
+		// demand -- only a cross-clock .matched needs it.
+		pool<Wire *> cone;
+		bool cone_built = false;
+		auto reads = [&](Wire *w) -> bool {
+			if (!cone_built) {
+				cone_built = true;
+				dict<SigBit, std::vector<Cell *>> drv;
+				for (auto c : mod->cells())
+					if (c->type != ID($sva) && c->type != ID($check))
+						for (auto &conn : c->connections())
+							if (c->output(conn.first))
+								for (auto bit : conn.second)
+									if (bit.is_wire())
+										drv[bit].push_back(c);
+				std::vector<SigBit> work;
+				pool<Cell *> tseen;
+				std::function<void(Cell *)> walk = [&](Cell *c) {
+					if (!c || !tseen.insert(c).second)
+						return;
+					for (auto &conn : c->connections()) {
+						for (auto bit : conn.second)
+							if (bit.is_wire())
+								work.push_back(bit);
+						walk(child_cell(conn.second));
+					}
+					// a named property/sequence instance reads its
+					// declaration body (reached by name, not by port)
+					if (Cell *d = decl_by_name(sva_op(c)))
+						walk(d);
+				};
+				walk(check_root);
+				pool<SigBit> bseen;
+				while (!work.empty()) {
+					SigBit b = work.back();
+					work.pop_back();
+					if (!bseen.insert(b).second)
+						continue;
+					cone.insert(b.wire);
+					for (auto c : drv[b])
+						for (auto &conn : c->connections())
+							if (c->input(conn.first))
+								for (auto bit : conn.second)
+									if (bit.is_wire())
+										work.push_back(bit);
+				}
+			}
+			return cone.count(w) > 0;
+		};
 		pool<Wire *> driven;
 		for (auto c : mod->cells())
 			for (auto &conn : c->connections())
@@ -608,10 +701,17 @@ struct SvaCompiler {
 			for (auto bit : conn.first)
 				if (bit.is_wire())
 					driven.insert(bit.wire);
-		std::vector<Wire *> scan(mod->wires().begin(), mod->wires().end());
 		for (Wire *w : scan) {
-			if (lowered.count(w))
+			if (lowered.count(w)) {
+				if (w->attributes.count(ID(sva_matched_dest))) {
+					std::string here = stringf("%s%s", clk_pos ? "posedge " : "negedge ", log_signal(clk));
+					std::string there = w->attributes.at(ID(sva_matched_dest)).decode_string();
+					if (here != there && reads(w))
+						log_error("sva2check: cross-clock `%s' is read by checks on different clocks (%s, %s); "
+								"not supported.\n", log_id(w), there.c_str(), here.c_str());
+				}
 				continue;
+			}
 			std::string nm = w->name.str();
 			for (int m = 0; m < 2; m++) {
 				const char *suf = m ? ".matched" : ".triggered";
@@ -621,13 +721,81 @@ struct SvaCompiler {
 				std::string base = nm.substr(0, nm.size() - sl);
 				if (!base.empty() && base[0] == '\\')
 					base = base.substr(1);
-				if (!decls->count(base))
+				if (!have_decls || !decls->count(base)) {
+					// an undriven method wire is a free variable in every
+					// engine: refuse it when this check reads it (an
+					// opt_clean before sva2check deletes unreferenced
+					// declaration cells; `prep; sva2check' did exactly that)
+					// a hierarchical reference (sva2check runs before
+					// flatten) to a submodule signal that happens to be
+					// named `triggered'/`matched' is undriven here too
+					bool hier = base.find('.') != std::string::npos ||
+							mod->cell(RTLIL::escape_id(base)) != nullptr;
+					if (!hier && !driven.count(w) && reads(w))
+						log_error("sva2check: `%s' is a sequence method of `%s', which has no declaration here "
+									"(run sva2check before opt_clean/prep: they delete unreferenced declarations).\n",
+								nm.c_str(), base.c_str());
 					break;
+				}
 				if (driven.count(w)) {
 					log_warning("Wire `%s' matches sequence method syntax but is driven; using the wire.\n", nm.c_str());
 					break;
 				}
-				mod->connect(w, inline_decl((*decls)[base], {}, false,
+				// a declaration clocked on another clock (`sequence q;
+				// @(posedge c1) ...`) used to be inlined on THIS check's
+				// clock, its own clock dropped: cross-clock `.matched` read
+				// the source sequence at the wrong ticks with no
+				// synchronization (2026-10-22, tmc_c2f.sv)
+				Cell *decl = (*decls)[base];
+				auto ddp = ports_of(decl);
+				Cell *droot = ddp.empty() ? nullptr : child_cell(decl->getPort(ddp[0]));
+				SigSpec sclk;
+				bool spos = true;
+				if (droot && sva_op(droot) == "clocked" && clocked_event(droot, sclk, spos) &&
+						(sclk[0] != clk[0] || spos != clk_pos)) {
+					// synchronized to the clock of the check that reads it:
+					// left for that check (an unread one stays undriven)
+					if (!reads(w))
+						break;
+					if (!m)
+						log_error("sva2check: `%s' reads .triggered of a sequence on another clock; "
+								"LRM 16.14.5 synchronizes clocks with .matched.\n", nm.c_str());
+					if (!c2f)
+						log_error("sva2check: `%s' is a cross-clock .matched: it needs `sva2check -clk2fflogic' "
+								"and the clk2fflogic prep.\n", nm.c_str());
+					// LRM 16.14.5: the source match is stored until the
+					// first destination tick after it.  Source: the
+					// declaration attempted at every tick of its own
+					// clock; its end at tick k is the step k-1 value at a
+					// source edge (global-clock FFs, clk2fflogic step
+					// semantics).  A match in the step of a destination
+					// tick is seen by the next one (the destination samples
+					// before the match resolves).  The wire is read by the
+					// destination monitor at the step before its tick:
+					// held' = match || (held && !dedge).
+					SigBit saved_clk = clk;
+					bool saved_pos = clk_pos;
+					clk = sclk[0];
+					clk_pos = spos;
+					SigSpec end = inline_decl(decl, {}, false, Const(1, 1), Const(1, 1));
+					clk = saved_clk;
+					clk_pos = saved_pos;
+					SigSpec match = mod->And(NEW_ID, gclk_past(mod, end, State::S0), gclk_edge(mod, sclk[0], spos));
+					SigSpec dedge = gclk_edge(mod, clk, clk_pos);
+					Wire *hw = mod->addWire(NEW_ID);
+					hw->attributes[ID::init] = Const(0, 1);
+					SigSpec val = mod->Or(NEW_ID, match, mod->And(NEW_ID, hw, mod->Not(NEW_ID, dedge)));
+					mod->addFf(NEW_ID, val, hw);
+					mod->connect(w, val);
+					// the synchronization is to THIS check's clock; another
+					// check reading the same wire on a different clock
+					// would see the wrong destination ticks
+					w->attributes[ID(sva_matched_dest)] = Const(stringf("%s%s",
+							clk_pos ? "posedge " : "negedge ", log_signal(clk)));
+					lowered.insert(w);
+					break;
+				}
+				mod->connect(w, inline_decl(decl, {}, false,
 						Const(1, 1), Const(1, 1)));
 				lowered.insert(w);
 				break;
@@ -3092,98 +3260,193 @@ struct SvaCompiler {
 						Cell *cbc = child_cell(cbody);
 						if (cbc && !is_seq_op(sva_op(cbc)))
 							log_error("sva2check: multi-clock property element only supported as the direct consequent of |->/|=> in v1 (%s).\n", log_id(cc));
-						// delimit the start to the outer edges where it
-						// holds, persisted across the rest of the outer
-						// cycle (global-clock FFs: unaffected by
-						// clk2fflogic, which only rewrites clocked FFs)
+						// The handoff and the island verdict run on global-
+						// clock FFs (unaffected by clk2fflogic, which only
+						// rewrites clocked FFs) under the clk2fflogic step
+						// semantics: a tick at step k samples step k-1.
+						// LRM 16.14.2: |=> starts the consequent at the
+						// nearest STRICTLY future inner tick after the
+						// antecedent end; |-> at the nearest possibly
+						// overlapping one.  The v1 handoff got both wrong
+						// (2026-10-22, tmc_mcimpl.sv): its start level was
+						// c_start AND (outer edge OR hold) read at the
+						// current step, so a |-> antecedent had to stay true
+						// until the inner clock sampled it (a one-step
+						// antecedent was never seen: PROVED with the
+						// consequent constantly false), and the re-register
+						// on the inner clock checked a |=> consequent one
+						// inner tick late; the island fail was then read at
+						// every step (current values).  False proofs.
 						SigSpec oclk = clk;
 						bool opos = clk_pos;
-						Wire *pastw = wn("mcpastclk");
-						mod->addFf(NEW_ID, oclk, pastw);
-						// init so edge_prev is false at the init step:
-						// with pastw=0 a clock starting high at step 0
-						// false-triggers oedge while no wr-domain state
-						// ticks there, handing the island a match whose
-						// captured data does not exist yet (tmcloc1 data
-						// cex).  Matches clk2fflogic's own past-clk init.
-						pastw->attributes[ID::init] = RTLIL::Const(opos ? State::S1 : State::S0, 1);
-						SigSpec edge_now = opos ? oclk : mod->Not(NEW_ID, oclk);
-						SigSpec edge_prev = opos ? mod->Not(NEW_ID, SigSpec(pastw)) : SigSpec(pastw);
-						SigSpec oedge = mod->And(NEW_ID, edge_now, edge_prev);
-						Wire *holdw = wn("mchold");
-						mod->addFf(NEW_ID, mod->Mux(NEW_ID, holdw, c_start, oedge), holdw);
-						SigSpec s_level = mod->And(NEW_ID, c_start,
-								mod->Or(NEW_ID, oedge, holdw));
-						// deliver as a single inner-tick pulse at the
-						// first inner edge that sees the level
+						// edge at step k: clock level now vs. a past copy;
+						// the init keeps a clock that starts at its active
+						// level from faking an edge at step 0 (tmcloc1 data
+						// cex; matches clk2fflogic's own past-clk init)
+						auto edge_of = [&](SigSpec ck, bool pos, const char *role) -> SigSpec {
+							Wire *pw = wn(role);
+							pw->attributes[ID::init] = RTLIL::Const(pos ? State::S1 : State::S0, 1);
+							mod->addFf(NEW_ID, ck, pw);
+							SigSpec now = pos ? ck : mod->Not(NEW_ID, ck);
+							SigSpec prev = pos ? mod->Not(NEW_ID, SigSpec(pw)) : SigSpec(pw);
+							return mod->And(NEW_ID, now, prev);
+						};
+						auto gpast = [&](SigSpec d, const char *role) -> SigSpec {
+							Wire *w = wn(role, d.size());
+							w->attributes[ID::init] = Const(0, d.size());
+							mod->addFf(NEW_ID, d, w);
+							return w;
+						};
+						SigSpec oedge = edge_of(oclk, opos, "mcpastclk");
+						SigSpec iedge = edge_of(iclk[0], ipos, "mcpasticlk");
+						if (shift && child(0) && can_empty(child(0)))
+							log_error("sva2check: multi-clock |=> with an empty-capable antecedent is not supported (%s).\n", log_id(n));
+						// antecedent matched at the outer tick of this step
+						SigSpec match_now = mod->And(NEW_ID, gpast(ant_end, "mcant"), oedge);
+						// obligations from outer ticks strictly before the
+						// next inner tick, consumed by it.  A match in the
+						// step of an inner tick waits for the next one under
+						// |=>; under |-> that inner tick is its start (the
+						// speculative island below), so it is not pended
+						bool overlap = !shift;
+						SigSpec pend_in = overlap
+								? mod->And(NEW_ID, match_now, mod->Not(NEW_ID, iedge)) : match_now;
+						Wire *pendw = wn("mcpend");
+						pendw->attributes[ID::init] = Const(0, 1);
+						SigSpec pend_next = dis_gate(mod->Or(NEW_ID, pend_in,
+								mod->And(NEW_ID, pendw, mod->Not(NEW_ID, iedge))));
+						mod->addFf(NEW_ID, pend_next, pendw);
+						// |-> also starts at an inner tick that coincides
+						// with the outer one.  An inner-clock register
+						// latches its D one step before the edge, before
+						// the outer edge of that step is known, so that
+						// case runs on a speculative island started by
+						// every step's antecedent end; its failures are
+						// kept only for attempts whose outer edge did
+						// coincide (exact when the consequent fails at a
+						// fixed offset; refused otherwise)
+						int off = overlap ? fail_off(cbc) : 0;
+						if (overlap && off < 0)
+							log_error("sva2check: multi-clock |-> whose consequent has no fixed failure tick is not supported (%s).\n", log_id(n));
 						SigSpec saved_clk = clk;
 						bool saved_pos = clk_pos;
 						clk = iclk[0];
 						clk_pos = ipos;
 						multiclock = true;
-						SigSpec ss = reg(s_level, "mcstart");
-						SigSpec pss = reg(ss, "mcstart");
-						SigSpec pulse = mod->And(NEW_ID, ss, mod->Not(NEW_ID, pss));
-						// locals: carry every known local across the
-						// handoff in a shift chain on the consequent
-						// clock.  stage 0 loads the outer ring's value
-						// (combinatorial at the handoff tick; the ring,
-						// phase and age are stable for the rest of the
-						// outer cycle, and s_level guarantees the pulse
-						// fires inside it); stage k shifts once per
-						// consequent tick.  Reads inside the island
-						// select the stage by the island age vector.
-						// Writes in the island are rejected (v1).
-						if (slots_mode) {
-							int span = cbc ? seq_max_len(cbc) : 0;
-							int L = std::min(nslots, span + 1);
-							for (auto &kv : slotfiles) {
-								Wire *xw = kv.first;
-								SigSpec ov = local_read(xw);
-								std::vector<Wire *> chain(L);
-								for (int k = 0; k < L; k++) {
-									chain[k] = wn("mcslot", ov.size());
-									// stage 0 is gated by s_level (not the
-									// registered pulse): it must sample ov
-									// AT the first inner edge of the
-									// handoff so its Q is valid during the
-									// island's tick-0 window; a pulse-based
-									// enable lands one inner tick late and
-									// shifts the whole chain off by one
-									SigSpec d = k == 0
-											? mod->Mux(NEW_ID, SigSpec(chain[0]), ov, s_level)
-											: SigSpec(chain[k - 1]);
-									mod->addDff(NEW_ID, iclk[0], d, chain[k], ipos);
+						// one island: start is the per-step attempt start
+						// on the inner clock; stage0(xw) is the value a
+						// local carries into the attempt.  Locals: every
+						// known local rides a shift chain on the consequent
+						// clock; reads inside the island select the stage
+						// by the island age vector.  Writes in the island
+						// are rejected (v1).
+						auto island = [&](SigSpec st, const std::function<SigSpec(Wire *)> &stage0) -> SigSpec {
+							if (slots_mode) {
+								int span = cbc ? seq_max_len(cbc) : 0;
+								int L = std::min(nslots, span + 1);
+								// the island evaluates the tick of step k at
+								// step k-1, before that tick's shift: the
+								// local at age j is read from rd[j] = the
+								// value loaded j ticks ago as it stands one
+								// step before the j-th shift -- rd[0] the
+								// load input itself, rd[j] = stage j-1
+								for (auto &kv : slotfiles) {
+									Wire *xw = kv.first;
+									SigSpec ov = stage0(xw);
+									std::vector<Wire *> rd(L);
+									rd[0] = wn("mcslot", ov.size());
+									std::vector<Wire *> chain(std::max(L - 1, 0));
+									for (int k = 0; k < GetSize(chain); k++)
+										chain[k] = wn("mcslot", ov.size());
+									mod->connect(rd[0], mod->Mux(NEW_ID,
+											GetSize(chain) ? SigSpec(chain[0]) : SigSpec(Const(0, ov.size())), ov, st));
+									for (int k = 0; k < GetSize(chain); k++) {
+										mod->addDff(NEW_ID, iclk[0], k == 0 ? SigSpec(rd[0]) : SigSpec(chain[k - 1]),
+												chain[k], ipos);
+										rd[k + 1] = chain[k];
+									}
+									island_chains[xw] = rd;
 								}
-								island_chains[xw] = chain;
 							}
-						}
-						SigSpec saved_age = age;
-						if (slots_mode) {
-							island_mode = true;
-							age = Const(0, nslots);
-							age = sigset(age, 0, pulse);
-							slot_epoch++;
-						}
-						SigSpec r;
-						{
+							SigSpec saved_age = age;
+							if (slots_mode) {
+								island_mode = true;
+								age = Const(0, nslots);
+								age = sigset(age, 0, st);
+								slot_epoch++;
+							}
+							SigSpec r;
 							if (cbc) {
 								in_island = true;
-								r = strong_seq_fail(cbc, pulse);
+								r = strong_seq_fail(cbc, st);
 								in_island = false;
-							}
-							else {
+							} else {
 								static std::vector<Wire *> no_formals;
-								r = andN({pulse,
-										mod->Not(NEW_ID, reduce1(splice_expr(cbody, no_formals, false)))});
+								r = andN({st, mod->Not(NEW_ID, reduce1(splice_expr(cbody, no_formals, false)))});
 							}
+							if (slots_mode) {
+								island_mode = false;
+								island_chains.clear();
+								age = saved_age;
+								slot_epoch++;
+							}
+							return r;
+						};
+						std::vector<SigSpec> fails;
+						// locals of a pending obligation: the antecedent-
+						// end view of each local, captured with its match
+						dict<Wire *, SigSpec> held;
+						if (slots_mode)
+							for (auto &kv : slotfiles) {
+								SigSpec ov = local_read(kv.first);
+								Wire *lw = wn("mclocal", ov.size());
+								lw->attributes[ID::init] = Const(0, ov.size());
+								SigSpec lnext = mod->Mux(NEW_ID, SigSpec(lw), gpast(ov, "mcantlocal"), match_now);
+								mod->addFf(NEW_ID, lnext, lw);
+								held[kv.first] = lnext;
+							}
+						if (!held.empty()) {
+							// one pending slot per local: a second match
+							// before the inner tick that consumes the first
+							// would overwrite its values -- report it as a
+							// failure (spurious counterexample at worst,
+							// never a false proof)
+							approx("mc-locals-pending-collision", log_id(n));
+							fails.push_back(mod->And(NEW_ID, pend_in,
+									mod->And(NEW_ID, pendw, mod->Not(NEW_ID, iedge))));
 						}
-						if (slots_mode) {
-							island_mode = false;
-							island_chains.clear();
-							age = saved_age;
-							slot_epoch++;
+						SigSpec r_pend = island(pend_next, [&](Wire *xw) { return held.at(xw); });
+						// the island verdict at an inner tick: its fail
+						// sampled one step before the edge
+						fails.push_back(mod->And(NEW_ID, gpast(r_pend, "mcfail"), iedge));
+						if (overlap) {
+							// a coinciding edge at k needs both clocks at
+							// their inactive level at k-1: a speculative
+							// start anywhere else can never be real, and
+							// only adds unreachable-in-effect attempts the
+							// prover must learn to ignore
+							SigSpec o_idle = opos ? mod->Not(NEW_ID, oclk) : oclk;
+							SigSpec i_idle = ipos ? mod->Not(NEW_ID, SigSpec(iclk[0])) : SigSpec(iclk[0]);
+							SigSpec spec = andN({ant_end, o_idle, i_idle});
+							SigSpec r_spec = island(spec, [&](Wire *xw) { return local_read(xw); });
+							// was the attempt that fails at this inner tick
+							// (started `off` inner ticks ago) started at a
+							// coinciding outer tick?  q[j]: that fact for
+							// the j-th previous inner tick
+							SigSpec real = match_now;
+							SigSpec prev = match_now;
+							for (int j = 1; j <= off; j++) {
+								Wire *qw = wn("mcreal");
+								qw->attributes[ID::init] = Const(0, 1);
+								mod->addFf(NEW_ID, mod->Mux(NEW_ID, SigSpec(qw), prev, iedge), qw);
+								prev = qw;
+								real = qw;
+							}
+							fails.push_back(andN({gpast(r_spec, "mcfail"), iedge, real}));
 						}
+						SigSpec r = fails[0];
+						for (int i = 1; i < GetSize(fails); i++)
+							r = mod->Or(NEW_ID, r, fails[i]);
 						clk = saved_clk;
 						clk_pos = saved_pos;
 						return r;
@@ -3982,17 +4245,21 @@ struct Sva2CheckPass : public Pass {
 	void help() override
 	{
 		log("\n");
-		log("    sva2check [-expose_bad] [-exact] [-early] [selection]\n");
+		log("    sva2check [-expose_bad] [-exact] [-early] [-clk2fflogic] [selection]\n");
 		log("\n");
 		log("Compile the $sva property trees under assert-flavor $check cells into\n");
 		log("synchronous monitor hardware (single-clock spec subset: ## delays and\n");
 		log("ranges, repetitions, |->/|=>, boolean property operators, always/\n");
 		log("nexttime bounds, until, abort operators), then lower each $check to\n");
 		log("EN=1'b1, A = disable || !fail with \\CLK and \\CLK_POLARITY attributes.\n");
-		log("v1 multi-clock: a |->/|=> consequent `clocked` on a different clock\n");
-		log("compiles as its own island on that clock; such $check cells keep\n");
-		log("EN=1'b1 and carry no \\CLK attributes.  Other multi-clock elements\n");
-		log("abort with an error, as do local variables, within, and matches.\n");
+		log("Multi-clock (needs -clk2fflogic): a |->/|=> consequent `clocked` on a\n");
+		log("different clock compiles as its own island on that clock (LRM 16.14.2:\n");
+		log("|=> starts at the nearest strictly later tick of that clock, |-> at\n");
+		log("the nearest possibly coinciding one); `s.matched' of a sequence on\n");
+		log("another clock holds the match until the next tick of the reading\n");
+		log("check's clock (16.14.5).  Such $check cells keep EN=1'b1 and carry no\n");
+		log("\\CLK attributes.  Other multi-clock elements abort with an error, as\n");
+		log("do within and matches.\n");
 		log("Unbounded eventually/s_eventually of a plain expression lowers to a\n");
 		log("FLAVOR \"liveness\" $check (A = p, EN = 1'b1) for the native ic3\n");
 		log("liveness engine; temporal operands keep the \"bound it\" error.\n");
@@ -4017,6 +4284,18 @@ struct Sva2CheckPass : public Pass {
 		log("survives (the LRM's tick): the late form lets a short trace slip past\n");
 		log("an assumption.  -early on asserts changes no verdict, only failure\n");
 		log("ticks, and costs one monitor copy per attempt slot.\n");
+		log("\n");
+		log("By default every formal step is a tick of every clock (the async2sync\n");
+		log("flow).  With -clk2fflogic -- for designs prepped with clk2fflogic,\n");
+		log("where a step is a global step -- each verdict is gated on its clock\n");
+		log("edge and reads the values of the step before it (the LRM sampled\n");
+		log("values): asserts and covers count only at ticks, an assumption\n");
+		log("constrains only at ticks, liveness discharges only at ticks (approx\n");
+		log("clk2fflogic-live-ticks: a clock that stops for good with nothing\n");
+		log("pending is a spurious counterexample).  Without it, checks under\n");
+		log("clk2fflogic are evaluated at every step on current values: assumptions\n");
+		log("over-constrain between ticks (false proofs).  Required for multi-clock\n");
+		log("properties and cross-clock .matched.\n");
 		log("\n");
 		log("With -expose_bad, additionally create a module output port per\n");
 		log("converted check named bad_<check> driven by EN && !A, for AIGER\n");
@@ -4129,6 +4408,7 @@ struct Sva2CheckPass : public Pass {
 		bool expose_bad = false;
 		bool exact_mode = false;
 		bool early_opt = false;
+		bool c2f = false;
 		std::vector<std::string> sub_args;
 		for (auto &arg : args) {
 			if (arg == "-expose_bad") {
@@ -4141,6 +4421,10 @@ struct Sva2CheckPass : public Pass {
 			}
 			if (arg == "-early") {
 				early_opt = true;
+				continue;
+			}
+			if (arg == "-clk2fflogic") {
+				c2f = true;
 				continue;
 			}
 			sub_args.push_back(arg);
@@ -4250,6 +4534,7 @@ struct Sva2CheckPass : public Pass {
 				if (getenv("SVA_DEBUG_OPS"))
 					log("sva2check-debug: check %s\n", log_id(cell));
 				comp.exact_mode = exact_mode;
+				comp.c2f = c2f;
 				{
 					std::string fl = cell->getParam(ID(FLAVOR)).decode_string();
 					comp.early_fail = early_opt || getenv("SVA_EARLY") || fl == "assume" || fl == "restrict";
@@ -4553,7 +4838,7 @@ struct Sva2CheckPass : public Pass {
 					break;
 				}
 				comp.lower_sampled_value_cells(lowered_sv, sv_templates);
-				comp.lower_sequence_methods(lowered_methods);
+				comp.lower_sequence_methods(lowered_methods, spec);
 
 				// v1 liveness: an unbounded eventually/s_eventually whose
 				// operand is a plain boolean expression is F p with p a
@@ -4683,7 +4968,17 @@ struct Sva2CheckPass : public Pass {
 				if (once) {
 					if (liveness || tresp)
 						log_error("sva2check: unbounded eventually in an initial-block check %s is not supported.\n", log_id(cell));
-					root = mod->Initstate(NEW_ID);
+					if (c2f) {
+						// the first tick of the property clock, not step 0:
+						// under clk2fflogic it can come later.  High until
+						// that tick (in the async2sync flow: step 0 only,
+						// the same as $initstate)
+						Wire *tw = mod->addWire(NEW_ID);
+						tw->attributes[ID::init] = Const(0, 1);
+						mod->addDff(NEW_ID, comp.clk, State::S1, tw, comp.clk_pos);
+						root = mod->Not(NEW_ID, tw);
+					} else
+						root = mod->Initstate(NEW_ID);
 					cell->setParam(ID::TRG_ENABLE, State::S0);
 				}
 
@@ -4992,6 +5287,51 @@ struct Sva2CheckPass : public Pass {
 				if (once && (strong_until || fairness))
 					log_error("sva2check: %s in an initial-block check %s is not supported.\n",
 							strong_until ? "s_until" : "a fairness assumption", log_id(cell));
+				// -clk2fflogic (2026-10-22): the compiled verdict is per tick
+				// of the property clock with every formal step a tick (the
+				// async2sync flow).  Under clk2fflogic a step is a global
+				// step: read as is, every check was evaluated at EVERY step
+				// on current values -- asserts over-strict, and an
+				// assumption constraining inputs between ticks or a cover /
+				// eventually satisfied between ticks gave FALSE PROOFS
+				// (tmc_c2f.sv).  The verdict of the tick at step k is the
+				// step k-1 value at an edge at k: asserts and covers count
+				// only there (exact); an assumption constrains only there
+				// (exact, and weaker than every-step).  Liveness asserts
+				// discharge only at ticks: a clock that stops for good with
+				// nothing pending is a spurious counterexample (tagged); a
+				// fairness predicate keeps the past value ungated, which
+				// can only weaken the assumption.
+				SigSpec c2f_edge;
+				if (c2f && !comp.multiclock) {
+					c2f_edge = gclk_edge(mod, comp.clk, comp.clk_pos);
+					if (fairness)
+						new_a = gclk_past(mod, new_a, State::S0);
+					else if (liveness) {
+						comp.approx("clk2fflogic-live-ticks", log_id(cell));
+						new_a = mod->And(NEW_ID, gclk_past(mod, new_a, State::S0), c2f_edge);
+					} else if (flavor == "cover")
+						new_a = mod->And(NEW_ID, gclk_past(mod, new_a, State::S0), c2f_edge);
+					else
+						new_a = mod->Not(NEW_ID, mod->And(NEW_ID,
+								gclk_past(mod, mod->Not(NEW_ID, new_a), State::S0), c2f_edge));
+					// -expose_bad: a cover's "event" is its (gated) hit
+					if (flavor == "cover")
+						fail = new_a;
+					else if (!fairness)
+						fail = mod->Not(NEW_ID, new_a);
+				}
+				if (comp.multiclock && !c2f)
+					log_error("sva2check: %s is a multi-clock property: it needs `sva2check -clk2fflogic' and the "
+							"clk2fflogic prep (its verdict is gated on clock edges).\n", log_id(cell));
+				auto c2f_live = [&](SigSpec la) -> SigSpec {
+					if (!c2f || comp.multiclock)
+						return la;
+					if (flavor == "assume" || flavor == "restrict")
+						return gclk_past(mod, la, State::S0);
+					comp.approx("clk2fflogic-live-ticks", log_id(cell));
+					return mod->And(NEW_ID, gclk_past(mod, la, State::S0), c2f_edge);
+				};
 				cell->setPort(ID(EN), SigSpec(State::S1));
 				cell->setPort(ID(A), new_a);
 				if (liveness)
@@ -5015,7 +5355,8 @@ struct Sva2CheckPass : public Pass {
 					// clock edges, so fail can only change on one) and
 					// omit the clock attributes, which would otherwise
 					// misleadingly pin the outer clock
-					log("sva2check: %s: multi-clock property; $check left unclocked (checked at every step).\n", log_id(cell));
+					log("sva2check: %s: multi-clock property; $check left unclocked (verdict gated on the clock edges).\n",
+							log_id(cell));
 				}
 				cell->attributes[ID(sva2check)] = Const(1, 1);
 				{
@@ -5058,7 +5399,7 @@ struct Sva2CheckPass : public Pass {
 					live->connections_ = cell->connections_;
 					live->attributes = cell->attributes;
 					live->setParam(ID(FLAVOR), std::string("liveness"));
-					live->setPort(ID(A), la);
+					live->setPort(ID(A), c2f_live(la));
 					live->setPort(ID(EN), SigSpec(State::S1));
 					live->attributes[ID(sva2check)] = Const(1, 1);
 				}
@@ -5084,7 +5425,7 @@ struct Sva2CheckPass : public Pass {
 					SigSpec la = su_q;
 					if (dop == "disable_iff")
 						la = mod->Or(NEW_ID, dsig, la);
-					live->setPort(ID(A), la);
+					live->setPort(ID(A), c2f_live(la));
 					live->setPort(ID(EN), SigSpec(State::S1));
 					live->attributes[ID(sva2check)] = Const(1, 1);
 				}

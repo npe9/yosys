@@ -1,8 +1,13 @@
+// SVA2CHECK-FLAGS: -clk2fflogic
 // Two-clock async FIFO (Gray pointers, 2FF synchronizers, depth 8).
 // Layer A multiclock test: multiclock DESIGN, single-clock properties.
 // clk2fflogic goes AFTER memory so memory_map still sees a clocked
 // (sync-write) memory and emits $dff; clk2fflogic then removes the clocks.
 // PREP-EXTRA-AFTER-MEMORY: clk2fflogic
+// -clk2fflogic (2026-10-22): checks are evaluated at their clock ticks on
+// sampled values; the canary's earliest failure is the second clk_wr tick
+// (step 3: ticks need a low step between them), not step 1 (the old
+// every-step evaluation).
 module tfifo (
     input  logic       clk_wr,
     input  logic       clk_rd,
@@ -45,7 +50,7 @@ module tfifo (
 
     // canary: one write does not fill a depth-8 FIFO (would mean full is
     // stuck or the pointer math is wrong) — must DIS
-    p_full_canary: assert property (@(posedge clk_wr) wr_en |=> full);          // DIS @1
+    p_full_canary: assert property (@(posedge clk_wr) wr_en |=> full);          // DIS @3
 
     // assume/assert self-consistency pairs: identical property as assume +
     // as assert. If ic3 dropped the $assume from its transition relation,

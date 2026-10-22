@@ -2772,9 +2772,11 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 					is_signed = false;
 					return RTLIL::SigSpec(w, 32);
 				}
-				if (str == "\\$high" || str == "\\$low" || str == "\\$left" || str == "\\$right") {
+				if (str == "\\$high" || str == "\\$low" || str == "\\$left" || str == "\\$right" ||
+						str == "\\$increment") {
 					// bounds of a declared packed vector (register v3 D8: these
-					// used to be undriven placeholders, then loud errors)
+					// used to be undriven placeholders, then loud errors);
+					// $increment is 1 when $left >= $right, else -1 (LRM 20.7)
 					AstNode *arg = GetSize(children) == 1 ? children[0].get() : nullptr;
 					AstNode *decl = (arg && arg->type == AST_IDENTIFIER) ? arg->id2ast : nullptr;
 					AstNode *rng = (decl && !decl->children.empty() && decl->children[0] &&
@@ -2787,7 +2789,7 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 					if (rng->range_swapped)   // declared [lo:hi]: the AST keeps it normalized
 						std::swap(l, r);
 					int v = str == "\\$high" ? std::max(l, r) : str == "\\$low" ? std::min(l, r)
-							: str == "\\$left" ? l : r;
+							: str == "\\$left" ? l : str == "\\$right" ? r : (l >= r ? 1 : -1);
 					is_signed = true;
 					return RTLIL::SigSpec(RTLIL::Const(v, 32));
 				}

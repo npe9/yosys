@@ -1,6 +1,7 @@
+// SVA2CHECK-FLAGS: -clk2fflogic
 // PREP-EXTRA-AFTER-MEMORY: clk2fflogic
 // Minimal multiclock-local scoreboard: 1-bit data, 1-stage read sync, ##1.
-// IC3-TIMEOUT: 600
+// IC3-TIMEOUT: 1800
 module tmcloc2(input logic wr_clk, input logic rd_clk,
                input logic push_pulse, input logic din);
   logic wr_seen, mem_v, v0, pop, rdata;

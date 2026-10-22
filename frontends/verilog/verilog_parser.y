@@ -96,6 +96,9 @@
 			std::istream* lexin;
 			// IEEE 1800-2009 default clocking / default disable iff (clause 16).
 			std::unique_ptr<AstNode> sva_default_clock;
+			// IEEE 14.14: the module's `global clocking` event; `@($global_clock)`
+			// in a concurrent assertion means this event
+			std::unique_ptr<AstNode> sva_global_clock;
 			std::unique_ptr<AstNode> sva_default_disable;
 			// IEEE 1800-2009 17.2: checker formal ports (identifier with an
 			// optional default-expression child) collected while parsing a
@@ -1013,6 +1016,11 @@ module:
 		extra->current_ast_mod = mod;
 		extra->port_stubs.clear();
 		extra->port_counter = 0;
+		// default / global clocking are per module (IEEE 14.12, 14.14): a
+		// default clocking of an earlier module used to clock this module's
+		// unclocked assertions (an undriven implicit clock net)
+		extra->sva_default_clock.reset();
+		extra->sva_global_clock.reset();
 		mod->str = *$4;
 		append_attr(mod, std::move($1));
 	} module_header_imports module_para_opt module_args_opt TOK_SEMICOL module_body TOK_ENDMODULE opt_label opt_semi {
@@ -1041,6 +1049,11 @@ program:
 		extra->current_ast_mod = mod;
 		extra->port_stubs.clear();
 		extra->port_counter = 0;
+		// default / global clocking are per module (IEEE 14.12, 14.14): a
+		// default clocking of an earlier module used to clock this module's
+		// unclocked assertions (an undriven implicit clock net)
+		extra->sva_default_clock.reset();
+		extra->sva_global_clock.reset();
 		mod->str = *$4;
 		append_attr(mod, std::move($1));
 	} module_header_imports module_para_opt module_args_opt TOK_SEMICOL module_body TOK_ENDPROGRAM opt_label opt_semi {
@@ -1684,6 +1697,11 @@ interface:
 		extra->current_ast_mod = intf;
 		extra->port_stubs.clear();
 		extra->port_counter = 0;
+		// default / global clocking are per module (IEEE 14.12, 14.14): a
+		// default clocking of an earlier module used to clock this module's
+		// unclocked assertions (an undriven implicit clock net)
+		extra->sva_default_clock.reset();
+		extra->sva_global_clock.reset();
 		intf->str = *$3;
 		extra->interface_names.insert(*$3);
 	} module_header_imports module_para_opt module_args_opt TOK_SEMICOL interface_body TOK_ENDINTERFACE opt_label opt_semi {
@@ -6790,6 +6808,13 @@ sva_property_spec:
 sva_at_clock:
 	TOK_AT TOK_LPAREN sva_event TOK_RPAREN {
 		$$ = std::move($3);
+		// `@($global_clock)` arrives as edge($global_clock)
+		AstNode *gid = $$.get();
+		if (gid && gid->type == AST_SVA && gid->str == "edge" && gid->children.size() == 1)
+			gid = gid->children[0].get();
+		if (extra->sva_global_clock && gid && gid->type == AST_IDENTIFIER && gid->str == "\\$global_clock" &&
+				gid->children.empty())
+			$$ = extra->sva_global_clock->clone();
 	} |
 	TOK_AT hierarchical_id {
 		$$ = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
@@ -7519,9 +7544,10 @@ sva_let_decl:
 
 clocking_decl:
 	TOK_GLOBAL TOK_CLOCKING TOK_ID sva_at_clock TOK_SEMICOL clocking_items TOK_ENDCLOCKING opt_label {
-		// IEEE 14.3: `global clocking` designates the module's default
-		// clocking for concurrent assertions; simulation-only and dropped
-		// like the other clocking forms
+		// IEEE 14.14: `global clocking` names the global clock event;
+		// `@($global_clock)` in a concurrent assertion stands for it (it
+		// used to become an undriven implicit `$global_clock` net)
+		extra->sva_global_clock = $4->clone();
 		checkLabelsMatch(@7, "Clocking block label", $3.get(), $8.get());
 	} |
 	TOK_CLOCKING TOK_ID sva_at_clock TOK_SEMICOL clocking_items TOK_ENDCLOCKING opt_label {

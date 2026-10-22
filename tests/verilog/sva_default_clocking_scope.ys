@@ -1,0 +1,15 @@
+# `default clocking` is per module (IEEE 14.12): an earlier module's default
+# clocking used to clock a later module's unclocked assertion -- with an
+# undriven implicit net named after the other module's clock.
+logger -expect log "Skipping mb/pb: property is not a \$sva spec" 1
+read_verilog -sv -formal <<EOT
+module ma (input logic clka, a);
+  default clocking @(posedge clka); endclocking
+  pa: assert property (a |=> a);
+endmodule
+module mb (input logic clkb, b);
+  pb: assert property (b |=> b);
+endmodule
+EOT
+hierarchy -top mb
+sva2check

@@ -1,0 +1,71 @@
+# A packed-array-of-struct parameter whose elements are struct patterns
+# (OpenTitan `localparam racl_range_t [0:0] RaclPolicySelRanges... =
+# '{ '{base: .., limit: .., policy_sel: .., enable: ..} }`): every read was
+# "did not fold to a constant". Named (any key order) or positional,
+# nested struct members included; element member reads `R[1].sel.hi` fold
+# (they were implicit undriven wires).
+# A whole-struct parameter with a nested struct member: the member's
+# typedef was unresolved in the layout (sized one bit), so the value and
+# every member read were garbage (`One.limit` read 2, not F).
+read_verilog -sv <<EOT
+package rp;
+  typedef struct packed { logic [1:0] hi; logic lo; } sub_t;
+  typedef struct packed { logic [3:0] base; logic [3:0] limit; sub_t sel; logic en; } range_t;
+endpackage
+module child (input rp::range_t [1:0] r_i, output logic [23:0] o);
+  assign o = r_i;
+endmodule
+module top;
+  localparam logic [1:0] Hi = 2'd2;
+  localparam rp::range_t [1:0] Ranges = '{
+    '{ en: 1'b1, limit: 4'hF, base: 4'h0, sel: '{ lo: 1'b0, hi: Hi } },
+    '{ 4'h3, 4'h9, '{ 2'd1, 1'b1 }, 1'b0 }
+  };
+  logic [23:0] via_port, direct;
+  child u (.r_i(Ranges), .o(via_port));
+  assign direct = Ranges;
+  always_comb begin
+    assert (direct == {4'h0, 4'hF, 2'd2, 1'b0, 1'b1, 4'h3, 4'h9, 2'd1, 1'b1, 1'b0});
+    assert (via_port == direct);
+    assert (Ranges[1].sel.hi == 2'd2);
+    assert (Ranges[0].limit == 4'h9);
+    assert (Ranges[0].sel == {2'd1, 1'b1});
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports
+design -reset
+read_verilog -sv <<EOT
+typedef struct packed { logic [1:0] hi; logic lo; } sub_t;
+typedef struct packed { logic [3:0] base; sub_t sel; } nest_t;
+package rp2;
+  typedef struct packed { logic [1:0] hi; logic lo; } sub_t;
+  typedef struct packed { logic [3:0] base; logic [3:0] limit; sub_t sel; logic en; } range_t;
+endpackage
+module top;
+  localparam nest_t Nest = '{ base: 4'h1, sel: '{ hi: 2'd2, lo: 1'b0 } };
+  localparam rp2::range_t One = '{ en: 1'b1, limit: 4'hF, base: 4'h0, sel: '{ lo: 1'b0, hi: 2'd2 } };
+  nest_t v;
+  logic [11:0] w;
+  assign v = Nest;
+  assign w = One;
+  always_comb begin
+    assert (v == {4'h1, 2'd2, 1'b0});
+    assert (Nest.sel.hi == 2'd2);
+    assert (Nest.base == 4'h1);
+    assert (w == {4'h0, 4'hF, 2'd2, 1'b0, 1'b1});
+    assert (One.limit == 4'hF);
+    assert (One.sel.hi == 2'd2);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

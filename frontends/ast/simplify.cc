@@ -1056,6 +1056,73 @@ static int size_packed_struct(AstNode *snode, int base_offset)
 	return width;
 }
 
+// A struct type whose typedef'd struct members (`sub_t sel;`) still carry
+// their WIRETYPE: sized as is, such a member is one bit and every member
+// offset after it is wrong.
+static bool struct_has_unresolved_members(AstNode *st)
+{
+	for (auto &it : st->children) {
+		if (!it)
+			continue;
+		if (it->type == AST_STRUCT || it->type == AST_UNION) {
+			if (struct_has_unresolved_members(it.get()))
+				return true;
+		} else if (it->type == AST_STRUCT_ITEM) {
+			for (auto &ch : it->children)
+				if (ch && ch->type == AST_WIRETYPE)
+					return true;
+		}
+	}
+	return false;
+}
+
+// A sized copy of the struct with typedef'd struct members replaced by
+// their struct types; nullptr if a member cannot be resolved that way
+// (a typedef'd vector, or packed dimensions on a struct member).
+static std::unique_ptr<AstNode> resolve_struct_layout(AstNode *stype)
+{
+	std::function<bool(AstNode *)> fix = [&](AstNode *st) -> bool {
+		for (auto &it : st->children) {
+			if (!it)
+				continue;
+			if (it->type == AST_STRUCT || it->type == AST_UNION) {
+				if (!fix(it.get()))
+					return false;
+				continue;
+			}
+			if (it->type != AST_STRUCT_ITEM)
+				continue;
+			AstNode *wt = nullptr;
+			bool ranged = false;
+			for (auto &ch : it->children) {
+				if (ch && ch->type == AST_WIRETYPE)
+					wt = ch.get();
+				if (ch && (ch->type == AST_RANGE || ch->type == AST_MULTIRANGE))
+					ranged = true;
+			}
+			if (!wt)
+				continue;
+			if (ranged || !current_scope.count(wt->str) || current_scope.at(wt->str)->type != AST_TYPEDEF ||
+					current_scope.at(wt->str)->children.empty())
+				return false;
+			AstNode *t = current_scope.at(wt->str)->children[0].get();
+			if (t->type != AST_STRUCT && t->type != AST_UNION)
+				return false;
+			auto rep = t->clone();
+			rep->str = it->str;
+			if (!fix(rep.get()))
+				return false;
+			it = std::move(rep);
+		}
+		return true;
+	};
+	auto copy = stype->clone();
+	if (!fix(copy.get()))
+		return nullptr;
+	size_packed_struct(copy.get(), 0);
+	return copy;
+}
+
 static std::unique_ptr<AstNode> node_int(AstSrcLocType loc, int ival)
 {
 	return AstNode::mkconst_int(loc, ival, true);
@@ -4947,6 +5014,20 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					unpacked_dimensions == 0 && !attributes.count(ID(sv_unpacked_dims)) &&
 					children[0]->type == AST_ASSIGN_PATTERN) {
 				AstNode *stype = attributes.at(ID::wiretype).get();
+				// the struct's layout with typedef'd struct members resolved:
+				// such a member (`sub_t sel;`) can still carry its WIRETYPE
+				// here and sizes as one bit, which shifted every member and
+				// folded the parameter to garbage. Unresolvable members leave
+				// the pattern unfolded (a loud "did not fold" on reads).
+				std::unique_ptr<AstNode> stype_resolved;
+				bool layout_ok = true;
+				if (struct_has_unresolved_members(stype)) {
+					stype_resolved = resolve_struct_layout(stype);
+					if (stype_resolved)
+						stype = stype_resolved.get();
+					else
+						layout_ok = false;
+				}
 				while (!children[0]->basic_prep && children[0]->simplify(false, stage, -1, false))
 					did_something = true;
 				AstNode *pat = children[0].get();
@@ -4968,13 +5049,65 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 							el->set_attribute(k.first, std::move(k.second));
 					did_something = true;
 				}
+				// a nested struct pattern (`sel: '{hi: .., lo: ..}`) folds
+				// through its member's struct type first; left unfolded, the
+				// parameter kept the pattern and member reads were garbage
+				if (layout_ok) {
+					auto bare_name = [](const std::string &s) {
+						return s.empty() || s[0] != '\\' ? s : s.substr(1);
+					};
+					std::vector<AstNode *> items;
+					for (auto &cand : stype->children)
+						if (cand && (cand->type == AST_STRUCT_ITEM || cand->type == AST_STRUCT || cand->type == AST_UNION))
+							items.push_back(cand.get());
+					int pos = 0;
+					for (auto &el : pat->children) {
+						AstNode *item = nullptr;
+						if (el->attributes.count(ID(sv_member))) {
+							std::string mname = bare_name(el->attributes.at(ID(sv_member))->str);
+							for (auto *cand : items)
+								if (bare_name(cand->str) == mname)
+									item = cand;
+						} else if (!el->attributes.count(ID(sv_typekey)) && pos < GetSize(items)) {
+							item = items[pos];
+						}
+						pos++;
+						if (!item || el->type != AST_ASSIGN_PATTERN)
+							continue;
+						AstNode *nested = (item->type == AST_STRUCT || item->type == AST_UNION) ? item : nullptr;
+						if (!nested)
+							for (auto &ch : item->children)
+								if (ch && ch->type == AST_WIRETYPE && current_scope.count(ch->str) &&
+										current_scope.at(ch->str)->type == AST_TYPEDEF &&
+										!current_scope.at(ch->str)->children.empty())
+									nested = current_scope.at(ch->str)->children[0].get();
+						if (!nested || (nested->type != AST_STRUCT && nested->type != AST_UNION))
+							continue;
+						auto st = nested->clone();
+						size_packed_struct(st.get(), 0);
+						auto inner = el->clone();
+						inner->attributes.erase(ID(sv_member));
+						auto tmp = std::make_unique<AstNode>(el->location, AST_LOCALPARAM, std::move(inner));
+						tmp->str = "\\$nested_member";
+						tmp->set_attribute(ID::wiretype, std::move(st));
+						while (tmp->simplify(true, 1, -1, false)) { }
+						if (tmp->children.empty() || tmp->children[0]->type != AST_CONSTANT)
+							continue;
+						auto folded = tmp->children[0]->clone();
+						for (auto id : {ID(sv_member), ID(sv_typekey)})
+							if (el->attributes.count(id))
+								folded->set_attribute(id, el->attributes.at(id)->clone());
+						el = std::move(folded);
+						did_something = true;
+					}
+				}
 				bool all_const = true, named = false;
 				for (auto &el : pat->children) {
 					all_const = all_const && el->type == AST_CONSTANT;
 					named = named || el->attributes.count(ID(sv_member)) != 0 ||
 						el->attributes.count(ID(sv_typekey)) != 0;
 				}
-				if (all_const) {
+				if (all_const && layout_ok) {
 					int width = stype->range_left - stype->range_right + 1;
 					std::vector<RTLIL::State> bits(width, RTLIL::State::S0);
 					auto bare = [](const std::string &s) {
@@ -5982,6 +6115,75 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 	}
 
+	// a member of an element of a PACKED array-of-struct parameter
+	// (`R[1].sel.hi` with `localparam range_t [1:0] R = '{...}`, OpenTitan
+	// RACL ranges): fold it from the parameter's constant value. It used to
+	// become an implicitly declared undriven wire.
+	if (type == AST_PREFIX && GetSize(children) == 2 && children[1]->type == AST_IDENTIFIER &&
+			children[1]->children.empty() && current_scope.count(str)) {
+		AstNode *decl = current_scope.at(str);
+		if ((decl->type == AST_PARAMETER || decl->type == AST_LOCALPARAM) && decl->unpacked_dimensions == 0 &&
+				GetSize(decl->dimensions) >= 2 && !decl->children.empty() && decl->children[0]->type == AST_CONSTANT &&
+				decl->attributes.count(ID::wiretype) && decl->attributes.at(ID::wiretype)->type == AST_CONSTANT) {
+			std::string tn = decl->attributes.at(ID::wiretype)->str;
+			AstNode *td = current_scope.count(tn) ? current_scope.at(tn) : nullptr;
+			AstNode *etype = (td && td->type == AST_TYPEDEF && !td->children.empty() &&
+					(td->children[0]->type == AST_STRUCT || td->children[0]->type == AST_UNION)) ? td->children[0].get() : nullptr;
+			std::unique_ptr<AstNode> st;
+			if (etype)
+				st = struct_has_unresolved_members(etype) ? resolve_struct_layout(etype) : etype->clone();
+			if (st) {
+				size_packed_struct(st.get(), 0);
+				int ew = st->range_left - st->range_right + 1;
+				auto &dm = decl->dimensions[0];
+				int n_inner = 1;
+				for (int i = 1; i < GetSize(decl->dimensions); i++)
+					n_inner *= decl->dimensions[i].range_width;
+				while (children[0]->simplify(true, stage, -1, false)) { }
+				AstNode *idx = children[0].get();
+				if (idx->type == AST_RANGE && idx->children.size() == 1)
+					idx = idx->children[0].get();
+				if (n_inner == ew && idx->type == AST_CONSTANT) {
+					int index = idx->asInt(true);
+					int pos = dm.range_swapped ? dm.range_right + dm.range_width - 1 - index : index - dm.range_right;
+					if (pos < 0 || pos >= dm.range_width)
+						input_error("Index %d of parameter array %s is out of range.\n", index, log_id(str));
+					// the member path (`sel.hi`) through nested structs;
+					// nested member ranges are offsets in the element
+					std::string mname = children[1]->str;
+					if (!mname.empty() && mname[0] == '\\')
+						mname = mname.substr(1);
+					AstNode *item = st.get();
+					size_t p0 = 0;
+					while (item) {
+						size_t dot = mname.find('.', p0);
+						std::string seg = mname.substr(p0, dot == std::string::npos ? std::string::npos : dot - p0);
+						AstNode *next = nullptr;
+						for (auto &cand : item->children) {
+							std::string cn = cand->str;
+							if (!cn.empty() && cn[0] == '\\')
+								cn = cn.substr(1);
+							if (cn == seg)
+								next = cand.get();
+						}
+						item = next;
+						if (dot == std::string::npos)
+							break;
+						p0 = dot + 1;
+					}
+					if (!item || !item->range_valid)
+						input_error("Parameter array %s has no member `%s'.\n", log_id(str), mname.c_str());
+					std::vector<RTLIL::State> bits = decl->children[0]->bitsAsConst(dm.range_width * ew, false).to_bits();
+					int lo = pos * ew + std::min(item->range_left, item->range_right) - st->range_right;
+					int hi = pos * ew + std::max(item->range_left, item->range_right) - st->range_right;
+					std::vector<RTLIL::State> v(bits.begin() + lo, bits.begin() + hi + 1);
+					newNode = mkconst_bits(location, v, false);
+					goto apply_newNode;
+				}
+			}
+		}
+	}
+
 	// a member of an element of an unpacked-array PARAMETER (`P[1].m` with
 	// `parameter c_t P [4] = ...`): fold it from the parameter's value.  The
 	// constant-prefix rule below would turn it into an identifier `P[1].m`
@@ -6378,8 +6580,74 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		// sized to the element width.  The pattern never folded to a
 		// constant (every read degraded: prim_prince, sram_ctrl FAIL@parse).
 		// Keyed / default patterns keep the loud path.
-		if (unpacked_dimensions == 0 && GetSize(dimensions) >= 2 && !children.empty() &&
+		// (a whole-struct parameter, whose wiretype attribute is the struct
+		// itself, is folded member by member above; its `dimensions` may
+		// describe nested members and must not be read as array dimensions)
+		bool whole_struct = attributes.count(ID::wiretype) &&
+				(attributes.at(ID::wiretype)->type == AST_STRUCT || attributes.at(ID::wiretype)->type == AST_UNION);
+		if (unpacked_dimensions == 0 && GetSize(dimensions) >= 2 && !children.empty() && !whole_struct &&
 				children[0]->type == AST_ASSIGN_PATTERN) {
+			auto bare = [](std::string s) {
+				if (!s.empty() && s[0] == '\\')
+					s = s.substr(1);
+				return s;
+			};
+			// an element that is itself a struct pattern (`localparam
+			// range_t [0:0] R = '{ '{base: .., limit: ..} }`, OpenTitan
+			// RACL ranges): its members in declaration order, MSB first,
+			// each sized to the member; named or positional, no default
+			std::function<std::unique_ptr<AstNode>(AstNode *, AstNode *)> struct_val = [&](AstNode *pat, AstNode *st) -> std::unique_ptr<AstNode> {
+				if (!st || st->type != AST_STRUCT || pat->type != AST_ASSIGN_PATTERN)
+					return nullptr;
+				std::vector<AstNode *> items;
+				for (auto &it : st->children)
+					if (it && (it->type == AST_STRUCT_ITEM || it->type == AST_STRUCT))
+						items.push_back(it.get());
+				bool named = false;
+				dict<std::string, AstNode *> by_name;
+				for (auto &c : pat->children) {
+					if (c->attributes.count(ID(sv_typekey)) || c->attributes.count(ID(sv_index)))
+						return nullptr;
+					if (c->attributes.count(ID(sv_member))) {
+						named = true;
+						std::string key = bare(c->attributes.at(ID(sv_member))->str);
+						if (key == "default")
+							return nullptr;
+						by_name[key] = c.get();
+					}
+				}
+				if (!named && GetSize(pat->children) != GetSize(items))
+					return nullptr;
+				auto cat = std::make_unique<AstNode>(pat->location, AST_CONCAT);
+				for (int k = GetSize(items) - 1; k >= 0; k--) {
+					AstNode *item = items[k];
+					AstNode *src = named ? (by_name.count(bare(item->str)) ? by_name.at(bare(item->str)) : nullptr)
+							: pat->children[k].get();
+					if (!src || !item->range_valid)
+						return nullptr;
+					int w = std::abs(item->range_left - item->range_right) + 1;
+					std::unique_ptr<AstNode> v;
+					if (src->type == AST_ASSIGN_PATTERN) {
+						AstNode *nested = item->type == AST_STRUCT ? item : nullptr;
+						if (!nested)
+							for (auto &ch : item->children)
+								if (ch && ch->type == AST_WIRETYPE && current_scope.count(ch->str) &&
+										current_scope.at(ch->str)->type == AST_TYPEDEF &&
+										!current_scope.at(ch->str)->children.empty())
+									nested = current_scope.at(ch->str)->children[0].get();
+						v = struct_val(src, nested);
+						if (!v)
+							return nullptr;
+					} else {
+						v = src->clone();
+						v->attributes.erase(ID(sv_member));
+					}
+					cat->children.push_back(std::make_unique<AstNode>(src->location, AST_CAST_SIZE,
+							mkconst_int(src->location, w, true), std::move(v)));
+				}
+				return cat;
+			};
+			AstNode *elem_struct = resolve_wiretype_struct(this);
 			std::function<std::unique_ptr<AstNode>(AstNode *, int)> flat = [&](AstNode *pat, int d) -> std::unique_ptr<AstNode> {
 				if (d >= GetSize(dimensions) - 1 || pat->type != AST_ASSIGN_PATTERN)
 					return nullptr;
@@ -6397,7 +6665,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 						return nullptr;
 					std::unique_ptr<AstNode> v;
 					if (e->type == AST_ASSIGN_PATTERN) {
-						v = flat(e.get(), d + 1);
+						v = d + 1 < GetSize(dimensions) - 1 ? flat(e.get(), d + 1) : struct_val(e.get(), elem_struct);
 						if (!v)
 							return nullptr;
 					} else

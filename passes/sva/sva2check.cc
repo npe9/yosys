@@ -4626,6 +4626,30 @@ struct Sva2CheckPass : public Pass {
 				// even `a` was PROVED; register v3 C1, 2026-10-19).  Compile
 				// it as an ordinary clocked check whose only attempt starts
 				// in the initial state.
+				// a STRONG until as an implication's consequent with boolean
+				// operands (`ant |-> a s_until b`, LRM 16.13.12): a s_until b ==
+				// (a until b) && s_eventually b.  The main check compiles the
+				// weak form (the operator is switched for this compile and
+				// restored after: a declaration body stays as written); a
+				// "<name>$live" twin carries the eventuality, built like the
+				// temporal response `ant |-> s_eventually b`.  It used to be
+				// "unsupported property operator 's_until'".
+				Cell *nsu = nullptr;
+				std::string nsu_op;
+				if (flavor == "assert" && !liveness && !tresp && body &&
+						(sva_op(body) == "|->" || sva_op(body) == "|=>")) {
+					auto ip = comp.ports_of(body);
+					Cell *cc = ip.size() >= 2 ? comp.child_cell(body->getPort(ip[1])) : nullptr;
+					if (cc && (sva_op(cc) == "s_until" || sva_op(cc) == "s_until_with")) {
+						auto up = comp.ports_of(cc);
+						if (up.size() >= 2 && !comp.child_cell(cc->getPort(up[0])) &&
+								!comp.child_cell(cc->getPort(up[1]))) {
+							nsu = cc;
+							nsu_op = sva_op(cc);
+							cc->setParam(ID(OP), std::string(nsu_op == "s_until" ? "until" : "until_with"));
+						}
+					}
+				}
 				bool once = cell->getParam(ID::TRG_ENABLE).as_bool() && cell->getParam(ID::TRG_WIDTH).as_int() == 0;
 				SigSpec root = Const(1, 1);
 				if (once) {
@@ -4977,6 +5001,39 @@ struct Sva2CheckPass : public Pass {
 					cell->attributes[ID(sva_lowering)] = Const(tag);
 				}
 
+				if (nsu) {
+					nsu->setParam(ID(OP), nsu_op);   // restore the declaration's operator
+					if (comp.multiclock)
+						log_error("sva2check: %s in a multi-clock property is not supported in %s.\n", nsu_op.c_str(), log_id(cell));
+					pool<Cell *> seen;
+					if (comp.tree_has_locals(body, seen))
+						log_error("sva2check: local variables with a nested %s are not supported in %s.\n", nsu_op.c_str(), log_id(cell));
+					auto ip = comp.ports_of(body);
+					SigSpec open = comp.seq_dispatch(body->getPort(ip[0]),
+							comp.child_cell(body->getPort(ip[0])), root, Const(1, 1));
+					if (sva_op(body) == "|=>") {
+						open = comp.delay(open, 1, "impl");
+						if (comp.can_empty(comp.child_cell(body->getPort(ip[0]))))
+							open = comp.orN({open, root});
+					}
+					auto up = comp.ports_of(nsu);
+					SigSpec b1 = comp.reduce1(comp.resolve(nsu->getPort(up[1])));
+					// same pend bit as the temporal response (see there)
+					SigSpec pend = comp.feedback([=](SigSpec q) {
+						return mod->And(NEW_ID, mod->Not(NEW_ID, b1), mod->Or(NEW_ID, open, q));
+					}, "nsu_pend", 1);
+					SigSpec la = mod->Or(NEW_ID, mod->Not(NEW_ID, pend), b1);
+					if (dop == "disable_iff")
+						la = mod->Or(NEW_ID, dsig, la);
+					RTLIL::Cell *live = mod->addCell(cell->name.str() + "$live", ID($check));
+					live->parameters = cell->parameters;
+					live->connections_ = cell->connections_;
+					live->attributes = cell->attributes;
+					live->setParam(ID(FLAVOR), std::string("liveness"));
+					live->setPort(ID(A), la);
+					live->setPort(ID(EN), SigSpec(State::S1));
+					live->attributes[ID(sva2check)] = Const(1, 1);
+				}
 				if (strong_until) {
 					if (comp.multiclock)
 						log_error("sva2check: s_until in a multi-clock property is not supported in %s.\n", log_id(cell));

@@ -1,0 +1,10 @@
+# Followed-by with a variable-length antecedent needs an existential over
+# its matches; it is refused loudly rather than lowered as the implication
+# (which proved it vacuously when no match existed).
+logger -expect error "followed-by" 1
+read_verilog -sv -formal <<EOT
+module m (input logic clk, a, b);
+  p: assert property (@(posedge clk) a[*1:3] #-# b);
+endmodule
+EOT
+sva2check

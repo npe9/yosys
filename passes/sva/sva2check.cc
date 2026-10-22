@@ -3016,6 +3016,39 @@ struct SvaCompiler {
 			return prop_dispatch(port(i), child(i), start);
 		};
 
+		if (op == "#-#" || op == "#=#") {
+			// followed-by (LRM 16.13.9): s #-# p == not (s |-> not p) -- the
+			// attempt FAILS when s has no match.  It was lowered as the
+			// implication, which holds vacuously then: a false proof
+			// (`r[*3] #=# always !r` PROVED with r high only twice).
+			// Exact for a fixed-length s (one match point): fail = s cannot
+			// match by its deadline, or p fails after the match.  A
+			// variable-length or empty-capable s needs an existential over
+			// its matches: refused.
+			Cell *sc = child(0);
+			int lmax = sc ? seq_max_len(sc) : 1, lmin = sc ? seq_min_len(sc) : 1;
+			if ((sc && can_empty(sc)) || lmax < 1 || lmin != lmax)
+				log_error("sva2check: followed-by (%s) with a variable-length or empty-capable antecedent is not "
+						"supported in %s.\n", op.c_str(), log_id(n));
+			SigSpec ant_end = seq_dispatch(port(0), sc, start, Const(1, 1));
+			SigSpec f_s = sc ? strong_seq_fail(sc, start)
+					: andN({start, mod->Not(NEW_ID, reduce1(resolve(port(0))))});
+			SigSpec c_start = op == "#=#" ? delay(ant_end, 1, "fol") : ant_end;
+			SigSpec f_p;
+			if (!slots_mode || op != "#=#") {
+				f_p = prop_dispatch(port(1), child(1), c_start);
+			} else {
+				SigSpec saved_age = age;
+				dict<Wire *, std::pair<SigSpec, SigSpec>> saved_pending = pending_wr;
+				age = age_tick(age);
+				slot_epoch++;
+				pending_wr.clear();
+				f_p = prop_dispatch(port(1), child(1), c_start);
+				age = saved_age;
+				pending_wr = saved_pending;
+			}
+			return orN({f_s, f_p});
+		}
 		if (op == "|->" || op == "|=>" || op == "#-#" || op == "#=#") {
 			// the antecedent is a merged-existential context (concurrent
 			// attempts every tick): [->]/[=] keep the collapsed global
@@ -3307,7 +3340,28 @@ struct SvaCompiler {
 				pending_wr = saved_pending;
 				return r;
 			}
-			return sub(0);
+			// unranged `always p` == always [0:$] p: p at EVERY tick from the
+			// attempt start on.  It used to evaluate p at the start tick only
+			// -- right for a top-level assertion (an attempt starts every
+			// tick anyway), a FALSE PROOF anywhere else: `a |-> always b`,
+			// `s |=> always b`, `initial assert property (always b)` were
+			// proved with b failing later.
+			SigSpec held = feedback([=](SigSpec q) {
+				return orN({start, q});
+			}, "always_all", 1);
+			SigSpec w = orN({start, held});
+			SigSpec saved_age = age;
+			dict<Wire *, std::pair<SigSpec, SigSpec>> saved_pending = pending_wr;
+			if (slots_mode) {
+				age = Const(0, nslots);
+				age = sigset(age, 0, Const(1, 1)[0]);
+				slot_epoch++;
+				pending_wr.clear();
+			}
+			SigSpec r = prop_dispatch(port(0), child(0), w);
+			age = saved_age;
+			pending_wr = saved_pending;
+			return r;
 		}
 		if (op == "nexttime" || op == "s_nexttime") {
 			// children: [property] or [const k, property].  Move the attempt
@@ -4524,15 +4578,40 @@ struct Sva2CheckPass : public Pass {
 				// error, so only the genuinely uncheckable shapes fall.
 				bool tresp = false;
 				Cell *tev = nullptr;
+				int tresp_delay = 0;
 				if (flavor == "assert" && !liveness && body &&
 						(sva_op(body) == "|->" || sva_op(body) == "|=>")) {
 					auto ip = comp.ports_of(body);
 					Cell *cc = ip.size() == 2 ? comp.child_cell(body->getPort(ip[1])) : nullptr;
+					// `a |-> nexttime[k] s_eventually b` (LRM 16.13.10 p5/p6):
+					// the obligation opens k ticks later.  Weak and strong
+					// nexttime agree here: the formal model's traces are
+					// infinite, so the next tick always exists.
+					int k_sum = 0;
+					while (cc && (sva_op(cc) == "nexttime" || sva_op(cc) == "s_nexttime")) {
+						auto np = comp.ports_of(cc);
+						int k = 1;
+						Cell *inner = nullptr;
+						SigSpec p0 = np.empty() ? SigSpec() : cc->getPort(np[0]);
+						SigSpec p1 = np.size() > 1 ? cc->getPort(np[1]) : SigSpec();
+						if (!p1.empty() && !(p1.is_fully_const() && p1.as_int() == 0) && comp.child_cell(p1)) {
+							if (!comp.const_int(p0, k) || k < 0)
+								break;
+							inner = comp.child_cell(p1);
+						} else {
+							inner = comp.child_cell(p0);
+						}
+						if (!inner)
+							break;
+						k_sum += k;
+						cc = inner;
+					}
 					if (cc && (sva_op(cc) == "eventually" || sva_op(cc) == "s_eventually")) {
 						auto ep = comp.ports_of(cc);
 						if (ep.size() == 1 && !comp.child_cell(cc->getPort(ep[0]))) {
 							tresp = true;
 							tev = cc;
+							tresp_delay = k_sum;
 						}
 					}
 				}
@@ -4648,6 +4727,8 @@ struct Sva2CheckPass : public Pass {
 						if (comp.can_empty(comp.child_cell(body->getPort(ip[0]))))
 							open = comp.orN({open, Const(1, 1)});  // see prop_fail
 					}
+					if (tresp_delay > 0)
+						open = comp.delay(open, tresp_delay, "nexttime");
 					SigSpec bsig = comp.resolve(tev->getPort(comp.ports_of(tev)[0]));
 					if (Cell *decl = comp.decl_for_wire(bsig))
 						log_error("sva2check: named declaration operand of unbounded %s is not supported in %s.\n",

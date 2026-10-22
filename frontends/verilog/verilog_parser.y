@@ -817,7 +817,7 @@
 %type <ast_node_type_t> asgn_binop inc_or_dec_op
 %type <ast_t> genvar_identifier port_unpacked
 %type <ch_t> sva_dir
-%type <ast_t> sva_property_spec sva_at_clock sva_clock_opt sva_dis_opt sva_event sva_event_item sva_prop sva_impl sva_live
+%type <ast_t> sva_property_spec sva_at_clock sva_clock_opt sva_dis_opt sva_event sva_event_item sva_prop sva_impl sva_live sva_live_op
 %type <ast_t> sva_until sva_iff sva_or sva_and sva_not sva_intersect sva_within sva_throughout
 %type <ast_t> sva_concat sva_delay_tail sva_repeat sva_bool sva_bexpr sva_primary sva_cycle sva_bounds sva_bounds_tail sva_msg sva_msg_args sva_action
 %type <ast_t> sva_case_items sva_matches sva_inside_items
@@ -863,7 +863,10 @@
 // SVA repetition tokens (an `[*]'/`[+]'/`[->'/`[=]' bracket followed by an
 // expression is a repetition, by `]' an unbounded one, both kept over the
 // associative-dimension reading).
-%expect 131
+// +9 (2026-10-21, sva_live_op after nexttime / not): the operand of a
+// prefixed always / eventually extends as far right as possible (shift),
+// the same reading `always a until b` already had
+%expect 140
 
 %precedence FAKE_THEN
 %precedence TOK_ELSE
@@ -6885,6 +6888,12 @@ sva_impl:
 
 sva_live:
 	sva_until { $$ = std::move($1); } |
+	sva_live_op { $$ = std::move($1); };
+
+// the always / eventually prefix forms, also the operand of nexttime and
+// not (IEEE 1800 16.13.10: `nexttime always a`, `s_nexttime s_eventually a`
+// -- the operand is a property_expr; they used to be syntax errors)
+sva_live_op:
 	TOK_ALWAYS sva_live {
 		$$ = sva_add(mk_sva(@$, "always"), std::move($2));
 	} |
@@ -6944,6 +6953,23 @@ sva_not:
 		if (*$1 != "not")
 			err_at_loc(@1, "SVA requires operator 'not', got '%s'.", $1->c_str());
 		$$ = sva_add(mk_sva(@$, "not"), std::move($2));
+	} |
+	TOK_PRIMITIVE sva_live_op {
+		if (*$1 != "not")
+			err_at_loc(@1, "SVA requires operator 'not', got '%s'.", $1->c_str());
+		$$ = sva_add(mk_sva(@$, "not"), std::move($2));
+	} |
+	TOK_NEXTTIME sva_live_op { $$ = sva_add(mk_sva(@$, "nexttime"), std::move($2)); } |
+	TOK_NEXTTIME TOK_LBRA expr TOK_RBRA sva_live_op {
+		$$ = mk_sva(@$, "nexttime");
+		$$->children.push_back(std::move($3));
+		$$->children.push_back(std::move($5));
+	} |
+	TOK_S_NEXTTIME sva_live_op { $$ = sva_add(mk_sva(@$, "s_nexttime"), std::move($2)); } |
+	TOK_S_NEXTTIME TOK_LBRA expr TOK_RBRA sva_live_op {
+		$$ = mk_sva(@$, "s_nexttime");
+		$$->children.push_back(std::move($3));
+		$$->children.push_back(std::move($5));
 	} |
 	TOK_NEXTTIME sva_not { $$ = sva_add(mk_sva(@$, "nexttime"), std::move($2)); } |
 	TOK_NEXTTIME TOK_LBRA expr TOK_RBRA sva_not {

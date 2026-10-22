@@ -804,7 +804,7 @@
 %type <string_t> module_name_id
 %type <ast_t> range range_or_multirange non_opt_range non_opt_multirange param_unpacked param_packed wire_name_dims timing_event timing_events
 %type <ast_t> wire_type expr basic_expr concat_list assignment_pattern_list member_pattern_list rvalue lvalue lvalue_concat_list non_io_wire_type io_wire_type alias_lvalues match_filter type_operand opt_type_cast
-%type <string_t> opt_label opt_sva_label tok_prim_wrapper hierarchical_id hierarchical_type_id integral_number
+%type <string_t> sva_seq_method opt_label opt_sva_label tok_prim_wrapper hierarchical_id hierarchical_type_id integral_number
 %type <string_t> type_name bind_name static_method_name scoped_type_name foreach_dotted_opt class_name rs_ident
 %type <ast_t> opt_enum_init enum_type struct_type enum_struct_type func_return_type typedef_base_type
 %type <ast_t> param_type_rhs
@@ -7205,10 +7205,39 @@ sva_primary:
 		fcall->str = *$1;
 		extra->ast_stack.push_back(fcall.get());
 		$$ = std::move(fcall);
-	} TOK_LPAREN arg_list optional_comma TOK_RPAREN {
-		$$ = std::move($2);
+	} TOK_LPAREN arg_list optional_comma TOK_RPAREN sva_seq_method {
 		extra->ast_stack.pop_back();
+		if (!$7) {
+			$$ = std::move($2);
+		} else {
+			// `seq(args).triggered` / `.matched` (IEEE 1800-2009 16.9.11):
+			// "rule2 is equivalent to rule2a" -- the instance becomes the
+			// body of a hidden argument-free declaration and the method
+			// applies to that, the form the rest of the flow handles
+			if (*$7 != "\\triggered" && *$7 != "\\matched")
+				err_at_loc(@7, "Unsupported method `%s' on sequence instance `%s'.", $7->c_str() + 1, $1->c_str() + 1);
+			AstNode *scope = nullptr;
+			for (auto it = extra->ast_stack.rbegin(); it != extra->ast_stack.rend() && !scope; ++it)
+				if ((*it)->type == AST_MODULE || (*it)->type == AST_GENBLOCK)
+					scope = *it;
+			if (!scope)
+				err_at_loc(@$, "Sequence method on an instance with arguments outside a module.");
+			static int seq_method_ctr = 0;
+			std::string hidden = stringf("%s$method$%d", $1->c_str(), ++seq_method_ctr);
+			auto id = std::make_unique<AstNode>(@1, AST_CELLTYPE);
+			id->str = hidden;
+			auto decl = mk_sva(@$, "sequence_decl");
+			decl->children.push_back(std::move(id));
+			decl->children.push_back(std::move($2));
+			scope->children.push_back(std::move(decl));
+			$$ = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
+			$$->str = hidden + "." + $7->substr(1);
+		}
 	};
+
+sva_seq_method:
+	%empty { $$ = nullptr; } |
+	TOK_DOT TOK_ID { $$ = std::move($2); };
 
 sva_matches:
 	%empty { $$ = mk_sva(@$, "matches"); } |

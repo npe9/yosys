@@ -106,7 +106,12 @@ def check_covers(yosys, smtbmc, path, top, solver, bound, timeout):
     with open(ys, "w") as fh:
         fh.write(PREP.format(svaflags=run_ic3.sva_flags(path), guard=run_ic3.degraded_guard(path),
                              flags=run_ic3.read_flags(path), files=path, top=" -top " + top if top else "",
-                             deletes="", smt=smt, extra_a2s=extra_a2s, extra_mem=extra_mem))
+                             # asserts out (assumes stay): in cover mode smtbmc
+                             # stops at the first failing assert, which would
+                             # truncate the cover check at that step (seen on the
+                             # AXI4 FVIP crossbar's by-design dest failure @3)
+                             deletes="delete t:$assert\ndelete t:$check r:FLAVOR=assert %i\n",
+                             smt=smt, extra_a2s=extra_a2s, extra_mem=extra_mem))
     p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" "$2"', "y", yosys, ys], timeout=timeout)
     if p.returncode != 0:
         print("%s: cover prep-failed" % label)

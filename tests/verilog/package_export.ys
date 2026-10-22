@@ -1,0 +1,37 @@
+# IEEE 1800-2017 26.6: `export B::name;` in package A makes the imported
+# name visible as `A::name` (OpenTitan spi_device_pkg re-exports the
+# spi_device_reg_pkg depths; `$clog2(spi_device_pkg::SramCmdFifoDepth+1)`
+# did not resolve). Parameters and types.
+read_verilog -sv <<EOT
+package regp;
+  parameter int unsigned Depth = 7;
+  typedef logic [5:0] addr_t;
+endpackage
+package devp;
+  import regp::Depth;
+  export regp::Depth;
+  import regp::addr_t;
+  export regp::addr_t;
+  parameter int unsigned Twice = Depth * 2;
+endpackage
+module top #(parameter int unsigned D = devp::Depth, localparam int unsigned W = $clog2(D+1))
+  ;
+  logic [7:0] o, t, w;
+  devp::addr_t a;
+  assign o = D;
+  assign t = devp::Twice;
+  assign w = W;
+  assign a = '1;
+  always_comb begin
+    assert (o == 8'd7);
+    assert (t == 8'd14);
+    assert (w == 8'd3);
+    assert ($bits(a) == 6);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

@@ -2198,7 +2198,39 @@ dpi_export_decl:
 	TOK_EXPORT TOK_STRING TOK_FUNCTION TOK_ID TOK_SEMICOL |
 	TOK_EXPORT TOK_STRING TOK_EXTERN TOK_TASK TOK_ID TOK_SEMICOL |
 	TOK_EXPORT TOK_STRING TOK_EXTERN TOK_FUNCTION TOK_ID TOK_SEMICOL |
-	TOK_EXPORT TOK_SCOPED_ID TOK_SEMICOL;
+	TOK_EXPORT TOK_SCOPED_ID TOK_SEMICOL {
+		// IEEE 1800-2017 26.6: `export B::name;` in package A makes the
+		// imported name visible as `A::name` (OpenTitan spi_device_pkg
+		// re-exports spi_device_reg_pkg depths). Declare an alias in A:
+		// a typedef for a type, otherwise a localparam. Wildcard exports
+		// (`export B::*`, `export *::*`) stay unmodelled.
+		AstNode *pkg = extra->current_ast_mod;
+		std::string q = *$2;
+		size_t sep = q.rfind("::");
+		std::string leaf = sep == std::string::npos ? "" : q.substr(sep + 2);
+		if (pkg && pkg->type == AST_PACKAGE && !leaf.empty() && leaf != "*") {
+			std::string name = "\\" + leaf;
+			if (extra->pkg_user_types.count(q)) {
+				auto wire = std::make_unique<AstNode>(@2, AST_WIRE);
+				wire->is_logic = true;
+				auto wt = std::make_unique<AstNode>(@2, AST_WIRETYPE);
+				wt->str = q;
+				wire->children.push_back(std::move(wt));
+				wire->is_custom_type = true;
+				auto td = std::make_unique<AstNode>(@2, AST_TYPEDEF, std::move(wire));
+				td->str = name;
+				AstNode *tnode = extra->saveChild(std::move(td));
+				extra->pkg_user_types[pkg->str + "::" + leaf] = tnode;
+			} else {
+				auto id = std::make_unique<AstNode>(@2, AST_IDENTIFIER);
+				id->str = q;
+				auto lp = std::make_unique<AstNode>(@2, AST_LOCALPARAM, std::move(id));
+				lp->str = name;
+				lp->set_attribute(ID(sv_export_alias), AstNode::mkconst_int(@2, 1, false));
+				extra->saveChild(std::move(lp));
+			}
+		}
+	};
 
 task_func_decl:
 	attr TOK_DPI_FUNCTION TOK_ID dpi_signing TOK_ID {

@@ -4563,6 +4563,18 @@ struct Sva2CheckPass : public Pass {
 				// $sva child) keeps the existing "bound it" error via
 				// prop_fail below.
 				bool liveness = false;
+				// `always s_eventually p` at the TOP of a (non-initial)
+				// assertion (LRM 16.13.13 p3, "p infinitely often"): the
+				// assertion already attempts at every tick, so the outer
+				// always adds nothing -- it is `s_eventually p` here.
+				// (Nested, or in an initial block, it is not; those stay loud.)
+				if (flavor == "assert" && body && sva_op(body) == "always" &&
+						!(cell->getParam(ID::TRG_ENABLE).as_bool() && cell->getParam(ID::TRG_WIDTH).as_int() == 0)) {
+					auto ap = comp.ports_of(body);
+					Cell *inner = ap.empty() ? nullptr : comp.child_cell(body->getPort(ap[0]));
+					if (inner && (sva_op(inner) == "eventually" || sva_op(inner) == "s_eventually"))
+						body = inner;
+				}
 				if (flavor == "assert" && body &&
 						(sva_op(body) == "eventually" || sva_op(body) == "s_eventually")) {
 					auto bp = comp.ports_of(body);
@@ -4579,6 +4591,7 @@ struct Sva2CheckPass : public Pass {
 				bool tresp = false;
 				Cell *tev = nullptr;
 				int tresp_delay = 0;
+				int tresp_bidx = 0;   // the operand port of the (s_)eventually
 				if (flavor == "assert" && !liveness && body &&
 						(sva_op(body) == "|->" || sva_op(body) == "|=>")) {
 					auto ip = comp.ports_of(body);
@@ -4612,6 +4625,21 @@ struct Sva2CheckPass : public Pass {
 							tresp = true;
 							tev = cc;
 							tresp_delay = k_sum;
+						} else if (sva_op(cc) == "s_eventually" && ep.size() == 2 && !comp.child_cell(cc->getPort(ep[1]))) {
+							// `ant |-> s_eventually [m:$] b` (LRM 16.13.13 p7) ==
+							// ant |-> nexttime[m] s_eventually b
+							Cell *bc = comp.child_cell(cc->getPort(ep[0]));
+							int lo, hi;
+							if (bc && sva_op(bc) == "bounds") {
+								auto bp = comp.ports_of(bc);
+								if (bp.size() >= 2 && comp.const_int(bc->getPort(bp[0]), lo) &&
+										comp.const_int(bc->getPort(bp[1]), hi) && hi < 0 && lo >= 0) {
+									tresp = true;
+									tev = cc;
+									tresp_bidx = 1;
+									tresp_delay = k_sum + lo;
+								}
+							}
 						}
 					}
 				}
@@ -4753,7 +4781,7 @@ struct Sva2CheckPass : public Pass {
 					}
 					if (tresp_delay > 0)
 						open = comp.delay(open, tresp_delay, "nexttime");
-					SigSpec bsig = comp.resolve(tev->getPort(comp.ports_of(tev)[0]));
+					SigSpec bsig = comp.resolve(tev->getPort(comp.ports_of(tev)[tresp_bidx]));
 					if (Cell *decl = comp.decl_for_wire(bsig))
 						log_error("sva2check: named declaration operand of unbounded %s is not supported in %s.\n",
 								sva_op(tev).c_str(), log_id(cell));

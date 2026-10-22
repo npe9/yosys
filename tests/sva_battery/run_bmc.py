@@ -82,6 +82,68 @@ def expectations(path):
     return exp
 
 
+def cover_expectations(path):
+    """cover name -> ('reached', N) | ('unreachable', None) (register v3 D4)."""
+    exp = {}
+    for line in open(path).read().splitlines():
+        m = re.match(r'\s*(\w+)\s*:\s*cover\s+(?:property|sequence)\s*\(.*;\s*//\s*(REACHED|UNREACHABLE)\s*@?(\d+)?', line)
+        if m:
+            exp[m.group(1)] = (m.group(2).lower(), int(m.group(3)) if m.group(3) else None)
+    return exp
+
+
+def check_covers(yosys, smtbmc, path, top, solver, bound, timeout):
+    """Second engine for cover verdicts: `yosys-smtbmc -c` on the same SMT2.
+    REACHED @N must be reached first at step N; UNREACHABLE must not be
+    reached within the bound (bounded evidence only -- the proof is ic3's)."""
+    cexp = cover_expectations(path)
+    if not cexp:
+        return True
+    label = os.path.basename(path)
+    smt = os.path.join(tempfile.gettempdir(), "bmccov_%d.smt2" % os.getpid())
+    ys = os.path.join(tempfile.gettempdir(), "bmccov_%d.ys" % os.getpid())
+    extra_a2s, extra_mem = prep_extras(path)
+    with open(ys, "w") as fh:
+        fh.write(PREP.format(svaflags=run_ic3.sva_flags(path), guard=run_ic3.degraded_guard(path),
+                             flags=run_ic3.read_flags(path), files=path, top=" -top " + top if top else "",
+                             deletes="", smt=smt, extra_a2s=extra_a2s, extra_mem=extra_mem))
+    p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" "$2"', "y", yosys, ys], timeout=timeout)
+    if p.returncode != 0:
+        print("%s: cover prep-failed" % label)
+        return False
+    if not top:
+        m = re.search(r"yosys-smt2-topmod (\S+)", open(smt).read())
+        top = m.group(1) if m else None
+    if not top:
+        print("%s: cover pass: no topmod in smt2" % label)
+        return False
+    try:
+        p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$@"', "y", smtbmc, "-s", solver, "-c",
+                 "-t", str(bound), "-m", top or label, smt], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print("%s: smtbmc cover pass timed out after %ds" % (label, timeout))
+        return False
+    reached = {}
+    for line in (p.stdout + p.stderr).splitlines():
+        m = re.search(r"Reached cover statement in step (\d+) at \S+: (\S+)", line)
+        if m:
+            reached.setdefault(m.group(2), int(m.group(1)))
+    ok = True
+    print("%s: %d covers checked by smtbmc -c (bound %d):" % (label, len(cexp), bound))
+    for name in sorted(cexp):
+        kind, n = cexp[name]
+        r = reached.get(name)
+        if kind == "reached" and r is not None and (n is None or r == n):
+            print("  reach@%-3d %s (as expected)" % (r, name))
+        elif kind == "unreachable" and r is None:
+            print("  unreached %s (not within bound %d; ic3 proves it)" % (name, bound))
+        else:
+            print("  MISMATCH  %s: expected %s%s, smtbmc %s" % (name, kind.upper(),
+                  " @%d" % n if n is not None else "", "reached @%d" % r if r is not None else "not reached"))
+            ok = False
+    return ok
+
+
 def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
               stream=None, dump_yw=None):
     top = top or run_ic3.top_pragma(path)   # `// TOP: <module>` for multi-root files
@@ -291,6 +353,11 @@ def main():
                       dump_yw=args.dump_yw)
         if r is None or not r:
             ok = False
+        if not args.stream:
+            top = args.top or run_ic3.top_pragma(path)
+            bound = max([args.bound] + [n + 4 for k, n in cover_expectations(path).values() if n is not None])
+            if not check_covers(args.yosys, args.smtbmc, path, top, args.solver, bound, args.timeout):
+                ok = False
     sys.exit(0 if ok else 1)
 
 

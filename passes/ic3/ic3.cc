@@ -145,6 +145,19 @@ struct Ic3MiniSat : public ezSAT
 	}
 };
 
+// -timeout <s>: a per-query wall-clock budget shared by the main solver and
+// its pre-pass solvers; every SAT call checks it and throws, the query is
+// then reported undecided (one hard cover used to hold a 145-cover run for
+// hours with nothing reported)
+struct Ic3Timeout {};
+static bool ic3_deadline_on = false;
+static std::chrono::steady_clock::time_point ic3_deadline;
+static void ic3_check_deadline()
+{
+	if (ic3_deadline_on && std::chrono::steady_clock::now() > ic3_deadline)
+		throw Ic3Timeout();
+}
+
 struct Ic3Solver
 {
 	RTLIL::Module *module;
@@ -466,6 +479,7 @@ struct Ic3Solver
 	{
 		std::vector<int> exprs;
 		std::vector<bool> vals;
+		ic3_check_deadline();
 		nsolves++;
 		if (nsolves % 100000 == 0)
 			fprintf(stderr, "ic3-debug: %d solves, %d frames, clauses=%d (blk=%lld gen=%lld init=%lld bad=%lld ctg=%lld) t_add=%.1fs t_gen=%.1fs\n",
@@ -477,6 +491,7 @@ struct Ic3Solver
 	{
 		std::vector<int> exprs = svec;
 		model.clear();
+		ic3_check_deadline();
 		nsolves++;
 		if (nsolves % 100000 == 0)
 			fprintf(stderr, "ic3-debug: %d solves, %d frames, clauses=%d (blk=%lld gen=%lld init=%lld bad=%lld ctg=%lld) t_add=%.1fs t_gen=%.1fs\n",
@@ -1452,7 +1467,7 @@ struct Ic3Pass : Pass
 	void help() override
 	{
 		log("\n");
-		log("    ic3 [-top <name>] [-check-cells] [-init-zero] [-max <frames>] [-kind <k>]\n");
+		log("    ic3 [-top <name>] [-check-cells] [-init-zero] [-max <frames>] [-kind <k>] [-timeout <s>]\n");
 		log("        [-ctg <depth>] [-cex <prefix>] [-v]\n");
 		log("\n");
 		log("Proves (or disproves) the safety properties given as $assert cells and\n");
@@ -1504,6 +1519,10 @@ struct Ic3Pass : Pass
 		log("        try k-induction up to depth k before the IC3 loop\n");
 		log("        (default: 8; 0 disables)\n");
 		log("\n");
+		log("    -timeout <seconds>\n");
+		log("        wall-clock budget per property / cover query; an exhausted\n");
+		log("        query is reported undecided and the next one starts\n");
+		log("\n");
 		log("    -bmc <depth>\n");
 		log("        bounded-model-checking pre-pass: ask bad@t for t = 1..depth\n");
 		log("        on a throwaway solver before k-induction and IC3; on a hit\n");
@@ -1534,6 +1553,14 @@ struct Ic3Pass : Pass
 		bool allow_degraded = false;
 		bool verbose = false;
 		int max_frames = 1000;
+		double timeout_s = 0;
+		// arm the per-query budget (0: none)
+		auto arm = [&]() {
+			ic3_deadline_on = timeout_s > 0;
+			if (ic3_deadline_on)
+				ic3_deadline = std::chrono::steady_clock::now() +
+						std::chrono::milliseconds((long long)(timeout_s * 1000));
+		};
 		int kind_max = 8;
 		int bmc_max = 0;
 		int ctg_depth_max = 0;
@@ -1572,6 +1599,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-bmc") {
 				bmc_max = atoi(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-timeout") {
+				timeout_s = atof(args[++argidx].c_str());
 				continue;
 			}
 			if (args[argidx] == "-cex") {
@@ -1772,7 +1803,15 @@ struct Ic3Pass : Pass
 			solver.ctg_depth_max = ctg_depth_max;
 
 			int depth = 0;
-			int result = solver.prove(cell, depth);
+			int result;
+			arm();
+			try {
+				result = solver.prove(cell, depth);
+			} catch (Ic3Timeout &) {
+				result = 2;
+				log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+			}
+			ic3_deadline_on = false;
 
 			if (result == 0) {
 				log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());
@@ -1832,7 +1871,15 @@ struct Ic3Pass : Pass
 			solver.bmc_max = bmc_max;
 			solver.ctg_depth_max = ctg_depth_max;
 			int depth = 0;
-			int result = solver.prove(tmp, depth);
+			int result;
+			arm();
+			try {
+				result = solver.prove(tmp, depth);
+			} catch (Ic3Timeout &) {
+				result = 2;
+				log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+			}
+			ic3_deadline_on = false;
 			if (result == 1) {
 				log("ic3: %s: cover reached (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
 				n_reached++;
@@ -1880,7 +1927,15 @@ struct Ic3Pass : Pass
 			}
 
 			int depth = 0;
-			int result = solver.prove_liveness(cell, depth, cex_file);
+			int result;
+			arm();
+			try {
+				result = solver.prove_liveness(cell, depth, cex_file);
+			} catch (Ic3Timeout &) {
+				result = 2;
+				log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+			}
+			ic3_deadline_on = false;
 
 			if (result == 0) {
 				log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());

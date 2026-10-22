@@ -1,0 +1,71 @@
+# break/continue under a data-dependent condition in an unrolled for-loop
+# (IEEE 1800-2017 12.8; cva6 miss_handler `if (req[i]) begin sel = i;
+# break; end`). They used to be "Ignoring task call `\break'".
+read_verilog -sv <<EOT
+module top (input logic clk, input logic [3:0] r, input logic st, input logic [3:0] m, output logic [1:0] last_o);
+  assign last_o = last_ff;
+  logic [1:0] first, last_ff, in_case;
+  logic [2:0] cnt_skip;
+  logic found;
+  always_comb begin
+    first = 0;
+    found = 0;
+    for (int i = 0; i < 4; i++) begin
+      if (r[i]) begin
+        first = i[1:0];
+        found = 1;
+        break;
+      end
+    end
+  end
+  // count set bits of r, skipping positions masked by m
+  always_comb begin
+    cnt_skip = 0;
+    for (int i = 0; i < 4; i++) begin
+      if (m[i]) continue;
+      cnt_skip = cnt_skip + r[i];
+    end
+  end
+  always_comb begin
+    in_case = 2'd3;
+    case (st)
+      1'b0: for (int i = 3; i >= 0; i--) begin
+              if (r[i]) begin
+                in_case = i[1:0];
+                break;
+              end
+            end
+      default: ;
+    endcase
+  end
+  always_ff @(posedge clk) begin
+    for (int i = 0; i < 4; i++) begin
+      if (r[i]) begin
+        last_ff <= i[1:0];
+        break;
+      end
+    end
+  end
+  wire [1:0] ref_first = r[0] ? 2'd0 : r[1] ? 2'd1 : r[2] ? 2'd2 : 2'd3;
+  wire [1:0] ref_top = r[3] ? 2'd3 : r[2] ? 2'd2 : r[1] ? 2'd1 : r[0] ? 2'd0 : 2'd3;
+  always_comb begin
+    assert (found == |r);
+    assert (!(|r) || first == ref_first);
+    assert (!(|r) -> first == 2'd0);
+    assert (cnt_skip == (r[0] & ~m[0]) + (r[1] & ~m[1]) + (r[2] & ~m[2]) + (r[3] & ~m[3]));
+    assert (st || in_case == ref_top);
+    assert (!st || in_case == 2'd3);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+# the loop-exit flags are per-pass temporaries: no latch, and the only
+# flip-flop is last_ff's
+select -assert-none t:$dlatch
+select -assert-count 1 t:$dff
+# the comb checks below do not need the flip-flop
+delete t:$dff
+chformal -lower
+sat -verify -prove-asserts -show-ports

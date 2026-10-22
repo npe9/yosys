@@ -1,0 +1,12 @@
+# A procedural for-loop the unroller cannot unroll (here the induction
+# variable is an implicit net) used to vanish with only a warning, leaving
+# `n = 0`; it is now a frontend degradation (an error unless -permissive).
+logger -expect error "Procedural for-loop dropped; its induction variable is not a register" 1
+read_verilog -sv <<EOT
+module top (input logic [3:0] r, output logic [3:0] n);
+  always_comb begin
+    n = 0;
+    for (kk = 0; kk < 4; kk = kk + 1) n = n + r[kk];
+  end
+endmodule
+EOT

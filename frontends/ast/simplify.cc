@@ -4652,8 +4652,12 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			// materialize an assignment-pattern value into a packed constant
 			// (named members per sv_member, otherwise positional) so member
 			// selects and range declarations can fold against the parameter
+			// (not for an unpacked ARRAY of structs: its pattern lists
+			// elements, not members -- `'{default:'0}` used to fold into one
+			// struct-wide constant)
 			if (attributes.count(ID::wiretype) &&
 					attributes.at(ID::wiretype)->type == AST_STRUCT &&
+					unpacked_dimensions == 0 && !attributes.count(ID(sv_unpacked_dims)) &&
 					children[0]->type == AST_ASSIGN_PATTERN) {
 				AstNode *stype = attributes.at(ID::wiretype).get();
 				while (!children[0]->basic_prep && children[0]->simplify(false, stage, -1, false))
@@ -5593,6 +5597,97 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 	}
 
+	// a member of an element of an unpacked-array PARAMETER (`P[1].m` with
+	// `parameter c_t P [4] = ...`): fold it from the parameter's value.  The
+	// constant-prefix rule below would turn it into an identifier `P[1].m`
+	// read as an undriven implicit wire.
+	if (type == AST_PREFIX && GetSize(children) == 2 && children[1]->type == AST_IDENTIFIER &&
+			children[1]->children.empty() && current_scope.count(str)) {
+		AstNode *decl = current_scope.at(str);
+		if ((decl->type == AST_PARAMETER || decl->type == AST_LOCALPARAM) && decl->unpacked_dimensions == 1 &&
+				!decl->children.empty() && decl->children[0]->type == AST_ASSIGN_PATTERN) {
+			while (children[0]->simplify(true, stage, -1, false)) { }
+			AstNode *idx = children[0].get();
+			if (idx->type == AST_RANGE && idx->children.size() == 1)
+				idx = idx->children[0].get();
+			AstNode *pat = decl->children[0].get();
+			// the element struct type (the wiretype attribute holds its NAME)
+			AstNode *etype = decl->attributes.count(ID::wiretype) ? decl->attributes.at(ID::wiretype).get() : nullptr;
+			if (etype && etype->type != AST_STRUCT && etype->type != AST_UNION) {
+				std::string tn = etype->str;
+				etype = nullptr;
+				AstNode *td = current_scope.count(tn) ? current_scope.at(tn) : nullptr;
+				if (!td && current_ast_mod)
+					for (auto &c : current_ast_mod->children)
+						if (c && c->type == AST_TYPEDEF && c->str == tn)
+							td = c.get();
+				if (td && td->type == AST_TYPEDEF && !td->children.empty())
+					td = td->children[0].get();
+				if (td && (td->type == AST_STRUCT || td->type == AST_UNION))
+					etype = td;
+			}
+			if (idx->type == AST_CONSTANT && etype) {
+				auto &dm = decl->dimensions[0];
+				bool ascending = dm.range_swapped;
+				int base = ascending ? dm.range_right : dm.range_right + dm.range_width - 1;
+				int index = idx->asInt(true);
+				int pos = ascending ? index - base : base - index;
+				if (pos < 0 || pos >= dm.range_width)
+					input_error("Index %d of parameter array %s is out of range.\n", index, log_id(str));
+				// `'{default: v}` (alone or after explicit elements): v for
+				// every element the pattern does not list
+				AstNode *dflt = nullptr;
+				int listed = 0;
+				for (auto &c : pat->children) {
+					auto it = c->attributes.find(ID(sv_member));
+					std::string key = it != c->attributes.end() && it->second ? it->second->str : "";
+					if (key == "default" || key == "\\default")
+						dflt = c.get();
+					else
+						listed++;
+				}
+				AstNode *src_elem = pos < listed ? pat->children[pos].get() : dflt;
+				if (!src_elem)
+					input_error("Index %d of parameter array %s has no element in its value.\n", index, log_id(str));
+				auto st = etype->clone();
+				size_packed_struct(st.get(), 0);
+				std::unique_ptr<AstNode> elem = src_elem->clone();
+				elem->attributes.erase(ID(sv_member));
+				if (elem->type == AST_ASSIGN_PATTERN) {
+					auto tmp = std::make_unique<AstNode>(location, AST_LOCALPARAM, std::move(elem));
+					tmp->str = "\\$member_element";
+					tmp->set_attribute(ID::wiretype, st->clone());
+					while (tmp->simplify(true, 1, -1, false)) { }
+					elem = tmp->children[0]->clone();
+				} else {
+					while (elem->simplify(true, 1, -1, false)) { }
+				}
+				std::string mname = children[1]->str;
+				if (!mname.empty() && mname[0] == '\\')
+					mname = mname.substr(1);
+				AstNode *item = nullptr;
+				for (auto &cand : st->children) {
+					std::string cn = cand->str;
+					if (!cn.empty() && cn[0] == '\\')
+						cn = cn.substr(1);
+					if (cn == mname)
+						item = cand.get();
+				}
+				if (elem->type == AST_CONSTANT && item && item->range_valid) {
+					int sw = st->range_left - st->range_right + 1;
+					std::vector<RTLIL::State> bits = elem->bitsAsConst(sw, false).to_bits();
+					int lo = std::min(item->range_left, item->range_right) - st->range_right;
+					int hi = std::max(item->range_left, item->range_right) - st->range_right;
+					std::vector<RTLIL::State> v(bits.begin() + lo, bits.begin() + hi + 1);
+					newNode = mkconst_bits(location, v, false);
+					goto apply_newNode;
+				}
+				if (!item)
+					input_error("Struct type of parameter array %s has no member `%s'.\n", log_id(str), mname.c_str());
+			}
+		}
+	}
+
 	// resolve constant prefixes (IEEE hierarchical names use constant indices)
 	if (type == AST_PREFIX && children[0]->type == AST_CONSTANT) {
 		if (children[1]->type == AST_PREFIX)
@@ -5886,6 +5981,36 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					children[0] = std::move(pat);
 					did_something = true;
 				}
+			}
+		}
+		// `'{default: v}` (possibly after explicit elements) for a 1-D
+		// unpacked array: list every element, so element reads and
+		// pass-through flattening see one child per element
+		if (unpacked_dimensions == 1 && !children.empty() && children[0]->type == AST_ASSIGN_PATTERN) {
+			AstNode *pat = children[0].get();
+			AstNode *dflt = nullptr;
+			std::vector<AstNode *> listed;
+			bool keyed = false;
+			for (auto &c : pat->children) {
+				auto it = c->attributes.find(ID(sv_member));
+				std::string key = it != c->attributes.end() && it->second ? it->second->str : "";
+				if (key == "default" || key == "\\default")
+					dflt = c.get();
+				else if (!key.empty())
+					keyed = true;
+				else
+					listed.push_back(c.get());
+			}
+			int n = dimensions[0].range_width;
+			if (dflt && !keyed && GetSize(listed) <= n) {
+				auto npat = std::make_unique<AstNode>(pat->location, AST_ASSIGN_PATTERN);
+				for (int i = 0; i < n; i++) {
+					auto e = (i < GetSize(listed) ? listed[i] : dflt)->clone();
+					e->attributes.erase(ID(sv_member));
+					npat->children.push_back(std::move(e));
+				}
+				children[0] = std::move(npat);
+				did_something = true;
 			}
 		}
 		if (unpacked_dimensions > 0 && !children.empty() && children[0]->type == AST_IDENTIFIER &&

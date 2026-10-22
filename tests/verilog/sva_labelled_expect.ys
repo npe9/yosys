@@ -1,0 +1,12 @@
+# A labelled `expect` statement (LRM 16.17) used to fail to parse: the
+# lexer's TOK_SVA_LABEL lookahead listed assert/assume/cover/restrict but
+# not expect, so `e1: expect property (...)` was a syntax error.
+read_verilog -sv -formal <<EOT
+module m (input logic clk, input logic a, input logic b);
+  initial begin
+    e1: expect (@(posedge clk) a ##1 b);
+  end
+endmodule
+EOT
+hierarchy -top m
+select -assert-count 1 c:e1

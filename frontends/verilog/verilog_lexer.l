@@ -495,10 +495,11 @@ ASSOC_DIM "["[ \t\r\n]*([a-zA-Z_$][a-zA-Z0-9_$]*|"\*")([ \t\r\n]|"/*"([^*]|\*+[^
 "always_ff"    { SV_KEYWORD(parser::make_TOK_ALWAYS_FF(out_loc)); }
 "always_latch" { SV_KEYWORD(parser::make_TOK_ALWAYS_LATCH(out_loc)); }
 
+ /* (`expect` added 2026-10-22: `e: expect (...)` in a procedural block was a syntax error) */
  /* use special token for labels on assert, assume, cover, and restrict because it's insanley complex
     to fix parsing of cells otherwise. (the current cell parser forces a reduce very early to update some
     global state.. its a mess) */
-[a-zA-Z_$][a-zA-Z0-9_$]*/[ \t\r\n]*:[ \t\r\n]*(assert|assume|cover|restrict)[^a-zA-Z0-9_$\.] {
+[a-zA-Z_$][a-zA-Z0-9_$]*/[ \t\r\n]*:[ \t\r\n]*(assert|assume|cover|restrict|expect)[^a-zA-Z0-9_$\.] {
 	if (!strcmp(YYText(), "default"))
 		return parser::make_TOK_DEFAULT(out_loc);
 	string_t val = std::make_unique<std::string>(std::string("\\") + YYText());

@@ -1,0 +1,18 @@
+# ic3 -timeout must bound a single SAT call (2026-10-22).  The deadline
+# used to be checked only between solves: this one UNSAT query (10-bit
+# multiplier associativity, no induction) ran 150s+ past `-timeout 5`.
+# Now the solve runs in propagation-budget slices and stops at ~2s.
+read_verilog -sv -formal <<EOT
+module tmulc(input clk, input [9:0] a, input [9:0] b, input [9:0] c);
+  wire [9:0] l = (a*b)*c;
+  wire [9:0] r = a*(b*c);
+  a_assoc: assert property (@(posedge clk) l == r);
+endmodule
+EOT
+prep -top tmulc
+sva2check
+async2sync
+opt_clean
+logger -expect log "a_assoc: query budget of 2s exhausted" 1
+logger -expect log "a_assoc: undecided" 1
+ic3 -check-cells -init-zero -kind 0 -timeout 2

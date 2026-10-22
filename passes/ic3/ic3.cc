@@ -30,6 +30,19 @@
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
+// -timeout <s>: a per-query wall-clock budget shared by the main solver and
+// its pre-pass solvers; every SAT call checks it and throws, the query is
+// then reported undecided (one hard cover used to hold a 145-cover run for
+// hours with nothing reported)
+struct Ic3Timeout {};
+static bool ic3_deadline_on = false;
+static std::chrono::steady_clock::time_point ic3_deadline;
+static void ic3_check_deadline()
+{
+	if (ic3_deadline_on && std::chrono::steady_clock::now() > ic3_deadline)
+		throw Ic3Timeout();
+}
+
 // ezSAT backend on the plain (non-simplifying) in-tree MiniSat solver.
 // The default ezMiniSAT uses SimpSolver whose variable elimination re-runs
 // on every incremental solve; IC3 interleaves clause addition and solving
@@ -123,8 +136,29 @@ struct Ic3MiniSat : public ezSAT
 			else
 				assumps.push(Minisat::mkLit(minisat_vars.at(-idx-1), true));
 
-		if (!minisat_solver->solve(assumps))
-			return false;
+		// Under -timeout a single solve must not overrun the budget (the
+		// deadline used to be checked only between SAT calls: one hard
+		// solve on a ~5M-clause unrolling ran past it).  Solve in
+		// propagation-budget slices and check the deadline between them;
+		// learnt clauses survive across slices, and an interrupted solve
+		// leaves the solver at level 0, reusable for the next query.
+		if (!ic3_deadline_on) {
+			if (!minisat_solver->solve(assumps))
+				return false;
+		} else {
+			while (1) {
+				ic3_check_deadline();
+				minisat_solver->setPropBudget(1 << 21);
+				Minisat::lbool r = minisat_solver->solveLimited(assumps);
+				if (r == Minisat::lbool((uint8_t)0))
+					break;
+				if (r == Minisat::lbool((uint8_t)1)) {
+					minisat_solver->budgetOff();
+					return false;
+				}
+			}
+			minisat_solver->budgetOff();
+		}
 
 		modelValues.clear();
 		modelValues.resize(modelIdx.size());
@@ -145,19 +179,6 @@ struct Ic3MiniSat : public ezSAT
 	}
 };
 
-// -timeout <s>: a per-query wall-clock budget shared by the main solver and
-// its pre-pass solvers; every SAT call checks it and throws, the query is
-// then reported undecided (one hard cover used to hold a 145-cover run for
-// hours with nothing reported)
-struct Ic3Timeout {};
-static bool ic3_deadline_on = false;
-static std::chrono::steady_clock::time_point ic3_deadline;
-static void ic3_check_deadline()
-{
-	if (ic3_deadline_on && std::chrono::steady_clock::now() > ic3_deadline)
-		throw Ic3Timeout();
-}
-
 struct Ic3Solver
 {
 	RTLIL::Module *module;
@@ -169,6 +190,16 @@ struct Ic3Solver
 	int max_frames;
 
 	std::vector<RTLIL::Cell*> assume_cells;
+
+	// further checks whose cones encode() must include (the batched BMC
+	// pre-pass encodes every assert and cover on one unrolling)
+	std::vector<RTLIL::Cell*> extra_seeds;
+
+	// initial value of each state1 bit (set by encode()): 0/1 when the
+	// initial state fixes it, -1 when it is free; init_fixed says every
+	// bit is fixed (always so under -init-zero)
+	std::vector<int> init_val;
+	bool init_fixed = false;
 
 	// fairness cells ($fair: assume(s_eventually ...), lowered by sva2check
 	// from assume/restrict of unbounded eventually): they seed the cone of
@@ -208,6 +239,9 @@ struct Ic3Solver
 
 	// CTG-guided generalization recursion depth (0 = disabled)
 	int ctg_depth_max;
+
+	// state bits whose initial value is an explicit 1 (encode())
+	int n_init_ones = 0;
 
 	int nsolves;
 	long long n_bad, n_blockq, n_gen, n_init, n_ctg;
@@ -282,6 +316,10 @@ struct Ic3Solver
 		};
 		seed(prop->getPort(ID::A));
 		seed(prop->getPort(ID::EN));
+		for (auto cell : extra_seeds) {
+			seed(cell->getPort(ID::A));
+			seed(cell->getPort(ID::EN));
+		}
 		for (auto cell : assume_cells) {
 			seed(cell->getPort(ID::A));
 			seed(cell->getPort(ID::EN));
@@ -332,33 +370,54 @@ struct Ic3Solver
 			}
 
 		// initial state: \init attributes where present (Sx bits stay free),
-		// everything else free unless -init-zero forces all registers to 0
+		// everything else free.  -init-zero fixes the remaining bits (and
+		// the Sx bits) to 0 but keeps every explicit 0/1 init: it used to
+		// force ALL registers to 0, silently overriding `reg init = 1'b1`
+		// -- a reset generator that never fired, so a harness DUT never saw
+		// reset and covers were reached during what should be reset (peer
+		// Mem_Controller/Deburster harnesses, 2026-10-22; smtbmc and the
+		// sim replay, prepped with `setundef -init -zero`, honour the init)
 		RTLIL::SigSpec big_lhs, big_rhs;
-		if (init_zero) {
-			RTLIL::SigSpec rem = satgen.initial_state.export_all();
-			big_lhs.append(rem);
-			big_rhs.append(RTLIL::SigSpec(RTLIL::State::S0, rem.size()));
-		} else {
-			for (auto wire : module->wires()) {
-				if (wire->attributes.count(ID::init) == 0)
+		for (auto wire : module->wires()) {
+			if (wire->attributes.count(ID::init) == 0)
+				continue;
+			RTLIL::SigSpec lhs = sigmap(wire);
+			RTLIL::Const rhs = wire->attributes.at(ID::init);
+			log_assert(lhs.size() == rhs.size());
+			RTLIL::SigSpec l, r;
+			for (int i = 0; i < lhs.size(); i++) {
+				RTLIL::SigSpec bit = lhs.extract(i, 1);
+				if (!satgen.initial_state.check_all(bit))
 					continue;
-				RTLIL::SigSpec lhs = sigmap(wire);
-				RTLIL::SigSpec rhs = wire->attributes.at(ID::init);
-				log_assert(lhs.size() == rhs.size());
-				for (int i = 0; i < lhs.size(); i++) {
-					RTLIL::SigSpec bit = lhs.extract(i, 1);
-					if (rhs[i] == RTLIL::State::Sx || !satgen.initial_state.check_all(bit)) {
-						lhs.remove(i, 1);
-						rhs.remove(i, 1);
-						i--;
-					}
-				}
-				if (lhs.size()) {
-					big_lhs.remove2(lhs, &big_rhs);
-					big_lhs.append(lhs);
-					big_rhs.append(rhs);
+				if (rhs[i] != RTLIL::State::S0 && rhs[i] != RTLIL::State::S1) {
+					if (!init_zero)
+						continue;
+					l.append(bit);
+					r.append(RTLIL::State::S0);
+				} else {
+					l.append(bit);
+					r.append(rhs[i]);
 				}
 			}
+			if (l.size()) {
+				big_lhs.remove2(l, &big_rhs);
+				big_lhs.append(l);
+				big_rhs.append(r);
+			}
+		}
+		n_init_ones = 0;
+		for (auto b : big_rhs)
+			if (b == RTLIL::State::S1)
+				n_init_ones++;
+		if (init_zero) {
+			pool<RTLIL::SigBit> fixed;
+			for (auto bit : big_lhs)
+				fixed.insert(bit);
+			for (auto bit : satgen.initial_state.export_all())
+				if (!fixed.count(bit)) {
+					big_lhs.append(bit);
+					big_rhs.append(RTLIL::State::S0);
+				}
 		}
 		if (big_lhs.size())
 			ez.assume(ez.OR(satgen.signals_eq(big_lhs, big_rhs, 1), init_act));
@@ -372,6 +431,19 @@ struct Ic3Solver
 				states[t].push_back(satgen.importSigBit(bit, t));
 		state1 = states[1];
 		state2 = ntf >= 2 ? states[2] : states[1];
+		{
+			dict<RTLIL::SigBit, int> iv;
+			for (int i = 0; i < big_lhs.size(); i++)
+				iv[big_lhs[i]] = big_rhs[i] == RTLIL::State::S1 ? 1 : 0;
+			init_val.clear();
+			init_fixed = true;
+			for (auto bit : istates) {
+				auto it = iv.find(bit);
+				init_val.push_back(it == iv.end() ? -1 : it->second);
+				if (it == iv.end())
+					init_fixed = false;
+			}
+		}
 
 		// bad := en && !a  (per bit, padded vacuously with zeros)
 		auto build_bad = [&](int t) {
@@ -525,9 +597,10 @@ struct Ic3Solver
 	{
 		auto t0 = std::chrono::steady_clock::now();
 		std::vector<int> ind_assumptions = act_assumptions(lvl);
-		// with -init-zero the unique initial state is the all-zero state,
-		// so Init-disjointness of a cube is just "has a positive literal"
-		bool init_is_allzero = init_zero;
+		// when the initial state is one fixed vector (always under
+		// -init-zero), Init-disjointness of a cube is just "some literal
+		// contradicts its bit's init value" -- no solve needed
+		bool init_is_const = init_fixed;
 		std::vector<int> init_assumptions;
 		push_assum(init_assumptions, -init_act);
 		for (int pass = 0; pass < 4; pass++) {
@@ -563,17 +636,17 @@ struct Ic3Solver
 					if (!block(cti, lvl, ctg_depth + 1))
 						break;
 				}
-				if (ok && !init_is_allzero) {
+				if (ok && !init_is_const) {
 					std::vector<int> b = init_assumptions;
 					push_cube(b, cube, state1);
 					ok = !solve_assum(b);
 				}
-				if (ok && init_is_allzero) {
-					bool has_pos = false;
-					for (int lit : cube)
-						if (lit > 0)
-							has_pos = true;
-					ok = has_pos;
+				if (ok && init_is_const) {
+					bool clash = false;
+					for (int i = 0; i < (int)cube.size(); i++)
+						if (cube[i] && (cube[i] > 0 ? 1 : 0) != init_val[i])
+							clash = true;
+					ok = clash;
 				}
 				if (!ok)
 					cube[x] = saved;
@@ -1509,7 +1582,9 @@ struct Ic3Pass : Pass
 		log("        (printed first either way; refused by default: register v3 B5)\n");
 		log("\n");
 		log("    -init-zero\n");
-		log("        force all registers to a zero initial state\n");
+		log("        registers without a 0/1 \\init value (no attribute, or x bits)\n");
+		log("        start at 0; explicit \\init values are kept (as after\n");
+		log("        `setundef -init -zero')\n");
 		log("\n");
 		log("    -max <frames>\n");
 		log("        maximum number of IC3 frames before giving up as undecided\n");
@@ -1524,9 +1599,11 @@ struct Ic3Pass : Pass
 		log("        query is reported undecided and the next one starts\n");
 		log("\n");
 		log("    -bmc <depth>\n");
-		log("        bounded-model-checking pre-pass: ask bad@t for t = 1..depth\n");
-		log("        on a throwaway solver before k-induction and IC3; on a hit\n");
-		log("        the property is disproved without building frames\n");
+		log("        bounded-model-checking pre-pass: every assert and cover on one\n");
+		log("        shared unrolling, asked at t = 1..depth before k-induction and\n");
+		log("        IC3; a hit disproves the assert / reaches the cover exactly,\n");
+		log("        and each model is scanned for further hits.  Progress is\n");
+		log("        logged per depth\n");
 		log("        (default: 0 = disabled)\n");
 		log("\n");
 		log("    -ctg <depth>\n");
@@ -1777,9 +1854,101 @@ struct Ic3Pass : Pass
 		if (!assumes.empty())
 			log("ic3: %d assume constraint(s) will be applied at both timeframes.\n", GetSize(assumes));
 		if (init_zero)
-			log("ic3: all registers forced to zero initial state.\n");
+			log("ic3: registers without a 0/1 \\init value start at zero (explicit \\init values are kept).\n");
 		else
 			log("ic3: registers without \\init attribute have a free initial state.\n");
+
+		// Batched BMC pre-pass (-bmc N).  The per-query pre-pass built a
+		// fresh N+1-step unrolling for every check: on the Deburster FVIP
+		// harness (152 covers, ~5M clauses per unrolling) that alone ate
+		// most of each 60s query budget and 138 covers came back undecided
+		// that smtbmc -c reaches in 2s.  Encode the union cone of every
+		// assert and cover ONCE, ask each open target at t = 1..N, and
+		// harvest from each model every other target it also hits (as
+		// smtbmc does).  Hits are exact (depth = t-1); misses fall through
+		// to k-induction and IC3 with the per-query pre-pass off.
+		dict<RTLIL::Cell*, int> bmc_hit;
+		if (bmc_max > 0 && (!props.empty() || !covers.empty())) {
+			auto t0 = std::chrono::steady_clock::now();
+			auto elapsed = [&]() {
+				return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			};
+			std::vector<RTLIL::Cell*> targets = props;
+			int first_cover = GetSize(targets);
+			targets.insert(targets.end(), covers.begin(), covers.end());
+			int ntargets = GetSize(targets);
+			Ic3Solver bs(module, init_zero, max_frames);
+			bs.assume_cells = assumes;
+			bs.extra_seeds = targets;
+			bs.encode(targets[0], bmc_max + 1);
+			log("ic3: bmc pre-pass: %d assert(s) and %d cover(s) on one %d-step unrolling "
+					"(%d clauses, %d variables, encoded in %.1fs)\n",
+					first_cover, ntargets - first_cover, bmc_max + 1,
+					bs.ez.numCnfClauses(), bs.ez.numCnfVariables(), elapsed());
+			// hit := EN && !A for an assert; EN && A for a cover (the
+			// inverted assert the cover loop below checks)
+			auto target_lit = [&](int k, int t) {
+				RTLIL::Cell *c = targets[k];
+				std::vector<int> a = bs.satgen.importSigSpec(c->getPort(ID::A), t);
+				std::vector<int> en = bs.satgen.importSigSpec(c->getPort(ID::EN), t);
+				if (k >= first_cover)
+					a = bs.ez.vec_not(a);
+				while (a.size() < en.size()) a.push_back(bs.ez.CONST_FALSE);
+				while (en.size() < a.size()) en.push_back(bs.ez.CONST_FALSE);
+				return bs.ez.vec_reduce_and(bs.ez.vec_and(en, bs.ez.vec_not(a)));
+			};
+			std::vector<bool> open(ntargets, true);
+			int nopen = ntargets;
+			int t;
+			for (t = 1; t <= bmc_max && nopen > 0; t++) {
+				std::vector<int> lits(ntargets, 0);
+				for (int k = 0; k < ntargets; k++)
+					if (open[k])
+						lits[k] = target_lit(k, t);
+				int hits = 0;
+				for (int k = 0; k < ntargets; k++) {
+					if (!open[k])
+						continue;
+					std::vector<int> assumptions;
+					bs.push_assum(assumptions, -bs.init_act);
+					assumptions.push_back(lits[k]);
+					std::vector<int> watch, idx;
+					for (int j = 0; j < ntargets; j++)
+						if (open[j]) {
+							watch.push_back(lits[j]);
+							idx.push_back(j);
+						}
+					std::vector<bool> model;
+					bool sat;
+					arm();
+					try {
+						sat = bs.solve_model(assumptions, watch, model);
+					} catch (Ic3Timeout &) {
+						ic3_deadline_on = false;
+						open[k] = false;
+						nopen--;
+						log("ic3: %s: bmc pre-pass budget of %gs exhausted at depth %d\n",
+								targets[k]->name.unescape().c_str(), timeout_s, t - 1);
+						continue;
+					}
+					ic3_deadline_on = false;
+					if (!sat)
+						continue;
+					for (int i = 0; i < GetSize(idx); i++)
+						if (model[i] && open[idx[i]]) {
+							open[idx[i]] = false;
+							nopen--;
+							hits++;
+							bmc_hit[targets[idx[i]]] = t - 1;
+							log("ic3: %s: bmc pre-pass hit at depth %d\n",
+									targets[idx[i]]->name.unescape().c_str(), t - 1);
+						}
+				}
+				log("ic3: bmc pre-pass: depth %d: %d hit(s), %d open (%.1fs)\n", t - 1, hits, nopen, elapsed());
+			}
+			log("ic3: bmc pre-pass: %d of %d target(s) hit within depth %d (%.1fs)\n",
+					GetSize(bmc_hit), ntargets, t - 2, elapsed());
+		}
 
 		// lowering provenance from sva2check (register v3 A3): printed
 		// next to every verdict so no PROVED hides an approximation
@@ -1799,19 +1968,24 @@ struct Ic3Pass : Pass
 			solver.assume_cells = assumes;
 			solver.fair_cells = fairs;
 			solver.kind_max = kind_max;
-			solver.bmc_max = bmc_max;
+			solver.bmc_max = 0;	// run batched above
 			solver.ctg_depth_max = ctg_depth_max;
 
 			int depth = 0;
 			int result;
-			arm();
-			try {
-				result = solver.prove(cell, depth);
-			} catch (Ic3Timeout &) {
-				result = 2;
-				log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+			if (bmc_hit.count(cell)) {
+				result = 1;
+				depth = bmc_hit.at(cell);
+			} else {
+				arm();
+				try {
+					result = solver.prove(cell, depth);
+				} catch (Ic3Timeout &) {
+					result = 2;
+					log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+				}
+				ic3_deadline_on = false;
 			}
-			ic3_deadline_on = false;
 
 			if (result == 0) {
 				log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());
@@ -1868,18 +2042,23 @@ struct Ic3Pass : Pass
 			solver.assume_cells = assumes;
 			solver.fair_cells = fairs;
 			solver.kind_max = kind_max;
-			solver.bmc_max = bmc_max;
+			solver.bmc_max = 0;	// run batched above
 			solver.ctg_depth_max = ctg_depth_max;
 			int depth = 0;
 			int result;
-			arm();
-			try {
-				result = solver.prove(tmp, depth);
-			} catch (Ic3Timeout &) {
-				result = 2;
-				log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+			if (bmc_hit.count(cell)) {
+				result = 1;
+				depth = bmc_hit.at(cell);
+			} else {
+				arm();
+				try {
+					result = solver.prove(tmp, depth);
+				} catch (Ic3Timeout &) {
+					result = 2;
+					log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+				}
+				ic3_deadline_on = false;
 			}
-			ic3_deadline_on = false;
 			if (result == 1) {
 				log("ic3: %s: cover reached (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
 				n_reached++;
@@ -1914,7 +2093,7 @@ struct Ic3Pass : Pass
 			solver.assume_cells = assumes;
 			solver.fair_cells = fairs;
 			solver.kind_max = kind_max;
-			solver.bmc_max = bmc_max;
+			solver.bmc_max = 0;	// run batched above
 			solver.ctg_depth_max = ctg_depth_max;
 
 			std::string cex_file;

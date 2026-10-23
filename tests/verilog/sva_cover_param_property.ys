@@ -1,0 +1,36 @@
+# cover of a parameterized property instance whose body is an implication
+# (core-v-verif uvma_obi_memory `cover property (p_addr_signal_stable(addr))`,
+# body `req ##0 !gnt |=> $stable(sig)`): it was skipped as "cover of a
+# property operator".  It now covers like the same implication written
+# inline (16.14.3 non-vacuous successes): same depth, and the formal is
+# bound -- `p_stable(ctr)` is unreachable (a free formal would reach it).
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] ctr = 4'd0;
+  always_ff @(posedge clk) ctr <= ctr + 4'd1;
+  logic req, gnt;
+  logic [3:0] addr;
+  assign req = ctr == 4'd3 || ctr == 4'd4;
+  assign gnt = ctr == 4'd4;
+  assign addr = (ctr >= 4'd5) ? 4'd9 : 4'd2;
+  default clocking @(posedge clk); endclocking
+  property p_stable(sig);
+    req ##0 !gnt |=> $stable(sig);
+  endproperty
+  property p_never(sig);
+    req ##0 gnt ##0 !req |=> $stable(sig);
+  endproperty
+  c_arg: cover property (p_stable(addr));
+  c_inl: cover property (req ##0 !gnt |=> $stable(addr));
+  c_none: cover property (p_never(addr));
+  c_free: cover property (p_stable(ctr));
+endmodule
+EOT
+prep -top top
+sva2check
+async2sync
+logger -expect log "c_arg: cover reached \(depth 4\)" 1
+logger -expect log "c_inl: cover reached \(depth 4\)" 1
+logger -expect log "c_none: cover unreachable" 1
+logger -expect log "c_free: cover unreachable" 1
+ic3 -init-zero

@@ -5522,6 +5522,33 @@ struct Sva2CheckPass : public Pass {
 						dbody = comp.unwrap_spec(dbody, &bare);
 						return dbody ? comp.seq_shaped(dbody) : !bare.empty();
 					};
+					// an instance of a property declaration whose body is an
+					// implication (core-v-verif obi `cover property
+					// (p_addr_signal_stable(addr))`, body `req ##0 !gnt |=>
+					// $stable(sig)`): the body spliced through the bound
+					// actuals, as the root assert path does, covers as that
+					// implication
+					if (sbody && !comp.seq_shaped(sbody) && comp.decl_by_name(sva_op(sbody))) {
+						Cell *dbody = nullptr;
+						std::vector<Wire *> dformals;
+						Cell *ub = nullptr;
+						if (comp.lookup_decl(sbody, dbody, dformals) && dbody)
+							ub = comp.unwrap_spec(dbody);
+						if (ub && (sva_op(ub) == "|->" || sva_op(ub) == "|=>")) {
+							std::vector<SigSpec> acts = comp.inst_actuals(sbody);
+							if (GetSize(acts) != GetSize(dformals))
+								log_error("sva2check: instance of %s has %d actuals, declaration has %d formals.\n",
+										sva_op(sbody).c_str(), GetSize(acts), GetSize(dformals));
+							std::vector<Wire *> fs;
+							for (int i = 0; i < GetSize(dformals); i++) {
+								comp.subst[dformals[i]] = acts[i];
+								if (dformals[i])
+									fs.push_back(dformals[i]);
+							}
+							dict<Cell *, Cell *> memo;
+							sbody = fs.empty() ? ub : comp.splice_tree(ub, fs, memo);
+						}
+					}
 					// an implication body covers its non-vacuous successes
 					bool impl_cover = sbody && (sva_op(sbody) == "|->" || sva_op(sbody) == "|=>");
 					if (sbody) {

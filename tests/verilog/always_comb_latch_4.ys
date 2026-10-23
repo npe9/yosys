@@ -1,3 +1,12 @@
+# Fork divergence from upstream (user decision 2026-10-23, round fe20):
+# upstream pins the structural reading -- `y` is assigned only under
+# `if (z)`, so proc_dlatch builds a latch and always_comb errors.  But z is
+# `assign z = 1'b1`: the latch's enable is constant 1, it never holds a
+# value, and the process is combinational.  The fork resolves strict
+# always_comb latches against the module's combinational drivers after
+# all processes are converted (proc_dlatch): a latch that never holds
+# becomes a connection.  A latch that can hold still errors
+# (always_comb_latch_1..3, always_comb_const_index_nolatch.ys).
 read_verilog -sv <<EOF
 module top;
 parameter AVOID_LATCH = 0;
@@ -13,5 +22,5 @@ always_comb begin
 end
 endmodule
 EOF
-logger -expect error "^Latch inferred for signal `\\top\.\$unnamed_block\$3\.y' from always_comb process" 1
 proc
+select -assert-none t:$dlatch t:$adlatch

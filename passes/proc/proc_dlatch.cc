@@ -37,6 +37,16 @@ struct proc_dlatch_db_t
 	FfInitVals initvals;
 
 	pool<Cell*> generated_dlatches;
+
+	struct comb_latch_t {
+		Cell *cell;
+		SigSpec lhs, rhs;
+		SigBit en, arst;
+		bool has_rst, has_set;
+		IdString proc_name;
+		std::string src;
+	};
+	vector<comb_latch_t> comb_latches;
 	dict<Cell*, vector<SigBit>> mux_srcbits;
 	dict<SigBit, pair<Cell*, int>> mux_drivers;
 	dict<SigBit, int> sigusers;
@@ -375,6 +385,67 @@ struct proc_dlatch_db_t
 		cell->setPort(ID::S, sig_new_s);
 	}
 
+	// An always_comb "latch" that never holds -- its enable, or'd with its
+	// async set/reset, is constant 1 once the module's combinational
+	// drivers are evaluated -- stores nothing: every bit is written on
+	// every pass, through indices the mux tree cannot see are constant
+	// (OpenTitan prim_lfsr `sbox_perm_test[sbox_in_indices[k]] = 1'b1`
+	// over a parameter-derived permutation).  It becomes a connection (a
+	// mux on the set/reset condition).  The drivers include other
+	// always_comb processes, so this runs after all of them, to a fixpoint
+	// (latch cells are opaque to ConstEval).  What remains is storage:
+	// upstream an error (LRM 9.2.2.2: always_comb must not infer storage);
+	// the fork's leniency survives only for designs read with
+	// `read_verilog -permissive`, as a warning that also marks the module
+	// (* sv_degraded *).
+	void resolve_comb_latches()
+	{
+		bool changed = !comb_latches.empty();
+		while (changed) {
+			changed = false;
+			ConstEval ce(module);
+			vector<comb_latch_t> keep;
+			for (auto &l : comb_latches) {
+				auto const1 = [&](SigBit bit) {
+					SigSpec sig = bit;
+					ce.push();
+					bool ok = ce.eval(sig);
+					ce.pop();
+					return ok && sig == SigSpec(State::S1);
+				};
+				if (!const1(l.en) && !((l.has_rst || l.has_set) && const1(l.arst))) {
+					keep.push_back(l);
+					continue;
+				}
+				log("No latch inferred for signal `%s.%s' from always_comb process `%s.%s': it never holds.\n",
+						module->name.c_str(), log_signal(l.lhs), module->name.c_str(), l.proc_name.c_str());
+				generated_dlatches.erase(l.cell);
+				module->remove(l.cell);
+				int width = GetSize(l.lhs);
+				if (l.has_rst || l.has_set)
+					module->connect(l.lhs, module->Mux(NEW_ID, l.rhs, RTLIL::Const(l.has_rst ? State::S0 : State::S1, width), l.arst));
+				else
+					module->connect(l.lhs, l.rhs);
+				changed = true;
+			}
+			comb_latches.swap(keep);
+		}
+		for (auto &l : comb_latches) {
+			if (!module->get_bool_attribute(IdString("\\sv_permissive")))
+				log_error("Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
+						module->name.c_str(), log_signal(l.lhs), module->name.c_str(), l.proc_name.c_str());
+			log_warning("[sv_degraded] Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
+					module->name.c_str(), log_signal(l.lhs), module->name.c_str(), l.proc_name.c_str());
+			IdString attr = IdString("\\sv_degraded");
+			std::string cur;
+			if (module->attributes.count(attr))
+				cur = module->attributes.at(attr).decode_string();
+			std::string entry = stringf("always_comb latch for %s @%s", log_signal(l.lhs), l.src.c_str());
+			module->attributes[attr] = RTLIL::Const(cur.empty() ? entry : cur + "; " + entry);
+		}
+		comb_latches.clear();
+	}
+
 	void fixup_muxes()
 	{
 		pool<Cell*> visited, queue;
@@ -533,11 +604,17 @@ void proc_dlatch(proc_dlatch_db_t &db, RTLIL::Process *proc, LatchPolicy policy)
 			bool has_rst = (nrst != db.false_node);
 			bool has_set = (nset != db.false_node);
 
+			SigBit arst = State::S0;
+			if (has_rst)
+				arst = db.make_hold(nrst, src);
+			else if (has_set)
+				arst = db.make_hold(nset, src);
+
 			Cell *cell;
 			if (has_rst)
-				cell = db.module->addAdlatch(NEW_ID, en, db.make_hold(nrst, src), rhs, lhs, RTLIL::Const(State::S0, width));
+				cell = db.module->addAdlatch(NEW_ID, en, arst, rhs, lhs, RTLIL::Const(State::S0, width));
 			else if (has_set)
-				cell = db.module->addAdlatch(NEW_ID, en, db.make_hold(nset, src), rhs, lhs, RTLIL::Const(State::S1, width));
+				cell = db.module->addAdlatch(NEW_ID, en, arst, rhs, lhs, RTLIL::Const(State::S1, width));
 			else
 				cell = db.module->addDlatch(NEW_ID, en, rhs, lhs);
 			cell->set_src_attribute(src);
@@ -546,21 +623,9 @@ void proc_dlatch(proc_dlatch_db_t &db, RTLIL::Process *proc, LatchPolicy policy)
 			db.generated_dlatches.insert(cell);
 
 			if (proc->get_bool_attribute(ID::always_comb)) {
-				// upstream: an error (LRM 9.2.2.2: always_comb must not
-				// infer storage).  The fork's leniency survives only for
-				// designs read with `read_verilog -permissive`, as a
-				// warning that also marks the module (* sv_degraded *).
-				if (!db.module->get_bool_attribute(IdString("\\sv_permissive")))
-					log_error("Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
-							db.module->name.c_str(), log_signal(lhs), db.module->name.c_str(), proc->name.c_str());
-				log_warning("[sv_degraded] Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
-						db.module->name.c_str(), log_signal(lhs), db.module->name.c_str(), proc->name.c_str());
-				IdString attr = IdString("\\sv_degraded");
-				std::string cur;
-				if (db.module->attributes.count(attr))
-					cur = db.module->attributes.at(attr).decode_string();
-				std::string entry = stringf("always_comb latch for %s @%s", log_signal(lhs), src.c_str());
-				db.module->attributes[attr] = RTLIL::Const(cur.empty() ? entry : cur + "; " + entry);
+				// decided once every process of the module is converted:
+				// see resolve_comb_latches()
+				db.comb_latches.push_back({cell, lhs, rhs, en, arst, has_rst, has_set, proc->name, src});
 			}
 			else if (proc->get_bool_attribute(ID::always_latch))
 				log("Latch inferred for signal `%s.%s' from always_latch process `%s.%s': %s\n",
@@ -626,6 +691,7 @@ struct ProcDlatchPass : public Pass {
 			proc_dlatch_db_t db(mod);
 			for (auto proc : mod->selected_processes())
 				proc_dlatch(db, proc, policy);
+			db.resolve_comb_latches();
 			db.fixup_muxes();
 		}
 	}

@@ -5708,6 +5708,15 @@ struct Sva2CheckPass : public Pass {
 							comp.pending_wr.clear();
 						}
 					} else {
+						// a bare property/sequence NAME reached as a plain
+						// boolean: its declaration is gone (an opt_clean
+						// before sva2check, e.g. `prep`, used to delete
+						// it), and the check would be a verdict on the
+						// free name wire
+						if (body_sig.size() >= 1 && body_sig[0].is_wire() &&
+								body_sig[0].wire->get_bool_attribute(ID(sva_decl_name)))
+							log_error("sva2check: property body `%s' of %s names a declaration that is no longer in the design (removed before sva2check?); it would be checked as a free input.\n",
+									log_id(body_sig[0].wire), log_id(cell));
 						fail = mod->And(NEW_ID, root, mod->Not(NEW_ID, comp.reduce1(body_sig)));
 					}
 					new_a = mod->Not(NEW_ID, fail);

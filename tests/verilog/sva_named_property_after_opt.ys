@@ -1,0 +1,44 @@
+# `assert property (@(posedge clk) p)` with an argument-free `property p`
+# under a flow that runs opt_clean before sva2check (`prep`): opt_clean
+# deleted the declaration's $sva cell (nothing reads its Y), sva2check
+# then checked the bare name wire p as a FREE input -- every such check
+# was disproved at depth 0 and tagged exact (pre-existing; the battery and
+# ladder run sva2check before any opt).  The proved/disproved twins pin
+# that the declaration body is what gets checked.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] c = 4'd0;
+  always_ff @(posedge clk) c <= c + 4'd1;
+  property p_ok;  c == 4'd3  |-> c != 4'd14; endproperty
+  property p_bad; c == 4'd14 |-> c != 4'd14; endproperty
+  sequence s_ok; c == 4'd2 ##1 c == 4'd3; endsequence
+  a_ok:  assert property (@(posedge clk) p_ok);
+  a_bad: assert property (@(posedge clk) p_bad);
+  c_seq: cover property (@(posedge clk) s_ok);
+endmodule
+EOT
+prep -top top
+sva2check
+async2sync
+logger -expect log "a_ok: proved" 1
+logger -expect log "a_bad: disproved \(depth 14\)" 1
+logger -expect log "c_seq: cover reached \(depth 3\)" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# a declaration that is gone by sva2check (keep stripped, opt_clean) is
+# refused, not checked as a free name wire
+logger -expect error "body `p_ok' of a_x names a declaration that is no longer in the design" 1
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] c = 4'd0;
+  always_ff @(posedge clk) c <= c + 4'd1;
+  property p_ok;  c == 4'd3  |-> c != 4'd14; endproperty
+  a_x: assert property (@(posedge clk) p_ok);
+endmodule
+EOT
+prep -top top
+setattr -unset keep t:$sva r:OP=property_decl %i
+opt_clean
+sva2check

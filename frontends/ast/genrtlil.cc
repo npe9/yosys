@@ -1808,6 +1808,10 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 								ch->str == "let_decl") && !ch->children.empty() && ch->children[0] &&
 								ch->children[0]->str == str) {
 							sva_decl_ref = true;
+							// sva2check resolves this wire by name; if the
+							// declaration is gone by then, it refuses
+							// rather than check the wire as a free input
+							wire->set_bool_attribute(ID(sva_decl_name));
 							break;
 						}
 				}
@@ -2956,8 +2960,14 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			RTLIL::Cell *cell = current_module->addCell(NEW_ID, "\\$sva");
 			set_src_attr(cell, this);
 			cell->setParam("\\OP", RTLIL::Const(str));
-			if (is_decl)
+			if (is_decl) {
 				cell->setParam("\\NAME", RTLIL::Const(decl_name));
+				// nothing reads a declaration's Y: without keep, an
+				// opt_clean before sva2check (e.g. `prep`) deleted it, and
+				// `assert property (@(posedge clk) p)` then checked the bare
+				// name wire p as a FREE input (false results tagged exact)
+				cell->set_bool_attribute(ID::keep);
+			}
 			cell->setPort(ID::Y, ywire);
 
 			static const IdString arg_ports[] = {ID::A, ID::B, ID::C, ID::D, ID::E};

@@ -147,7 +147,7 @@ def ps(s):
     if k in BOOL_KINDS: return pb(s)
     if k == "delay":
         lo, hi = s.a[1], s.a[2]
-        dl = "##%d" % lo if lo == hi else "##[%d:%d]" % (lo, hi)
+        dl = "##%d" % lo if lo == hi else "##[%d:%s]" % (lo, "$" if hi is None else hi)
         return "(%s %s %s)" % (ps(s.a[0]), dl, ps(s.a[3]))
     if k == "sor": return "(%s or %s)" % (ps(s.a[0]), ps(s.a[1]))
     if k == "sand": return "(%s and %s)" % (ps(s.a[0]), ps(s.a[1]))
@@ -157,7 +157,7 @@ def ps(s):
     if k == "first_match": return "first_match(%s)" % ps(s.a[0])
     if k == "rep":
         lo, hi = s.a[1], s.a[2]
-        return "%s[*%d]" % (pb(s.a[0]), lo) if lo == hi else "%s[*%d:%d]" % (pb(s.a[0]), lo, hi)
+        return "%s[*%d]" % (pb(s.a[0]), lo) if lo == hi else "%s[*%d:%s]" % (pb(s.a[0]), lo, "$" if hi is None else hi)
     if k == "goto": return "%s[->%d]" % (pb(s.a[0]), s.a[1])
     if k == "noncons": return "%s[=%d]" % (pb(s.a[0]), s.a[1])
     raise ValueError(k)
@@ -263,3 +263,46 @@ def syntax_mutants(sv):
     out.append(("bad-rep", mk("a[*] b")))
     out.append(("prop-in-seq", mk("(a |-> b) ##1 c")))
     return out
+
+
+class UnbGen(Gen):
+    """Unbounded sequences in property position (weak semantics, register
+    v3 D2): the shapes sva2check compiles exactly -- [c throughout]
+    b[->1], b[->1] ##k bools..., x[*0|1:$] ##k y, P ##[m:$] Q -- plus
+    near misses it must refuse (UNSUPPORTED, never a wrong verdict)."""
+
+    def unb(self):
+        r = self.r.random()
+        b, c, x, y = self.boolean(), self.boolean(), self.boolean(), self.boolean()
+        if r < 0.25:
+            g = N("goto", b, 1)
+            return N("throughout", c, g) if self.r.random() < 0.6 else g
+        if r < 0.45:
+            s = N("goto", b, 1)
+            for _ in range(self.r.randint(1, 2)):
+                k = self.r.randint(0, 2)
+                s = N("delay", s, k, k, self.boolean())
+            return s
+        if r < 0.75:
+            lo = self.r.choice([0, 1])
+            k = self.r.randint(1, 3)
+            return N("delay", N("rep", x, lo, None), k, k, y)
+        if r < 0.92:
+            lo = self.r.randint(0, 2)
+            head = self.boolean() if self.r.random() < 0.7 else N("delay", self.boolean(), 1, 1, self.boolean())
+            g = N("delay", head, lo, None, y)
+            if self.r.random() < 0.4:   # the gap inside the left ## spine
+                g = N("delay", g, 1, 1, self.boolean())
+            return g
+        # near misses (refused): two-occurrence goto, rep with a sequence tail
+        if self.r.random() < 0.5:
+            return N("goto", b, 2)
+        return N("delay", N("rep", x, 1, None), 1, 1, N("delay", y, 1, 1, c))
+
+    def top(self):
+        dis = N("sig", "rst") if self.r.random() < 0.25 else None
+        if self.r.random() < 0.7:
+            p = N("impl", self.boolean(), self.unb(), self.r.random() < 0.4)
+        else:
+            p = self.unb()
+        return N("top", dis, p)

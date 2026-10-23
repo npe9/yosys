@@ -28,6 +28,7 @@ Supported grammar (v1):
   seq    : bool | seq ##n seq | seq ##[m:n] seq | seq or seq | seq and seq |
            seq intersect seq | bool throughout seq | seq within seq |
            first_match(seq) | bool[*n] | bool[*m:n] | bool[->n] | bool[=n]
+           (an upper bound n may be `$`: hi None)
   prop   : seq | seq |-> prop | seq |=> prop | not prop | prop and prop |
            prop or prop | if (bool) prop else prop | nexttime[k] prop |
            always[m:n] prop | s_eventually[m:n] prop | bool until bool |
@@ -107,7 +108,15 @@ def seq_match(s, tr, start, L):
         ends1, open1 = seq_match(s1, tr, start, L)
         ends, opn = set(), open1
         for e1 in ends1:
-            for d in range(lo, hi + 1):
+            # hi None = `$` (unbounded): delays past the known prefix
+            # start s2 at or after L, which only leaves the match open
+            if hi is None:
+                base = (start - 1) if e1 is EMPTY else e1
+                dmax = max(lo, L - base)
+                opn = True
+            else:
+                dmax = hi
+            for d in range(lo, dmax + 1):
                 # LRM 16.9.2: s1 ##d s2 starts s2 at (end of s1) + d;
                 # ##0 overlaps the end step.  An EMPTY s1 ends at start-1,
                 # so the same rule gives start + d - 1.  LRM 16.9.2.1:
@@ -194,7 +203,7 @@ def seq_match(s, tr, start, L):
             ends.add(EMPTY)
         j = start
         count = 0
-        while count < hi:
+        while hi is None or count < hi:   # hi None = `$`
             if j >= L:
                 opn = True; break
             if not eval_bool(b, tr, j):

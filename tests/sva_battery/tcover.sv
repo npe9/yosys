@@ -2,8 +2,8 @@
 // reachability (2026-10-21).  A cover of a bounded sequence or a boolean
 // is REACHED @N when its match can first occur at step N (a witness), or
 // UNREACHABLE when the engine proves it can never occur.  Before D4 every
-// cover was "not checked" (A tied to 0).  A property-operator body stays a
-// loud skip.  Motivating case (AXI4 FVIP on a crossbar, peer session): a
+// cover was "not checked" (A tied to 0).  Implications cover their
+// non-vacuous successes; other property operators stay a loud skip.  Motivating case (AXI4 FVIP on a crossbar, peer session): a
 // cover on a DUT output that an over-strong assumption made unreachable --
 // c_vac below, the vacuity a passing assertion cannot show.
 // Trace: x @ 2..4, y @ 3; g a free input.
@@ -29,8 +29,9 @@ module tcover (input logic clk, input logic g);
   c_pd:    cover property (@(posedge clk) pr(x, y));              // REACHED @3
   c_pd2:   cover property (@(posedge clk) pr(y, !x));             // UNREACHABLE
   c_pb:    cover property (@(posedge clk) pb(x, !x));             // REACHED @5
-  // a property-operator body has no cover lowering yet: loud skip
-  c_imp:   cover property (@(posedge clk) x |-> y);               // NOT-CHECKED
+  // an implication covers its non-vacuous successes (2026-10-23,
+  // tcover_impl.sv): x matches at 2..4, y holds at 3
+  c_imp:   cover property (@(posedge clk) x |-> y);               // REACHED @3
   // an assumption that forbids g makes its cover unreachable (vacuity)
   a_g:     assume property (@(posedge clk) !g);
   c_vac:   cover property (@(posedge clk) g);                    // UNREACHABLE

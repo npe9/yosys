@@ -3544,8 +3544,13 @@ struct SvaCompiler {
 						prop_dispatch(port(nargs - 1), child(nargs - 1), start)})});
 			return r;
 		}
-		if (op == "strong")
-			return prop_dispatch(port(0), child(0), start);
+		if (op == "strong") {
+			bool saved = strong_ctx;
+			strong_ctx = true;
+			SigSpec r = prop_dispatch(port(0), child(0), start);
+			strong_ctx = saved;
+			return r;
+		}
 		if (op == "weak") {
 			// weak/strong differ only on finite traces (LRM 16.12.1); model
 			// checking explores infinite traces, where a weak sequence
@@ -3771,6 +3776,12 @@ struct SvaCompiler {
 		if (c && getenv("SVA_DEBUG_OPS"))
 			log("sva2check-debug: prop_dispatch %s (%s) in %s\n", sva_op(c).c_str(), log_id(c), check_name.c_str());
 		if (c) {
+			// x[*0:$] ##k y after rewrite_empty_delays is an `or` node
+			if (sva_op(c) == "or" && !strong_ctx && seq_max_len(c) < 0) {
+				SigSpec wf;
+				if (weak_unbounded_fail(c, start, wf))
+					return wf;
+			}
 			if (!is_seq_op(sva_op(c))) {
 				// named instance: sequence declarations in property
 				// position complete strongly; property/let declarations
@@ -4139,14 +4150,397 @@ struct SvaCompiler {
 			log_error("sva2check: sequence in %s is used as a property but can match empty (LRM 16.13.22).\n", log_id(n));
 	}
 
+	// cover of an implication (register v3 D4): IEEE 1800-2017 16.14.3
+	// counts a property's NON-VACUOUS successes, and 16.14.8 makes
+	// `R |-> P` non-vacuous when R matches and P succeeds non-vacuously.
+	// So the hits of `R |-> P` are P's hits started at R's end (one tick
+	// later for |=>): a sequence P hits at its match end, a Boolean at its
+	// tick, a nested implication recursively.  Anything else: why is set
+	// and the result is empty.
+	SigSpec cover_hit(Cell *c, SigSpec start, std::string &why)
+	{
+		std::string op = sva_op(c);
+		if (op != "|->" && op != "|=>") {
+			why = "cover of a property operator (" + op + ")";
+			return SigSpec();
+		}
+		auto ps = ports_of(c);
+		if (GetSize(ps) < 2) {
+			why = "cover of a malformed implication";
+			return SigSpec();
+		}
+		Cell *a = child_cell(c->getPort(ps[0]));
+		if (a && !seq_shaped(a)) {
+			why = "cover of an implication with a property antecedent";
+			return SigSpec();
+		}
+		SigSpec e = seq_dispatch(c->getPort(ps[0]), a, start, Const(1, 1));
+		if (op == "|=>") {
+			e = delay(e, 1, "cov");
+			if (a && can_empty(a))
+				e = orN({e, start});
+		}
+		SigSpec qport = c->getPort(ps[1]);
+		Cell *q = child_cell(qport);
+		while (q && (sva_op(q) == "strong" || sva_op(q) == "weak")) {
+			qport = q->getPort(ID(A));
+			q = child_cell(qport);
+		}
+		if (!q)
+			return andN({e, reduce1(resolve(qport))});
+		if (sva_op(q) == "clocked") {
+			why = "cover of a multi-clock implication";
+			return SigSpec();
+		}
+		if (seq_shaped(q)) {
+			refuse_empty_prop(q);
+			return seq_end(q, e, Const(1, 1));
+		}
+		return cover_hit(q, e, why);
+	}
+
+	// Inside an explicit strong(...): an unbounded sequence there needs a
+	// liveness obligation, not the weak monitor below.
+	bool strong_ctx = false;
+
+	// IEEE 1800-2017 16.12.2: a sequence in property position of an
+	// assert/assume is weak.  For a BOUNDED sequence weak and strong agree
+	// on infinite traces (strong_seq_fail); for an unbounded one they do
+	// not: the weak form fails only when a finite prefix leaves the attempt
+	// no live thread (no extension can match).  Exact monitors for the
+	// shapes the corpora use, all relying on one fact: the attempts merged
+	// in the group register share their future, and a later attempt's
+	// threads are a subset of an earlier one's, so tracking the latest
+	// attempt detects every failure:
+	//   (a) [c throughout] b[->1]           (AXI handshakes, prim_sync_reqack, edn)
+	//   (b) b[->1] ##k S, S bounded          (alert VIP)
+	//   (c) x[*0:$] / x[+] ##k y, k >= 1     (prim_packer)
+	//   (d) P ##[m:$] Q                      (sha3pad): only P can fail; Q
+	//       can always still match in some extension of the trace
+	// b, c, x, y are Boolean.  Anything else returns false (the caller
+	// keeps the "no finite bound" refusal).  Locals, multi-clock islands
+	// and nested throughout gates are refused here.
+	bool weak_unbounded_fail(Cell *n, SigSpec start, SigSpec &fail)
+	{
+		if (slots_mode || in_island || !dyn_gate.empty())
+			return false;
+		auto rd = [&](Cell *c, int i) -> SigSpec {
+			auto ps = ports_of(c);
+			if (i >= GetSize(ps))
+				return SigSpec();
+			if (clone_scope && !clone_cmap.count(c))
+				ensure_stub(c);
+			Cell *src = clone_scope ? clone_cmap[c] : nullptr;
+			return cport(c, src, ps[i]);
+		};
+		auto kid = [&](Cell *c, int i) -> Cell * {
+			auto ps = ports_of(c);
+			return i < GetSize(ps) ? child_cell(c->getPort(ps[i])) : nullptr;
+		};
+		auto boolv = [&](Cell *c, int i) -> SigSpec { return reduce1(resolve(rd(c, i))); };
+		auto is_goto1 = [&](Cell *c) -> bool {
+			if (!c || sva_op(c) != "[->]" || kid(c, 0))
+				return false;
+			Cell *b = kid(c, 1);
+			if (!b || sva_op(b) != "bounds")
+				return false;
+			auto bp = ports_of(b);
+			int lo, hi;
+			if (bp.empty() || !const_int(b->getPort(bp[0]), lo) || lo != 1)
+				return false;
+			if (GetSize(bp) >= 2 && (!const_int(b->getPort(bp[1]), hi) || hi != 1))
+				return false;
+			return true;
+		};
+		// ## cycle: k exact (lo == hi) or [lo:$] (hi = -1)
+		auto cycle = [&](Cell *c, int &lo, int &hi) -> bool {
+			auto ps = ports_of(c);
+			SigSpec cyc = c->getPort(ps[GetSize(ps) == 2 ? 0 : 1]);
+			Cell *cc = child_cell(cyc);
+			if (!cc) {
+				int k;
+				if (!const_int(cyc, k) || k < 0)
+					return false;
+				lo = hi = k;
+				return true;
+			}
+			std::string cop = sva_op(cc);
+			if (cop == "##[*]" || cop == "##[+]") {
+				lo = cop == "##[+]" ? 1 : 0;
+				hi = -1;
+				return true;
+			}
+			if (cop != "bounds")
+				return false;
+			auto bp = ports_of(cc);
+			if (bp.empty() || !const_int(cc->getPort(bp[0]), lo))
+				return false;
+			hi = -1;
+			if (GetSize(bp) >= 2 && !const_int(cc->getPort(bp[1]), hi))
+				return false;
+			return true;
+		};
+		auto note = [&](const char *shape) {
+			log("sva2check: %s: unbounded sequence in property position compiled with weak semantics (%s).\n",
+					check_name.c_str(), shape);
+		};
+		SigSpec one = Const(1, 1);
+		std::string op = sva_op(n);
+
+		// x[*0:$] ##k y as rewrite_empty_delays leaves it:
+		// (x[*1:$] ##k y) or (##(k-1) y) -- the empty run as its own arm;
+		// one monitor (with the zero-repetition tail) instead of a
+		// property-level `or` of two attempts that fail at different ticks
+		if (op == "or") {
+			Cell *a = kid(n, 0), *bb = kid(n, 1);
+			if (!a || !bb || sva_op(a) != "##" || sva_op(bb) != "##" ||
+					GetSize(ports_of(a)) != 3 || GetSize(ports_of(bb)) != 2)
+				return false;
+			int alo, ahi, blo, bhi;
+			if (!cycle(a, alo, ahi) || alo != ahi || alo < 1 || !cycle(bb, blo, bhi) || blo != bhi || blo != alo - 1)
+				return false;
+			Cell *ax = kid(a, 0);
+			auto rep_one = [&](Cell *c) -> bool {
+				if (!c || (sva_op(c) != "[*]" && sva_op(c) != "[+]") || kid(c, 0))
+					return false;
+				Cell *bc = kid(c, 1);
+				if (!bc)
+					return sva_op(c) == "[+]";
+				auto bp = ports_of(bc);
+				int blo2, bhi2;
+				return sva_op(bc) == "bounds" && GetSize(bp) >= 2 && const_int(bc->getPort(bp[0]), blo2) &&
+						const_int(bc->getPort(bp[1]), bhi2) && blo2 == 1 && bhi2 < 0;
+			};
+			if (!rep_one(ax) || kid(a, 2) || kid(bb, 1) || rd(a, 2) != rd(bb, 1))
+				return false;
+			fail = weak_rep_fail(boolv(ax, 0), boolv(a, 2), alo, true, start);
+			note("repetition then Boolean tail");
+			return true;
+		}
+
+		// (a) [c throughout] b[->1]
+		{
+			Cell *body = n;
+			SigSpec c = one;
+			if (op == "throughout") {
+				if (kid(n, 0))
+					return false;
+				c = boolv(n, 0);
+				body = kid(n, 1);
+			}
+			if (is_goto1(body)) {
+				SigSpec b = boolv(body, 0);
+				SigSpec cur;
+				feedback([&](SigSpec q) {
+					cur = orN({start, q});
+					return andN({cur, c, mod->Not(NEW_ID, b)});
+				}, "wpend", 1);
+				fail = andN({cur, mod->Not(NEW_ID, c)});
+				note("goto");
+				return true;
+			}
+			if (op == "throughout")
+				return false;
+		}
+		if (op != "##")
+			return false;
+		auto ps = ports_of(n);
+		bool lead2 = GetSize(ps) == 2;
+		int lo, hi;
+		if (!cycle(n, lo, hi))
+			return false;
+		Cell *lhs = lead2 ? nullptr : kid(n, 0);
+		int ti = lead2 ? 1 : 2;
+		Cell *tail = kid(n, ti);
+
+		// (d) P ##[m:$] Q, possibly inside the left ## spine
+		// (`(P ##[1:$] Q) ##1 R`, sha3pad): every element after the
+		// unbounded gap can still match in some continuation of the trace
+		// (Annex F weak semantics), so only P can fail.  A constant-false
+		// element after the gap is refused (left to the old error).
+		{
+			Cell *u = nullptr;
+			bool ok = true;
+			for (Cell *c = n; c && sva_op(c) == "##"; ) {
+				int clo, chi;
+				if (!cycle(c, clo, chi)) {
+					ok = false;
+					break;
+				}
+				auto cps = ports_of(c);
+				int cti = GetSize(cps) == 2 ? 1 : 2;
+				if (!kid(c, cti)) {
+					SigSpec q = rd(c, cti);
+					if (q.is_fully_const() && !q.as_bool()) {
+						ok = false;
+						break;
+					}
+				}
+				if (chi < 0) {
+					u = c;
+					break;
+				}
+				if (GetSize(cps) == 2)
+					break;
+				c = kid(c, 0);
+			}
+			if (ok && u) {
+				bool ulead2 = GetSize(ports_of(u)) == 2;
+				Cell *ulhs = ulead2 ? nullptr : kid(u, 0);
+				if (ulead2)
+					fail = Const(0, 1);
+				else if (!ulhs)
+					fail = andN({start, mod->Not(NEW_ID, boolv(u, 0))});
+				else if (seq_max_len(ulhs) >= 0)
+					fail = strong_seq_fail(ulhs, start);
+				else
+					return false;
+				note("unbounded delay");
+				return true;
+			}
+		}
+		if (lead2 || lo != hi)
+			return false;
+		int k = lo;
+
+		// (b) b[->1] ##k1 v1 ##k2 v2 ... [##k S]: the goto at the bottom
+		// of the left-associative ## spine, Boolean elements after it, and
+		// optionally a bounded sequence as the outermost tail
+		{
+			std::vector<std::pair<int, SigSpec>> elems;   // (cycles before, Boolean), innermost first
+			Cell *top_tail = nullptr;
+			int top_k = 0;
+			Cell *cur_n = n;
+			bool ok = true;
+			while (cur_n && sva_op(cur_n) == "##" && GetSize(ports_of(cur_n)) == 3) {
+				int clo, chi;
+				if (!cycle(cur_n, clo, chi) || clo != chi) {
+					ok = false;
+					break;
+				}
+				Cell *rt = kid(cur_n, 2);
+				if (rt) {
+					if (cur_n != n || seq_max_len(rt) < 0) {
+						ok = false;
+						break;
+					}
+					top_tail = rt;
+					top_k = clo;
+				} else {
+					elems.push_back({clo, boolv(cur_n, 2)});
+				}
+				cur_n = kid(cur_n, 0);
+			}
+			if (ok && is_goto1(cur_n)) {
+				std::reverse(elems.begin(), elems.end());
+				SigSpec b = boolv(cur_n, 0);
+				SigSpec cur;
+				feedback([&](SigSpec q) {
+					cur = orN({start, q});
+					return andN({cur, mod->Not(NEW_ID, b)});
+				}, "wpend", 1);
+				// the attempts merged at the goto end move as one token
+				// through the elements; an element that fails stops the
+				// token, so each attempt reports its first failure once
+				SigSpec tok = andN({cur, b});
+				SigSpec f = Const(0, 1);
+				for (auto &el : elems) {
+					tok = delay(tok, el.first, "wgoto");
+					f = orN({f, andN({tok, mod->Not(NEW_ID, el.second)})});
+					tok = andN({tok, el.second});
+				}
+				if (top_tail)
+					f = orN({f, strong_seq_fail(top_tail, delay(tok, top_k, "wgoto"))});
+				fail = f;
+				note("goto then bounded tail");
+				return true;
+			}
+		}
+
+		// (c) x[*0:$] / x[+] ##k y
+		// x[*0:$] / x[*1:$] / x[+] of a Boolean (the bounds child, when
+		// present, must be (0|1, $))
+		auto rep_unb = [&](Cell *c, bool &m0) -> bool {
+			if (!c || (sva_op(c) != "[*]" && sva_op(c) != "[+]") || kid(c, 0))
+				return false;
+			m0 = sva_op(c) == "[*]";
+			Cell *bc = kid(c, 1);
+			if (!bc)
+				return true;
+			if (sva_op(bc) != "bounds")
+				return false;
+			auto bp = ports_of(bc);
+			int blo, bhi;
+			if (GetSize(bp) < 2 || !const_int(bc->getPort(bp[0]), blo) || !const_int(bc->getPort(bp[1]), bhi) ||
+					bhi >= 0 || (blo != 0 && blo != 1))
+				return false;
+			m0 = blo == 0;
+			return true;
+		};
+		bool m0 = false;
+		if (lhs && !tail && k >= 1 && rep_unb(lhs, m0)) {
+			fail = weak_rep_fail(boolv(lhs, 0), boolv(n, ti), k, m0, start);
+			note("repetition then Boolean tail");
+			return true;
+		}
+		return false;
+	}
+
+	// x[*m:$] ##k y (m 0 or 1, k >= 1, x and y Boolean), weak.  Attempts
+	// whose x-run is alive share their future (one group, register wrep);
+	// a run started at s that dies at d (x low) has tails checking y at
+	// every tick of [s+k-m, d+k-1] (the m = 0 zero-repetition tail at
+	// s+k-1 included), so the attempt fails iff y is low throughout that
+	// window, known at its end.  A later start in the group has a smaller
+	// window, so the group's latest start decides; successive groups'
+	// windows do not interleave (a new group starts at or after the old
+	// one's death).  On the timeline delayed by k the windows are
+	// [WS, WE] with WS = latest start + k - m and WE = death + k - 1, and
+	// one "y seen in this window" bit is exact.  When WS and WE fall on the
+	// same tick the window is that single tick (for m = 1 they belong to
+	// one group; for m = 0 an older window ending there is implied by the
+	// new one).  m = 1 and x low at the start: no run, an immediate fail.
+	SigSpec weak_rep_fail(SigSpec x, SigSpec y, int k, bool m0, SigSpec start)
+	{
+		SigSpec nx = mod->Not(NEW_ID, x);
+		SigSpec here;   // a group present at this tick
+		feedback([&](SigSpec q) {
+			here = m0 ? orN({start, q}) : orN({andN({start, x}), q});
+			return andN({here, x});
+		}, "wrep", 1);
+		SigSpec death = andN({here, nx});
+		SigSpec ls = m0 ? start : andN({start, x});
+		SigSpec ws = delay(ls, k - (m0 ? 1 : 0), "wwin");
+		SigSpec we = delay(death, k - 1, "wwin");
+		SigSpec seen_now;
+		feedback([&](SigSpec q) {
+			seen_now = mod->Mux(NEW_ID, orN({q, y}), y, ws);
+			return seen_now;
+		}, "wseen", 1);
+		SigSpec fail = andN({we, mod->Not(NEW_ID, seen_now)});
+		if (!m0)
+			fail = orN({fail, andN({start, nx})});
+		return fail;
+	}
+
 	SigSpec strong_seq_fail(Cell *n, SigSpec start)
 	{
 		refuse_empty_prop(n);
 		int len = seq_max_len(n);
-		if (len < 0 || len > 64)
+		if (len < 0 && strong_ctx)
+			log_error("sva2check: strong unbounded sequence in %s needs a liveness obligation (not supported).\n", log_id(n));
+		if (len < 0) {
+			SigSpec wf;
+			if (weak_unbounded_fail(n, start, wf))
+				return wf;
+		}
+		int minl = seq_min_len(n);
+		// the 64-tick cap bounds the rotating copies of a VARIABLE-length
+		// sequence; a fixed-length one has a one-tick window and is exact
+		// at any length (caliptra doe: 73 ticks of `[*DLY_RND]` runs)
+		if (len < 0 || (len > 64 && minl != len) || len > 1024)
 			log_error("sva2check: sequence in %s used in property position has no finite bound (max %d ticks).\n", log_id(n), len);
 		int deadline = len - 1;
-		int minl = seq_min_len(n);
 		// A variable-length sequence: the window [t, t+deadline] of the
 		// attempt started at t also sees the ends of LATER attempts, which
 		// used to excuse its miss -- `g throughout (1 ##[1:3] x)` was
@@ -5128,15 +5522,29 @@ struct Sva2CheckPass : public Pass {
 						dbody = comp.unwrap_spec(dbody, &bare);
 						return dbody ? comp.seq_shaped(dbody) : !bare.empty();
 					};
+					// an implication body covers its non-vacuous successes
+					bool impl_cover = sbody && (sva_op(sbody) == "|->" || sva_op(sbody) == "|=>");
 					if (sbody) {
 						pool<Cell *> seen;
 						int l = comp.seq_max_len(sbody);
-						if (!cover_shaped(sbody))
+						if (!impl_cover && !cover_shaped(sbody))
 							why = "cover of a property operator (" + sva_op(sbody) + ")";
 						else if (comp.tree_has_locals(sbody, seen))
-							why = "cover of a sequence with local variables";
-						else if (l < 0 || l > 64)
-							why = "cover of an unbounded sequence";
+							why = impl_cover ? "cover of an implication with local variables"
+									: "cover of a sequence with local variables";
+						else if (!impl_cover && l > 1024)
+							why = "cover of a sequence longer than 1024 ticks";
+						// an unbounded sequence covers through its match
+						// pulse like a bounded one: reachability is
+						// existential over attempts, so the merged ends of
+						// attempts started every tick are exact here
+					}
+					SigSpec impl_hit;
+					if (why.empty() && impl_cover) {
+						impl_hit = comp.cover_hit(sbody, root, why);
+						if (why.empty() && disable && sva_op(disable) == "disable_iff")
+							comp.approx("cover-disable-at-match", std::string(log_id(cell)) +
+									": an attempt disabled before its match tick still counts");
 					}
 					if (!why.empty()) {
 						unsupported++;
@@ -5146,10 +5554,13 @@ struct Sva2CheckPass : public Pass {
 						continue;
 					}
 					SigSpec hit;
-					if (sbody) {
+					if (impl_cover) {
+						hit = impl_hit;
+					} else if (sbody) {
 						comp.refuse_empty_prop(sbody);
 						hit = comp.seq_end(sbody, root, Const(1, 1));
-						if (disable && sva_op(disable) == "disable_iff" && comp.seq_max_len(sbody) > 1)
+						int sl = comp.seq_max_len(sbody);
+						if (disable && sva_op(disable) == "disable_iff" && (sl > 1 || sl < 0))
 							comp.approx("cover-disable-at-match", std::string(log_id(cell)) +
 									": an attempt disabled before its match tick still counts");
 					} else {

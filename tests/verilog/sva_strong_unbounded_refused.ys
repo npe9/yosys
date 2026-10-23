@@ -1,0 +1,10 @@
+# strong(...) over an unbounded sequence is a liveness obligation; the weak
+# monitors (register v3 D2) must not compile it: a precise refusal.
+logger -expect error "strong unbounded sequence in .* needs a liveness obligation" 1
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, input logic b);
+  p: assert property (@(posedge clk) a |-> strong(##[1:$] b));
+endmodule
+EOT
+prep -top top
+sva2check

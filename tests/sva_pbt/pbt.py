@@ -240,7 +240,7 @@ lock = threading.Lock()
 
 def one_case(seed, index, args):
     rng = random.Random("pbt:%d:%d" % (seed, index))
-    g = pbt_gen.Gen(rng, max_depth=args.depth, budget=args.budget)
+    g = (pbt_gen.UnbGen if args.unbounded else pbt_gen.Gen)(rng, max_depth=args.depth, budget=args.budget)
     top = g.top()
     traces = [random_trace(rng, args.bound) for _ in range(args.traces)]
     wd = tempfile.mkdtemp(prefix="pbt_")
@@ -322,6 +322,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--syntax-every", type=int, default=10)
     ap.add_argument("--no-shrink", action="store_true")
+    ap.add_argument("--unbounded", action="store_true",
+                    help="generate unbounded sequences in property position (weak semantics)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:

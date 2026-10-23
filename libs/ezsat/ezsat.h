@@ -181,6 +181,11 @@ public:
 	void assume(int id);
 	void assume(int id, int context_id) { assume(OR(id, NOT(context_id))); }
 	int bind(int id, bool auto_freeze = true);
+	// bind the operands of an expression DAG bottom-up with an explicit
+	// stack (bind() recursed once per DAG level and overflowed the stack on
+	// deep cones: wide arithmetic, long unrollings)
+	void bind_prepass(int root);
+	int bind_prepass_depth = 0;
 	int bound(int id) const;
 
 	int numCnfVariables() const { return cnfVariableCount; }

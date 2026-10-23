@@ -1,0 +1,18 @@
+# ezSAT::bind recursed once per level of an expression DAG; a deep cone
+# (a 4096-bit ripple-carry add, like caliptra's 384-bit arithmetic over
+# an unrolling) overflowed the 8 MB macOS main-thread stack: a segfault in
+# ic3 (caliptra fv_add_sub_alter, rc=-11).  Operands are now bound
+# bottom-up with an explicit stack.
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic [4095:0] a, b);
+  logic [4095:0] s;
+  assign s = a + b;
+  p: assert property (@(posedge clk) s != 4096'd0);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "p: disproved \(depth 0\)" 1
+ic3 -init-zero

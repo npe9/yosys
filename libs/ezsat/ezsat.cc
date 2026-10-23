@@ -546,8 +546,44 @@ std::string ezSAT::cnfLiteralInfo(int idx) const
 	return "<unnamed>";
 }
 
+void ezSAT::bind_prepass(int root)
+{
+	cnfExpressionVariables.resize(expressions.size());
+	std::vector<std::pair<int, bool>> stack;
+	stack.push_back({root, false});
+	while (!stack.empty()) {
+		int id = stack.back().first;
+		bool expanded = stack.back().second;
+		// literals bind without recursion; eliminated nodes keep the
+		// recursive path (it handles the re-bind)
+		if (id >= 0 || cnfExpressionVariables[-id-1] != 0) {
+			stack.pop_back();
+			continue;
+		}
+		if (expanded) {
+			stack.pop_back();
+			if (id != root)
+				bind(id, false);
+			continue;
+		}
+		stack.back().second = true;
+		OpId op;
+		std::vector<int> args;
+		lookup_expression(id, op, args);
+		for (int i = int(args.size()) - 1; i >= 0; i--)
+			if (args[i] < 0 && cnfExpressionVariables[-args[i]-1] == 0)
+				stack.push_back({args[i], false});
+	}
+}
+
 int ezSAT::bind(int id, bool auto_freeze)
 {
+	if (id < 0 && bind_prepass_depth == 0) {
+		bind_prepass_depth++;
+		bind_prepass(id);
+		bind_prepass_depth--;
+	}
+
 	addhash(__LINE__);
 	addhash(id);
 	addhash(auto_freeze);

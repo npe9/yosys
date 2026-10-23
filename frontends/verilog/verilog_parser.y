@@ -113,6 +113,10 @@
 			// Condition of the immediate assertion whose else-statement is being parsed.
 			std::unique_ptr<AstNode> pending_assert_cond;
 			bool collecting_let_ports = false;
+			// inside a property declaration body: IEEE 1800-2017 16.15 applies
+			// `default disable iff` to the assertion statement, not to the
+			// declarations it instantiates
+			bool in_property_decl = false;
 			std::vector<std::string> let_port_names;
 			pool<std::string> interface_names;
 			// struct/union member default values (`bit lo = c;`), collected
@@ -6894,7 +6898,7 @@ sva_property_spec:
 		auto body = std::move($3);
 		if (!clock && extra->sva_default_clock)
 			clock = extra->sva_default_clock->clone();
-		if (!dis && extra->sva_default_disable)
+		if (!dis && extra->sva_default_disable && !extra->in_property_decl)
 			dis = extra->sva_default_disable->clone();
 		if (!clock && !dis) {
 			$$ = std::move(body);
@@ -7612,7 +7616,9 @@ sva_property_decl:
 		extra->collecting_let_ports = true;
 	} sva_ports {
 		extra->collecting_let_ports = false;
+		extra->in_property_decl = true;
 	} TOK_SEMICOL sva_prop_locals sva_property_spec TOK_SEMICOL TOK_ENDPROPERTY opt_label {
+		extra->in_property_decl = false;
 		checkLabelsMatch(@10, "Property label", $2.get(), $11.get());
 		auto id = std::make_unique<AstNode>(@2, AST_CELLTYPE);
 		id->str = *$2;

@@ -1,0 +1,25 @@
+# `default disable iff` with a parameterized property instance (core-v-verif
+# uvma_rvfi/obi assert modules): the default was also injected into the
+# property declaration's body, and sva2check refused the instance
+# ("disable_iff inside an instantiated property/sequence").  IEEE 1800-2017
+# 16.15 applies the default to the assertion statement only.
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic reset_n, input logic [3:0] d);
+  logic [3:0] q;
+  logic [3:0] cnt = 4'd0;
+  always_ff @(posedge clk) cnt <= cnt + 4'd1;
+  // q changes at cnt 4 and 5; the default disable covers cnt 3..5
+  assign q = (cnt == 4'd4) ? 4'd5 : 4'd0;
+  default clocking @(posedge clk); endclocking
+  default disable iff (cnt >= 4'd3 && cnt <= 4'd5);
+  property p_stable(sig);
+    cnt >= 4'd1 |=> $stable(sig);
+  endproperty
+  a_q: assert property (p_stable(q));
+endmodule
+EOT
+prep -top top
+sva2check
+async2sync
+logger -expect log "ic3: 1 properties: proved=1 disproved=0 undecided=0" 1
+ic3 -init-zero

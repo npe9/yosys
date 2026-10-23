@@ -1,0 +1,23 @@
+# {<<N{expr}} whose operand is not a bare identifier was hoisted into a
+# module-level `assign $stream$ = expr`.  Inside a function or an always
+# block that reads the process's local outside the process, i.e. as x:
+# OpenTitan prim_lfsr `function revcol(col); return {<<LfsrIdxDw{col}};`
+# was 'x (pre-existing, silent).  The operand is now sliced in place.
+read_verilog -sv <<EOT
+module top (input logic [7:0] w, output logic ok);
+  typedef logic [3:0][1:0] col_t;
+  function automatic col_t revcol(col_t col);
+    return {<<2{col}};
+  endfunction
+  function automatic logic [7:0] rev3(logic [7:0] x);
+    return {<<3{x}};
+  endfunction
+  logic [7:0] c;
+  always_comb c = revcol(w);
+  assign ok = c == {w[1:0], w[3:2], w[5:4], w[7:6]} &&
+              rev3(w) == {w[1:0], w[4:2], w[7:5]} &&
+              {<<4{w, 4'b1001}} == {4'b1001, w[3:0], w[7:4]};
+endmodule
+EOT
+proc
+sat -verify -prove ok 1

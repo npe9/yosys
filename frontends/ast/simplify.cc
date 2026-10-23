@@ -3657,24 +3657,30 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				pos -= sz;
 			}
 			std::reverse(blocks.begin(), blocks.end());
-			std::string name;
-			if (payload->type == AST_IDENTIFIER && payload->children.empty()) {
-				name = payload->str;
-			} else {
-				auto tmp = mktemp_logic(location, "$stream$", current_ast_mod, true, width - 1, 0, false);
-				auto asg = std::make_unique<AstNode>(location, AST_ASSIGN, tmp->clone(), payload->clone());
-				current_ast_mod->children.push_back(std::move(asg));
-				name = tmp->str;
-			}
+			// blocks of a bare identifier are part-selects of it; any other
+			// payload is sliced in place as sz'($unsigned(payload) >> lo).  (It
+			// used to be hoisted into a module-level `assign $stream$ = payload`,
+			// which reads a function's or always block's local -- `return
+			// {<<6{col}}` in OpenTitan prim_lfsr revcol -- outside its process,
+			// i.e. as x.)
+			bool bare = payload->type == AST_IDENTIFIER && payload->children.empty();
 			auto cat = std::make_unique<AstNode>(location, AST_CONCAT);
 			for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
-				auto bit = std::make_unique<AstNode>(location, AST_IDENTIFIER);
-				bit->str = name;
-				auto range = std::make_unique<AstNode>(location, AST_RANGE);
-				range->children.push_back(mkconst_int(location, it->first, true));
-				range->children.push_back(mkconst_int(location, it->second, true));
-				bit->children.push_back(std::move(range));
-				cat->children.push_back(std::move(bit));
+				if (bare) {
+					auto bit = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+					bit->str = payload->str;
+					auto range = std::make_unique<AstNode>(location, AST_RANGE);
+					range->children.push_back(mkconst_int(location, it->first, true));
+					range->children.push_back(mkconst_int(location, it->second, true));
+					bit->children.push_back(std::move(range));
+					cat->children.push_back(std::move(bit));
+				} else {
+					auto shifted = std::make_unique<AstNode>(location, AST_SHIFT_RIGHT,
+							std::make_unique<AstNode>(location, AST_TO_UNSIGNED, payload->clone()),
+							mkconst_int(location, it->second, false));
+					cat->children.push_back(std::make_unique<AstNode>(location, AST_CAST_SIZE,
+							mkconst_int(location, it->first - it->second + 1, false), std::move(shifted)));
+				}
 			}
 			if (cat->children.size() == 1)
 				cat->children[0]->cloneInto(*this);

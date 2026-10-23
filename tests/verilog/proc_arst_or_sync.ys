@@ -1,0 +1,52 @@
+# `if (!rst_n || clr)` in an async-reset process (caliptra hmac, hmac_drbg,
+# sha512_masked fv_constraints): the reset branch is taken asynchronously
+# by !rst_n and synchronously by clr.  It was "Multiple edge sensitive
+# events found for this signal!".  proc_arst splits the condition; the
+# result is equivalent to the nested form.
+read_verilog -sv <<EOT
+module gold (input logic clk, rst_n, clr, d, e, output logic q);
+  always @(posedge clk or negedge rst_n)
+    if (!rst_n) q <= 1'b0;
+    else if (clr) q <= 1'b0;
+    else if (e) q <= d;
+endmodule
+module gate (input logic clk, rst_n, clr, d, e, output logic q);
+  always @(posedge clk or negedge rst_n)
+    if (!rst_n || clr) q <= 1'b0;
+    else if (e) q <= d;
+endmodule
+module gate2 (input logic clk, rst_n, clr, d, e, output logic q);
+  always @(posedge clk or negedge rst_n)
+    if (clr || !rst_n) q <= 1'b0;
+    else if (e) q <= d;
+endmodule
+EOT
+proc
+opt_clean
+select -assert-count 1 gate/t:$adff
+select -assert-count 1 gate2/t:$adff
+async2sync
+design -save all
+equiv_make gold gate eq
+hierarchy -top eq
+equiv_simple -seq 2
+equiv_induct
+equiv_status -assert
+design -load all
+equiv_make gold gate2 eq2
+hierarchy -top eq2
+equiv_simple -seq 2
+equiv_induct
+equiv_status -assert
+design -reset
+
+# an OR with a term that is not the reset edge's level stays an error
+logger -expect error "Multiple edge sensitive events" 1
+read_verilog -sv <<EOT
+module bad (input logic clk, rst_n, clr, d, output logic q);
+  always @(posedge clk or negedge rst_n)
+    if (rst_n || clr) q <= 1'b0;
+    else q <= d;
+endmodule
+EOT
+proc

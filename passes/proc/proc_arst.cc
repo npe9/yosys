@@ -195,6 +195,58 @@ void proc_arst(RTLIL::Module *mod, RTLIL::Process *proc, SigMap &assign_map)
 
 	bool did_something = false;
 
+	// `always @(posedge clk or negedge rst_n) if (!rst_n || clr) q <= R;
+	// else ...` (caliptra hmac/sha512 fv_constraints): the reset branch is
+	// taken asynchronously by the edge signal's term and synchronously by
+	// the rest.  Split the root `switch (A || B)` into `switch A` (the async
+	// reset, recognized below) whose other case is `switch B { R; else }`.
+	// Simulation semantics: at the clock edge with rst_n high, clr selects R.
+	if (edge_syncs.size() > 1 && proc->root_case.switches.size() == 1) {
+		RTLIL::SwitchRule *sw = proc->root_case.switches[0];
+		Cell *orc = nullptr;
+		if (sw->signal.size() == 1 && GetSize(sw->cases) == 2 &&
+				sw->cases[0]->compare == std::vector<RTLIL::SigSpec>{RTLIL::SigSpec(RTLIL::State::S1)} &&
+				sw->cases[1]->compare.empty())
+			for (auto cell : mod->cells())
+				if (cell->type.in(ID($logic_or), ID($or)) && GetSize(cell->getPort(ID::Y)) == 1 &&
+						cell->getPort(ID::Y) == sw->signal)
+					orc = cell;
+		if (orc) {
+			RTLIL::SigSpec ports[2] = {orc->getPort(ID::A), orc->getPort(ID::B)};
+			for (int k = 0; k < 2; k++) {
+				RTLIL::SigSpec a = ports[k], b = ports[1-k];
+				if (a.size() != 1)
+					continue;
+				bool matched = false;
+				for (auto sync : edge_syncs) {
+					bool polarity = sync->type == RTLIL::SyncType::STp;
+					// the reset case is the one where `a` is 1
+					if (check_signal(mod, a, sync->signal, polarity) && polarity)
+						matched = true;
+				}
+				if (!matched)
+					continue;
+				log("Splitting async reset term %s from synchronous term %s in `%s.%s'.\n",
+						log_signal(a), log_signal(b), mod->name, proc->name);
+				RTLIL::SigSpec bbit = b.size() == 1 ? b : RTLIL::SigSpec(mod->ReduceBool(NEW_ID, b));
+				RTLIL::CaseRule *reset_case = sw->cases[0], *else_case = sw->cases[1];
+				RTLIL::SwitchRule *inner = new RTLIL::SwitchRule;
+				inner->signal = bbit;
+				inner->attributes = sw->attributes;
+				RTLIL::CaseRule *inner_reset = reset_case->clone();
+				RTLIL::CaseRule *inner_else = new RTLIL::CaseRule;
+				inner_else->attributes = else_case->attributes;
+				inner_else->actions.swap(else_case->actions);
+				inner_else->switches.swap(else_case->switches);
+				inner->cases.push_back(inner_reset);
+				inner->cases.push_back(inner_else);
+				else_case->switches.push_back(inner);
+				sw->signal = a;
+				break;
+			}
+		}
+	}
+
 	while (proc->root_case.switches.size() == 1) {
 		RTLIL::SigSpec root_sig = proc->root_case.switches[0]->signal;
 

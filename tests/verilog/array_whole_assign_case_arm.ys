@@ -1,0 +1,37 @@
+# A whole unpacked-array assignment in the arms of an always_comb case, with
+# unpacked-array ports among the sources (OpenTitan aes_cipher_core
+# `state_d = add_round_key_out`): the expansion's temporary is not state,
+# and the arms that do not use it must not make proc infer a latch
+# ("Latch inferred for signal $wholeassign$").
+read_verilog -sv <<EOT
+module top #(parameter int NumShares = 1) (input logic clk, input logic [1:0] sel,
+    input logic [3:0][7:0] init_i [NumShares], input logic [3:0][7:0] clr_i [NumShares],
+    output logic [3:0][7:0] state_o [NumShares]);
+  logic [3:0][7:0] rk_out [NumShares], st_d [NumShares], st_q [NumShares];
+  for (genvar s = 0; s < NumShares; s++) begin : g
+    assign rk_out[s] = st_q[s] ^ init_i[s];
+  end
+  always_comb begin : state_mux
+    unique case (sel)
+      2'd0: st_d = init_i;
+      2'd1: st_d = rk_out;
+      2'd2: st_d = clr_i;
+      default: st_d = clr_i;
+    endcase
+  end
+  always_ff @(posedge clk) st_q <= st_d;
+  assign state_o = rk_out;
+  always_comb begin
+    if (sel == 2'd0) assert (st_d[0] == init_i[0]);
+    if (sel == 2'd1) assert (st_d[0] == rk_out[0]);
+    if (sel[1]) assert (st_d[0] == clr_i[0]);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+select -assert-none t:$dlatch
+delete t:$dff
+chformal -lower
+sat -verify -prove-asserts -show-ports

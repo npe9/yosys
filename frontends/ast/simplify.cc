@@ -554,6 +554,27 @@ static std::unique_ptr<AstNode> make_mem_elem_ref(Location loc, AstNode *mem, in
 	return elem;
 }
 
+// A 2-D unpacked memory `logic [w-1:0] m [A][B]`: element width and the two
+// unpacked index ranges.
+static bool get_2d_unpacked_mem_info(AstNode *mem, int &elem_width, int &lo0, int &hi0, int &lo1, int &hi1)
+{
+	// after stage 1 the memory keeps one flattened unpacked range child;
+	// its shape is in `dimensions` (unpacked dimensions first)
+	if (mem->type != AST_MEMORY || mem->unpacked_dimensions != 2 || GetSize(mem->dimensions) < 3)
+		return false;
+	auto &d0 = mem->dimensions[0], &d1 = mem->dimensions[1];
+	if (d0.range_width < 1 || d1.range_width < 1)
+		return false;
+	elem_width = 1;
+	for (int i = 2; i < GetSize(mem->dimensions); i++)
+		elem_width *= mem->dimensions[i].range_width;
+	lo0 = d0.range_right;
+	hi0 = d0.range_right + d0.range_width - 1;
+	lo1 = d1.range_right;
+	hi1 = d1.range_right + d1.range_width - 1;
+	return (int64_t)d1.range_width * elem_width <= whole_array_rewrite_max_bits;
+}
+
 // Rewrite whole-array accesses to plain 1-D unpacked memories into indexed
 // element form, before child simplification: reads and cell connection
 // arguments become a concatenation {mem[hi], ..., mem[lo]} so the element at
@@ -628,6 +649,13 @@ static std::vector<std::unique_ptr<AstNode>> expand_whole_array_assign(AstNode *
 	tmp_wire->str = tmpname;
 	tmp_wire->is_logic = true;
 	tmp_wire->is_reg = procedural;
+	// in a process the temporary is written right before every read (the
+	// split assignments follow it in the same branch): not state, so a
+	// branch that leaves it unassigned must not make proc infer a latch
+	// or a flip-flop for it (aes_cipher_core: `state_d = add_round_key_out`
+	// in one arm of an always_comb case)
+	if (procedural)
+		tmp_wire->set_attribute(ID::nosync, AstNode::mkconst_int(loc, 1, false));
 	AstNode *tmp_wire_p = tmp_wire.get();
 	while (tmp_wire_p->simplify(true, 1, -1, false)) { }
 	current_scope[tmpname] = tmp_wire_p;
@@ -662,6 +690,14 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 
 	bool node_is_assign = node->type == AST_ASSIGN || node->type == AST_ASSIGN_EQ || node->type == AST_ASSIGN_LE;
 	bool procedural = in_procedural || node->type == AST_ALWAYS || node->type == AST_INITIAL;
+	// calls are left alone ($bits/$size/... would see the concatenation's
+	// shape), except the sampled-value functions, which are element-wise:
+	// $past(arr) / $stable(arr) of a whole unpacked array (OpenTitan
+	// aes_cipher_core, caliptra doe / sha512 properties) are those of the
+	// element concatenation
+	bool opaque_call = (node->type == AST_FCALL || node->type == AST_TCALL) &&
+			!(node->type == AST_FCALL && (node->str == "\\$past" || node->str == "\\$stable" ||
+			node->str == "\\$changed" || node->str == "\\$sampled"));
 
 	for (size_t i = 0; i < node->children.size(); i++) {
 		AstNode *child = node->children[i].get();
@@ -706,7 +742,7 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 		// whole-array read below); out-of-bounds or oversized slices are left
 		// for the generic memory-read path
 		if (child->type == AST_IDENTIFIER && !in_lvalue && !(node_is_assign && i == 0) && child->id2ast &&
-				child->id2ast->type == AST_MEMORY && !(node->type == AST_FCALL || node->type == AST_TCALL) &&
+				child->id2ast->type == AST_MEMORY && !opaque_call &&
 				child->children.size() == 1 && child->children[0] && child->children[0]->type == AST_RANGE &&
 				child->children[0]->range_valid && child->children[0]->range_left != child->children[0]->range_right &&
 				get_1d_unpacked_mem_info(child->id2ast, elem_width, lo, hi)) {
@@ -729,11 +765,57 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 			}
 		}
 
+		// a row of a 2-D unpacked memory as a cell connection
+		// (`.in_i(mux_in[k])`, OpenTitan aes_ghash; IEEE 1800-2017 23.3.3):
+		// the concatenation of its elements, lowest index in the LSBs like
+		// the flattened unpacked port it connects to.  (Only connections:
+		// upstream pins the sub-array ASSIGNMENT as an error,
+		// tests/svtypes/multirange_subarray_access.)
+		// (a connection to a known module's port may already have been
+		// moved into `assign $indirect$<port>... = <arg>`)
+		bool is_connection = node->type == AST_ARGUMENT ||
+				(node->type == AST_ASSIGN && i == 1 && node->children.size() == 2 && node->children[0] &&
+				 node->children[0]->type == AST_IDENTIFIER && node->children[0]->str.rfind("$indirect$", 0) == 0);
+		if (is_connection && child->type == AST_IDENTIFIER && child->id2ast &&
+				child->id2ast->type == AST_MEMORY && child->attributes.count(ID(sv_subarray_row))) {
+			int ew, lo0, hi0, lo1, hi1;
+			if (get_2d_unpacked_mem_info(child->id2ast, ew, lo0, hi0, lo1, hi1)) {
+				auto idx = child->attributes.at(ID(sv_subarray_row))->clone();
+				while (idx->simplify(true, 1, -1, false)) { }
+				if (idx->type == AST_CONSTANT) {
+					int k = idx->asInt(true);
+					if (k >= lo0 && k <= hi0) {
+						AstNode *mem2 = child->id2ast;
+						auto loc = child->location;
+						child->type = AST_CONCAT;
+						child->str.clear();
+						child->id2ast = nullptr;
+						child->is_signed = false;
+						child->children.clear();
+						child->attributes.erase(ID(sv_subarray_row));
+						for (int j = lo1; j <= hi1; j++) {
+							auto mr = std::make_unique<AstNode>(loc, AST_MULTIRANGE,
+									std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, k, true)),
+									std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, j, true)));
+							auto elem = std::make_unique<AstNode>(loc, AST_IDENTIFIER, std::move(mr));
+							elem->str = mem2->str;
+							elem->id2ast = mem2;
+							elem->integer = 2;
+							elem->basic_prep = false;
+							child->children.push_back(std::move(elem));
+						}
+						mem2->set_attribute(ID::mem2reg, AstNode::mkconst_int(loc, 1, false));
+						continue;
+					}
+				}
+			}
+		}
+
 		// whole-array read: replace the bare identifier with a concatenation
 		// of element references, lowest index in the LSBs (AST_CONCAT
 		// children: first child = low bits)
 		if (child->type == AST_IDENTIFIER && !in_lvalue && !(node_is_assign && i == 0) && child->children.empty() && child->id2ast &&
-				child->id2ast->type == AST_MEMORY && !(node->type == AST_FCALL || node->type == AST_TCALL) &&
+				child->id2ast->type == AST_MEMORY && !opaque_call &&
 				get_1d_unpacked_mem_info(child->id2ast, elem_width, lo, hi)) {
 			AstNode *mem = child->id2ast;
 			auto loc = child->location;
@@ -3729,7 +3811,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				continue;
 			int w = std::abs(packed->range_left - packed->range_right) + 1;
 			int n = std::abs(unpacked->range_left - unpacked->range_right) + 1;
-			if (w < 1 || n < 2)
+			// a one-element array port (`logic [7:0] p [1]`, OpenTitan's
+			// `[NumShares]` with NumShares = 1) is flattened too: left as a
+			// wire with its unpacked range, `p[0]` read bit 0 (silently)
+			if (w < 1 || n < 1)
 				continue;
 			auto loc = packed->location;
 			port->children.erase(port->children.begin() + 1);
@@ -6506,6 +6591,12 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		int dims_sel = children[0]->type == AST_MULTIRANGE ? children[0]->children.size() : 1;
 		// Save original number of dimensions for $size() etc.
 		integer = dims_sel;
+		// a row of a 2-D unpacked memory (`m[k]` of `m [A][B]`): keep the
+		// row index; the flattening below loses it, and a cell connection
+		// of the row is expanded from it (rewrite_whole_array_refs)
+		if (decl_node->type == AST_MEMORY && decl_node->unpacked_dimensions == 2 && dims_sel == 1 &&
+				children[0]->type == AST_RANGE && children[0]->children.size() == 1)
+			set_attribute(ID(sv_subarray_row), children[0]->children[0]->clone());
 
 		// Split access into unpacked and packed parts.
 		std::unique_ptr<AstNode> unpacked_range = nullptr;

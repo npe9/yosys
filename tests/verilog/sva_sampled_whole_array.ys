@@ -1,0 +1,19 @@
+# $past / $stable / $changed of a whole unpacked array (OpenTitan
+# aes_cipher_core `state_q != $past(add_round_key_out)`, caliptra doe
+# `$stable(fv_round_key_array)`): element-wise, i.e. those of the element
+# concatenation.  It was "Insufficient number of array indices".
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic [7:0] a, input logic [7:0] b);
+  logic [7:0] arr [2];
+  logic started = 1'b0;
+  always_ff @(posedge clk) begin arr[0] <= a; arr[1] <= b; started <= 1'b1; end
+  p_st: assert property (@(posedge clk) started |-> $stable(arr) == ($stable(arr[0]) && $stable(arr[1])));
+  p_ch: assert property (@(posedge clk) started |-> $changed(arr) == ($changed(arr[0]) || $changed(arr[1])));
+  p_pa: assert property (@(posedge clk) started |-> ($past(arr) == arr) == ($past(arr[0]) == arr[0] && $past(arr[1]) == arr[1]));
+endmodule
+EOT
+prep -top top
+sva2check
+async2sync
+logger -expect log "ic3: 3 properties: proved=3 disproved=0 undecided=0" 1
+ic3

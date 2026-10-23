@@ -1,0 +1,20 @@
+# A one-element unpacked array port (`logic [7:0] p [1]`; OpenTitan's
+# `[NumShares]` with NumShares = 1) was left unflattened, so `p[0]` read
+# bit 0 of the port, zero-extended: silent wrong RTL.
+read_verilog -sv <<EOT
+module child (input logic [7:0] in_i [1], output logic [7:0] out_o [1]);
+  assign out_o[0] = in_i[0] ^ 8'h5a;
+endmodule
+module top (input logic [7:0] a);
+  logic [7:0] x [1], y [1];
+  assign x[0] = a;
+  child u (.in_i(x), .out_o(y));
+  always_comb assert (y[0] == (a ^ 8'h5a));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

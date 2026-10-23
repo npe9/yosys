@@ -1,0 +1,32 @@
+# A row of a 2-D unpacked memory as a cell connection (OpenTitan aes_ghash
+# `.in_i(ghash_add_in_mux_in[s])`, IEEE 1800-2017 23.3.3) connects that row's
+# elements; it was "Insufficient number of array indices".  The connection
+# may also have been moved into an $indirect$ assignment when the module
+# is reprocessed.  (A sub-array ASSIGNMENT stays an error: upstream pins it,
+# tests/svtypes/multirange_subarray_access.)
+read_verilog -sv <<EOT
+module sel #(parameter int N = 3) (input logic [7:0] in_i [N], input logic [1:0] s, output logic [7:0] o);
+  assign o = in_i[s];
+endmodule
+module top (input logic [7:0] a, input logic [7:0] b, input logic [1:0] s);
+  logic [7:0] mux_in [2][3];
+  logic [7:0] o [2];
+  assign mux_in[0][0] = a; assign mux_in[0][1] = b; assign mux_in[0][2] = a ^ b;
+  assign mux_in[1][0] = ~a; assign mux_in[1][1] = ~b; assign mux_in[1][2] = a & b;
+  for (genvar k = 0; k < 2; k++) begin : g
+    sel #(.N(3)) u (.in_i(mux_in[k]), .s(s), .o(o[k]));
+  end
+  always_comb begin
+    if (s == 2'd0) assert (o[0] == a && o[1] == ~a);
+    if (s == 2'd1) assert (o[0] == b && o[1] == ~b);
+    if (s == 2'd2) assert (o[0] == (a ^ b) && o[1] == (a & b));
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+memory
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

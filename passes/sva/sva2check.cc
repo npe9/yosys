@@ -1844,6 +1844,11 @@ struct SvaCompiler {
 		// read, so local reads splice at the age current at the read.  The
 		// callee's locals need slots even when the caller has none.
 		bool had_slots = slots_mode;
+		if (dbody && in_prop && !slots_mode && gate == Const(1, 1)) {
+			UntilLocals ul;
+			if (until_locals_match(dbody, ul))
+				return until_locals_fail(ul, dformals, start);
+		}
 		if (dbody && !slots_mode) {
 			pool<Cell *> seen;
 			if (tree_has_locals(dbody, seen)) {
@@ -3074,6 +3079,196 @@ struct SvaCompiler {
 		SigSpec fail = with ? andN({live, np}) : andN({live, np, mod->Not(NEW_ID, q)});
 		// all-zero = no attempt pending (safe for the early check)
 		ffd(dis_gate(andN({live, p, mod->Not(NEW_ID, q)})), lw, true);
+		return fail;
+	}
+
+	// Locals over an unbounded until (2026-10-23): the OpenTitan
+	// ASSERT_FPV_LINEAR_FSM shape
+	//   (b, v = e) |-> p(v) until q        (weak until / until_with)
+	// with ONE local v of an enum type, a single-tick antecedent, boolean
+	// p and q, and neither b, e nor q reading v.  Each attempt in flight
+	// has its own v, but attempts with equal v see the same future (p
+	// and q are per-tick booleans), so a set over v's values is exact:
+	// one membership bit per enum constant -- the reviewed K-slot CAM
+	// with K = the enum count and dedup by construction.  Per bit, as
+	// until_fail per attempt: until fails on !p_i && !q, until_with on
+	// !p_i; both continue on p_i && !q (a failed entry clears its own
+	// bit).  A capture outside the enum constants takes one of
+	// until_locals_slots general CAM entries (deduplicated); with all of
+	// them live it cannot be tracked and pulses cam_overflow, which
+	// becomes the separate <name>$overflow check: the main verdict is
+	// exact only when that check proves.
+	struct UntilLocals {
+		Cell *ant = nullptr, *con = nullptr, *as = nullptr;
+		SigSpec b, e, p, q;
+		Wire *v = nullptr;
+		std::vector<Const> dom;
+		bool with = false;
+	};
+	bool allow_until_locals = false;
+	int until_locals_slots = 2;   // general entries for non-enum captures
+	SigSpec cam_overflow;
+
+	bool cone_reads(SigSpec s, Wire *v, pool<Wire *> &seen)
+	{
+		for (auto bit : s) {
+			if (!bit.is_wire())
+				continue;
+			if (bit.wire == v)
+				return true;
+			if (!seen.insert(bit.wire).second)
+				continue;
+			auto it = expr_drv.find(bit.wire);
+			if (it == expr_drv.end())
+				continue;
+			for (auto &conn : it->second->connections())
+				if (conn.first != ID(Y) && conn.first != ID(DATA) && cone_reads(conn.second, v, seen))
+					return true;
+		}
+		return false;
+	}
+
+	bool until_locals_match(Cell *body, UntilLocals &m)
+	{
+		if (!allow_until_locals || !body || multiclock || island_mode || sva_op(body) != "|->")
+			return false;
+		auto bp = ports_of(body);
+		if (GetSize(bp) != 2)
+			return false;
+		m.ant = child_cell(body->getPort(bp[0]));
+		m.con = child_cell(body->getPort(bp[1]));
+		if (!m.ant || !m.con || sva_op(m.ant) != "seq_match")
+			return false;
+		std::string uop = sva_op(m.con);
+		if (uop != "until" && uop != "until_with")
+			return false;
+		m.with = uop == "until_with";
+		auto ap = ports_of(m.ant), up = ports_of(m.con);
+		if (GetSize(ap) != 2 || GetSize(up) != 2)
+			return false;
+		m.b = m.ant->getPort(ap[0]);
+		m.p = m.con->getPort(up[0]);
+		m.q = m.con->getPort(up[1]);
+		if (child_cell(m.b) || child_cell(m.p) || child_cell(m.q))
+			return false;
+		Cell *mt = child_cell(m.ant->getPort(ap[1]));
+		if (!mt || sva_op(mt) != "matches")
+			return false;
+		auto mp = ports_of(mt);
+		if (GetSize(mp) != 1)
+			return false;
+		m.as = child_cell(mt->getPort(mp[0]));
+		if (!m.as || sva_op(m.as) != "assign")
+			return false;
+		auto sp = ports_of(m.as);
+		if (GetSize(sp) != 2)
+			return false;
+		for (auto bit : m.as->getPort(sp[0]))
+			if (bit.is_wire()) {
+				m.v = bit.wire;
+				break;
+			}
+		if (!m.v)
+			return false;
+		m.e = m.as->getPort(sp[1]);
+		m.dom.clear();
+		for (auto &a : m.v->attributes) {
+			std::string k = a.first.str();
+			if (k.rfind("\\enum_value_", 0) != 0)
+				continue;
+			std::string bits = k.substr(12);
+			if (GetSize(bits) != m.v->width)
+				return false;
+			std::vector<State> st;
+			for (int i = GetSize(bits) - 1; i >= 0; i--) {
+				if (bits[i] != '0' && bits[i] != '1')
+					return false;
+				st.push_back(bits[i] == '1' ? State::S1 : State::S0);
+			}
+			m.dom.push_back(Const(st));
+		}
+		if (m.dom.empty() || GetSize(m.dom) > 256)
+			return false;
+		pool<Wire *> seen;
+		if (cone_reads(m.q, m.v, seen))
+			return false;
+		seen.clear();
+		if (cone_reads(m.b, m.v, seen))
+			return false;
+		seen.clear();
+		if (cone_reads(m.e, m.v, seen))
+			return false;
+		seen.clear();
+		return cone_reads(m.p, m.v, seen);
+	}
+
+	SigSpec until_locals_fail(UntilLocals &m, const std::vector<Wire *> &formals, SigSpec start)
+	{
+		std::vector<Wire *> fl = formals;
+		fl.push_back(m.v);
+		auto ex = [&](SigSpec raw) { return splice_expr(raw, fl, false); };
+		SigSpec b = reduce1(resolve(ex(m.b)));
+		SigSpec e = resolve(ex(m.e));
+		// the assignment's width: the frontend pads the port
+		if (GetSize(e) > m.v->width)
+			e = e.extract(0, m.v->width);
+		else if (GetSize(e) < m.v->width)
+			e.extend_u0(m.v->width, false);
+		SigSpec q = reduce1(resolve(ex(m.q)));
+		SigSpec nq = mod->Not(NEW_ID, q);
+		auto p_at = [&](SigSpec val) -> SigSpec {
+			SubstGuard g(this);
+			g.bind(m.v, val);
+			return reduce1(resolve(ex(m.p)));
+		};
+		// the attempt matched its antecedent: the until starts now, with
+		// this tick's capture (the start tick is checked combinationally)
+		SigSpec cap = andN({start, b});
+		SigSpec p_now = p_at(e);
+		SigSpec fail = m.with ? andN({cap, mod->Not(NEW_ID, p_now)})
+		                      : andN({cap, mod->Not(NEW_ID, p_now), nq});
+		SigSpec ins = andN({cap, p_now, nq});
+		SigSpec in_dom = Const(0, 1);
+		for (auto &val : m.dom) {
+			SigSpec p_i = p_at(val);
+			SigSpec hit = mod->Eq(NEW_ID, e, val);
+			in_dom = orN({in_dom, hit});
+			Wire *bit = wn("until_set", 1);
+			SigSpec np_i = mod->Not(NEW_ID, p_i);
+			fail = orN({fail, m.with ? andN({SigSpec(bit), np_i}) : andN({SigSpec(bit), np_i, nq})});
+			// all-zero = no attempt pending (safe for the early check)
+			ffd(dis_gate(orN({andN({SigSpec(bit), p_i, nq}), andN({ins, hit})})), bit, true);
+		}
+		// captures outside the enum constants (a sparse FSM's free initial
+		// state, a fault value): a few general CAM entries, deduplicated
+		// against the surviving ones; overflow only when all are taken
+		SigSpec need = andN({ins, mod->Not(NEW_ID, in_dom)});
+		std::vector<SigSpec> surv;
+		std::vector<Wire *> vbit, vval;
+		SigSpec dup = Const(0, 1);
+		for (int g = 0; g < until_locals_slots; g++) {
+			Wire *bit = wn("until_cam", 1);
+			Wire *val = wn("until_cam_val", m.v->width);
+			SigSpec p_g = p_at(SigSpec(val));
+			SigSpec np_g = mod->Not(NEW_ID, p_g);
+			fail = orN({fail, m.with ? andN({SigSpec(bit), np_g}) : andN({SigSpec(bit), np_g, nq})});
+			SigSpec sv = andN({SigSpec(bit), p_g, nq});
+			dup = orN({dup, andN({sv, mod->Eq(NEW_ID, SigSpec(val), e)})});
+			surv.push_back(sv);
+			vbit.push_back(bit);
+			vval.push_back(val);
+		}
+		need = andN({need, mod->Not(NEW_ID, dup)});
+		SigSpec taken = Const(0, 1);
+		for (int g = 0; g < until_locals_slots; g++) {
+			SigSpec take = andN({need, mod->Not(NEW_ID, surv[g]), mod->Not(NEW_ID, taken)});
+			taken = orN({taken, mod->Not(NEW_ID, surv[g])});
+			ffd(dis_gate(orN({surv[g], take})), vbit[g], true);
+			// data, not attempt state: never cleared
+			mod->addDff(NEW_ID, clk, mod->Mux(NEW_ID, SigSpec(vval[g]), e, take), vval[g], clk_pos);
+		}
+		SigSpec ovf = andN({need, mod->Not(NEW_ID, taken)});
+		cam_overflow = cam_overflow.empty() ? ovf : orN({cam_overflow, ovf});
 		return fail;
 	}
 
@@ -4934,6 +5129,9 @@ struct Sva2CheckPass : public Pass {
 				{
 					std::string fl = cell->getParam(ID(FLAVOR)).decode_string();
 					comp.early_fail = early_opt || getenv("SVA_EARLY") || fl == "assume" || fl == "restrict";
+					// the $overflow twin is an assert on the property clock;
+					// clk2fflogic gating of the twin is not built
+					comp.allow_until_locals = !c2f && (fl == "assert" || fl == "assume");
 				}
 
 				SigSpec aport = cell->getPort(ID(A));
@@ -5697,7 +5895,8 @@ struct Sva2CheckPass : public Pass {
 						Cell *dbody = dp.empty() ? nullptr : comp.child_cell(dcell->getPort(dp[0]));
 						bool had_slots = comp.slots_mode;
 						pool<Cell *> seen;
-						if (dbody && comp.tree_has_locals(dbody, seen)) {
+						SvaCompiler::UntilLocals ul;
+						if (dbody && !comp.until_locals_match(dbody, ul) && comp.tree_has_locals(dbody, seen)) {
 							int l = comp.seq_max_len(dbody);
 							if (l < 0)
 								log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(dbody));
@@ -5820,7 +6019,31 @@ struct Sva2CheckPass : public Pass {
 					std::string tag = comp.lowering_tag();
 					if (const_cone(mod, cell->getPort(ID::A)))
 						tag += ":const";
+					if (!comp.cam_overflow.empty())
+						tag += ":if-" + std::string(log_id(cell)) + "$overflow";
 					cell->attributes[ID(sva_lowering)] = Const(tag);
+				}
+				if (!comp.cam_overflow.empty()) {
+					// locals over an unbounded until (until_locals_fail): a
+					// capture outside the local's enum constants is not
+					// tracked, so the main verdict is exact only when this
+					// twin proves.  Mirrors the $live twin; ic3 reports a
+					// failure as "capacity exceeded", never as a design
+					// counterexample.  A main DISPROOF is always real (the
+					// set only drops obligations).
+					RTLIL::Cell *ov = mod->addCell(cell->name.str() + "$overflow", ID($check));
+					ov->parameters = cell->parameters;
+					ov->connections_ = cell->connections_;
+					ov->attributes = cell->attributes;
+					ov->setParam(ID(FLAVOR), std::string("assert"));
+					SigSpec oa = mod->Not(NEW_ID, comp.cam_overflow);
+					if (dop == "disable_iff")
+						oa = mod->Or(NEW_ID, dsig, oa);
+					ov->setPort(ID(A), oa);
+					ov->setPort(ID(EN), SigSpec(State::S1));
+					ov->attributes[ID(sva2check)] = Const(1, 1);
+					ov->attributes[ID(sva_capacity)] = Const(1, 1);
+					ov->attributes[ID(sva_lowering)] = Const(std::string("exact"));
 				}
 
 				if (nsu) {

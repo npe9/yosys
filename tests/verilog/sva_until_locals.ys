@@ -1,0 +1,123 @@
+# Locals over an unbounded until: the OpenTitan ASSERT_FPV_LINEAR_FSM shape
+#   (c, v = $past(s)) |-> (s != v) until !c
+# lowered with one membership bit per enum constant of v (exact: attempts
+# with equal v share their future).  It used to be refused ("local
+# variables over an unbounded sequence").  A capture outside the enum's
+# constants is reported by the <name>$overflow twin as "capacity
+# exceeded", never as a design counterexample.
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic rst);
+  typedef enum logic [2:0] {S0 = 3'd1, S1 = 3'd2, S2 = 3'd4, S3 = 3'd7} st_e;
+  st_e lin = S0;    // linear: S0 S1 S2 S3 S3 ...
+  st_e cyc = S0;    // revisits S0 at step 3
+  always_ff @(posedge clk) begin
+    case (lin)
+      S0: lin <= S1;
+      S1: lin <= S2;
+      default: lin <= S3;
+    endcase
+    case (cyc)
+      S0: cyc <= S1;
+      S1: cyc <= S2;
+      default: cyc <= S0;
+    endcase
+  end
+  // the prim_assert.sv macro text: async-reset cond, disable iff
+  bit cond;
+  always_ff @(posedge clk or posedge rst) if (rst) cond <= 0; else cond <= 1;
+  property lin_p;
+    st_e initial_state;
+    (!$stable(lin) & cond, initial_state = $past(lin)) |->
+        (lin != initial_state) until !(cond);
+  endproperty
+  property cyc_p;
+    st_e initial_state;
+    (!$stable(cyc) & cond, initial_state = $past(cyc)) |->
+        (cyc != initial_state) until !(cond);
+  endproperty
+  a_lin: assert property (@(posedge clk) disable iff (rst) lin_p);
+  a_cyc: assert property (@(posedge clk) disable iff (rst) cyc_p);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_lin: proved \[lowering=exact:if-a_lin\$overflow\]" 1
+logger -expect log "a_lin\$overflow: proved" 1
+logger -expect log "a_cyc: disproved \(depth 3\)" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# dedup: the same id captured twice before the release stays one entry;
+# the bad twin reads the id back while it is still pending
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  typedef enum logic [1:0] {A = 2'd0, B = 2'd1, C = 2'd2} id_e;
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  wire req = t == 4'd1 || t == 4'd2;          // two requests for A
+  id_e id;  assign id = A;
+  wire ack = t == 4'd6;
+  id_e out_ok;  assign out_ok  = (t < 4'd6) ? B : A;   // A only after ack
+  id_e out_bad; assign out_bad = (t == 4'd4) ? A : B;  // A while pending
+  property ok_p;  id_e v; (req, v = id) |-> (out_ok != v) until ack; endproperty
+  property bad_p; id_e v; (req, v = id) |-> (out_bad != v) until ack; endproperty
+  a_ok:  assert property (@(posedge clk) ok_p);
+  a_bad: assert property (@(posedge clk) bad_p);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_ok: proved" 1
+logger -expect log "a_bad: disproved \(depth 4\)" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# non-enum captures take general entries (2): the violation of a
+# non-enum capture is caught (a_gen); a third distinct non-enum value
+# live at once is not tracked -- the twin says so, and the main check
+# carries the condition in its tag (its 'proved' here is exactly what the
+# twin warns about)
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  typedef enum logic [2:0] {A = 3'd0, B = 3'd1} id_e;
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  id_e g_id;  assign g_id = id_e'(3'd5);
+  id_e g_out; assign g_out = (t == 4'd5) ? id_e'(3'd5) : A;
+  property gen_p; id_e v; (t == 4'd2, v = g_id) |-> (g_out != v) until 1'b0; endproperty
+  a_gen: assert property (@(posedge clk) gen_p);
+  wire req = t == 4'd2 || t == 4'd3 || t == 4'd4;
+  id_e id;  assign id = id_e'(t + 4'd3);          // 5, 6, 7: none a constant
+  id_e out; assign out = (t == 4'd9) ? id_e'(3'd7) : A;
+  property p; id_e v; (req, v = id) |-> (out != v) until 1'b0; endproperty
+  a_cap: assert property (@(posedge clk) p);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_gen: disproved \(depth 5\)" 1
+logger -expect log "a_gen\$overflow: proved" 1
+logger -expect log "a_cap\$overflow: capacity exceeded \(depth 4\)" 1
+logger -expect log "a_cap: proved \[lowering=exact:if-a_cap\$overflow\]" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# other shapes stay refused
+logger -expect error "local variables over an unbounded sequence" 1
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, input logic [3:0] d);
+  property p; logic [3:0] v; (a, v = d) |-> (d != v) until a; endproperty
+  a_r: assert property (@(posedge clk) p);
+endmodule
+EOT
+hierarchy -top top
+sva2check

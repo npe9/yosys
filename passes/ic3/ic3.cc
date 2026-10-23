@@ -1987,7 +1987,15 @@ struct Ic3Pass : Pass
 				ic3_deadline_on = false;
 			}
 
-			if (result == 0) {
+			if (result == 1 && cell->get_bool_attribute(ID(sva_capacity))) {
+				// sva2check's $overflow twin: not a design counterexample --
+				// the check it belongs to is not exact on this trace
+				log("ic3: %s: capacity exceeded (depth %d): more distinct local-variable captures outside "
+						"their type's constants were live than sva2check tracks; the verdict of the check it "
+						"belongs to is not exact%s\n",
+						name.c_str(), depth, lowering_tag(cell).c_str());
+				n_undecided++;
+			} else if (result == 0) {
 				log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());
 				n_proved++;
 			} else if (result == 1) {

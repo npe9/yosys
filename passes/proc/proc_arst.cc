@@ -82,6 +82,21 @@ bool check_signal(RTLIL::Module *mod, RTLIL::SigSpec signal, RTLIL::SigSpec ref,
 		}
 	}
 
+	// the edge itself may be an inversion of the level (`posedge !rst_ni`,
+	// OpenTitan's ASSERT_DEFAULT_RST): its $logic_not cell is not the one
+	// the `if (!rst_ni)` condition reads, so compare against the edge's
+	// source with the polarity flipped
+	for (auto cell : mod->cells())
+		if (cell->type.in(ID($logic_not), ID($not)) && GetSize(cell->getPort(ID::A)) == 1 &&
+				cell->getPort(ID::Y) == ref) {
+			bool p2 = !polarity;
+			if (check_signal(mod, signal, cell->getPort(ID::A), p2)) {
+				polarity = p2;
+				return true;
+			}
+			break;
+		}
+
 	return false;
 }
 

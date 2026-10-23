@@ -1,0 +1,37 @@
+# `always_ff @(posedge clk_i or posedge !rst_ni) if (!rst_ni) ...` -- the
+# OpenTitan ASSERT_DEFAULT_RST form, used by ASSERT_FPV_LINEAR_FSM's cond
+# register.  The edge's $logic_not is not the cell the `if` reads, so
+# proc_arst found no reset: "Multiple edge sensitive events found for this
+# signal!".  The result is equivalent to the canonical negedge form.
+read_verilog -sv <<EOT
+module gold (input logic clk_i, rst_ni, d, output logic q);
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) q <= 1'b0; else q <= d;
+endmodule
+module gate (input logic clk_i, rst_ni, d, output logic q);
+  always_ff @(posedge clk_i or posedge !rst_ni)
+    if (!rst_ni) q <= 1'b0; else q <= d;
+endmodule
+EOT
+proc
+async2sync
+equiv_make gold gate eq
+equiv_simple -seq 3
+equiv_status -assert
+design -reset
+read_verilog -sv <<EOT
+module gold (input logic clk_i, rst_ni, d, output logic q);
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) q <= 1'b0; else q <= d;
+endmodule
+module gate2 (input logic clk_i, rst_ni, d, output logic q);
+  always_ff @(posedge clk_i or posedge ~rst_ni)
+    if (~rst_ni) q <= 1'b0; else q <= d;
+endmodule
+EOT
+proc
+async2sync
+equiv_make gold gate2 eq
+equiv_simple -seq 3
+equiv_status -assert
+design -reset

@@ -6213,14 +6213,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				if (td && (td->type == AST_STRUCT || td->type == AST_UNION))
 					etype = td;
 			}
-			if (idx->type == AST_CONSTANT && etype) {
+			if (etype) {
 				auto &dm = decl->dimensions[0];
 				bool ascending = dm.range_swapped;
 				int base = ascending ? dm.range_right : dm.range_right + dm.range_width - 1;
-				int index = idx->asInt(true);
-				int pos = ascending ? index - base : base - index;
-				if (pos < 0 || pos >= dm.range_width)
-					input_error("Index %d of parameter array %s is out of range.\n", index, log_id(str));
 				// `'{default: v}` (alone or after explicit elements): v for
 				// every element the pattern does not list
 				AstNode *dflt = nullptr;
@@ -6233,44 +6229,97 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					else
 						listed++;
 				}
-				AstNode *src_elem = pos < listed ? pat->children[pos].get() : dflt;
-				if (!src_elem)
-					input_error("Index %d of parameter array %s has no element in its value.\n", index, log_id(str));
-				auto st = etype->clone();
+				// the element layout, typedef'd struct members resolved
+				std::unique_ptr<AstNode> st = struct_has_unresolved_members(etype) ? resolve_struct_layout(etype) : etype->clone();
+				if (!st)
+					input_error("Struct type of parameter array %s could not be laid out.\n", log_id(str));
 				size_packed_struct(st.get(), 0);
-				std::unique_ptr<AstNode> elem = src_elem->clone();
-				elem->attributes.erase(ID(sv_member));
-				if (elem->type == AST_ASSIGN_PATTERN) {
-					auto tmp = std::make_unique<AstNode>(location, AST_LOCALPARAM, std::move(elem));
-					tmp->str = "\\$member_element";
-					tmp->set_attribute(ID::wiretype, st->clone());
-					while (tmp->simplify(true, 1, -1, false)) { }
-					elem = tmp->children[0]->clone();
-				} else {
-					while (elem->simplify(true, 1, -1, false)) { }
-				}
+				// the member path (`session_cfg.mode`, kmac AppCfg) through
+				// nested structs; nested member ranges are element offsets
 				std::string mname = children[1]->str;
 				if (!mname.empty() && mname[0] == '\\')
 					mname = mname.substr(1);
-				AstNode *item = nullptr;
-				for (auto &cand : st->children) {
-					std::string cn = cand->str;
-					if (!cn.empty() && cn[0] == '\\')
-						cn = cn.substr(1);
-					if (cn == mname)
-						item = cand.get();
+				AstNode *item = st.get();
+				{
+					size_t p0 = 0;
+					while (item) {
+						size_t dot = mname.find('.', p0);
+						std::string seg = mname.substr(p0, dot == std::string::npos ? std::string::npos : dot - p0);
+						AstNode *next = nullptr;
+						for (auto &cand : item->children) {
+							std::string cn = cand->str;
+							if (!cn.empty() && cn[0] == '\\')
+								cn = cn.substr(1);
+							if (cn == seg)
+								next = cand.get();
+						}
+						item = next;
+						if (dot == std::string::npos)
+							break;
+						p0 = dot + 1;
+					}
 				}
-				if (elem->type == AST_CONSTANT && item && item->range_valid) {
+				if (!item)
+					input_error("Struct type of parameter array %s has no member `%s'.\n", log_id(str), mname.c_str());
+				// the member of element `pos` as a constant (nullptr if the
+				// element does not fold)
+				auto elem_member = [&](int pos) -> std::unique_ptr<AstNode> {
+					AstNode *src_elem = pos < listed ? pat->children[pos].get() : dflt;
+					if (!src_elem)
+						return nullptr;
+					std::unique_ptr<AstNode> elem = src_elem->clone();
+					elem->attributes.erase(ID(sv_member));
+					if (elem->type == AST_ASSIGN_PATTERN) {
+						auto tmp = std::make_unique<AstNode>(location, AST_LOCALPARAM, std::move(elem));
+						tmp->str = "\\$member_element";
+						tmp->set_attribute(ID::wiretype, etype->clone());
+						while (tmp->simplify(true, 1, -1, false)) { }
+						elem = tmp->children[0]->clone();
+					} else {
+						while (elem->simplify(true, 1, -1, false)) { }
+					}
+					if (elem->type != AST_CONSTANT || !item->range_valid)
+						return nullptr;
 					int sw = st->range_left - st->range_right + 1;
 					std::vector<RTLIL::State> bits = elem->bitsAsConst(sw, false).to_bits();
 					int lo = std::min(item->range_left, item->range_right) - st->range_right;
 					int hi = std::max(item->range_left, item->range_right) - st->range_right;
 					std::vector<RTLIL::State> v(bits.begin() + lo, bits.begin() + hi + 1);
-					newNode = mkconst_bits(location, v, false);
-					goto apply_newNode;
+					return mkconst_bits(location, v, false);
+				};
+				if (idx->type == AST_CONSTANT) {
+					int index = idx->asInt(true);
+					int pos = ascending ? index - base : base - index;
+					if (pos < 0 || pos >= dm.range_width)
+						input_error("Index %d of parameter array %s is out of range.\n", index, log_id(str));
+					if (pos >= listed && !dflt)
+						input_error("Index %d of parameter array %s has no element in its value.\n", index, log_id(str));
+					if (auto v = elem_member(pos)) {
+						newNode = std::move(v);
+						goto apply_newNode;
+					}
+				} else {
+					// a data-dependent index (`AppCfg[arb_idx].session_cfg.mode`):
+					// select among the elements' constant members; an index
+					// outside the array reads x (IEEE 1800-2017 7.4.6)
+					int mw = std::abs(item->range_left - item->range_right) + 1;
+					std::unique_ptr<AstNode> sel = mkconst_bits(location, std::vector<RTLIL::State>(mw, RTLIL::State::Sx), false);
+					bool ok = true;
+					for (int pos = dm.range_width - 1; pos >= 0 && ok; pos--) {
+						auto v = elem_member(pos);
+						if (!v) {
+							ok = false;
+							break;
+						}
+						int index = ascending ? base + pos : base - pos;
+						auto eq = std::make_unique<AstNode>(location, AST_EQ, idx->clone(), mkconst_int(location, index, true));
+						sel = std::make_unique<AstNode>(location, AST_TERNARY, std::move(eq), std::move(v), std::move(sel));
+					}
+					if (ok) {
+						newNode = std::move(sel);
+						goto apply_newNode;
+					}
 				}
-				if (!item)
-					input_error("Struct type of parameter array %s has no member `%s'.\n", log_id(str), mname.c_str());
 			}
 		}
 	}

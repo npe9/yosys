@@ -1,0 +1,35 @@
+# A member read of an unpacked struct-array PARAMETER with a nested member
+# path and a data-dependent index (OpenTitan kmac_app
+# `AppCfg[arb_idx].session_cfg.mode`): "Hierarchical prefix did not
+# resolve". Elements fold to constants; the index selects among them, and
+# an index outside the array reads x.
+read_verilog -sv <<EOT
+package kp;
+  typedef enum logic [1:0] { ModeA = 2'd1, ModeB = 2'd2, ModeC = 2'd3 } mode_e;
+  typedef struct packed { logic pfx; mode_e mode; logic [2:0] ks; } ses_t;
+  typedef struct packed { logic masked; ses_t session_cfg; } app_t;
+  parameter app_t CfgA = '{ masked: 1'b0, session_cfg: '{ pfx: 1'b1, mode: ModeA, ks: 3'd4 } };
+  parameter app_t CfgB = '{ masked: 1'b1, session_cfg: '{ pfx: 1'b0, mode: ModeB, ks: 3'd2 } };
+  parameter app_t CfgC = '{ masked: 1'b0, session_cfg: '{ pfx: 1'b0, mode: ModeC, ks: 3'd7 } };
+endpackage
+module top import kp::*; #(parameter app_t AppCfg [3] = '{CfgA, CfgB, CfgC}) (input logic [1:0] idx);
+  mode_e m;
+  logic [2:0] k, k1;
+  logic msk;
+  assign m = AppCfg[idx].session_cfg.mode;
+  assign k = AppCfg[idx].session_cfg.ks;
+  assign msk = AppCfg[idx].masked;
+  assign k1 = AppCfg[1].session_cfg.ks;
+  always_comb begin
+    if (idx == 2'd0) assert (m == ModeA && k == 3'd4 && !msk);
+    if (idx == 2'd1) assert (m == ModeB && k == 3'd2 && msk);
+    if (idx == 2'd2) assert (m == ModeC && k == 3'd7 && !msk);
+    assert (k1 == 3'd2);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+chformal -lower
+sat -verify -prove-asserts -show-ports

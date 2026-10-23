@@ -1,0 +1,55 @@
+# `ant |-> strong(##[m:$] r)` (OpenTitan prim_esc/prim_alert FPV, sha3pad)
+# was refused: "strong unbounded sequence needs a liveness obligation".
+# r boolean is `ant |-> s_eventually [m:$] r`; r a fixed-length sequence
+# matches from some tick >= t+m exactly when its end pulse fires at some
+# tick >= t+m+L-1.  Both compile to the temporal-response liveness check.
+# As an ASSUMPTION the response is a fairness constraint ($fair), which
+# the liveness proofs rely on (prim_esc FiniteEsc_M).
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic req, input logic tick);
+  logic [1:0] st = 2'd0;            // advances on tick, wraps 3 -> 0
+  always_ff @(posedge clk) if (tick) st <= st + 2'd1;
+  logic [1:0] sat = 2'd0;           // saturates at 2
+  always_ff @(posedge clk) if (tick && sat != 2'd2) sat <= sat + 2'd1;
+  // fairness: tick holds for 2 ticks in a row eventually after every req
+  assume property (@(posedge clk) req |-> strong(##[1:$] tick [*2]));
+  assume property (@(posedge clk) s_eventually req);
+  // with the fair tick, st returns to 0 again and again
+  a_wrap: assert property (@(posedge clk) st != 2'd0 |-> strong(##[1:$] st == 2'd0));
+  // sat never reaches 3: disproved by a fair cycle
+  a_sat:  assert property (@(posedge clk) 1'b1 |-> strong(##[2:$] sat == 2'd3));
+  // a sequence response: st steps 1 then 2 eventually
+  a_seq:  assert property (@(posedge clk) 1'b1 |-> strong(##[1:$] st == 2'd1 ##1 st == 2'd2));
+  // the fairness is not over-strong: tick held high forever is fair
+  a_ntick: assert property (@(posedge clk) 1'b1 |-> strong(##[1:$] !tick));
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_wrap: proved" 1
+logger -expect log "a_sat: disproved" 1
+logger -expect log "a_seq: proved" 1
+logger -expect log "a_ntick: disproved" 1
+logger -expect log "2 fairness constraint\(s\)" 4
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# without `s_eventually req` the response assumption is vacuous: tick may
+# stay low, and a_wrap is disproved
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic req, input logic tick);
+  logic [1:0] st = 2'd0;
+  always_ff @(posedge clk) if (tick) st <= st + 2'd1;
+  assume property (@(posedge clk) req |-> strong(##[1:$] tick [*2]));
+  a_wrap: assert property (@(posedge clk) st != 2'd0 |-> strong(##[1:$] st == 2'd0));
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_wrap: disproved" 1
+ic3 -init-zero

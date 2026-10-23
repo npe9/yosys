@@ -5471,7 +5471,16 @@ struct Sva2CheckPass : public Pass {
 				Cell *tev = nullptr;
 				int tresp_delay = 0;
 				int tresp_bidx = 0;   // the operand port of the (s_)eventually
-				if (flavor == "assert" && !liveness && body &&
+				// `ant |-> strong(##[m:$] r)` (LRM 16.12.2, 16.13.13): r a
+				// boolean is `s_eventually [m:$] r`; r a fixed-length L
+				// sequence matches from some tick >= t+m exactly when its
+				// end pulse (an attempt every tick) fires at some tick
+				// >= t+m+L-1
+				std::vector<std::pair<int, SigSpec>> tresp_chain;
+				// an assumed response is a fairness constraint:
+				// G(open -> F b) == GF !(pend && !b) for the pend bit below
+				bool tresp_fair = flavor == "assume" || flavor == "restrict";
+				if ((flavor == "assert" || tresp_fair) && !liveness && body &&
 						(sva_op(body) == "|->" || sva_op(body) == "|=>")) {
 					auto ip = comp.ports_of(body);
 					Cell *cc = ip.size() == 2 ? comp.child_cell(body->getPort(ip[1])) : nullptr;
@@ -5497,6 +5506,64 @@ struct Sva2CheckPass : public Pass {
 							break;
 						k_sum += k;
 						cc = inner;
+					}
+					if (cc && sva_op(cc) == "strong") {
+						// left spine of `##`: (((true ##[m:$] r0) ##k1 r1) ##k2 r2 ...)
+						auto sp = comp.ports_of(cc);
+						Cell *dc = sp.size() == 1 ? comp.child_cell(cc->getPort(sp[0])) : nullptr;
+						std::vector<Cell *> spine;
+						while (dc && sva_op(dc) == "##" && comp.ports_of(dc).size() == 3) {
+							spine.push_back(dc);
+							dc = comp.child_cell(dc->getPort(comp.ports_of(dc)[0]));
+						}
+						// a level's rhs: a boolean or a fixed-length sequence
+						auto rhs_len = [&](SigSpec r) -> int {
+							Cell *rc = comp.child_cell(r);
+							if (!rc)
+								return 1;
+							pool<Cell *> seen;
+							if (!comp.is_seq_op(sva_op(rc)) || comp.can_empty(rc) || comp.tree_has_locals(rc, seen))
+								return -1;
+							int lo = comp.seq_min_len(rc), hi = comp.seq_max_len(rc);
+							return lo >= 1 && lo == hi ? lo : -1;
+						};
+						bool ok = !spine.empty() && dc && sva_op(dc) == "true";
+						int m = 0, len = 0;
+						std::vector<std::pair<int, SigSpec>> chain;   // (k, rhs), innermost first
+						for (int i = GetSize(spine) - 1; ok && i >= 0; i--) {
+							auto dp = comp.ports_of(spine[i]);
+							Cell *bc = comp.child_cell(spine[i]->getPort(dp[1]));
+							int lo = 0, hi = 0;
+							if (bc && sva_op(bc) == "bounds") {
+								auto bp = comp.ports_of(bc);
+								ok = bp.size() >= 2 && comp.const_int(bc->getPort(bp[0]), lo) &&
+										comp.const_int(bc->getPort(bp[1]), hi);
+							} else {
+								ok = !bc && comp.const_int(spine[i]->getPort(dp[1]), lo);
+								hi = lo;
+							}
+							SigSpec r = spine[i]->getPort(dp[2]);
+							int rl = ok ? rhs_len(r) : -1;
+							ok = ok && rl >= 1 && lo >= 0;
+							if (!ok)
+								break;
+							if (i == GetSize(spine) - 1) {
+								// the innermost level carries the unbounded delay
+								ok = hi < 0;
+								m = lo;
+								len = rl;
+							} else {
+								ok = hi == lo;
+								len += lo + rl - 1;
+							}
+							chain.push_back({lo, r});
+						}
+						if (ok) {
+							tresp = true;
+							tev = cc;
+							tresp_chain = chain;
+							tresp_delay = k_sum + m + len - 1;
+						}
 					}
 					if (cc && (sva_op(cc) == "eventually" || sva_op(cc) == "s_eventually")) {
 						auto ep = comp.ports_of(cc);
@@ -5670,11 +5737,26 @@ struct Sva2CheckPass : public Pass {
 					}
 					if (tresp_delay > 0)
 						open = comp.delay(open, tresp_delay, "nexttime");
-					SigSpec bsig = comp.resolve(tev->getPort(comp.ports_of(tev)[tresp_bidx]));
-					if (Cell *decl = comp.decl_for_wire(bsig))
-						log_error("sva2check: named declaration operand of unbounded %s is not supported in %s.\n",
-								sva_op(tev).c_str(), log_id(cell));
-					SigSpec b1 = comp.reduce1(bsig);
+					SigSpec b1;
+					if (!tresp_chain.empty()) {
+						// end pulse of the strong sequence's fixed tail with
+						// an attempt every tick: the innermost rhs from
+						// every tick, each outer rhs from the previous end
+						// delayed by its ##k
+						for (int i = 0; i < GetSize(tresp_chain); i++) {
+							SigSpec st = i == 0 ? SigSpec(Const(1, 1)) : comp.delay(b1, tresp_chain[i].first, "strong_resp");
+							SigSpec r = tresp_chain[i].second;
+							Cell *rc = comp.child_cell(r);
+							b1 = rc ? comp.seq_dispatch(r, rc, st, Const(1, 1))
+							        : comp.andN({st, comp.reduce1(comp.resolve(r))});
+						}
+					} else {
+						SigSpec bsig = comp.resolve(tev->getPort(comp.ports_of(tev)[tresp_bidx]));
+						if (Cell *decl = comp.decl_for_wire(bsig))
+							log_error("sva2check: named declaration operand of unbounded %s is not supported in %s.\n",
+									sva_op(tev).c_str(), log_id(cell));
+						b1 = comp.reduce1(bsig);
+					}
 					SigSpec pend = comp.feedback([=](SigSpec q) {
 						return mod->And(NEW_ID, mod->Not(NEW_ID, b1), mod->Or(NEW_ID, open, q));
 					}, "tresp_pend", 1);
@@ -5682,7 +5764,10 @@ struct Sva2CheckPass : public Pass {
 					// fail = !A for -expose_bad
 					new_a = mod->Or(NEW_ID, mod->Not(NEW_ID, pend), b1);
 					fail = mod->Not(NEW_ID, new_a);
-					liveness = true;
+					if (tresp_fair)
+						fairness = true;   // a $fair cell on A (see the fairness branch)
+					else
+						liveness = true;
 				} else if (flavor == "cover") {
 					// register v3 D4: `cover property (s)` / `cover sequence
 					// (s)` of a bounded sequence or a boolean.  A is the

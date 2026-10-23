@@ -1,0 +1,54 @@
+# Property/sequence locals take their declared type (IEEE 1800-2017 16.10)
+# and their own scope.  Every local used to be one 32-bit signed wire per
+# NAME, shared by all declarations and aliasing a module signal of that
+# name: a `logic [39:0]` local compared 32 bits (a_wide_ok falsely
+# disproved at depth 3), a typedef local was an implicit 1-bit wire, and a
+# local named like a module signal read that signal's width (a_enum_ok
+# falsely disproved at depth 1).  Each proved twin has a disproved twin at
+# a known nonzero depth.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  typedef enum logic [2:0] {S0 = 3'd3, S1 = 3'd1, S2 = 3'd4} st_e;
+  st_e s = S0;
+  logic v = 1'b0;   // a module signal named like a local
+  logic [39:0] x = 40'h0;
+  logic [39:0] y = 40'h0;
+  logic [3:0] c = 4'd0;
+  always_ff @(posedge clk) begin
+    s <= (s == S0) ? S1 : (s == S1) ? S2 : S0;
+    v <= ~v;
+    c <= c + 4'd1;
+    x <= {c, 36'h0} | 40'h1;
+    y <= x;
+  end
+  property p_wide_ok;  logic [39:0] v; (1'b1, v = x) |-> ##1 y == v; endproperty
+  property p_wide_bad; logic [39:0] v; (1'b1, v = x) |-> ##1 y == v + 40'h1; endproperty
+  property p_enum_ok;  st_e v; (1'b1, v = s) |-> ##1 s != v; endproperty
+  property p_enum_bad; st_e w; (1'b1, w = s) |-> ##2 s == w; endproperty
+  // a 1-bit local truncates: v keeps x[36] only
+  property p_bit_ok;   logic v; (1'b1, v = x[36]) |-> ##1 y[36] == v; endproperty
+  property p_bit_bad;  logic v; (1'b1, v = x[37:36]) |-> ##1 y[37:36] == v; endproperty
+  sequence s_cap; logic [39:0] t; (1'b1, t = x) ##1 y == t; endsequence
+  a_wide_ok:  assert property (@(posedge clk) p_wide_ok);
+  a_wide_bad: assert property (@(posedge clk) p_wide_bad);
+  a_enum_ok:  assert property (@(posedge clk) p_enum_ok);
+  a_enum_bad: assert property (@(posedge clk) p_enum_bad);
+  a_bit_ok:   assert property (@(posedge clk) p_bit_ok);
+  a_bit_bad:  assert property (@(posedge clk) p_bit_bad);
+  a_seq_ok:   assert property (@(posedge clk) s_cap);
+  a_v_mod:    assert property (@(posedge clk) ##1 v != $past(v));   // the module v is untouched
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_wide_ok: proved" 1
+logger -expect log "a_wide_bad: disproved \(depth 1\)" 1
+logger -expect log "a_enum_ok: proved" 1
+logger -expect log "a_enum_bad: disproved \(depth 2\)" 1
+logger -expect log "a_bit_ok: proved" 1
+logger -expect log "a_bit_bad: disproved \(depth 4\)" 1
+logger -expect log "a_seq_ok: proved" 1
+logger -expect log "a_v_mod: proved" 1
+ic3 -init-zero

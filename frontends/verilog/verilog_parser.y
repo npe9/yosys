@@ -117,6 +117,18 @@
 			// `default disable iff` to the assertion statement, not to the
 			// declarations it instantiates
 			bool in_property_decl = false;
+			// property/sequence locals (IEEE 1800-2017 16.10): each gets its
+			// own wire of the declared type, named uniquely; the body's
+			// references are renamed when the declaration completes.  They
+			// were one 32-bit signed wire per NAME, shared by every
+			// declaration and aliasing a module signal of that name (a
+			// `logic [39:0]` local compared 32 bits; a typedef local was an
+			// implicit 1-bit wire)
+			dict<std::string, std::string> sva_local_renames;
+			int sva_local_uid = 0;
+			int sva_local_kind = 0;   // 0 logic [range], 1 int/integer, 2 user type
+			std::unique_ptr<AstNode> sva_local_range;
+			std::string sva_local_tname;
 			std::vector<std::string> let_port_names;
 			pool<std::string> interface_names;
 			// struct/union member default values (`bit lo = c;`), collected
@@ -569,6 +581,41 @@
 			log_error("Value conversion failed: `%s'\n", text.c_str());
 		SET_AST_NODE_LOC(n.get(), loc, loc);
 		return n;
+	}
+
+	static void sva_local_wire(ParseState *extra, const parser::location_type &loc, const std::string &name)
+	{
+		std::string mangled = name + stringf("$sva_local$%d", extra->sva_local_uid++);
+		extra->sva_local_renames[name] = mangled;
+		auto wire = std::make_unique<AstNode>(loc, AST_WIRE);
+		wire->str = mangled;
+		wire->is_logic = true;
+		wire->is_reg = true;
+		if (extra->sva_local_kind == 2) {
+			extra->addWiretypeNode(&extra->sva_local_tname, wire.get());
+		} else if (extra->sva_local_kind == 1) {
+			wire->is_signed = true;
+			wire->range_valid = true;
+			wire->range_left = 31;
+			wire->range_right = 0;
+			wire->children.push_back(makeRange(loc, 31, 0, true));
+		} else if (extra->sva_local_range) {
+			wire->children.push_back(extra->sva_local_range->clone());
+		}
+		extra->saveChild(std::move(wire));
+	}
+
+	static void sva_rename_locals(ParseState *extra, AstNode *n)
+	{
+		if (!n || extra->sva_local_renames.empty())
+			return;
+		if (n->type == AST_IDENTIFIER) {
+			auto it = extra->sva_local_renames.find(n->str);
+			if (it != extra->sva_local_renames.end())
+				n->str = it->second;
+		}
+		for (auto &c : n->children)
+			sva_rename_locals(extra, c.get());
 	}
 
 	static void sva_formal_wire(ParseState *extra, const parser::location_type &loc, const std::string &name)
@@ -7569,6 +7616,7 @@ sva_sequence_decl:
 	TOK_SEQUENCE TOK_ID {
 		extra->let_port_names.clear();
 		extra->collecting_let_ports = true;
+		extra->sva_local_renames.clear();
 	} sva_ports {
 		extra->collecting_let_ports = false;
 	} TOK_SEMICOL sva_prop_locals sva_or TOK_SEMICOL TOK_ENDSEQUENCE opt_label {
@@ -7577,6 +7625,8 @@ sva_sequence_decl:
 		id->str = *$2;
 		auto node = mk_sva(@$, "sequence_decl");
 		node->children.push_back(std::move(id));
+		sva_rename_locals(extra, $8.get());
+		extra->sva_local_renames.clear();
 		node->children.push_back(std::move($8));
 		for (auto &port : extra->let_port_names) {
 			auto formal = std::make_unique<AstNode>(@2, AST_IDENTIFIER);
@@ -7588,8 +7638,8 @@ sva_sequence_decl:
 	};
 
 sva_local_names:
-	TOK_ID { sva_formal_wire(extra, @1, *$1); } |
-	sva_local_names TOK_COMMA TOK_ID { sva_formal_wire(extra, @3, *$3); };
+	TOK_ID { sva_local_wire(extra, @1, *$1); } |
+	sva_local_names TOK_COMMA TOK_ID { sva_local_wire(extra, @3, *$3); };
 
 fork_join:
 	TOK_JOIN opt_label |
@@ -7601,10 +7651,20 @@ fork_stmts:
 	fork_stmts behavioral_stmt;
 
 sva_prop_local:
-	TOK_USER_TYPE TOK_ID TOK_SEMICOL |
-	TOK_INT sva_local_names TOK_SEMICOL |
-	TOK_INTEGER sva_local_names TOK_SEMICOL |
-	TOK_LOGIC range_or_multirange sva_local_names TOK_SEMICOL;
+	TOK_USER_TYPE {
+		extra->sva_local_kind = 2;
+		extra->sva_local_tname = *$1;
+	} sva_local_names TOK_SEMICOL |
+	TOK_PKG_USER_TYPE {
+		extra->sva_local_kind = 2;
+		extra->sva_local_tname = *$1;
+	} sva_local_names TOK_SEMICOL |
+	TOK_INT { extra->sva_local_kind = 1; } sva_local_names TOK_SEMICOL |
+	TOK_INTEGER { extra->sva_local_kind = 1; } sva_local_names TOK_SEMICOL |
+	TOK_LOGIC range_or_multirange {
+		extra->sva_local_kind = 0;
+		extra->sva_local_range = std::move($2);
+	} sva_local_names TOK_SEMICOL { extra->sva_local_range.reset(); };
 
 sva_prop_locals:
 	%empty |
@@ -7614,6 +7674,7 @@ sva_property_decl:
 	TOK_PROPERTY TOK_ID {
 		extra->let_port_names.clear();
 		extra->collecting_let_ports = true;
+		extra->sva_local_renames.clear();
 	} sva_ports {
 		extra->collecting_let_ports = false;
 		extra->in_property_decl = true;
@@ -7624,6 +7685,8 @@ sva_property_decl:
 		id->str = *$2;
 		auto node = mk_sva(@$, "property_decl");
 		node->children.push_back(std::move(id));
+		sva_rename_locals(extra, $8.get());
+		extra->sva_local_renames.clear();
 		node->children.push_back(std::move($8));
 		for (auto &port : extra->let_port_names) {
 			auto formal = std::make_unique<AstNode>(@2, AST_IDENTIFIER);

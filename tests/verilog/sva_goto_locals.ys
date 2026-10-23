@@ -1,0 +1,144 @@
+# Locals captured before a goto in the antecedent: the caliptra ecc shape
+#   b ##0 (1'b1, v = e) ##1 g[->1] |-> [##k] B[*n]
+# lowered with a small CAM (every pending attempt ends at the same first
+# g); it used to be refused ("local variables over an unbounded
+# sequence").  More distinct captures live than the CAM holds are
+# reported by the <name>$overflow twin as "capacity exceeded".
+#
+# Through a declaration with formals in a generate loop (montmultiplier's
+# multi_p(prime[i], ...)), the capture and the consequent reading the
+# formal: on a free formal wire a_ok would disprove.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  logic [7:0] d; assign d = {t, ~t};
+  wire s = t == 4'd1 || t == 4'd2;     // two attempts pending at once
+  wire g = t == 4'd5;
+  logic [7:0] r = 8'd0;                // holds the FIRST capture
+  always_ff @(posedge clk) if (t == 4'd1) r <= d;
+  property ok_p(x);  logic [7:0] v; s && t == 4'd1 ##0 (1'b1, v = d ^ x) ##1 g[->1] |-> (r ^ x) == v; endproperty
+  property bad_p(x); logic [7:0] v; s ##0 (1'b1, v = d ^ x) ##1 g[->1] |-> (r ^ x) == v; endproperty
+  for (genvar i = 0; i < 2; i++) begin : gl
+    a_ok:  assert property (@(posedge clk) ok_p(8'h0F ^ 8'(i)));
+    a_bad: assert property (@(posedge clk) bad_p(8'h0F ^ 8'(i)));
+  end
+  // disable iff kills the pending bad attempt (t == 2) before its release
+  a_dis: assert property (@(posedge clk) disable iff (t == 4'd4) bad_p(8'h0F));
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_ok: proved" 2
+logger -expect log "a_bad: disproved \(depth 5\)" 2
+logger -expect log "a_dis: proved" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# two captures (a 4-bit and a 1-bit one: a wider tuple makes the ic3
+# proof slow), a delayed repeated consequent: the tuple is held through
+# the consequent's last read (reads at 4..6 pass, a fourth at 7 fails)
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  wire s = t == 4'd1;
+  wire g = t == 4'd3;
+  logic [3:0] r = 4'd0;
+  always_ff @(posedge clk) if (t == 4'd1) r <= t ^ 4'd9; else if (t == 4'd6) r <= 4'd0;
+  property ok_p;  logic [3:0] a; logic b; s ##0 (1'b1, a = t ^ 4'd9, b = t[0]) ##1 g[->1] |-> ##1 (r == a && b)[*3]; endproperty
+  property bad_p; logic [3:0] a; logic b; s ##0 (1'b1, a = t ^ 4'd9, b = t[0]) ##1 g[->1] |-> ##1 (r == a && b)[*4]; endproperty
+  property nx_p;  logic [3:0] a; s ##0 (1'b1, a = t ^ 4'd9) ##1 g[->1] |=> (r == a)[*3]; endproperty
+  a_tok: assert property (@(posedge clk) ok_p);
+  a_tbad: assert property (@(posedge clk) bad_p);
+  a_nx: assert property (@(posedge clk) nx_p);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_tok: proved" 1
+logger -expect log "a_tbad: disproved \(depth 7\)" 1
+logger -expect log "a_nx: proved" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# dedup: four pending attempts with one value stay one entry (no
+# overflow); four distinct values exceed the 3 entries at the fourth
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  wire s = t >= 4'd1 && t <= 4'd4;
+  wire g = t == 4'd6;
+  logic [3:0] k; assign k = 4'd7;
+  property dd_p;  logic [3:0] v; s ##0 (1'b1, v = k) ##1 g[->1] |-> v == 4'd7; endproperty
+  // a trivial consequent: the twin is the point (proving the main check
+  // over three full slots takes ic3 minutes)
+  property cap_p; logic [3:0] v; s ##0 (1'b1, v = t) ##1 g[->1] |-> 1'b1; endproperty
+  a_dd:  assert property (@(posedge clk) dd_p);
+  a_cap: assert property (@(posedge clk) cap_p);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_dd: proved \[lowering=exact:if-a_dd\$overflow\]" 1
+logger -expect log "a_dd\$overflow: proved" 1
+logger -expect log "a_cap\$overflow: capacity exceeded \(depth 4\)" 1
+logger -expect log "a_cap: proved \[lowering=exact:if-a_cap\$overflow\]" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# a named property under default clocking with disable iff (the
+# fv_ecc_pm_ctrl_abstract form): the body reaches sva2check inlined into
+# the assertion, not as a declaration reference
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  default clocking @(posedge clk); endclocking
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  wire rst_n = 1'b1;
+  wire pulse = t == 4'd1;
+  wire stall = t >= 4'd1 && t <= 4'd3;     // first !stall after 1: t == 4
+  logic [3:0] o;  assign o = (t == 4'd6) ? 4'd1 : 4'd0;
+  logic [3:0] o2; assign o2 = (t == 4'd6) ? 4'd2 : 4'd0;
+  property ok_p;
+    logic [3:0] nx;
+    pulse ##0 (1'b1, nx = t) ##1 !stall[->1] |-> ##2 o == nx;
+  endproperty
+  property bad_p;
+    logic [3:0] nx;
+    pulse ##0 (1'b1, nx = t) ##1 !stall[->1] |-> ##2 o2 == nx;
+  endproperty
+  a_dc:  assert property (disable iff (!rst_n) ok_p);
+  a_dcb: assert property (disable iff (!rst_n) bad_p);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_dc: proved" 1
+logger -expect log "a_dcb: disproved \(depth 6\)" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# a goto condition reading the local stays refused
+logger -expect error "local variables over an unbounded sequence" 1
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, input logic [3:0] d);
+  property p; logic [3:0] v; a ##0 (1'b1, v = d) ##1 (d == v)[->1] |-> a; endproperty
+  a_r: assert property (@(posedge clk) p);
+endmodule
+EOT
+hierarchy -top top
+sva2check

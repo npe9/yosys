@@ -1,0 +1,25 @@
+# ic3 -max 0 runs the pre-passes only: a liveness check whose bad state is
+# reachable is undecided without running the liveness fixpoint (Phase B
+# enumerated the !p states one by one with no bound: OpenTitan's FPV-only
+# NoStarvation_A never returned at -max 0).  Without -max 0 it proves.
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic req);
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  wire gnt = t == 4'd0;
+  a_live: assert property (@(posedge clk) req |-> s_eventually gnt);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+design -save d
+logger -expect log "a_live: liveness fixpoint not run at -max 0 -- undecided" 1
+logger -expect log "a_live: undecided" 1
+ic3 -init-zero -kind 0 -bmc 1 -max 0
+logger -check-expected
+design -load d
+logger -expect log "a_live: proved" 1
+ic3 -init-zero
+logger -check-expected

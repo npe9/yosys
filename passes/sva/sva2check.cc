@@ -1848,6 +1848,9 @@ struct SvaCompiler {
 			UntilLocals ul;
 			if (until_locals_match(dbody, ul))
 				return until_locals_fail(ul, dformals, start);
+			GotoLocals gl;
+			if (goto_locals_match(dbody, gl))
+				return goto_locals_fail(gl, dformals, start);
 		}
 		if (dbody && !slots_mode) {
 			pool<Cell *> seen;
@@ -3266,6 +3269,229 @@ struct SvaCompiler {
 			ffd(dis_gate(orN({surv[g], take})), vbit[g], true);
 			// data, not attempt state: never cleared
 			mod->addDff(NEW_ID, clk, mod->Mux(NEW_ID, SigSpec(vval[g]), e, take), vval[g], clk_pos);
+		}
+		SigSpec ovf = andN({need, mod->Not(NEW_ID, taken)});
+		cam_overflow = cam_overflow.empty() ? ovf : orN({cam_overflow, ovf});
+		return fail;
+	}
+
+	// Locals captured before a goto in the antecedent (2026-10-23; the
+	// caliptra ecc shapes fv_montmultiplier, fv_ecc_pm_ctrl_abstract):
+	//   b ##0 (1'b1, v1 = e1, ...) [##0 ...] ##1 g[->1] |-> [##k] B[*n]
+	// with boolean b, g and B, constant k and n, no e reading a local,
+	// and neither b nor g reading one.  Every attempt pending at a tick
+	// ends at the same first g, so its future depends only on its
+	// captured tuple: a CAM of goto_locals_slots entries, each a pend bit
+	// (released at g) and the tuple, held until the consequent's last
+	// read k+n-1 ticks after the release.  A capture equal to a pending
+	// entry that survives the tick has the same future and is merged.
+	// With every entry pending or held, the capture cannot be tracked and
+	// pulses cam_overflow: the <name>$overflow check, as for the until
+	// shape -- the main verdict is exact only when that check proves.
+	struct GotoLocals {
+		std::vector<SigSpec> b;
+		std::vector<std::pair<Wire *, SigSpec>> caps;
+		SigSpec g, B;
+		int k = 0, n = 1;
+	};
+	int goto_locals_slots = 3;
+
+	bool goto_locals_lhs(SigSpec s, GotoLocals &m)
+	{
+		Cell *c = child_cell(s);
+		if (!c) {
+			m.b.push_back(s);
+			return true;
+		}
+		std::string op = sva_op(c);
+		auto cp = ports_of(c);
+		int d = -1;
+		if (op == "##" && GetSize(cp) == 3 && !child_cell(c->getPort(cp[1])) && const_int(c->getPort(cp[1]), d) && d == 0)
+			return goto_locals_lhs(c->getPort(cp[0]), m) && goto_locals_lhs(c->getPort(cp[2]), m);
+		if (op != "seq_match" || GetSize(cp) != 2 || child_cell(c->getPort(cp[0])))
+			return false;
+		m.b.push_back(c->getPort(cp[0]));
+		Cell *mt = child_cell(c->getPort(cp[1]));
+		if (!mt || sva_op(mt) != "matches")
+			return false;
+		for (auto mp : ports_of(mt)) {
+			Cell *as = child_cell(mt->getPort(mp));
+			if (!as || sva_op(as) != "assign")
+				return false;
+			auto sp = ports_of(as);
+			if (GetSize(sp) != 2)
+				return false;
+			Wire *v = nullptr;
+			for (auto bit : as->getPort(sp[0]))
+				if (bit.is_wire()) {
+					v = bit.wire;
+					break;
+				}
+			if (!v)
+				return false;
+			for (auto &cap : m.caps)
+				if (cap.first == v)
+					return false;
+			m.caps.push_back({v, as->getPort(sp[1])});
+		}
+		return true;
+	}
+
+	bool goto_locals_match(Cell *body, GotoLocals &m)
+	{
+		if (!allow_until_locals || !body || multiclock || island_mode)
+			return false;
+		std::string iop = sva_op(body);
+		if (iop != "|->" && iop != "|=>")
+			return false;
+		auto bp = ports_of(body);
+		if (GetSize(bp) != 2)
+			return false;
+		Cell *ant = child_cell(body->getPort(bp[0]));
+		if (!ant || sva_op(ant) != "##")
+			return false;
+		auto ap = ports_of(ant);
+		int d = -1;
+		if (GetSize(ap) != 3 || child_cell(ant->getPort(ap[1])) || !const_int(ant->getPort(ap[1]), d) || d != 1)
+			return false;
+		Cell *gt = child_cell(ant->getPort(ap[2]));
+		if (!gt || sva_op(gt) != "[->]")
+			return false;
+		auto gp = ports_of(gt);
+		if (GetSize(gp) != 2 || child_cell(gt->getPort(gp[0])))
+			return false;
+		Cell *gb = child_cell(gt->getPort(gp[1]));
+		int lo = -1, hi = -1;
+		// a single bound has one argument (hi 0)
+		if (!gb || sva_op(gb) != "bounds" || ports_of(gb).empty() ||
+				!const_int(gb->getPort(ports_of(gb)[0]), lo) ||
+				(GetSize(ports_of(gb)) >= 2 && !const_int(gb->getPort(ports_of(gb)[1]), hi)) ||
+				lo != 1 || (GetSize(ports_of(gb)) >= 2 && hi != 0))
+			return false;
+		m.g = gt->getPort(gp[0]);
+		m.b.clear();
+		m.caps.clear();
+		if (!goto_locals_lhs(ant->getPort(ap[0]), m) || m.caps.empty())
+			return false;
+		// consequent: [##k] B[*n], B boolean
+		SigSpec con = body->getPort(bp[1]);
+		m.k = iop == "|=>" ? 1 : 0;
+		m.n = 1;
+		Cell *cc = child_cell(con);
+		if (cc && sva_op(cc) == "##") {
+			auto dp = ports_of(cc);
+			Cell *tc = GetSize(dp) == 3 ? child_cell(cc->getPort(dp[0])) : nullptr;
+			int kk = -1;
+			if (!tc || sva_op(tc) != "true" || child_cell(cc->getPort(dp[1])) || !const_int(cc->getPort(dp[1]), kk) || kk < 0)
+				return false;
+			m.k += kk;
+			con = cc->getPort(dp[2]);
+			cc = child_cell(con);
+		}
+		if (cc && sva_op(cc) == "[*]") {
+			auto rp = ports_of(cc);
+			Cell *rb = GetSize(rp) == 2 ? child_cell(cc->getPort(rp[1])) : nullptr;
+			int rn = -1, rh = -1;
+			if (!rb || sva_op(rb) != "bounds" || ports_of(rb).empty() ||
+					!const_int(rb->getPort(ports_of(rb)[0]), rn) ||
+					(GetSize(ports_of(rb)) >= 2 && !const_int(rb->getPort(ports_of(rb)[1]), rh)) ||
+					rn < 1 || (GetSize(ports_of(rb)) >= 2 && rh != 0))
+				return false;
+			m.n = rn;
+			con = cc->getPort(rp[0]);
+			cc = child_cell(con);
+		}
+		if (cc || m.k + m.n > 1024)
+			return false;
+		m.B = con;
+		for (auto &cap : m.caps) {
+			pool<Wire *> seen;
+			if (cone_reads(m.g, cap.first, seen))
+				return false;
+			for (auto &bb : m.b) {
+				seen.clear();
+				if (cone_reads(bb, cap.first, seen))
+					return false;
+			}
+			for (auto &other : m.caps) {
+				seen.clear();
+				if (cone_reads(other.second, cap.first, seen))
+					return false;
+			}
+		}
+		return true;
+	}
+
+	SigSpec goto_locals_fail(GotoLocals &m, const std::vector<Wire *> &formals, SigSpec start)
+	{
+		std::vector<Wire *> fl = formals;
+		for (auto &cap : m.caps)
+			fl.push_back(cap.first);
+		auto ex = [&](SigSpec raw) { return splice_expr(raw, fl, false); };
+		SigSpec cap = start;
+		for (auto &bb : m.b)
+			cap = andN({cap, reduce1(resolve(ex(bb)))});
+		SigSpec g = reduce1(resolve(ex(m.g)));
+		SigSpec ng = mod->Not(NEW_ID, g);
+		// the captured tuple, each value at its local's width (the
+		// frontend pads the assignment port)
+		SigSpec tup;
+		int tw = 0;
+		for (auto &c : m.caps) {
+			SigSpec e = resolve(ex(c.second));
+			if (GetSize(e) > c.first->width)
+				e = e.extract(0, c.first->width);
+			else if (GetSize(e) < c.first->width)
+				e.extend_u0(c.first->width, false);
+			tup.append(e);
+			tw += c.first->width;
+		}
+		auto B_at = [&](SigSpec val) -> SigSpec {
+			SubstGuard gd(this);
+			int off = 0;
+			for (auto &c : m.caps) {
+				gd.bind(c.first, val.extract(off, c.first->width));
+				off += c.first->width;
+			}
+			return reduce1(resolve(ex(m.B)));
+		};
+		int last = m.k + m.n - 1;   // the consequent's last read, ticks after the release
+		SigSpec fail = Const(0, 1), dup = Const(0, 1);
+		std::vector<SigSpec> surv, held;
+		std::vector<Wire *> pend, val;
+		for (int i = 0; i < goto_locals_slots; i++) {
+			Wire *pb = wn("goto_pend", 1);
+			Wire *vv = wn("goto_val", tw);
+			SigSpec rel = andN({SigSpec(pb), g});
+			// rel delayed by 0..last: dl[d] is the release d ticks ago
+			std::vector<SigSpec> dl = {rel};
+			for (int d = 1; d <= last; d++)
+				dl.push_back(reg(dl.back(), "goto_rel"));
+			SigSpec nb = mod->Not(NEW_ID, B_at(SigSpec(vv)));
+			for (int j = 0; j < m.n; j++)
+				fail = orN({fail, andN({dl[m.k + j], nb})});
+			// the tuple is still needed after this tick: a release less
+			// than `last` ticks ago (its reads run past now)
+			SigSpec h = Const(0, 1);
+			for (int d = 0; d < last; d++)
+				h = orN({h, dl[d]});
+			SigSpec sv = andN({SigSpec(pb), ng});
+			dup = orN({dup, andN({sv, mod->Eq(NEW_ID, SigSpec(vv), tup)})});
+			surv.push_back(sv);
+			held.push_back(h);
+			pend.push_back(pb);
+			val.push_back(vv);
+		}
+		SigSpec need = andN({cap, mod->Not(NEW_ID, dup)});
+		SigSpec taken = Const(0, 1);
+		for (int i = 0; i < goto_locals_slots; i++) {
+			SigSpec fr = andN({mod->Not(NEW_ID, surv[i]), mod->Not(NEW_ID, held[i])});
+			SigSpec take = andN({need, fr, mod->Not(NEW_ID, taken)});
+			taken = orN({taken, fr});
+			// all-zero = no attempt pending (safe for the early check)
+			ffd(dis_gate(orN({surv[i], take})), pend[i], true);
+			// data, not attempt state: never cleared
+			mod->addDff(NEW_ID, clk, mod->Mux(NEW_ID, SigSpec(val[i]), tup, take), val[i], clk_pos);
 		}
 		SigSpec ovf = andN({need, mod->Not(NEW_ID, taken)});
 		cam_overflow = cam_overflow.empty() ? ovf : orN({cam_overflow, ovf});
@@ -5945,6 +6171,10 @@ struct Sva2CheckPass : public Pass {
 					}
 					if (strong_until) {
 						fail = comp.until_fail(su_p, su_q, Const(1, 1), su_with);
+					} else if (SvaCompiler::GotoLocals gl; body && comp.goto_locals_match(body, gl)) {
+						// a named property under default clocking arrives
+						// here with its body inlined into the spec
+						fail = comp.goto_locals_fail(gl, std::vector<Wire *>(), root);
 					} else if (body) {
 						pool<Cell *> seen;
 						bool had_slots = comp.slots_mode;
@@ -5981,7 +6211,9 @@ struct Sva2CheckPass : public Pass {
 						bool had_slots = comp.slots_mode;
 						pool<Cell *> seen;
 						SvaCompiler::UntilLocals ul;
-						if (dbody && !comp.until_locals_match(dbody, ul) && comp.tree_has_locals(dbody, seen)) {
+						SvaCompiler::GotoLocals gl;
+						if (dbody && !comp.until_locals_match(dbody, ul) && !comp.goto_locals_match(dbody, gl) &&
+								comp.tree_has_locals(dbody, seen)) {
 							int l = comp.seq_max_len(dbody);
 							if (l < 0)
 								log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(dbody));

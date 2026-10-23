@@ -1193,6 +1193,15 @@ struct Ic3Solver
 			log("ic3: %s: %d fairness constraint(s): disproof requires a fair !p-cycle\n",
 					log_id(prop), GetSize(fairv));
 
+		// -max 0 runs the pre-passes only: no IC3 frames, and no liveness
+		// fixpoint either (Phase B enumerates the !p states one by one and
+		// has no frame bound of its own -- OpenTitan's FPV-only
+		// NoStarvation_A ran for minutes at -max 0)
+		if (max_frames == 0) {
+			log("ic3: %s: liveness fixpoint not run at -max 0 -- undecided.\n", log_id(prop));
+			return 2;
+		}
+
 		// Phase B: S seeded from top (see the proof sketch above; the Phase
 		// A frame clauses would poison the gfp)
 		int sf = new_frame();
@@ -1990,8 +1999,8 @@ struct Ic3Pass : Pass
 			if (result == 1 && cell->get_bool_attribute(ID(sva_capacity))) {
 				// sva2check's $overflow twin: not a design counterexample --
 				// the check it belongs to is not exact on this trace
-				log("ic3: %s: capacity exceeded (depth %d): more distinct local-variable captures outside "
-						"their type's constants were live than sva2check tracks; the verdict of the check it "
+				log("ic3: %s: capacity exceeded (depth %d): more distinct local-variable captures were "
+						"live than sva2check tracks for this check; the verdict of the check it "
 						"belongs to is not exact%s\n",
 						name.c_str(), depth, lowering_tag(cell).c_str());
 				n_undecided++;

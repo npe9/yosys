@@ -1,0 +1,20 @@
+# ic3 -engine ric3 (register E0) without a usable rIC3 binary: every
+# safety property is undecided with the reason logged, not a crash and
+# not a verdict; an unknown engine name is refused.
+read_verilog -sv -formal <<EOT
+module t(input clk, input a);
+  reg [2:0] c = 0;
+  always @(posedge clk) begin
+    c <= c + a;
+    assert (c != 3'd6);
+  end
+endmodule
+EOT
+prep -top t
+async2sync
+logger -expect log "engine ric3: rIC3 rc 127" 1
+logger -expect log "1 properties: proved=0 disproved=0 undecided=1" 1
+ic3 -engine ric3 -ric3 /nonexistent/rIC3 -kind 0
+logger -check-expected
+logger -expect error "unknown engine 'abc'" 1
+ic3 -engine abc

@@ -26,6 +26,11 @@
 #include "libs/minisat/Solver.h"
 
 #include <chrono>
+#include <cmath>
+#include <fstream>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -1542,6 +1547,168 @@ private:
 	}
 };
 
+// Register E0 (engine roadmap): `-engine ric3` hands each safety property
+// to an external rIC3 process, the way smtbmc drives an SMT solver.  The
+// design (after the $initstate rewrite) is written once as RTLIL; per
+// property a child yosys keeps that assert and every assumption, maps the
+// rest to an AIG and writes AIGER with -zinit (a register without an
+// \init starts free, as in the native engine; -init-zero zeroes it
+// first).  rIC3 answers with its HWMCC exit code (20 safe, 10 unsafe,
+// anything else unknown) and, when unsafe, an AIGER witness whose input
+// lines give the depth and, with -cex, a Yosys witness via aiw2yw.  An
+// export or solver failure leaves that one property undecided.
+struct Ric3Driver
+{
+	std::string bin, engine, extra, dir, il, top, self_dir;
+	bool init_zero = false;
+	bool verbose = false;
+	double timeout_s = 0;
+
+	~Ric3Driver()
+	{
+		if (!dir.empty())
+			remove_directory(dir);
+	}
+
+	void setup(RTLIL::Design *design, RTLIL::Module *module, const std::vector<RTLIL::Cell*> &props,
+			const std::vector<RTLIL::Cell*> &assumes)
+	{
+		dir = make_temp_dir(get_base_tmpdir() + "/yosys_ic3_ric3_XXXXXX");
+		il = dir + "/design.il";
+		top = RTLIL::unescape_id(module->name);
+		self_dir = proc_self_dirname();
+		for (int k = 0; k < GetSize(props); k++)
+			props[k]->attributes[ID(ic3_ric3)] = RTLIL::Const(stringf("p%d", k));
+		for (auto c : assumes)
+			c->attributes[ID(ic3_ric3)] = RTLIL::Const(std::string("assume"));
+		{
+			auto quiet = logger().make_debug_scope(true);
+			Pass::call(design, "write_rtlil " + il);
+		}
+		for (auto c : props)
+			c->attributes.erase(ID(ic3_ric3));
+		for (auto c : assumes)
+			c->attributes.erase(ID(ic3_ric3));
+		log("ic3: engine ric3: %s -e %s%s%s (design written to %s)\n", bin.c_str(), engine.c_str(),
+				extra.empty() ? "" : " ", extra.c_str(), il.c_str());
+	}
+
+	// run_command() without a line callback returns system()'s raw wait
+	// status
+	static int run(const std::string &cmd)
+	{
+		int st = run_command(cmd);
+#ifndef _WIN32
+		if (st > 0)
+			st = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+#endif
+		return st;
+	}
+
+	static std::string last_error(const std::string &file)
+	{
+		std::ifstream f(file);
+		std::string line, err;
+		while (std::getline(f, line))
+			if (line.compare(0, 6, "ERROR:") == 0 || line.find("panicked") != std::string::npos)
+				err = line;
+		return err;
+	}
+
+	// 0 proved, 1 disproved (depth set), 2 undecided (why set)
+	int prove(int k, int &depth, const std::string &cex_file, std::string &why)
+	{
+		std::string base = stringf("%s/p%d", dir.c_str(), k);
+		{
+			std::ofstream ys(base + ".ys");
+			ys << "read_rtlil " << il << "\n";
+			ys << "hierarchy -top " << top << "\n";
+			ys << "delete t:$assert t:$assume t:$cover t:$live t:$fair t:$check %u %u %u %u %u "
+					<< "a:ic3_ric3=assume a:ic3_ric3=p" << k << " %u %d\n";
+			ys << "flatten\nchformal -lower\nmemory_map\n";
+			if (init_zero)
+				ys << "setundef -init -zero\n";
+			// as SatGen without undef modelling: an undriven wire is free at
+			// every step, an x constant (also one techmap / aigmap create,
+			// e.g. an out-of-range $shiftx) is 0
+			ys << "setundef -undriven -anyseq\nsetundef -zero\n";
+			ys << "dffunmap\ntechmap\naigmap\nsetundef -zero\nopt_clean\n";
+			ys << "write_aiger -zinit -ywmap " << base << ".ywa " << base << ".aig\n";
+		}
+		auto t0 = std::chrono::steady_clock::now();
+		int rc = run(stringf("'%syosys' -q -s %s.ys > %s.ylog 2>&1", self_dir.c_str(), base.c_str(), base.c_str()));
+		if (rc != 0) {
+			why = stringf("aiger export failed (rc %d) %s", rc, last_error(base + ".ylog").c_str());
+			return 2;
+		}
+		auto t1 = std::chrono::steady_clock::now();
+
+		std::string cmd = "RUST_LOG=warn ";
+		if (timeout_s > 0) {
+			long long lim = (long long)std::ceil(timeout_s);
+			// --time-limit is honoured by rIC3's IC3 loop; the alarm is the
+			// hard stop for every other engine and for preprocessing
+			cmd += stringf("perl -e 'alarm shift; exec @ARGV' %lld ", lim + 5);
+			cmd += stringf("'%s' -e %s --witness --time-limit %lld", bin.c_str(), engine.c_str(), lim);
+		} else
+			cmd += stringf("'%s' -e %s --witness", bin.c_str(), engine.c_str());
+		if (!extra.empty())
+			cmd += " " + extra;
+		cmd += stringf(" %s.aig > %s.out 2> %s.err", base.c_str(), base.c_str(), base.c_str());
+		rc = run(cmd);
+		auto t2 = std::chrono::steady_clock::now();
+		if (verbose)
+			log("ic3: engine ric3: p%d: export %.2fs, rIC3 %.2fs, rc %d\n", k,
+					std::chrono::duration<double>(t1 - t0).count(),
+					std::chrono::duration<double>(t2 - t1).count(), rc);
+		if (rc == 20)
+			return 0;
+		if (rc != 10) {
+			std::string err = last_error(base + ".err");
+			why = stringf("rIC3 rc %d%s%s", rc, err.empty() ? "" : ": ", err.c_str());
+			return 2;
+		}
+
+		// AIGER witness: "1", "b<k>", the initial latch line, one input
+		// line per step, "."
+		std::ifstream out(base + ".out");
+		std::vector<std::string> lines;
+		std::string line;
+		while (std::getline(out, line))
+			lines.push_back(line);
+		int start = -1;
+		for (int i = 0; i + 1 < GetSize(lines); i++)
+			if (lines[i] == "1" && !lines[i+1].empty() && lines[i+1][0] == 'b') {
+				start = i;
+				break;
+			}
+		int end = -1;
+		if (start >= 0)
+			for (int i = start + 3; i < GetSize(lines); i++)
+				if (lines[i] == ".") {
+					end = i;
+					break;
+				}
+		int steps = end - (start + 3);
+		if (start < 0 || end < 0 || steps < 1) {
+			why = "rIC3 reported unsafe without a readable witness";
+			return 2;
+		}
+		depth = steps - 1;
+		if (!cex_file.empty()) {
+			{
+				std::ofstream aiw(base + ".aiw");
+				for (int i = start; i <= end; i++)
+					aiw << lines[i] << "\n";
+			}
+			if (run(stringf("'%syosys-witness' aiw2yw %s.aiw %s.ywa '%s' > %s.wlog 2>&1", self_dir.c_str(),
+					base.c_str(), base.c_str(), cex_file.c_str(), base.c_str())) != 0)
+				log_warning("ic3: engine ric3: p%d: aiw2yw failed, no witness written to %s\n", k, cex_file.c_str());
+		}
+		return 1;
+	}
+};
+
 struct Ic3Pass : Pass
 {
 	Ic3Pass() : Pass("ic3", "prove safety and liveness properties via IC3/PDR") { }
@@ -1550,7 +1717,7 @@ struct Ic3Pass : Pass
 	{
 		log("\n");
 		log("    ic3 [-top <name>] [-check-cells] [-init-zero] [-max <frames>] [-kind <k>] [-timeout <s>]\n");
-		log("        [-ctg <depth>] [-cex <prefix>] [-v]\n");
+		log("        [-ctg <depth>] [-cex <prefix>] [-engine native|ric3] [-v]\n");
 		log("\n");
 		log("Proves (or disproves) the safety properties given as $assert cells and\n");
 		log("$check cells with FLAVOR \"assert\" in the selected module, using the\n");
@@ -1625,6 +1792,26 @@ struct Ic3Pass : Pass
 		log("        counterexample; liveness: lasso); replay with the same prep\n");
 		log("        and `sim -r <prefix><property>.yw -vcd trace.vcd`\n");
 		log("\n");
+		log("    -engine native|ric3\n");
+		log("        prove safety properties with the in-tree IC3 (native, the\n");
+		log("        default) or with an external rIC3 process per property: the\n");
+		log("        assert and every assumption are written as AIGER (-zinit) and\n");
+		log("        rIC3's exit code is the verdict, its witness the depth (and\n");
+		log("        with -cex the .yw).  The -bmc pre-pass still runs natively;\n");
+		log("        -kind / -max / -ctg do not apply to rIC3; covers and liveness\n");
+		log("        stay native.  -timeout is passed as --time-limit, with a hard\n");
+		log("        stop 5s later\n");
+		log("\n");
+		log("    -ric3 <path>\n");
+		log("        rIC3 binary (default: $RIC3, else rIC3 on PATH)\n");
+		log("\n");
+		log("    -ric3-engine <e>\n");
+		log("        rIC3 engine, passed as -e (default: ic3; portfolio runs its\n");
+		log("        multi-threaded portfolio)\n");
+		log("\n");
+		log("    -ric3-args <args>\n");
+		log("        extra rIC3 command-line arguments\n");
+		log("\n");
 		log("    -v\n");
 		log("        print per-property solve statistics\n");
 		log("\n");
@@ -1650,6 +1837,10 @@ struct Ic3Pass : Pass
 		int kind_max = 8;
 		int bmc_max = 0;
 		int ctg_depth_max = 0;
+		bool engine_ric3 = false;
+		Ric3Driver ric3;
+		ric3.engine = "ic3";
+		ric3.bin = getenv("RIC3") ? getenv("RIC3") : "rIC3";
 
 		log_header(design, "Executing IC3 pass (safety and liveness model checking).\n");
 
@@ -1693,6 +1884,26 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-cex") {
 				cex_prefix = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-engine" && argidx+1 < args.size()) {
+				std::string e = args[++argidx];
+				if (e == "ric3")
+					engine_ric3 = true;
+				else if (e != "native")
+					log_cmd_error("ic3: unknown engine '%s' (native or ric3).\n", e.c_str());
+				continue;
+			}
+			if (args[argidx] == "-ric3" && argidx+1 < args.size()) {
+				ric3.bin = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-ric3-engine" && argidx+1 < args.size()) {
+				ric3.engine = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-ric3-args" && argidx+1 < args.size()) {
+				ric3.extra = args[++argidx];
 				continue;
 			}
 			if (args[argidx] == "-v") {
@@ -1967,7 +2178,14 @@ struct Ic3Pass : Pass
 			return " [lowering=" + c->attributes.at(ID(sva_lowering)).decode_string() + "]";
 		};
 		int n_proved = 0, n_disproved = 0, n_undecided = 0;
-		for (auto cell : props) {
+		if (engine_ric3 && !props.empty()) {
+			ric3.init_zero = init_zero;
+			ric3.timeout_s = timeout_s;
+			ric3.verbose = verbose;
+			ric3.setup(design, module, props, assumes);
+		}
+		for (int prop_idx = 0; prop_idx < GetSize(props); prop_idx++) {
+			RTLIL::Cell *cell = props[prop_idx];
 			std::string name = cell->name.unescape();
 			std::string src;
 			if (cell->attributes.count(ID::src))
@@ -1982,9 +2200,21 @@ struct Ic3Pass : Pass
 
 			int depth = 0;
 			int result;
+			std::string safe = name;
+			for (auto &ch : safe)
+				if (!isalnum((unsigned char)ch) && ch != '_' && ch != '-')
+					ch = '_';
+			bool cex_done = false;
 			if (bmc_hit.count(cell)) {
 				result = 1;
 				depth = bmc_hit.at(cell);
+			} else if (engine_ric3) {
+				std::string why;
+				result = ric3.prove(prop_idx, depth,
+						cex_prefix.empty() ? "" : stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), why);
+				cex_done = true;
+				if (result == 2)
+					log("ic3: %s: engine ric3: %s\n", name.c_str(), why.c_str());
 			} else {
 				arm();
 				try {
@@ -2010,13 +2240,8 @@ struct Ic3Pass : Pass
 			} else if (result == 1) {
 				log("ic3: %s: disproved (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
 				n_disproved++;
-				if (!cex_prefix.empty()) {
-					std::string safe = name;
-					for (auto &ch : safe)
-						if (!isalnum((unsigned char)ch) && ch != '_' && ch != '-')
-							ch = '_';
+				if (!cex_prefix.empty() && !cex_done)
 					solver.export_cex(cell, stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), depth);
-				}
 			} else {
 				log("ic3: %s: undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
 				n_undecided++;

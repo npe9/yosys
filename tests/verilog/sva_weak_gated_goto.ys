@@ -1,0 +1,51 @@
+# Weak `c throughout (b[->1] ##k v ...)` in property position (OpenTitan
+# prim_alert_rxtx_assert_fpv PingEn_M): it used to be refused ("no finite
+# bound (max -1 ticks)").  Weak semantics: the attempt fails only when c
+# drops while it is alive (gap ticks included) or an element after the
+# goto is false; a goto that never comes is not a failure.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  wire a = t == 4'd2, a2 = t == 4'd1 || t == 4'd2;
+  wire g = t == 4'd5;
+  a_ok:   assert property (@(posedge clk) a |-> 1'b1 throughout (g[->1] ##1 t == 4'd6));
+  a_two:  assert property (@(posedge clk) a2 |-> 1'b1 throughout (g[->1] ##1 t == 4'd6));
+  a_wait: assert property (@(posedge clk) a |-> t != 4'd4 throughout (g[->1] ##1 t == 4'd6));
+  a_c:    assert property (@(posedge clk) a |-> 1'b1 throughout (g[->1] ##1 t == 4'd7));
+  a_pc:   assert property (@(posedge clk) a |-> t != 4'd6 throughout (g[->1] ##1 t == 4'd6));
+  a_gap:  assert property (@(posedge clk) a |-> t != 4'd6 throughout (g[->1] ##2 t == 4'd7));
+  a_gok:  assert property (@(posedge clk) a |-> t != 4'd8 throughout (g[->1] ##2 t == 4'd7));
+  a_two2: assert property (@(posedge clk) a |-> 1'b1 throughout (g[->1] ##1 t == 4'd6 ##1 t == 4'd8));
+  a_never: assert property (@(posedge clk) a |-> 1'b1 throughout (1'b0[->1] ##1 1'b0));
+  a_dis:  assert property (@(posedge clk) disable iff (t == 4'd3) a |-> t != 4'd4 throughout (g[->1] ##1 t == 4'd6));
+endmodule
+EOT
+hierarchy -top top
+logger -expect log "unbounded sequence in property position compiled with weak semantics \(gated goto then Boolean tail\)" 10
+sva2check
+proc
+async2sync
+logger -expect log "a_ok: proved" 1
+logger -expect log "a_two: proved" 1
+logger -expect log "a_wait: disproved \(depth 4\)" 1
+logger -expect log "a_c: disproved \(depth 6\)" 1
+logger -expect log "a_pc: disproved \(depth 6\)" 1
+logger -expect log "a_gap: disproved \(depth 6\)" 1
+logger -expect log "a_gok: proved" 1
+logger -expect log "a_two2: disproved \(depth 7\)" 1
+logger -expect log "a_never: proved" 1
+logger -expect log "a_dis: proved" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# a bounded sequence after the gated goto stays refused
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, g, x, y);
+  a_r: assert property (@(posedge clk) a |-> x throughout (g[->1] ##1 (y ##1 y)[*2]));
+endmodule
+EOT
+hierarchy -top top
+logger -expect error "no finite bound" 1
+sva2check

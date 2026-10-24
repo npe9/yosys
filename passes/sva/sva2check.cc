@@ -4762,8 +4762,45 @@ struct SvaCompiler {
 				note("goto");
 				return true;
 			}
-			if (op == "throughout")
-				return false;
+			if (op == "throughout") {
+				// c throughout (b[->1] ##k1 v1 ##k2 v2 ...), all Boolean
+				// (OpenTitan PingEn_M): shape (b) below with c required on
+				// every tick the attempt is alive, the gap ticks included
+				std::vector<std::pair<int, SigSpec>> elems;
+				Cell *cur_n = body;
+				while (cur_n && sva_op(cur_n) == "##" && GetSize(ports_of(cur_n)) == 3) {
+					int clo, chi;
+					if (!cycle(cur_n, clo, chi) || clo != chi || kid(cur_n, 2))
+						return false;
+					elems.push_back({clo, boolv(cur_n, 2)});
+					cur_n = kid(cur_n, 0);
+				}
+				if (elems.empty() || !is_goto1(cur_n))
+					return false;
+				std::reverse(elems.begin(), elems.end());
+				SigSpec b = boolv(cur_n, 0), cur;
+				feedback([&](SigSpec q) {
+					cur = orN({start, q});
+					return andN({cur, c, mod->Not(NEW_ID, b)});
+				}, "wpend", 1);
+				SigSpec f = andN({cur, mod->Not(NEW_ID, c)});
+				SigSpec tok = andN({cur, c, b});
+				for (auto &el : elems) {
+					for (int i = 1; i < el.first; i++) {
+						tok = delay(tok, 1, "wgoto");
+						f = orN({f, andN({tok, mod->Not(NEW_ID, c)})});
+						tok = andN({tok, c});
+					}
+					if (el.first > 0)
+						tok = delay(tok, 1, "wgoto");
+					SigSpec ok = andN({el.second, c});
+					f = orN({f, andN({tok, mod->Not(NEW_ID, ok)})});
+					tok = andN({tok, ok});
+				}
+				fail = f;
+				note("gated goto then Boolean tail");
+				return true;
+			}
 		}
 		if (op != "##")
 			return false;

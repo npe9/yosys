@@ -1,0 +1,52 @@
+# [x] ##[m:M] y with M past the 64-tick window (OpenTitan otbn_core
+# `|=> ##[1:100] locked`): it used to be refused ("no finite bound (max
+# 101 ticks)").  Lowered as one pending bit and the age of the oldest
+# pending attempt; t is a free-running 8-bit counter.
+#
+# The design has no inputs: one deterministic trace, periodic in t (256),
+# and every attempt (t == 2, t == 50) has its window closed by t == 115,
+# so the monitors are idle again when t == 2 comes round.  A BMC to depth
+# 120 is therefore complete here: the disproved legs are exact, and a leg
+# with no hit up to 120 holds (ic3 reports it undecided at -max 0).  Plain ic3 proves
+# them too, but slowly (it must learn age == t - start bit by bit).
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [7:0] t = 8'd0;
+  always_ff @(posedge clk) t <= t + 8'd1;
+  wire a = t == 8'd2;
+  // |=>: the window is [4, 103]
+  a_hi:   assert property (@(posedge clk) a |=> ##[1:100] t == 8'd103);
+  a_late: assert property (@(posedge clk) a |=> ##[1:100] t == 8'd104);
+  // m = 3: the window is [5, 72]
+  a_m3:   assert property (@(posedge clk) a |-> ##[3:70] t == 8'd5);
+  a_m3e:  assert property (@(posedge clk) a |-> ##[3:70] t == 8'd4);
+  // m = 0: the start tick itself counts
+  a_m0:   assert property (@(posedge clk) a |-> ##[0:70] t == 8'd2);
+  // Boolean lhs: x at the start tick, then the window [3, 82]
+  a_x:    assert property (@(posedge clk) a |-> t == 8'd2 ##[1:80] t == 8'd82);
+  a_xb:   assert property (@(posedge clk) a |-> t == 8'd3 ##[1:80] t == 8'd82);
+  // two attempts (2 and 50): a y at 40 meets the first only; the second
+  // (window [51, 115]) stays pending and misses at 115
+  a_two:  assert property (@(posedge clk) t == 8'd2 || t == 8'd50 |-> ##[1:65] t == 8'd60);
+  a_twob: assert property (@(posedge clk) t == 8'd2 || t == 8'd50 |-> ##[1:65] t == 8'd40);
+  a_dis:  assert property (@(posedge clk) disable iff (t == 8'd90) a |=> ##[1:100] t == 8'd104);
+endmodule
+EOT
+hierarchy -top top
+logger -expect log "past the 64-tick window compiled as a deadline counter" 10
+sva2check
+proc
+async2sync
+logger -expect log "a_hi: undecided" 1
+logger -expect log "a_late: disproved \(depth 103\)" 1
+logger -expect log "a_m3: undecided" 1
+logger -expect log "a_m3e: disproved \(depth 72\)" 1
+logger -expect log "a_m0: undecided" 1
+logger -expect log "a_x: undecided" 1
+logger -expect log "a_xb: disproved \(depth 2\)" 1
+logger -expect log "a_two: undecided" 1
+logger -expect log "a_twob: disproved \(depth 115\)" 1
+logger -expect log "a_dis: undecided" 1
+ic3 -init-zero -kind 0 -bmc 120 -max 0
+design -reset
+logger -check-expected

@@ -4983,10 +4983,87 @@ struct SvaCompiler {
 		return fail;
 	}
 
+	// [x] ##[m:M] y, x and y Boolean, M past the 64-tick window (OpenTitan
+	// otbn_core `|=> ##[1:100] locked`, `##[1:4000]`): every pending
+	// attempt with at least m ticks behind it is met by the same y, so
+	// after start is delayed by m-1 (m = 0: a y at the start tick meets
+	// it, the rest needs y in [1:M]) one pending bit and the age of the
+	// oldest pending attempt are exact.  The oldest attempt's deadline is
+	// the earliest any pending attempt can miss, so the first miss is
+	// reported; younger attempts are dropped with it.
+	bool deadline_fail(Cell *n, SigSpec start, SigSpec &fail)
+	{
+		if (slots_mode || in_island || !dyn_gate.empty() || sva_op(n) != "##")
+			return false;
+		auto ps = ports_of(n);
+		if (clone_scope && !clone_cmap.count(n))
+			ensure_stub(n);
+		Cell *src = clone_scope ? clone_cmap[n] : nullptr;
+		auto rd = [&](int i) { return cport(n, src, ps[i]); };
+		bool lead2 = GetSize(ps) == 2;
+		int ci = lead2 ? 0 : 1, ti = lead2 ? 1 : 2;
+		if (child_cell(n->getPort(ps[ti])))
+			return false;
+		// a leading ##[m:M] arrives as `true ##[m:M] y`
+		if (!lead2) {
+			Cell *lc = child_cell(n->getPort(ps[0]));
+			if (lc && sva_op(lc) != "true")
+				return false;
+			lead2 = lc != nullptr;
+		}
+		Cell *cc = child_cell(n->getPort(ps[ci]));
+		if (!cc || sva_op(cc) != "bounds")
+			return false;
+		auto bp = ports_of(cc);
+		int m, M;
+		if (GetSize(bp) < 2 || !const_int(cc->getPort(bp[0]), m) || !const_int(cc->getPort(bp[1]), M) ||
+				m < 0 || M < m || M > (1 << 20))
+			return false;
+		int m0 = m, M0 = M;
+		SigSpec y = reduce1(resolve(rd(ti)));
+		SigSpec f = Const(0, 1);
+		if (!lead2) {
+			SigSpec x = reduce1(resolve(rd(0)));
+			f = andN({start, mod->Not(NEW_ID, x)});
+			start = andN({start, x});
+		}
+		if (m == 0) {
+			start = andN({start, mod->Not(NEW_ID, y)});
+			m = 1;
+			if (M == 0) {
+				fail = orN({f, start});
+				return true;
+			}
+		}
+		start = delay(start, m - 1, "wdl");
+		M -= m - 1;
+		int w = 1;
+		while ((1 << w) <= M)
+			w++;
+		// old = attempts started before this tick (age >= 1), still unmet
+		Wire *pq = wn("wdlp", 1), *aq = wn("wdla", w);
+		SigSpec old = SigSpec(pq), ny = mod->Not(NEW_ID, y);
+		SigSpec miss = andN({old, ny, mod->Eq(NEW_ID, SigSpec(aq), Const(M, w))});
+		SigSpec keep = andN({old, ny, mod->Not(NEW_ID, miss)});
+		SigSpec np = orN({keep, start});
+		SigSpec na = mod->Mux(NEW_ID, Const(1, w), mod->Add(NEW_ID, SigSpec(aq), Const(1, w)), keep);
+		ffd(dis_gate(np), pq, false);
+		ffd(dis_gate(na), aq, false);
+		fail = orN({f, miss});
+		log("sva2check: %s: ##[%d:%d] past the 64-tick window compiled as a deadline counter.\n",
+				check_name.c_str(), m0, M0);
+		return true;
+	}
+
 	SigSpec strong_seq_fail(Cell *n, SigSpec start)
 	{
 		refuse_empty_prop(n);
 		int len = seq_max_len(n);
+		if (len > 64 && seq_min_len(n) != len) {
+			SigSpec df;
+			if (deadline_fail(n, start, df))
+				return df;
+		}
 		if (len < 0 && strong_ctx)
 			log_error("sva2check: strong unbounded sequence in %s needs a liveness obligation (not supported).\n", log_id(n));
 		if (len < 0) {

@@ -1,0 +1,21 @@
+# write_functional_cxx: a hierarchical name after flatten ("$flatten\u_chk.")
+# is printed as a C++ string literal; its backslash must be escaped, or "\u"
+# starts a universal character name and the generated file does not compile.
+read_verilog <<EOT
+module chk(input clk, input d, output q);
+  reg r;
+  always @(posedge clk) r <= d;
+  assign q = r ^ d;
+endmodule
+module top(input clk, input d, output q);
+  chk u_chk(.clk(clk), .d(d), .q(q));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+formalff -clk2ff
+! mkdir -p temp
+write_functional_cxx temp/functional_cxx_escape.cc
+! grep -qF 'fn("$flatten\\u_chk.' temp/functional_cxx_escape.cc
+! ! grep -qF 'fn("$flatten\u_chk.' temp/functional_cxx_escape.cc

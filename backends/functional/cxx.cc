@@ -69,6 +69,19 @@ struct CxxType {
 
 using CxxWriter = Functional::Writer;
 
+// A name as the body of a C++ string literal: a hierarchical name after
+// flatten contains backslashes, which must not become escape sequences.
+static std::string cxx_string_body(const std::string &s)
+{
+	std::string r;
+	for (char c : s) {
+		if (c == '\\' || c == '"')
+			r += '\\';
+		r += c;
+	}
+	return r;
+}
+
 struct CxxStruct {
 	std::string name;
 	dict<IdString, CxxType> types;
@@ -89,7 +102,7 @@ struct CxxStruct {
 		}
 		f.print("\n\t\ttemplate <typename T> void visit(T &&fn) {{\n");
 		for (auto p : types) {
-			f.print("\t\t\tfn(\"{}\", {});\n", p.first.unescape(), scope(p.first, p.first));
+			f.print("\t\t\tfn(\"{}\", {});\n", cxx_string_body(p.first.unescape()), scope(p.first, p.first));
 		}
 		f.print("\t\t}}\n");
 		f.print("\t}};\n\n");

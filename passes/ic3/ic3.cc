@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <sstream>
 #ifndef _WIN32
 #include <sys/wait.h>
 #endif
@@ -1547,50 +1548,121 @@ private:
 	}
 };
 
-// Register E0 (engine roadmap): `-engine ric3` hands each safety property
-// to an external rIC3 process, the way smtbmc drives an SMT solver.  The
-// design (after the $initstate rewrite) is written once as RTLIL; per
-// property a child yosys keeps that assert and every assumption, maps the
-// rest to an AIG and writes AIGER with -zinit (a register without an
-// \init starts free, as in the native engine; -init-zero zeroes it
-// first).  rIC3 answers with its HWMCC exit code (20 safe, 10 unsafe,
-// anything else unknown) and, when unsafe, an AIGER witness whose input
-// lines give the depth and, with -cex, a Yosys witness via aiw2yw.  An
-// export or solver failure leaves that one property undecided.
-struct Ric3Driver
+// External engines (register E0 / fe28): like yosys-smtbmc -s <solver>,
+// `-engine <name>` hands each safety property to an external model
+// checker through one of the formal backends.  The design (after the
+// $initstate rewrite) is written once as RTLIL; per property a child yosys
+// keeps that assert and every assumption and writes it as AIGER
+// (write_aiger -zinit), BTOR2 (write_btor) or SMT-LIB2 (write_smt2).  As
+// in SatGen without undef modelling, an undriven wire is free at every
+// step and an x constant is 0; a register without an \init starts free
+// (-init-zero zeroes it first).
+//
+//   engine  formats      proves  verdict from
+//   ric3    aiger, btor  yes     HWMCC exit code (20 safe, 10 unsafe)
+//   abc     aiger        yes     pdr's "Property proved" / "asserted in frame k"
+//   btormc  btor         no      BMC to -depth: "sat" disproves, else undecided
+//   smtbmc  smt2         yes     basecase -t D FAILED disproves; basecase and
+//                                induction -i -t D both PASSED proves
+//
+// A counterexample comes back as the engine's witness (aiw, btor2 or yw)
+// and with -cex is converted to a Yosys witness (yosys-witness aiw2yw /
+// wit2yw; smtbmc writes it directly).  A bounded "no counterexample" is
+// never a proof; an export or engine failure leaves that one property
+// undecided.
+struct ExtEngine
 {
-	std::string bin, engine, extra, dir, il, top, self_dir;
+	enum Kind { RIC3, ABC, BTORMC, SMTBMC } kind = RIC3;
+	enum Format { AIGER, BTOR, SMT2 } format = AIGER;
+	std::string name, bin, sub_engine = "ic3", solver = "yices", extra, dir, il, top, self_dir, keep_dir;
 	bool init_zero = false;
 	bool verbose = false;
 	double timeout_s = 0;
+	int depth_max = 20;
 
-	~Ric3Driver()
+	~ExtEngine()
 	{
-		if (!dir.empty())
+		if (!dir.empty() && keep_dir.empty())
 			remove_directory(dir);
+	}
+
+	// returns an error message, or "" when the combination is valid
+	std::string configure(const std::string &engine, const std::string &fmt)
+	{
+		name = engine;
+		if (engine == "ric3") {
+			kind = RIC3;
+			if (fmt.empty() || fmt == "aiger")
+				format = AIGER;
+			else if (fmt == "btor")
+				format = BTOR;
+			else
+				return "ric3 reads -format aiger or btor";
+		} else if (engine == "abc") {
+			kind = ABC;
+			format = AIGER;
+			if (!fmt.empty() && fmt != "aiger")
+				return "abc reads -format aiger only";
+		} else if (engine == "btormc") {
+			kind = BTORMC;
+			format = BTOR;
+			if (!fmt.empty() && fmt != "btor")
+				return "btormc reads -format btor only";
+		} else if (engine == "smtbmc") {
+			kind = SMTBMC;
+			format = SMT2;
+			if (!fmt.empty() && fmt != "smt2")
+				return "smtbmc reads -format smt2 only";
+		} else
+			return stringf("unknown engine '%s' (native, ric3, abc, btormc or smtbmc)", engine.c_str());
+		return "";
+	}
+
+	const char *format_name() const
+	{
+		return format == AIGER ? "aiger" : format == BTOR ? "btor" : "smt2";
 	}
 
 	void setup(RTLIL::Design *design, RTLIL::Module *module, const std::vector<RTLIL::Cell*> &props,
 			const std::vector<RTLIL::Cell*> &assumes)
 	{
-		dir = make_temp_dir(get_base_tmpdir() + "/yosys_ic3_ric3_XXXXXX");
+		if (keep_dir.empty())
+			dir = make_temp_dir(get_base_tmpdir() + "/yosys_ic3_ext_XXXXXX");
+		else {
+			dir = keep_dir;
+			if (run(stringf("mkdir -p '%s'", dir.c_str())) != 0)
+				log_cmd_error("ic3: cannot create -engine-keep directory %s.\n", dir.c_str());
+		}
 		il = dir + "/design.il";
 		top = RTLIL::unescape_id(module->name);
 		self_dir = proc_self_dirname();
+		if (bin.empty()) {
+			if (kind == RIC3)
+				bin = getenv("RIC3") ? getenv("RIC3") : "rIC3";
+			else if (kind == ABC)
+				bin = self_dir + "yosys-abc";
+			else if (kind == BTORMC)
+				bin = "btormc";
+			else
+				bin = self_dir + "yosys-smtbmc";
+		}
 		for (int k = 0; k < GetSize(props); k++)
-			props[k]->attributes[ID(ic3_ric3)] = RTLIL::Const(stringf("p%d", k));
+			props[k]->attributes[ID(ic3_ext)] = RTLIL::Const(stringf("p%d", k));
 		for (auto c : assumes)
-			c->attributes[ID(ic3_ric3)] = RTLIL::Const(std::string("assume"));
+			c->attributes[ID(ic3_ext)] = RTLIL::Const(std::string("assume"));
 		{
 			auto quiet = logger().make_debug_scope(true);
 			Pass::call(design, "write_rtlil " + il);
 		}
 		for (auto c : props)
-			c->attributes.erase(ID(ic3_ric3));
+			c->attributes.erase(ID(ic3_ext));
 		for (auto c : assumes)
-			c->attributes.erase(ID(ic3_ric3));
-		log("ic3: engine ric3: %s -e %s%s%s (design written to %s)\n", bin.c_str(), engine.c_str(),
-				extra.empty() ? "" : " ", extra.c_str(), il.c_str());
+			c->attributes.erase(ID(ic3_ext));
+		std::string how = kind == RIC3 ? " -e " + sub_engine : kind == SMTBMC ? " -s " + solver : "";
+		if (kind == BTORMC || kind == SMTBMC)
+			how += stringf(" (depth %d)", depth_max);
+		log("ic3: engine %s via %s: %s%s%s%s (design written to %s)\n", name.c_str(), format_name(), bin.c_str(),
+				how.c_str(), extra.empty() ? "" : " ", extra.c_str(), il.c_str());
 	}
 
 	// run_command() without a line callback returns system()'s raw wait
@@ -1605,107 +1677,317 @@ struct Ric3Driver
 		return st;
 	}
 
-	static std::string last_error(const std::string &file)
+	static std::vector<std::string> read_lines(const std::string &file)
 	{
 		std::ifstream f(file);
-		std::string line, err;
-		while (std::getline(f, line))
-			if (line.compare(0, 6, "ERROR:") == 0 || line.find("panicked") != std::string::npos)
+		std::vector<std::string> lines;
+		std::string line;
+		while (std::getline(f, line)) {
+			if (!line.empty() && line.back() == '\r')
+				line.pop_back();
+			lines.push_back(line);
+		}
+		return lines;
+	}
+
+	static std::string last_error(const std::string &file)
+	{
+		std::string err;
+		for (auto &line : read_lines(file))
+			if (line.compare(0, 6, "ERROR:") == 0 || line.find("panicked") != std::string::npos ||
+					line.find("Error") != std::string::npos)
 				err = line;
 		return err;
+	}
+
+	static void write_lines(const std::string &file, const std::vector<std::string> &lines, int from, int to)
+	{
+		std::ofstream f(file);
+		for (int i = from; i <= to; i++)
+			f << lines[i] << "\n";
+	}
+
+	// the hard stop around every engine: --time-limit / pdr -T are soft
+	std::string limit_prefix() const
+	{
+		std::string cmd = "RUST_LOG=warn ";
+		if (timeout_s > 0)
+			cmd += stringf("perl -e 'alarm shift; exec @ARGV' %lld ", (long long)std::ceil(timeout_s) + 5);
+		return cmd;
+	}
+
+	bool witness_to_yw(const std::string &tool, const std::string &wit, const std::string &map, const std::string &cex_file, int k)
+	{
+		if (run(stringf("'%syosys-witness' %s %s %s '%s' > %s.wlog 2>&1", self_dir.c_str(), tool.c_str(), wit.c_str(),
+				map.c_str(), cex_file.c_str(), wit.c_str())) == 0)
+			return true;
+		log_warning("ic3: engine %s: p%d: %s failed, no witness written to %s\n", name.c_str(), k, tool.c_str(), cex_file.c_str());
+		return false;
 	}
 
 	// 0 proved, 1 disproved (depth set), 2 undecided (why set)
 	int prove(int k, int &depth, const std::string &cex_file, std::string &why)
 	{
 		std::string base = stringf("%s/p%d", dir.c_str(), k);
+		if (!keep_dir.empty())
+			log("ic3: engine %s: p%d: files %s.*\n", name.c_str(), k, base.c_str());
 		{
 			std::ofstream ys(base + ".ys");
 			ys << "read_rtlil " << il << "\n";
 			ys << "hierarchy -top " << top << "\n";
 			ys << "delete t:$assert t:$assume t:$cover t:$live t:$fair t:$check %u %u %u %u %u "
-					<< "a:ic3_ric3=assume a:ic3_ric3=p" << k << " %u %d\n";
-			ys << "flatten\nchformal -lower\nmemory_map\n";
+					<< "a:ic3_ext=assume a:ic3_ext=p" << k << " %u %d\n";
+			// output ports are not properties: abc's pdr checks every AIGER
+			// output (it disproved plain output ports), rIC3 ignores them
+			ys << "flatten\nchformal -lower\nmemory_map\ndelete -output\n";
 			if (init_zero)
 				ys << "setundef -init -zero\n";
-			// as SatGen without undef modelling: an undriven wire is free at
-			// every step, an x constant (also one techmap / aigmap create,
-			// e.g. an out-of-range $shiftx) is 0
-			ys << "setundef -undriven -anyseq\nsetundef -zero\n";
-			ys << "dffunmap\ntechmap\naigmap\nsetundef -zero\nopt_clean\n";
-			ys << "write_aiger -zinit -ywmap " << base << ".ywa " << base << ".aig\n";
+			ys << "setundef -undriven -anyseq\nsetundef -zero\ndffunmap\n";
+			if (format == AIGER) {
+				// techmap / aigmap create x constants of their own (an
+				// out-of-range $shiftx)
+				ys << "techmap\naigmap\nsetundef -zero\nopt_clean\n";
+				ys << "write_aiger -zinit -ywmap " << base << ".ywa " << base << ".aig\n";
+			} else if (format == BTOR) {
+				// one global clock, as the native engine steps every FF:
+				// formalff marks the clock replaced_by_gclk, which is what
+				// write_btor's ywmap records as a clock for replay
+				ys << "formalff -clk2ff\nopt_clean\nwrite_btor -ywmap " << base << ".ywb " << base << ".btor\n";
+			} else {
+				ys << "opt_clean\nwrite_smt2 -stbv -wires " << base << ".smt2\n";
+			}
 		}
 		auto t0 = std::chrono::steady_clock::now();
 		int rc = run(stringf("'%syosys' -q -s %s.ys > %s.ylog 2>&1", self_dir.c_str(), base.c_str(), base.c_str()));
 		if (rc != 0) {
-			why = stringf("aiger export failed (rc %d) %s", rc, last_error(base + ".ylog").c_str());
+			why = stringf("%s export failed (rc %d) %s", format_name(), rc, last_error(base + ".ylog").c_str());
 			return 2;
 		}
 		auto t1 = std::chrono::steady_clock::now();
+		long long lim = timeout_s > 0 ? (long long)std::ceil(timeout_s) : 0;
+		int result = 2;
 
-		std::string cmd = "RUST_LOG=warn ";
-		if (timeout_s > 0) {
-			long long lim = (long long)std::ceil(timeout_s);
-			// --time-limit is honoured by rIC3's IC3 loop; the alarm is the
-			// hard stop for every other engine and for preprocessing
-			cmd += stringf("perl -e 'alarm shift; exec @ARGV' %lld ", lim + 5);
-			cmd += stringf("'%s' -e %s --witness --time-limit %lld", bin.c_str(), engine.c_str(), lim);
-		} else
-			cmd += stringf("'%s' -e %s --witness", bin.c_str(), engine.c_str());
-		if (!extra.empty())
-			cmd += " " + extra;
-		cmd += stringf(" %s.aig > %s.out 2> %s.err", base.c_str(), base.c_str(), base.c_str());
-		rc = run(cmd);
-		auto t2 = std::chrono::steady_clock::now();
-		if (verbose)
-			log("ic3: engine ric3: p%d: export %.2fs, rIC3 %.2fs, rc %d\n", k,
-					std::chrono::duration<double>(t1 - t0).count(),
-					std::chrono::duration<double>(t2 - t1).count(), rc);
-		if (rc == 20)
-			return 0;
-		if (rc != 10) {
-			std::string err = last_error(base + ".err");
-			why = stringf("rIC3 rc %d%s%s", rc, err.empty() ? "" : ": ", err.c_str());
-			return 2;
-		}
-
-		// AIGER witness: "1", "b<k>", the initial latch line, one input
-		// line per step, "."
-		std::ifstream out(base + ".out");
-		std::vector<std::string> lines;
-		std::string line;
-		while (std::getline(out, line))
-			lines.push_back(line);
-		int start = -1;
-		for (int i = 0; i + 1 < GetSize(lines); i++)
-			if (lines[i] == "1" && !lines[i+1].empty() && lines[i+1][0] == 'b') {
-				start = i;
-				break;
+		if (kind == RIC3) {
+			std::string model = base + (format == AIGER ? ".aig" : ".btor");
+			std::string cmd = limit_prefix() + stringf("'%s' -e %s --witness", bin.c_str(), sub_engine.c_str());
+			if (lim)
+				cmd += stringf(" --time-limit %lld", lim);
+			if (!extra.empty())
+				cmd += " " + extra;
+			cmd += stringf(" %s > %s.out 2> %s.err", model.c_str(), base.c_str(), base.c_str());
+			rc = run(cmd);
+			if (rc == 20)
+				result = 0;
+			else if (rc != 10) {
+				std::string err = last_error(base + ".err");
+				why = stringf("rIC3 rc %d%s%s", rc, err.empty() ? "" : ": ", err.c_str());
+			} else {
+				std::vector<std::string> lines = read_lines(base + ".out");
+				if (format == AIGER) {
+					// "1", "b<k>", the initial latch line, one input line
+					// per step, "."
+					int start = -1, end = -1;
+					for (int i = 0; i + 1 < GetSize(lines); i++)
+						if (lines[i] == "1" && !lines[i+1].empty() && lines[i+1][0] == 'b') {
+							start = i;
+							break;
+						}
+					if (start >= 0)
+						for (int i = start + 3; i < GetSize(lines); i++)
+							if (lines[i] == ".") {
+								end = i;
+								break;
+							}
+					int steps = end - (start + 3);
+					if (start >= 0 && end >= 0 && steps >= 1) {
+						depth = steps - 1;
+						result = 1;
+						if (!cex_file.empty()) {
+							write_lines(base + ".aiw", lines, start, end);
+							witness_to_yw("aiw2yw", base + ".aiw", base + ".ywa", cex_file, k);
+						}
+					}
+				} else {
+					// BTOR2 witness: "sat", "b<k>", "#0" + initial states,
+					// "@t" + inputs per step, "."
+					int start = -1, end = -1, steps = 0;
+					for (int i = 0; i < GetSize(lines); i++)
+						if (lines[i] == "sat") {
+							start = i;
+							break;
+						}
+					if (start >= 0)
+						for (int i = start; i < GetSize(lines); i++) {
+							if (!lines[i].empty() && lines[i][0] == '@')
+								steps++;
+							if (lines[i] == ".") {
+								end = i;
+								break;
+							}
+						}
+					if (start >= 0 && end >= 0 && steps >= 1) {
+						depth = steps - 1;
+						result = 1;
+						if (!cex_file.empty()) {
+							write_lines(base + ".wit", lines, start, end);
+							witness_to_yw("wit2yw", base + ".wit", base + ".ywb", cex_file, k);
+						}
+					}
+				}
+				if (result != 1)
+					why = "rIC3 reported unsafe without a readable witness";
 			}
-		int end = -1;
-		if (start >= 0)
-			for (int i = start + 3; i < GetSize(lines); i++)
-				if (lines[i] == ".") {
-					end = i;
+		} else if (kind == ABC) {
+			std::string cmd = limit_prefix() + stringf("'%s' -c 'read_aiger %s.aig; fold; strash; print_stats; pdr%s; write_cex -a %s.aiw'",
+					bin.c_str(), base.c_str(), lim ? stringf(" -T %lld", lim).c_str() : "", base.c_str());
+			if (!extra.empty())
+				log_warning("ic3: engine abc: -engine-args is ignored (the abc script is fixed).\n");
+			cmd += stringf(" > %s.out 2>&1", base.c_str());
+			rc = run(cmd);
+			std::vector<std::string> lines = read_lines(base + ".out");
+			int frame = -1;
+			bool proved = false, no_latches = false;
+			for (auto &line : lines) {
+				if (line.find("lat =    0 ") != std::string::npos || line.find("lat = 0 ") != std::string::npos)
+					no_latches = true;
+				if (line.compare(0, 15, "Property proved") == 0)
+					proved = true;
+				size_t p = line.find("was asserted in frame ");
+				if (line.compare(0, 7, "Output ") == 0 && p != std::string::npos)
+					frame = atoi(line.c_str() + p + 22);
+			}
+			if (frame >= 0) {
+				depth = frame;
+				result = 1;
+				if (!cex_file.empty()) {
+					// write_cex -a: the initial latch line, one input line
+					// per step, "# DONE"; aiw2yw wants the plain lines
+					std::vector<std::string> wit;
+					for (auto &line : read_lines(base + ".aiw"))
+						if (!line.empty() && line[0] != '#')
+							wit.push_back(line);
+					wit.push_back(".");
+					write_lines(base + ".cex.aiw", wit, 0, GetSize(wit) - 1);
+					witness_to_yw("aiw2yw", base + ".cex.aiw", base + ".ywa", cex_file, k);
+				}
+			} else if (proved)
+				result = 0;
+			else if (no_latches) {
+				// pdr reports a latch-free network (a combinational check,
+				// often constant once strashed) UNDECIDED; iprove decides it
+				rc = run(limit_prefix() + stringf("'%s' -c 'read_aiger %s.aig; fold; strash; iprove' > %s.comb.out 2>&1",
+						bin.c_str(), base.c_str(), base.c_str()));
+				for (auto &line : read_lines(base + ".comb.out")) {
+					if (line.compare(0, 13, "UNSATISFIABLE") == 0)
+						result = 0;
+					else if (line.compare(0, 11, "SATISFIABLE") == 0) {
+						result = 1;
+						depth = 0;
+						if (!cex_file.empty())
+							log_warning("ic3: engine abc: p%d: combinational counterexample, no witness written to %s\n",
+									k, cex_file.c_str());
+					}
+				}
+				if (result == 2)
+					why = stringf("abc: latch-free network, iprove gave no verdict (rc %d)", rc);
+			} else {
+				std::string err = last_error(base + ".out");
+				why = stringf("abc pdr gave no verdict (rc %d)%s%s", rc, err.empty() ? "" : ": ", err.c_str());
+			}
+		} else if (kind == BTORMC) {
+			std::string cmd = limit_prefix() + stringf("'%s' -kmax %d", bin.c_str(), depth_max);
+			if (!extra.empty())
+				cmd += " " + extra;
+			cmd += stringf(" %s.btor > %s.out 2> %s.err", base.c_str(), base.c_str(), base.c_str());
+			rc = run(cmd);
+			std::vector<std::string> lines = read_lines(base + ".out");
+			int start = -1, end = -1, steps = 0;
+			for (int i = 0; i < GetSize(lines); i++)
+				if (lines[i] == "sat") {
+					start = i;
 					break;
 				}
-		int steps = end - (start + 3);
-		if (start < 0 || end < 0 || steps < 1) {
-			why = "rIC3 reported unsafe without a readable witness";
-			return 2;
-		}
-		depth = steps - 1;
-		if (!cex_file.empty()) {
-			{
-				std::ofstream aiw(base + ".aiw");
-				for (int i = start; i <= end; i++)
-					aiw << lines[i] << "\n";
+			if (start >= 0)
+				for (int i = start; i < GetSize(lines); i++) {
+					if (!lines[i].empty() && lines[i][0] == '@')
+						steps++;
+					if (lines[i] == ".") {
+						end = i;
+						break;
+					}
+				}
+			if (start >= 0 && end >= 0 && steps >= 1) {
+				depth = steps - 1;
+				result = 1;
+				if (!cex_file.empty()) {
+					write_lines(base + ".wit", lines, start, end);
+					witness_to_yw("wit2yw", base + ".wit", base + ".ywb", cex_file, k);
+				}
+			} else if (rc == 0)
+				why = stringf("btormc: no counterexample up to depth %d (bounded; not a proof)", depth_max);
+			else {
+				std::string err = last_error(base + ".err");
+				why = stringf("btormc rc %d%s%s", rc, err.empty() ? "" : ": ", err.c_str());
 			}
-			if (run(stringf("'%syosys-witness' aiw2yw %s.aiw %s.ywa '%s' > %s.wlog 2>&1", self_dir.c_str(),
-					base.c_str(), base.c_str(), cex_file.c_str(), base.c_str())) != 0)
-				log_warning("ic3: engine ric3: p%d: aiw2yw failed, no witness written to %s\n", k, cex_file.c_str());
+		} else {
+			// basecase first: it is the one that can disprove, and a proof
+			// needs it anyway
+			auto status = [&](const std::string &out) -> std::string {
+				std::string st;
+				for (auto &line : read_lines(out)) {
+					size_t p = line.find("Status: ");
+					if (p != std::string::npos)
+						st = line.substr(p + 8);
+				}
+				return st;
+			};
+			std::string common = limit_prefix() + stringf("'%s' -s %s --presat --noprogress", bin.c_str(), solver.c_str());
+			if (!extra.empty())
+				common += " " + extra;
+			rc = run(common + stringf(" -t %d --dump-yw %s.yw %s.smt2 > %s.out 2>&1", depth_max, base.c_str(),
+					base.c_str(), base.c_str()));
+			std::string st = status(base + ".out");
+			if (st == "FAILED") {
+				std::string y;
+				{
+					std::ifstream f(base + ".yw");
+					std::stringstream ss;
+					ss << f.rdbuf();
+					y = ss.str();
+				}
+				// steps of the Yosys witness: one JSON object per step in
+				// the "steps" array
+				size_t p = y.find("\"steps\"");
+				int steps = 0;
+				if (p != std::string::npos)
+					for (size_t q = y.find("\"bits\"", p); q != std::string::npos; q = y.find("\"bits\"", q + 1))
+						steps++;
+				if (steps >= 1) {
+					depth = steps - 1;
+					result = 1;
+					if (!cex_file.empty())
+						run(stringf("cp %s.yw '%s'", base.c_str(), cex_file.c_str()));
+				} else
+					why = "smtbmc reported FAILED without a readable witness";
+			} else if (st == "PASSED") {
+				rc = run(common + stringf(" -i -t %d %s.smt2 > %s.ind.out 2>&1", depth_max, base.c_str(), base.c_str()));
+				std::string sti = status(base + ".ind.out");
+				if (sti == "PASSED")
+					result = 0;
+				else
+					why = stringf("smtbmc: basecase passed to depth %d, induction %s (bounded; not a proof)", depth_max,
+							sti.empty() ? "gave no status" : sti.c_str());
+			} else {
+				std::string err = last_error(base + ".out");
+				why = stringf("smtbmc rc %d, status '%s'%s%s", rc, st.c_str(), err.empty() ? "" : ": ", err.c_str());
+			}
 		}
-		return 1;
+		auto t2 = std::chrono::steady_clock::now();
+		if (verbose)
+			log("ic3: engine %s: p%d: export %.2fs, engine %.2fs, rc %d\n", name.c_str(), k,
+					std::chrono::duration<double>(t1 - t0).count(),
+					std::chrono::duration<double>(t2 - t1).count(), rc);
+		return result;
 	}
 };
 
@@ -1717,7 +1999,7 @@ struct Ic3Pass : Pass
 	{
 		log("\n");
 		log("    ic3 [-top <name>] [-check-cells] [-init-zero] [-max <frames>] [-kind <k>] [-timeout <s>]\n");
-		log("        [-ctg <depth>] [-cex <prefix>] [-engine native|ric3] [-v]\n");
+		log("        [-ctg <depth>] [-cex <prefix>] [-engine <e> [-format <f>] [-s <solver>] ...] [-v]\n");
 		log("\n");
 		log("Proves (or disproves) the safety properties given as $assert cells and\n");
 		log("$check cells with FLAVOR \"assert\" in the selected module, using the\n");
@@ -1792,25 +2074,53 @@ struct Ic3Pass : Pass
 		log("        counterexample; liveness: lasso); replay with the same prep\n");
 		log("        and `sim -r <prefix><property>.yw -vcd trace.vcd`\n");
 		log("\n");
-		log("    -engine native|ric3\n");
+		log("    -engine native|ric3|abc|btormc|smtbmc\n");
 		log("        prove safety properties with the in-tree IC3 (native, the\n");
-		log("        default) or with an external rIC3 process per property: the\n");
-		log("        assert and every assumption are written as AIGER (-zinit) and\n");
-		log("        rIC3's exit code is the verdict, its witness the depth (and\n");
-		log("        with -cex the .yw).  The -bmc pre-pass still runs natively;\n");
-		log("        -kind / -max / -ctg do not apply to rIC3; covers and liveness\n");
-		log("        stay native.  -timeout is passed as --time-limit, with a hard\n");
-		log("        stop 5s later\n");
+		log("        default) or, like yosys-smtbmc -s <solver>, with an external\n");
+		log("        model checker per property through a formal backend: the assert\n");
+		log("        and every assumption are written as AIGER, BTOR2 or SMT-LIB2 by\n");
+		log("        a child yosys and the engine's verdict and witness are read\n");
+		log("        back (with -cex converted to a .yw).\n");
 		log("\n");
-		log("    -ric3 <path>\n");
-		log("        rIC3 binary (default: $RIC3, else rIC3 on PATH)\n");
+		log("            engine  formats      proves  verdict\n");
+		log("            ric3    aiger, btor  yes     exit code 20 / 10\n");
+		log("            abc     aiger        yes     pdr\n");
+		log("            btormc  btor         no      BMC to -depth\n");
+		log("            smtbmc  smt2         yes     basecase + induction, -t <depth>\n");
+		log("\n");
+		log("        A bounded \"no counterexample\" is undecided, never proved.  The\n");
+		log("        -bmc pre-pass still runs natively; -kind / -max / -ctg apply only\n");
+		log("        to native; covers and liveness stay native.  -timeout is a hard\n");
+		log("        stop per engine run (5s grace).  Witnesses replay like native\n");
+		log("        ones: same prep, plus `setundef -init -zero` after -init-zero.\n");
+		log("\n");
+		log("    -format aiger|btor|smt2\n");
+		log("        backend for the external engine (default: aiger for ric3 and\n");
+		log("        abc, btor for btormc, smt2 for smtbmc)\n");
+		log("\n");
+		log("    -s <solver>\n");
+		log("        SMT solver for -engine smtbmc (default: yices)\n");
+		log("\n");
+		log("    -depth <n>\n");
+		log("        bound for btormc (-kmax) and smtbmc (-t) (default: 20)\n");
+		log("\n");
+		log("    -engine-bin <path>\n");
+		log("        engine binary (default: $RIC3 or rIC3; yosys-abc and\n");
+		log("        yosys-smtbmc next to this yosys; btormc on PATH)\n");
+		log("\n");
+		log("    -engine-args <args>\n");
+		log("        extra engine command-line arguments\n");
+		log("\n");
+		log("    -engine-keep <dir>\n");
+		log("        keep everything handed to and returned by the engine in <dir>:\n");
+		log("        design.il, per property p<k>.ys (the export script), the model\n");
+		log("        (p<k>.aig / .btor / .smt2) with its witness map, the engine's\n");
+		log("        output and witness (default: a temporary directory, removed)\n");
 		log("\n");
 		log("    -ric3-engine <e>\n");
 		log("        rIC3 engine, passed as -e (default: ic3; portfolio runs its\n");
-		log("        multi-threaded portfolio)\n");
-		log("\n");
-		log("    -ric3-args <args>\n");
-		log("        extra rIC3 command-line arguments\n");
+		log("        multi-threaded portfolio).  -ric3 <path> and -ric3-args <args>\n");
+		log("        are kept as aliases of -engine-bin / -engine-args\n");
 		log("\n");
 		log("    -v\n");
 		log("        print per-property solve statistics\n");
@@ -1837,10 +2147,8 @@ struct Ic3Pass : Pass
 		int kind_max = 8;
 		int bmc_max = 0;
 		int ctg_depth_max = 0;
-		bool engine_ric3 = false;
-		Ric3Driver ric3;
-		ric3.engine = "ic3";
-		ric3.bin = getenv("RIC3") ? getenv("RIC3") : "rIC3";
+		std::string engine_name = "native", engine_format;
+		ExtEngine ext;
 
 		log_header(design, "Executing IC3 pass (safety and liveness model checking).\n");
 
@@ -1887,23 +2195,35 @@ struct Ic3Pass : Pass
 				continue;
 			}
 			if (args[argidx] == "-engine" && argidx+1 < args.size()) {
-				std::string e = args[++argidx];
-				if (e == "ric3")
-					engine_ric3 = true;
-				else if (e != "native")
-					log_cmd_error("ic3: unknown engine '%s' (native or ric3).\n", e.c_str());
+				engine_name = args[++argidx];
 				continue;
 			}
-			if (args[argidx] == "-ric3" && argidx+1 < args.size()) {
-				ric3.bin = args[++argidx];
+			if (args[argidx] == "-format" && argidx+1 < args.size()) {
+				engine_format = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-s" && argidx+1 < args.size()) {
+				ext.solver = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-depth" && argidx+1 < args.size()) {
+				ext.depth_max = atoi(args[++argidx].c_str());
+				continue;
+			}
+			if ((args[argidx] == "-engine-bin" || args[argidx] == "-ric3") && argidx+1 < args.size()) {
+				ext.bin = args[++argidx];
+				continue;
+			}
+			if ((args[argidx] == "-engine-args" || args[argidx] == "-ric3-args") && argidx+1 < args.size()) {
+				ext.extra = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-engine-keep" && argidx+1 < args.size()) {
+				ext.keep_dir = args[++argidx];
 				continue;
 			}
 			if (args[argidx] == "-ric3-engine" && argidx+1 < args.size()) {
-				ric3.engine = args[++argidx];
-				continue;
-			}
-			if (args[argidx] == "-ric3-args" && argidx+1 < args.size()) {
-				ric3.extra = args[++argidx];
+				ext.sub_engine = args[++argidx];
 				continue;
 			}
 			if (args[argidx] == "-v") {
@@ -1913,6 +2233,15 @@ struct Ic3Pass : Pass
 			break;
 		}
 		extra_args(args, argidx, design);
+		bool engine_ext = engine_name != "native";
+		if (engine_ext) {
+			std::string err = ext.configure(engine_name, engine_format);
+			if (!err.empty())
+				log_cmd_error("ic3: %s.\n", err.c_str());
+			if (ext.depth_max < 1)
+				log_cmd_error("ic3: -depth must be at least 1.\n");
+		} else if (!engine_format.empty())
+			log_cmd_error("ic3: -format needs an external -engine.\n");
 
 		RTLIL::Module *module;
 		if (!top_name.empty()) {
@@ -2178,11 +2507,11 @@ struct Ic3Pass : Pass
 			return " [lowering=" + c->attributes.at(ID(sva_lowering)).decode_string() + "]";
 		};
 		int n_proved = 0, n_disproved = 0, n_undecided = 0;
-		if (engine_ric3 && !props.empty()) {
-			ric3.init_zero = init_zero;
-			ric3.timeout_s = timeout_s;
-			ric3.verbose = verbose;
-			ric3.setup(design, module, props, assumes);
+		if (engine_ext && !props.empty()) {
+			ext.init_zero = init_zero;
+			ext.timeout_s = timeout_s;
+			ext.verbose = verbose;
+			ext.setup(design, module, props, assumes);
 		}
 		for (int prop_idx = 0; prop_idx < GetSize(props); prop_idx++) {
 			RTLIL::Cell *cell = props[prop_idx];
@@ -2208,13 +2537,13 @@ struct Ic3Pass : Pass
 			if (bmc_hit.count(cell)) {
 				result = 1;
 				depth = bmc_hit.at(cell);
-			} else if (engine_ric3) {
+			} else if (engine_ext) {
 				std::string why;
-				result = ric3.prove(prop_idx, depth,
+				result = ext.prove(prop_idx, depth,
 						cex_prefix.empty() ? "" : stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), why);
 				cex_done = true;
 				if (result == 2)
-					log("ic3: %s: engine ric3: %s\n", name.c_str(), why.c_str());
+					log("ic3: %s: engine %s: %s\n", name.c_str(), engine_name.c_str(), why.c_str());
 			} else {
 				arm();
 				try {

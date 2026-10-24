@@ -1,0 +1,39 @@
+# ic3 -engine <external> (register E0 / fe28).  abc (yosys-abc, a build
+# product) proves one assert and disproves the other at the native depth;
+# a missing engine binary leaves every property undecided with the reason
+# logged; bad engine / format combinations are refused.
+read_verilog -sv -formal <<EOT
+module t(input clk, input a);
+  reg [2:0] c = 0;
+  reg [1:0] d = 2'b01;
+  always @(posedge clk) begin
+    c <= c + a;
+    d <= {d[0], d[1]};
+    assume (a || c != 3'd5);
+    assert (c != 3'd6);
+    assert (d != 2'b11);
+  end
+endmodule
+EOT
+prep -top t
+async2sync
+design -save t
+
+logger -expect log "disproved \(depth 7\)" 1
+logger -expect log "2 properties: proved=1 disproved=1 undecided=0" 1
+ic3 -engine abc -kind 0
+logger -check-expected
+
+design -load t
+logger -expect log "engine ric3: rIC3 rc 127" 2
+logger -expect log "2 properties: proved=0 disproved=0 undecided=2" 1
+ic3 -engine ric3 -engine-bin /nonexistent/rIC3 -kind 0
+logger -check-expected
+
+design -load t
+logger -expect log "engine btormc: btormc rc 127" 2
+ic3 -engine btormc -engine-bin /nonexistent/btormc -kind 0
+logger -check-expected
+
+logger -expect error "abc reads -format aiger only" 1
+ic3 -engine abc -format btor

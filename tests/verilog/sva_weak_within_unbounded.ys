@@ -1,0 +1,42 @@
+# Weak `S1 within (P ##[m:$] Q)` in property position (OpenTitan otbn
+# SecWipeChangedBaseRegs_A) used to be refused ("no finite bound (max -1
+# ticks)").  Annex F weak semantics: after any prefix in which P has
+# matched, S1's match and then Q can still be placed in a continuation, so
+# only P can fail -- even an S1 that the design never satisfies (a_never).
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  logic r = 1'b0;
+  always_ff @(posedge clk) r <= 1'b0;
+  wire a = t == 4'd2;
+  a_ok:    assert property (@(posedge clk) a |-> ((##[0:$] t == 4'd4) within (t == 4'd2 ##[0:$] t == 4'd6)));
+  a_bad:   assert property (@(posedge clk) a |-> ((##[0:$] t == 4'd4) within (t == 4'd3 ##[0:$] t == 4'd6)));
+  a_never: assert property (@(posedge clk) a |-> ((##[0:$] r) within (t == 4'd2 ##[0:$] t == 4'd6)));
+  a_seq:   assert property (@(posedge clk) a |-> ((##[0:$] r) within (t == 4'd2 ##1 t == 4'd3 ##[0:$] t == 4'd9)));
+  a_seqb:  assert property (@(posedge clk) a |-> ((##[0:$] r) within (t == 4'd2 ##1 t == 4'd4 ##[0:$] t == 4'd9)));
+endmodule
+EOT
+hierarchy -top top
+logger -expect log "compiled with weak semantics \(within an unbounded delay\)" 5
+sva2check
+proc
+async2sync
+logger -expect log "a_ok: proved" 1
+logger -expect log "a_bad: disproved \(depth 2\)" 1
+logger -expect log "a_never: proved" 1
+logger -expect log "a_seq: proved" 1
+logger -expect log "a_seqb: disproved \(depth 3\)" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# a constant-false S1 stays refused (an expected error ends the script)
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, b, x);
+  a_r: assert property (@(posedge clk) a |-> ((##[0:$] 1'b0) within (a ##[0:$] b)));
+endmodule
+EOT
+hierarchy -top top
+logger -expect error "no finite bound" 1
+sva2check

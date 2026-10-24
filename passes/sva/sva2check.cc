@@ -4802,26 +4802,16 @@ struct SvaCompiler {
 				return true;
 			}
 		}
-		if (op != "##")
-			return false;
-		auto ps = ports_of(n);
-		bool lead2 = GetSize(ps) == 2;
-		int lo, hi;
-		if (!cycle(n, lo, hi))
-			return false;
-		Cell *lhs = lead2 ? nullptr : kid(n, 0);
-		int ti = lead2 ? 1 : 2;
-		Cell *tail = kid(n, ti);
-
 		// (d) P ##[m:$] Q, possibly inside the left ## spine
 		// (`(P ##[1:$] Q) ##1 R`, sha3pad): every element after the
 		// unbounded gap can still match in some continuation of the trace
 		// (Annex F weak semantics), so only P can fail.  A constant-false
 		// element after the gap is refused (left to the old error).
-		{
+		// 1: matched (f set), 0: not this shape, -1: refuse
+		auto shape_d = [&](Cell *top, SigSpec &f) -> int {
 			Cell *u = nullptr;
 			bool ok = true;
-			for (Cell *c = n; c && sva_op(c) == "##"; ) {
+			for (Cell *c = top; c && sva_op(c) == "##"; ) {
 				int clo, chi;
 				if (!cycle(c, clo, chi)) {
 					ok = false;
@@ -4848,13 +4838,68 @@ struct SvaCompiler {
 				bool ulead2 = GetSize(ports_of(u)) == 2;
 				Cell *ulhs = ulead2 ? nullptr : kid(u, 0);
 				if (ulead2)
-					fail = Const(0, 1);
+					f = Const(0, 1);
 				else if (!ulhs)
-					fail = andN({start, mod->Not(NEW_ID, boolv(u, 0))});
+					f = andN({start, mod->Not(NEW_ID, boolv(u, 0))});
 				else if (seq_max_len(ulhs) >= 0)
-					fail = strong_seq_fail(ulhs, start);
+					f = strong_seq_fail(ulhs, start);
 				else
-					return false;
+					return -1;
+				return 1;
+			}
+			return 0;
+		};
+		// S1 has no constant-false element: Booleans and ## of them
+		std::function<bool(Cell *, int)> sat_ok = [&](Cell *c, int i) -> bool {
+			Cell *k = kid(c, i);
+			if (!k) {
+				SigSpec q = rd(c, i);
+				return !(q.is_fully_const() && !q.as_bool());
+			}
+			std::string kop = sva_op(k);
+			if (kop == "true")
+				return true;
+			if (kop != "##")
+				return false;
+			int klo, khi;
+			if (!cycle(k, klo, khi))
+				return false;
+			return GetSize(ports_of(k)) == 2 ? sat_ok(k, 1) : sat_ok(k, 0) && sat_ok(k, 2);
+		};
+
+		// S1 within (P ##[m:$] Q), S1 satisfiable (otbn SecWipeChanged*):
+		// S1's match and then Q can be placed after any prefix, so only P
+		// can fail, as in (d)
+		if (op == "within") {
+			Cell *s2 = kid(n, 1);
+			if (!s2 || !sat_ok(n, 0))
+				return false;
+			SigSpec f2;
+			if (shape_d(s2, f2) != 1)
+				return false;
+			fail = f2;
+			note("within an unbounded delay");
+			return true;
+		}
+		if (op != "##")
+			return false;
+		auto ps = ports_of(n);
+		bool lead2 = GetSize(ps) == 2;
+		int lo, hi;
+		if (!cycle(n, lo, hi))
+			return false;
+		Cell *lhs = lead2 ? nullptr : kid(n, 0);
+		int ti = lead2 ? 1 : 2;
+		Cell *tail = kid(n, ti);
+
+		// (d): see shape_d above
+		{
+			SigSpec fd;
+			int r = shape_d(n, fd);
+			if (r < 0)
+				return false;
+			if (r > 0) {
+				fail = fd;
 				note("unbounded delay");
 				return true;
 			}

@@ -1,0 +1,20 @@
+# Statement delays are dropped by the frontend like stock yosys (silently at
+# read time: upstream's delay tests expect no warning), but each site is
+# recorded in (* sim_dropped_delays *) and `sim` warns, since sim is where
+# the lost timing changes the result (audit 2026-10-24: `#100 $finish`
+# fired at step 0 without a word).
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+module tb(input clk);
+  reg [3:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  initial begin #100 $finish; end
+endmodule
+EOT
+select -assert-mod-count 1 A:sim_dropped_delays
+select -assert-mod-count 0 A:sv_degraded
+proc
+logger -check-expected
+logger -expect warning "statement delay\(s\) dropped by the frontend at .*:4; sim runs those statements without waiting" 1
+sim -clock clk -n 3
+logger -check-expected

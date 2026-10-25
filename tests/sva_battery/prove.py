@@ -140,6 +140,11 @@ def replay_confirm(yosys, path, top, include, witness, settle_engine,
                                      top=" -top " + top if top else "",
                                      extra_a2s=extra_a2s, extra_mem=extra_mem,
                                      engine=run_ic3.engine_for(path) + bmc + ctg)
+    # ic3 -init-zero (and run_bmc's setundef -init -zero) start registers
+    # without an init value at 0; the witness does not carry those values,
+    # so replay the same initial state instead of x
+    if "-init-zero" in script or "setundef -init -zero" in script:
+        script += "setundef -init -zero\n"
     script += "sim -r %s -summary %s -vcd %s\n" % (witness, summary, vcd)
     ys = os.path.join(cexdir, "replay_%s.ys" % safe_name(label))
     with open(ys, "w") as fh:
@@ -164,6 +169,21 @@ def replay_confirm(yosys, path, top, include, witness, settle_engine,
         return False, "replay produced no readable summary: %s" % e
     fired = [a["step"] for a in doc.get("assertions", [])
              if a.get("path") and a["path"][-1].lstrip("\\") == label]
+    # a liveness-flavor check never "fires": sim lists it with the step its
+    # obligation has been pending since.  The lasso witness confirms the
+    # disproof iff the obligation is known (not x) and still open at the
+    # end of the trace, i.e. the witness's loop never discharges it.  (ic3's
+    # recorded depth for a liveness disproof is not the step the obligation
+    # opens, so it is not compared.)
+    live = [l for l in doc.get("liveness", []) if l.get("name") == label]
+    if live:
+        ps = live[0].get("pending_since", -1)
+        if not live[0].get("known"):
+            return False, "liveness obligation never evaluated to a known value (x)"
+        if ps >= 0:
+            return True, "liveness obligation pending from step %d through the end (%d steps)" % \
+                (ps, doc.get("steps"))
+        return False, "liveness obligation held at the last step (last at %d)" % live[0].get("last_true", -1)
     if step in fired:
         return True, "assertion fires at step %d (of %d)" % \
             (step, doc.get("steps"))

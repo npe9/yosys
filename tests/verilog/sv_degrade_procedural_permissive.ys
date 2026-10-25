@@ -1,0 +1,19 @@
+# Companion of sv_degrade_procedural.ys: under -permissive every dropped
+# simulation-only construct warns at its site and tags the module.
+logger -expect warning "wait \(\.\.\.\). is dropped" 1
+logger -expect warning "procedural event control .@\(\.\.\.\);. is dropped" 1
+logger -expect warning "fork/join runs its branches as one sequential block" 1
+logger -expect warning "forever. runs its body once" 1
+logger -expect warning "final. block runs at step 0" 1
+logger -expect warning "event trigger .-.. is dropped" 1
+read_verilog -sv -permissive <<EOT
+module t(input clk); reg [3:0] c = 0; reg a = 0, b = 0;
+  always @(posedge clk) c <= c + 1;
+  initial begin wait (c == 3); @(posedge clk); -> a; end
+  initial fork a = 1; #5 b = 1; join
+  initial forever #5 $display("tick");
+  final $display("done");
+endmodule
+EOT
+logger -check-expected
+select -assert-mod-count 1 A:sv_degraded

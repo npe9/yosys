@@ -1,0 +1,28 @@
+# sim scores liveness obligations (sva2check's FLAVOR "liveness" $check:
+# A must hold infinitely often) only at the end of the trace, as pending or
+# held -- a finite trace cannot violate liveness, so they never "fail" per
+# step.  Fairness assumptions are reported as not enforced.  Audit
+# 2026-10-24: before this, `s_eventually (c == 5)` on a free-running
+# counter (true) failed at every step where c != 5.
+read_verilog -sv -formal <<EOT
+module t(input clk, input a);
+  reg [2:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  assert property (@(posedge clk) s_eventually (c == 3'd5));
+  assume property (@(posedge clk) s_eventually a);
+  assert property (@(posedge clk) c == 3'd2 |=> c == 3'd3);
+endmodule
+EOT
+sva2check
+proc
+design -save t
+
+logger -expect log "liveness check .*: pending since step [0-9]+ at the end of the trace \(never held\)" 1
+logger -expect log "1 fairness assumption\(s\) not enforced" 1
+sim -clock clk -n 3 -zinit -assert
+logger -check-expected
+
+design -load t
+logger -expect log "liveness check .*: pending since step [0-9]+ at the end of the trace \(last held at step [0-9]+\)" 1
+sim -clock clk -n 10 -zinit -assert
+logger -check-expected

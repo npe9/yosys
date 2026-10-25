@@ -887,7 +887,7 @@ struct AST_INTERNAL::ProcessGenerator
 				// $print, no arguments; the sim pass ends the run when the
 				// cell fires
 				std::stringstream sstr;
-				sstr << ast->str << "$" << ast->location.begin.filename << ":" << ast->location.begin.line << "$" << (autoidx++);
+				sstr << ast->str << "$" << RTLIL::encode_filename(*ast->location.begin.filename) << ":" << ast->location.begin.line << "$" << (autoidx++);
 
 				Wire *en = current_module->addWire(sstr.str() + "_EN", 1);
 				set_src_attr(en, ast);
@@ -920,7 +920,7 @@ struct AST_INTERNAL::ProcessGenerator
 			if (ast->str == "$display" || ast->str == "$displayb" || ast->str == "$displayh" || ast->str == "$displayo" ||
 		  ast->str == "$write"   || ast->str == "$writeb"   || ast->str == "$writeh"   || ast->str == "$writeo") {
 				std::stringstream sstr;
-				sstr << ast->str << "$" << ast->location.begin.filename << ":" << ast->location.begin.line << "$" << (autoidx++);
+				sstr << ast->str << "$" << RTLIL::encode_filename(*ast->location.begin.filename) << ":" << ast->location.begin.line << "$" << (autoidx++);
 
 				Wire *en = current_module->addWire(sstr.str() + "_EN", 1);
 				set_src_attr(en, ast);

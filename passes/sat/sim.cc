@@ -138,6 +138,13 @@ struct SimShared
 	bool allow_unlowered = false;
 	std::vector<std::string> unlowered;
 	dict<RTLIL::Cell*, bool> check_known;
+	// liveness obligations ($live, FLAVOR "live"/"liveness": A must hold
+	// infinitely often) cannot fail on a finite trace; sim records when A
+	// last held and reports obligations still open at the end.  Fairness
+	// assumptions ($fair, FLAVOR "fair") are not enforced, and say so.
+	struct LiveState { int last_true = -1; int pending_since = -1; bool known = false; };
+	dict<RTLIL::Cell*, LiveState> live_state;
+	pool<RTLIL::Cell*> fair_cells;
 	// xprop merge (default, LRM): x mux-select merges equal arms per bit.
 	// xprop pessimistic: any x in a mux/bwmux select poisons the result.
 	bool xprop_pessimistic = false;
@@ -278,6 +285,13 @@ struct SimInstance
 			parent->children[instance] = this;
 		}
 
+		// the Verilog frontend drops statement delays (`#N stmt`) like stock
+		// yosys and records where; sim is where the lost timing shows
+		if (module->has_attribute(ID(sim_dropped_delays)))
+			log_warning("Module %s: statement delay(s) dropped by the frontend at %s; sim runs those statements "
+					"without waiting (an `initial #N $finish' fires at step 0).\n", log_id(module),
+					module->get_string_attribute(ID(sim_dropped_delays)).c_str());
+
 		for (auto wire : module->wires())
 		{
 			SigSpec sig = sigmap(wire);
@@ -371,7 +385,7 @@ struct SimInstance
 					fst_memories[name] = shared->fst->getMemoryHandles(scope + "." + RTLIL::unescape_id(name));
 			}
 
-			if (cell->type.in(ID($assert), ID($cover), ID($assume), ID($check)))
+			if (cell->type.in(ID($assert), ID($cover), ID($assume), ID($check), ID($live), ID($fair)))
 				formal_database.insert(cell);
 			// the frontend's formal cells are ESCAPED types (`\$sva`, `\$past`,
 			// ...: addCell with the literal "\\$sva"), not the builtin
@@ -1079,10 +1093,34 @@ struct SimInstance
 				if (cell->type == ID($check) && cell->parameters.count(ID(FLAVOR).c_str()))
 					flavor = cell->parameters.at(ID(FLAVOR).c_str()).decode_string();
 				bool is_cover = cell->type == ID($cover) || flavor == "cover";
-				bool is_assume = cell->type == ID($assume) || flavor == "assume";
+				bool is_assume = cell->type == ID($assume) || flavor == "assume" || flavor == "restrict";
+				bool is_live = cell->type == ID($live) || flavor == "live" || flavor == "liveness";
+				bool is_fair = cell->type == ID($fair) || flavor == "fair";
 
 				State a = get_state(cell->getPort(ID::A))[0];
 				State en = get_state(cell->getPort(ID::EN))[0];
+
+				if (is_fair) {
+					shared->fair_cells.insert(cell);
+					continue;
+				}
+				if (is_live) {
+					// never a per-step failure: only "still pending" at the end
+					auto &ls = shared->live_state[cell];
+					if (en == State::S1) {
+						if (a == State::S1) {
+							ls.last_true = shared->step;
+							ls.pending_since = -1;
+							ls.known = true;
+						} else {
+							if (a == State::S0)
+								ls.known = true;
+							if (ls.pending_since < 0)
+								ls.pending_since = shared->step;
+						}
+					}
+					continue;
+				}
 
 				if (en == State::S1 && (is_cover ? a == State::S1 : a != State::S1)) {
 					shared->triggered_assertions.emplace_back(shared->step, this, cell);
@@ -2324,6 +2362,23 @@ struct SimWorker : SimShared
 			json.end_object();
 		}
 		json.end_array();
+		// liveness obligations (never per-step failures): when A last held
+		// and since when it is pending at the end of the trace (-1: never)
+		json.name("liveness");
+		json.begin_array();
+		for (auto &it : live_state) {
+			json.begin_object();
+			json.entry("type", it.first->type.unescape());
+			json.entry("name", it.first->name.unescape());
+			json.entry("last_true", it.second.last_true);
+			json.entry("pending_since", it.second.pending_since);
+			json.entry("known", it.second.known);
+			auto src = it.first->get_string_attribute(ID::src);
+			if (!src.empty())
+				json.entry("src", src);
+			json.end_object();
+		}
+		json.end_array();
 		json.name("display_output");
 		json.begin_array();
 		for (auto &output : display_output) {
@@ -2850,6 +2905,11 @@ struct SimPass : public Pass {
 		log("        both arms agree.  ($pmux is always all-x on an x select.)\n");
 		log("        Use for verification pessimism / CDC screening; results\n");
 		log("        under this mode deliberately diverge from the LRM table.\n");
+		log("        Bits the frontend already folded to constants (e.g. the\n");
+		log("        zero-extension of a narrower ?:) are not muxed and stay definite.\n");
+		log("        Both modes are RTLIL cell semantics.  A procedural if/case on an x\n");
+		log("        condition is simulated as the $mux/$pmux that proc made of it, not\n");
+		log("        with the LRM rule (an x if-condition takes the else branch).\n");
 		log("\n");
 		log("    -date\n");
 		log("        include date and full version info in output.\n");
@@ -3203,6 +3263,30 @@ struct SimPass : public Pass {
 		}
 
 		worker.write_summary();
+
+		// liveness: a finite trace can leave an obligation open, never violate it
+		{
+			std::vector<std::pair<std::string, std::string>> rows;
+			for (auto &it : worker.live_state) {
+				auto &ls = it.second;
+				std::string state;
+				if (!ls.known)
+					state = "never evaluated to a known value";
+				else if (ls.pending_since >= 0)
+					state = stringf("pending since step %d at the end of the trace%s", ls.pending_since,
+							ls.last_true >= 0 ? stringf(" (last held at step %d)", ls.last_true).c_str() : " (never held)");
+				else
+					state = stringf("held at the last step (%d)", ls.last_true);
+				rows.emplace_back(log_id(it.first), state);
+			}
+			std::sort(rows.begin(), rows.end());
+			for (auto &r : rows)
+				log("sim: liveness check %s: %s; a finite trace cannot violate liveness, this is not a counterexample\n",
+						r.first.c_str(), r.second.c_str());
+			if (!worker.fair_cells.empty())
+				log("sim: %d fairness assumption(s) not enforced (sim replays inputs, it cannot restrict them to fair runs)\n",
+						GetSize(worker.fair_cells));
+		}
 
 		// register v3 B2: a check that never saw a known value was never
 		// really checked

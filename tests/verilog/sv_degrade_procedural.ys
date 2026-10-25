@@ -1,0 +1,11 @@
+# Simulation-only procedural constructs the frontend does not model are
+# frontend degradations (register v3 A2; audit 2026-10-24): an error by
+# default, a per-site warning plus (* sv_degraded *) under -permissive.
+# Before, `wait`, `@(...);`, fork/join and forever were accepted silently
+# (stock yosys rejects them).
+logger -expect error "wait \(\.\.\.\). is dropped" 1
+read_verilog -sv <<EOT
+module t(input clk); reg [3:0] c = 0; always @(posedge clk) c <= c + 1;
+  initial begin wait (c == 3); $display("c=%0d", c); end
+endmodule
+EOT

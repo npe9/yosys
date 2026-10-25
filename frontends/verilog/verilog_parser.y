@@ -296,6 +296,41 @@
 					element, before->c_str() + 1, after->c_str() + 1);
 		}
 
+		// register v3 A2: a simulation-only statement the formal/synthesis
+		// flow does not model is a frontend degradation like any other (an
+		// error, or under -permissive a warning plus (* sv_degraded *) on
+		// the module being parsed)
+		static void note_dropped_delay(ParseState *extra, const frontend_verilog_yy::parser::location_type& loc)
+		{
+			AstNode *mod = extra->current_ast_mod;
+			if (mod == nullptr || mod->type != AST_MODULE)
+				return;
+			auto l = loc.to_loc();
+			std::string where = stringf("%s:%d", l.filename.c_str(), l.start_line);
+			IdString attr = IdString("\\sim_dropped_delays");
+			auto it = mod->attributes.find(attr);
+			std::string cur = (it != mod->attributes.end() && it->second) ? it->second->str : "";
+			mod->attributes[attr] = AstNode::mkconst_str(mod->location, cur.empty() ? where : cur + " " + where);
+		}
+
+		static void parse_degrade(ParseState *extra, const frontend_verilog_yy::parser::location_type& loc, const char *what,
+				bool upstream_leniency = false)
+		{
+			struct Restore {
+				AstNode *mod = AST_INTERNAL::current_ast_mod;
+				RTLIL::Module *rtl = AST_INTERNAL::current_module;
+				~Restore() { AST_INTERNAL::current_ast_mod = mod; AST_INTERNAL::current_module = rtl; }
+			} restore;
+			AST_INTERNAL::current_ast_mod = extra->current_ast_mod;
+			AST_INTERNAL::current_module = nullptr;
+			// a leniency stock yosys has too (statement delays) warns and tags
+			// but is never an error, like implicit nets (AST::degrade_warn)
+			if (upstream_leniency)
+				AST::degrade_warn(loc.to_loc(), "%s (simulation-only; not modeled).", what);
+			else
+				AST::degrade(loc.to_loc(), "%s (simulation-only; not modeled).", what);
+		}
+
 		AstNode* ParseState::saveChild(std::unique_ptr<AstNode> child) {
 			auto* child_leaky = child.get();
 			ast_stack.back()->children.push_back(std::move(child));
@@ -4181,6 +4216,7 @@ always_stmt:
 		extra->ast_stack.pop_back();
 	} |
 	attr TOK_FINAL {
+		parse_degrade(extra, @2, "`final' block runs at step 0, like an initial block");
 		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_INITIAL));
 		append_attr(node, std::move($1));
 		(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_BLOCK));
@@ -4895,7 +4931,12 @@ rvalue_call_stmt:
 // this production creates the obligatory if-else shift/reduce conflict
 behavioral_stmt:
 	defattr | assert | wire_decl | param_decl | localparam_decl | typedef_decl |
-	non_opt_delay behavioral_stmt |
+	non_opt_delay behavioral_stmt {
+		// stock yosys drops statement delays silently and upstream tests
+		// expect no warning; record the site on the module instead, and
+		// `sim` (the one consumer whose result the delay changes) warns
+		note_dropped_delay(extra, @1);
+	} |
 	simple_behavioral_stmt TOK_SEMICOL |
 	attr TOK_SEMICOL |
 	attr TOK_RETURN expr TOK_SEMICOL {
@@ -4937,15 +4978,19 @@ behavioral_stmt:
 			    break;
 			}
 		extra->ast_stack.pop_back();
+		parse_degrade(extra, @2, "fork/join runs its branches as one sequential block");
 		(void)$1;
 	} |
 	attr TOK_DISABLE TOK_FORK TOK_SEMICOL {
+		parse_degrade(extra, @2, "`disable fork' is dropped");
 		(void)$1;
 	} |
 	attr TOK_WAIT TOK_FORK TOK_SEMICOL {
+		parse_degrade(extra, @2, "`wait fork' is dropped");
 		(void)$1;
 	} |
 	attr TOK_WAIT TOK_LPAREN expr TOK_RPAREN opt_semi {
+		parse_degrade(extra, @2, "`wait (...)' is dropped: the statements after it run without waiting");
 		(void)$1;
 		(void)$4;
 	} |
@@ -4985,6 +5030,7 @@ behavioral_stmt:
 		extra->ast_stack.pop_back();
 	} |
 	attr TOK_FOREVER behavioral_stmt {
+		parse_degrade(extra, @2, "`forever' runs its body once");
 		(void)$1;
 	} |
 	attr TOK_RANDCASE {
@@ -5002,6 +5048,7 @@ behavioral_stmt:
 		extra->ast_stack.pop_back();
 	} |
 	attr proc_at TOK_LPAREN event_wait_list TOK_RPAREN TOK_SEMICOL {
+		parse_degrade(extra, @2, "procedural event control `@(...);' is dropped: the statements after it run without waiting");
 		(void)$1;
 	} |
 	attr proc_at rvalue behavioral_stmt {
@@ -5009,17 +5056,20 @@ behavioral_stmt:
 		// `@ev a = 1;` (IEEE 9.4.2, simulation-only): the wait itself is
 		// not modeled, but the statement body stays in the flow so it
 		// still elaborates (a bare `;` body keeps `@ev;` a plain no-op)
+		parse_degrade(extra, @2, "procedural event wait `@ev' is dropped: its statement runs without waiting");
 		(void)$1;
 		(void)$3;
 	} |
 	attr TOK_ARROW rvalue TOK_SEMICOL {
 		// event trigger statement, e.g. `->w.trigger;` (simulation-only)
+		parse_degrade(extra, @2, "event trigger `->' is dropped");
 		(void)$1;
 		(void)$3;
 	} |
 	attr TOK_NB_ARROW rvalue TOK_SEMICOL {
 		// nonblocking event trigger statement, e.g. `->>top.e;`
 		// (IEEE 15.5.1, simulation-only)
+		parse_degrade(extra, @2, "event trigger `->>' is dropped");
 		(void)$1;
 		(void)$3;
 	} |
@@ -5132,6 +5182,7 @@ behavioral_stmt:
 		extra->ast_stack.pop_back();
 	} |
 	attr TOK_ID TOK_COL attr TOK_FORK opt_label fork_stmts fork_join {
+		parse_degrade(extra, @4, "fork/join runs its branches as one sequential block");
 		(void)$1;
 	} |
 	attr TOK_BEGIN {

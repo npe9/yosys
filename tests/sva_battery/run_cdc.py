@@ -10,10 +10,11 @@ pass intentionally changes).
 Expected findings (one table line per crossing bit, plus reset findings):
   cdc_sync_2ff   | 1x OK       synchronizer-2ff    (clk_a -> clk_b)
   cdc_bare       | 1x ERROR    unsynchronized-bit  (clk_a -> clk_b)
-  cdc_gray_bus   | 4x OK       gray-bus            (clk_a -> clk_b, 4 bits)
+  cdc_gray_bus   | 4x WARNING  comb-before-sync    (clk_a -> clk_b, 4 bits: the Gray
+                   |                                value is combinational, not a launch flop)
   cdc_reset      | 2x WARNING  reset-cdc           (external port + foreign domain)
-  cdc_async_fifo | 8x OK       gray-bus            (two 4-bit gray pointers,
-                   |                                full/empty EQ compares)
+  cdc_async_fifo | 8x WARNING  comb-before-sync    (two 4-bit gray pointers, each a
+                   |                                combinational encoder output)
                    | 1x OK       synchronizer-2ff    (flag, clk_a -> clk_b)
   cdc_eq_bin     | 4x WARNING  synced-bus          (4-bit binary pointer,
                    |                                EQ compare is not Gray)
@@ -56,9 +57,9 @@ CASES = os.path.join(REPO, "tests", "verilog", "cdc_cases.sv")
 EXPECTED = {
     ("cdc_sync_2ff", "OK", "synchronizer-2ff"): 1,
     ("cdc_bare", "ERROR", "unsynchronized-bit"): 1,
-    ("cdc_gray_bus", "OK", "gray-bus"): 4,
+    ("cdc_gray_bus", "WARNING", "comb-before-sync"): 4,
     ("cdc_reset", "WARNING", "reset-cdc"): 2,
-    ("cdc_async_fifo", "OK", "gray-bus"): 8,
+    ("cdc_async_fifo", "WARNING", "comb-before-sync"): 8,
     ("cdc_async_fifo", "OK", "synchronizer-2ff"): 1,
     ("cdc_eq_bin", "WARNING", "synced-bus"): 4,
     # clock network analysis (generated clocks, gating, families)

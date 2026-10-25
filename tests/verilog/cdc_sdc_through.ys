@@ -1,0 +1,27 @@
+# read_sdc / cdc pairing (audit 2026-10-24): a set_false_path narrowed by
+# -through waives only some paths, so it must not downgrade every crossing
+# between the two clocks; targets no consumer interprets ([get_nets ...]) and
+# non-numeric -period values warn instead of vanishing.
+read_verilog -sv <<EOT
+module t(input clk_a, clk_b, din, output reg q);
+  reg s; always @(posedge clk_a) s <= din;
+  always @(posedge clk_b) q <= s;
+endmodule
+EOT
+proc
+! mkdir -p temp
+write_file temp/cdc_sdc_through.sdc <<EOT
+set P 10
+create_clock -name A -period 10 [get_ports clk_a]
+create_clock -name B -period $P [get_ports clk_b]
+create_clock -name B -period 7 [get_ports clk_b]
+set_false_path -from [get_clocks A] -to [get_clocks B] -through [get_nets s]
+EOT
+logger -expect warning "create_clock -period '\$P' is not a number" 1
+logger -expect warning "target \[get_nets s\] is not interpreted" 1
+read_sdc temp/cdc_sdc_through.sdc
+logger -check-expected
+logger -expect log "set_false_path with -through not used for clock pairing" 1
+logger -expect log "ERROR: +unsynchronized-bit +clk_a -> clk_b" 1
+cdc
+logger -check-expected

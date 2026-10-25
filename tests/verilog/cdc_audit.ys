@@ -1,0 +1,94 @@
+# cdc audit 2026-10-24: each adversarial case that used to get a false OK (or
+# a silent miss) now gets the verdict below.
+read_verilog -sv <<EOT
+// metastable first stage also feeds logic -> ERROR sync-fanout
+module r2_meta_fanout(input clk_a, clk_b, din, output reg q, output reg r);
+  reg s, m; always @(posedge clk_a) s <= din;
+  always @(posedge clk_b) m <= s;
+  always @(posedge clk_b) q <= m;
+  always @(posedge clk_b) r <= r ^ m;
+endmodule
+// logic of two source flops in front of the synchronizer -> WARNING comb-before-sync
+module r3_comb_before(input clk_a, clk_b, d1, d2, output reg q);
+  reg a1, a2; always @(posedge clk_a) begin a1 <= d1; a2 <= d2; end
+  wire x = a1 ^ a2;
+  reg m; always @(posedge clk_b) begin m <= x; q <= m; end
+endmodule
+// Gray encoder over a counter stepping by 3 -> WARNING gray-bus-unverified
+module r8_fake_gray(input clk_a, clk_b, output [3:0] bin_b);
+  reg [3:0] bin_a; wire [3:0] g = bin_a ^ (bin_a >> 1);
+  reg [3:0] ga, b1, b2;
+  always @(posedge clk_a) begin bin_a <= bin_a + 4'd3; ga <= g; end
+  always @(posedge clk_b) begin b1 <= ga; b2 <= b1; end
+  assign bin_b[3]=b2[3]; assign bin_b[2]=b2[3]^b2[2];
+  assign bin_b[1]=b2[3]^b2[2]^b2[1]; assign bin_b[0]=b2[3]^b2[2]^b2[1]^b2[0];
+endmodule
+// the same with a +1 counter -> OK gray-bus (the step is proved)
+module r8_real_gray(input clk_a, clk_b, output [3:0] bin_b);
+  reg [3:0] bin_a; wire [3:0] g = bin_a ^ (bin_a >> 1);
+  reg [3:0] ga, b1, b2;
+  always @(posedge clk_a) begin bin_a <= bin_a + 4'd1; ga <= g; end
+  always @(posedge clk_b) begin b1 <= ga; b2 <= b1; end
+  assign bin_b[3]=b2[3]; assign bin_b[2]=b2[3]^b2[2];
+  assign bin_b[1]=b2[3]^b2[2]^b2[1]; assign bin_b[0]=b2[3]^b2[2]^b2[1]^b2[0];
+endmodule
+// two port operands that both look like clocks -> WARNING clock-gating-ambiguous
+module r9c_fake_clkname(input clk, my_clk_en_async, output reg [1:0] c);
+  wire g = clk & my_clk_en_async; always @(posedge g) c <= c + 1;
+endmodule
+// crossing into a muxed clock -> ERROR unsynchronized-bit (no clock family)
+module r11_clkmux(input clk_a, clk_b, sel, din, output reg q, output reg qb);
+  reg s; always @(posedge clk_a) s <= din;
+  always @(posedge clk_b) qb <= din;
+  wire mclk = sel ? clk_b : clk_a;
+  always @(posedge mclk) q <= s;
+endmodule
+// active-high reset synchronizer (D tied 0, resets to 1) -> OK
+module r17_rst_sync_hi(input clk, rst, output reg [1:0] c);
+  reg r1, r2;
+  always @(posedge clk or posedge rst) if (rst) begin r1<=1; r2<=1; end else begin r1<=0; r2<=r1; end
+  always @(posedge clk or posedge r2) if (r2) c <= 0; else c <= c + 1;
+endmodule
+// "synchronizer" that never asserts (D tied 1, resets to 1) -> WARNING reset-cdc
+module r18_rst_fake(input clk, rst_n, output reg [1:0] c);
+  reg r1, r2;
+  always @(posedge clk or negedge rst_n) if (!rst_n) begin r1<=1; r2<=1; end else begin r1<=1; r2<=r1; end
+  always @(posedge clk or negedge r2) if (!r2) c <= 0; else c <= c + 1;
+endmodule
+// a crossing through a latch: not analyzed, said so
+module r5_latch(input clk_a, clk_b, en, din, output reg q);
+  reg s; always @(posedge clk_a) s <= din;
+  reg l; always @* if (en) l = s;
+  always @(posedge clk_b) q <= l;
+endmodule
+EOT
+proc
+opt_clean
+
+logger -expect log "ERROR: +sync-fanout +clk_a -> clk_b" 1
+cdc r2_meta_fanout
+logger -check-expected
+logger -expect log "WARNING: +comb-before-sync +clk_a -> clk_b" 1
+cdc r3_comb_before
+logger -check-expected
+logger -expect log "WARNING: +gray-bus-unverified" 4
+cdc r8_fake_gray
+logger -check-expected
+logger -expect log "OK: +gray-bus +clk_a -> clk_b" 4
+cdc r8_real_gray
+logger -check-expected
+logger -expect log "WARNING: +clock-gating-ambiguous" 1
+cdc r9c_fake_clkname
+logger -check-expected
+logger -expect log "ERROR: +unsynchronized-bit +clk_a -> mclk" 1
+cdc r11_clkmux
+logger -check-expected
+logger -expect log "OK: +reset-sync-(stage|deassert)" 3
+cdc r17_rst_sync_hi
+logger -check-expected
+logger -expect log "WARNING: +reset-cdc" 2
+cdc r18_rst_fake
+logger -check-expected
+logger -expect warning "1 latch\(es\) not analyzed" 1
+cdc r5_latch
+logger -check-expected

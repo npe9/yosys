@@ -43,6 +43,8 @@
 #include "passes/cmds/sdc_constraints.h"
 #include "libs/json11/json11.hpp"
 
+#include "kernel/satgen.h"
+
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
@@ -65,6 +67,11 @@ struct Crossing {
 	bool synced;
 	Cell *ffcell;
 	int qidx;
+	// synchronized crossings only: the first (metastable) stage's Q also
+	// feeds something other than the second stage; the crossing D bit is
+	// combinational logic rather than a launch flop's Q
+	bool fanout = false;
+	bool comb = false;
 };
 
 struct CdcAnalyzer
@@ -86,6 +93,9 @@ struct CdcAnalyzer
 
 	std::vector<CdcFinding> findings;
 	int num_crossing_nets = 0;
+	// bounded searches that gave up (their fallback is the conservative
+	// answer: not held / not a clock path / not Gray); reported per module
+	int bound_hits = 0;
 
 	CdcAnalyzer(Module *module) : module(module), sigmap(module) { }
 
@@ -281,7 +291,11 @@ struct CdcAnalyzer
 		std::vector<SigBit> work;
 		work.push_back(bit);
 		seen.insert(bit);
-		while (!work.empty() && depth < 64) {
+		while (!work.empty()) {
+			if (depth >= 64) {
+				bound_hits++;
+				break;
+			}
 			SigBit b = work.back();
 			work.pop_back();
 			depth++;
@@ -320,7 +334,11 @@ struct CdcAnalyzer
 		work.push_back(bit);
 		seen.insert(bit);
 		int steps = 0;
-		while (!work.empty() && steps < 256) {
+		while (!work.empty()) {
+			if (steps >= 256) {
+				bound_hits++;
+				break;
+			}
 			SigBit b = work.back();
 			work.pop_back();
 			steps++;
@@ -350,7 +368,7 @@ struct CdcAnalyzer
 	// glitch-free gating.  Returns parents (deduped); fills path_cells,
 	// enbits, and ext_parent.
 	void analyze_clock(int d, std::set<int> &parents, pool<Cell *> &path_cells,
-			pool<SigBit> &enbits, bool &ext_parent)
+			pool<SigBit> &enbits, bool &ext_parent, bool &ambiguous)
 	{
 		auto looks_like_clock = [&](SigBit bit) {
 			std::string n = bit.wire->name.unescape();
@@ -385,6 +403,7 @@ struct CdcAnalyzer
 			if (!is_gate_cell(drv))
 				continue;	// unrelated logic driving the net: stop
 			path_cells.insert(drv);
+			int ext_cands = 0;
 			for (auto &conn : drv->connections()) {
 				if (!drv->input(conn.first))
 					continue;
@@ -399,7 +418,11 @@ struct CdcAnalyzer
 					}
 					if (inbit.wire->port_input && looks_like_clock(inbit)) {
 						// a top-level clock port this gate derives from
+						// (by NAME: two such operands of one gate cannot
+						// be told apart, which the caller reports)
 						ext_parent = true;
+						if (++ext_cands > 1)
+							ambiguous = true;
 						continue;
 					}
 					if (!seen.count(inbit) && reaches_clock(inbit))
@@ -422,11 +445,13 @@ struct CdcAnalyzer
 			std::set<int> parents;
 			pool<Cell *> path_cells;
 			pool<SigBit> enbits;
-			bool ext_parent = false;
-			analyze_clock(d, parents, path_cells, enbits, ext_parent);
+			bool ext_parent = false, ambiguous = false;
+			analyze_clock(d, parents, path_cells, enbits, ext_parent, ambiguous);
 			if (parents.empty() && !ext_parent)
 				continue;	// a genuine root (port/undriven clock)
-			if (!parents.empty())
+			// (c) a clock mux (several parents) belongs to no parent's
+			// family: it is asynchronous to every one of them
+			if (GetSize(parents) == 1)
 				domain_parent[d] = *parents.begin();
 			std::string parent_names;
 			for (int p : parents) {
@@ -489,6 +514,10 @@ struct CdcAnalyzer
 					gate_sev[d] = "OK";
 					gate_cls[d] = "clock-gate-icg";
 				}
+			}
+			if (ambiguous && gate_sev[d] != "ERROR") {
+				gate_sev[d] = "WARNING";
+				gate_cls[d] = "clock-gating-ambiguous";
 			}
 			if (!gate_cls[d].empty())
 				findings.push_back({gate_sev[d], gate_cls[d], parent_names,
@@ -568,13 +597,13 @@ struct CdcAnalyzer
 	dict<std::pair<int, SigBit>, std::pair<pool<Cell *>, pool<SigBit>>> reset_chains;
 	bool reset_chains_built = false;
 
-	bool d_const1(SigSpec sig)
+	// D tied to one constant 0/1 bit: returns it, else Sx
+	RTLIL::State d_const(SigSpec sig)
 	{
 		sig = sigmap(sig);
-		for (auto bit : sig)
-			if (bit.wire || bit.data != RTLIL::S1)
-				return false;
-		return true;
+		if (GetSize(sig) != 1 || sig[0].wire || (sig[0].data != RTLIL::S0 && sig[0].data != RTLIL::S1))
+			return RTLIL::Sx;
+		return sig[0].data;
 	}
 
 	void build_reset_chains()
@@ -603,7 +632,9 @@ struct CdcAnalyzer
 			for (Cell *c : stages) {
 				FfData cf(nullptr, c);
 				SigBit q = sigmap(cf.sig_q[0]);
-				if (d_const1(cf.sig_d))
+				RTLIL::State dc = d_const(cf.sig_d);
+				if (dc != RTLIL::Sx && GetSize(cf.val_arst) == 1 &&
+						cf.val_arst[0] == (dc == RTLIL::S1 ? RTLIL::S0 : RTLIL::S1))
 					heads.insert(c);
 				for (Cell *o : stages) {
 					if (o == c)
@@ -620,7 +651,11 @@ struct CdcAnalyzer
 				std::vector<Cell *> chain;
 				pool<Cell *> seen;
 				Cell *cur = h;
+				FfData hf(nullptr, h);
 				while (cur && seen.insert(cur).second) {
+					FfData sf(nullptr, cur);
+					if (GetSize(sf.val_arst) != 1 || sf.val_arst[0] != hf.val_arst[0])
+						break;	// a stage resetting to the other value
 					chain.push_back(cur);
 					auto nit = nxt.find(cur);
 					cur = nit != nxt.end() ? nit->second : nullptr;
@@ -758,6 +793,12 @@ struct CdcAnalyzer
 		for (auto &p : c.path_exceptions) {
 			if (p.kind != "false_path")
 				continue;
+			// a false path narrowed by -through waives only some paths
+			// between the two clocks: it never waives the clock pair
+			if (!p.through.empty()) {
+				log("cdc: %s: set_false_path with -through not used for clock pairing\n", log_id(module->name));
+				continue;
+			}
 			add_pairs(match_clock_names(p.from), match_clock_names(p.to));
 		}
 		sdc_active = !sdc_port_clocks.empty() || !sdc_async_pairs.empty();
@@ -915,7 +956,7 @@ struct CdcAnalyzer
 	// EQ-compare case.  When `dom` >= 0, every flip-flop hopped through on
 	// the way back to the encoder $xor must belong to clock domain `dom`,
 	// so a foreign/source-domain vector is never accepted as local Gray.
-	bool gray_encoder(const std::vector<SigBit> &dbits, int dom)
+	bool gray_encoder(const std::vector<SigBit> &dbits, int dom, std::vector<SigBit> *wbits_out = nullptr)
 	{
 		int n = GetSize(dbits);
 		std::vector<std::vector<std::pair<SigBit, SigBit>>> opts(n);
@@ -979,9 +1020,12 @@ struct CdcAnalyzer
 		// neighbor: gray[i+1]'s w bit must be gray[i]'s nxt bit, with the
 		// offsets stepping one way through a single wire.
 		long nodes = 0;
+		std::vector<SigBit> chosen(n);
 		std::function<bool(int, Wire *, int, int, SigBit)> dfs = [&](int k, Wire *w, int prev_off, int step, SigBit prev_nxt) {
-			if (++nodes > 100000)
+			if (++nodes > 100000) {
+				bound_hits++;
 				return false;
+			}
 			if (k == n)
 				return true;
 			for (auto &opt : opts[k]) {
@@ -999,12 +1043,92 @@ struct CdcAnalyzer
 					if (step == 0)
 						step = d;
 				}
+				chosen[k] = cur;
 				if (dfs(k + 1, w != nullptr ? w : cur.wire, cur.offset, step, nxt))
 					return true;
 			}
 			return false;
 		};
-		return dfs(0, nullptr, 0, 0, SigBit());
+		if (!dfs(0, nullptr, 0, 0, SigBit()))
+			return false;
+		if (wbits_out)
+			*wbits_out = chosen;
+		return true;
+	}
+
+	// Gray step check: a Gray-coded value changes at most one bit per
+	// source clock only if the binary vector it encodes steps by +1, -1 or
+	// holds.  The vector must be register Q bits; SAT proves D - Q in
+	// {0, +1, -1} (mod 2^n) over the D cone for EVERY current state and
+	// input (a sufficient check: a counter that loads arbitrary values, or
+	// steps by 3, fails it).  Unsupported cells or a non-register vector:
+	// unverified.
+	bool gray_step_ok(std::vector<SigBit> wbits)
+	{
+		int n = GetSize(wbits);
+		if (n < 1)
+			return false;
+		std::sort(wbits.begin(), wbits.end(), [](const SigBit &a, const SigBit &b) {
+			if (a.wire != b.wire)
+				return a.wire->name < b.wire->name;
+			return a.offset < b.offset;
+		});
+		for (int i = 1; i < n; i++)
+			if (wbits[i].wire != wbits[0].wire || wbits[i].offset != wbits[i - 1].offset + 1)
+				return false;
+		SigSpec q, dsig;
+		for (auto b : wbits) {
+			auto dit = drivers.find(sigmap(b));
+			if (dit == drivers.end() || !dit->second.first->is_builtin_ff())
+				return false;
+			FfData ff(nullptr, dit->second.first);
+			int idx = dit->second.second;
+			if (!ff.has_clk || idx < 0 || idx >= GetSize(ff.sig_d))
+				return false;
+			q.append(sigmap(b));
+			dsig.append(sigmap(ff.sig_d[idx]));
+		}
+		// backward comb cone of the D bits, stopping at FF Q / ports
+		pool<Cell *> cone;
+		std::vector<SigBit> work;
+		pool<SigBit> seen;
+		for (auto b : dsig)
+			if (b.wire && seen.insert(b).second)
+				work.push_back(b);
+		while (!work.empty()) {
+			SigBit b = work.back();
+			work.pop_back();
+			auto dit = drivers.find(b);
+			if (dit == drivers.end())
+				continue;
+			Cell *drv = dit->second.first;
+			if (drv->is_builtin_ff() || drv->type.in(ID($dl), ID($dlatch)))
+				continue;
+			if (!cone.insert(drv).second)
+				continue;
+			if (GetSize(cone) > 2000) {
+				bound_hits++;
+				return false;
+			}
+			for (auto &conn : drv->connections()) {
+				if (!drv->input(conn.first))
+					continue;
+				for (auto ib : sigmap(conn.second))
+					if (ib.wire && seen.insert(ib).second)
+						work.push_back(ib);
+			}
+		}
+		ezSatPtr ez;
+		SatGen satgen(ez.get(), &sigmap);
+		for (Cell *c : cone)
+			if (!satgen.importCell(c))
+				return false;
+		std::vector<int> qv = satgen.importSigSpec(q), dv = satgen.importSigSpec(dsig);
+		std::vector<int> one = ez->vec_const_unsigned(1, n);
+		int same = ez->vec_eq(dv, qv);
+		int up = ez->vec_eq(dv, ez->vec_add(qv, one));
+		int down = ez->vec_eq(dv, ez->vec_sub(qv, one));
+		return !ez->solve(ez->NOT(ez->OR(same, ez->OR(up, down))));
 	}
 
 	bool gray_encoder(const std::vector<Crossing> &comp)
@@ -1067,8 +1191,10 @@ struct CdcAnalyzer
 		}
 		long nodes = 0;
 		std::function<bool(SigBit, std::vector<char> &, int)> dfs = [&](SigBit prefy, std::vector<char> &used, int depth) {
-			if (++nodes > 100000)
+			if (++nodes > 100000) {
+				bound_hits++;
 				return false;
+			}
 			if (depth == n - 1)
 				return true;
 			for (auto &cd : cands) {
@@ -1235,8 +1361,30 @@ struct CdcAnalyzer
 								domain_names[d_ff], bit_name(dsig[i]), cname});
 					if (foreign.empty())
 						continue;
-					crossings.push_back({d_ff, foreign, bit_name(dsig[i]), dsig[i], cname,
-							is_synchronized(cell, i, d_ff), cell, i});
+					Crossing c{d_ff, foreign, bit_name(dsig[i]), dsig[i], cname,
+							is_synchronized(cell, i, d_ff), cell, i};
+					if (c.synced) {
+						// the first stage is metastable: only the second
+						// stage may read it (assertions that observe it are
+						// not hardware and do not count)
+						auto chain = sync_chain(cell, i, d_ff);
+						SigBit q1 = sigmap(ff.sig_q[i]);
+						if (q1.wire && q1.wire->port_output)
+							c.fanout = true;
+						auto cit = consumers.find(q1);
+						if (cit != consumers.end())
+							for (Cell *u : cit->second)
+								if (u != chain[1].first && !is_formal(u))
+									c.fanout = true;
+						// the crossing net must be a launch flop's Q: logic
+						// between the source flops and the synchronizer can
+						// glitch, and a glitch is what the synchronizer then
+						// captures
+						auto dit = drivers.find(dsig[i]);
+						if (dit != drivers.end() && !dit->second.first->is_builtin_ff())
+							c.comb = true;
+					}
+					crossings.push_back(c);
 				}
 			}
 
@@ -1316,6 +1464,21 @@ struct CdcAnalyzer
 				findings.push_back({sev, cls, join_domains(c.srcs),
 						domain_names[c.dst], c.bit, c.cell});
 			}
+			{
+				std::vector<int> keep;
+				for (int i : synced) {
+					Crossing &c = crossings[i];
+					if (c.fanout)
+						findings.push_back({"ERROR", "sync-fanout", join_domains(c.srcs),
+								domain_names[c.dst], c.bit, c.cell});
+					else if (c.comb)
+						findings.push_back({"WARNING", "comb-before-sync", join_domains(c.srcs),
+								domain_names[c.dst], c.bit, c.cell});
+					else
+						keep.push_back(i);
+				}
+				synced = keep;
+			}
 			if (synced.empty())
 				continue;
 			if (GetSize(synced) == 1) {
@@ -1385,7 +1548,7 @@ struct CdcAnalyzer
 				// prefix-XOR decoder chain or an EQ-compare against a local
 				// Gray-coded vector (FIFO full/empty style, possibly with
 				// per-bit polarity on the synced operand).
-				std::map<int, bool> comp_gray;
+				std::map<int, bool> comp_gray, comp_step;
 				for (auto &it : comps) {
 					if (GetSize(it.second) < 2)
 						continue;
@@ -1398,6 +1561,12 @@ struct CdcAnalyzer
 						return x.qidx < y.qidx;
 					});
 					comp_gray[it.first] = (gray_encoder(comp) && gray_decoder(comp)) || eq_gray_compare(comp);
+					if (comp_gray[it.first]) {
+						std::vector<SigBit> dbits, wbits;
+						for (auto &c : comp)
+							dbits.push_back(c.dbit);
+						comp_step[it.first] = gray_encoder(dbits, -1, &wbits) && gray_step_ok(wbits);
+					}
 				}
 				for (int a = 0; a < n; a++) {
 					Crossing &c = crossings[synced[a]];
@@ -1407,8 +1576,10 @@ struct CdcAnalyzer
 						sev = "OK";
 						cls = "synchronizer-2ff";
 					} else if (comp_gray[find(a)]) {
-						sev = "OK";
-						cls = "gray-bus";
+						// Gray shape is not Gray behaviour: OK only once
+						// the encoded vector is proved to step by one
+						sev = comp_step[find(a)] ? "OK" : "WARNING";
+						cls = comp_step[find(a)] ? "gray-bus" : "gray-bus-unverified";
 					}
 					findings.push_back({sev, cls, join_domains(c.srcs), domain_names[c.dst], c.bit, c.cell});
 				}
@@ -1444,6 +1615,78 @@ struct CdcAnalyzer
 		}
 
 		find_crossings();
+		report_unanalyzed(design);
+	}
+
+	// (e) everything the structural analysis skips, said once per module
+	void report_unanalyzed(Design *design)
+	{
+		int latches = 0, mems = 0, subs = 0, noclk = 0;
+		for (auto cell : module->cells()) {
+			if (cell->type.in(ID($dlatch), ID($adlatch), ID($dlatchsr), ID($dl)) ||
+					cell->type.begins_with("$_DLATCH"))
+				latches++;
+			else if (cell->is_builtin_ff()) {
+				FfData ff(nullptr, cell);
+				if (!ff.has_clk || GetSize(ff.sig_clk) != 1)
+					noclk++;
+			} else if (cell->is_mem_cell())
+				mems++;
+			else if (design && design->module(cell->type) != nullptr)
+				subs++;
+		}
+		if (latches)
+			log_warning("cdc: module %s: %d latch(es) not analyzed: crossings through latches are not reported.\n", log_id(module), latches);
+		if (mems)
+			log_warning("cdc: module %s: %d memory cell(s) not analyzed: run memory_map before cdc.\n", log_id(module), mems);
+		if (subs)
+			log_warning("cdc: module %s: %d submodule instance(s): crossings into or out of them are not analyzed; run flatten before cdc.\n", log_id(module), subs);
+		if (noclk)
+			log_warning("cdc: module %s: %d flip-flop(s) without a single clock bit ($ff/global-clock or multi-bit clock) not analyzed.\n", log_id(module), noclk);
+		// input ports reaching FF data inputs: no launch domain is known
+		// (an SDC set_input_delay -clock is stored but not used)
+		pool<std::string> ports;
+		for (auto cell : module->cells()) {
+			if (!cell->is_builtin_ff())
+				continue;
+			FfData ff(nullptr, cell);
+			if (!ff.has_clk)
+				continue;
+			pool<SigBit> seen;
+			std::vector<SigBit> work;
+			for (auto b : sigmap(ff.sig_d))
+				if (b.wire && seen.insert(b).second)
+					work.push_back(b);
+			while (!work.empty() && GetSize(seen) < 512) {
+				SigBit b = work.back();
+				work.pop_back();
+				if (b.wire->port_input && !clk_domains.count(b)) {
+					ports.insert(b.wire->name.unescape());
+					continue;
+				}
+				auto dit = drivers.find(b);
+				if (dit == drivers.end() || dit->second.first->is_builtin_ff())
+					continue;
+				for (auto &conn : dit->second.first->connections())
+					if (dit->second.first->input(conn.first))
+						for (auto ib : sigmap(conn.second))
+							if (ib.wire && seen.insert(ib).second)
+								work.push_back(ib);
+			}
+		}
+		if (!ports.empty()) {
+			std::vector<std::string> v(ports.begin(), ports.end());
+			std::sort(v.begin(), v.end());
+			std::string list;
+			for (int i = 0; i < GetSize(v) && i < 4; i++)
+				list += (list.empty() ? "" : ", ") + v[i];
+			if (GetSize(v) > 4)
+				list += stringf(", ... (%d total)", GetSize(v));
+			log_warning("cdc: module %s: input port(s) %s reach flip-flop data inputs with no known launch clock: those paths are not checked.\n",
+					log_id(module), list.c_str());
+		}
+		if (bound_hits)
+			log_warning("cdc: module %s: %d bounded search(es) gave up; their findings take the conservative answer.\n", log_id(module), bound_hits);
 	}
 };
 
@@ -1463,7 +1706,12 @@ struct CdcPass : public Pass {
 		log("This command performs a structural clock-domain crossing (CDC) analysis of\n");
 		log("the selected modules. The design must be prepared first: run 'proc' (usually\n");
 		log("followed by 'opt_clean') before this pass. A selected module that still\n");
-		log("contains processes is a fatal error.\n");
+		log("contains processes is a fatal error.  The analysis is per module and does\n");
+		log("not look through latches or memories: run 'flatten' and 'memory_map' first.\n");
+		log("What a module leaves unanalyzed (latches, memory cells, submodule\n");
+		log("instances, flip-flops without a single clock bit, input ports that reach\n");
+		log("flip-flops with no known launch clock, bounded searches that gave up) is\n");
+		log("reported as a warning, never silently.\n");
 		log("\n");
 		log("Clock domains are inferred from the clock pins of all flip-flop cells in\n");
 		log("each module; a top-level input port driving FF clock pins becomes a clock\n");
@@ -1476,7 +1724,14 @@ struct CdcPass : public Pass {
 		log("own clock domain is reported as a crossing, classified as follows:\n");
 		log("\n");
 		log("  - synchronizer-2ff   (OK)      crossing followed by a 2+ stage chain of\n");
-		log("                                 same-domain flip-flops (Q feeding next D)\n");
+		log("                                 same-domain flip-flops (Q feeding next D),\n");
+		log("                                 launched from a flip-flop Q, first stage\n");
+		log("                                 read only by the second stage\n");
+		log("  - sync-fanout        (ERROR)   the first (metastable) synchronizer stage\n");
+		log("                                 also feeds logic or a port\n");
+		log("  - comb-before-sync   (WARNING) the synchronized net is combinational\n");
+		log("                                 logic, not a launch flop's Q: it can\n");
+		log("                                 glitch, and the glitch is what gets sampled\n");
 		log("  - same-clock-family  (OK)      crossing between domains derived from one\n");
 		log("                                 clock (e.g. a divide-by-2 generated clock):\n");
 		log("                                 synchronous, not a metastability risk\n");
@@ -1489,9 +1744,14 @@ struct CdcPass : public Pass {
 		log("                                 never registered/latched: glitch hazard\n");
 		log("  - clock-mux          (WARNING) domain clock muxed from multiple parent\n");
 		log("                                 clocks: asynchronous to every one of them\n");
+		log("                                 (it joins no parent's clock family)\n");
+		log("  - clock-gating-ambiguous (WARNING) a clock gate with two input ports that\n");
+		log("                                 both look like clocks by name: which one is\n");
+		log("                                 the enable cannot be decided structurally\n");
 		log("  - reset-sync-stage   (OK)      the flop belongs to a >=2-stage reset\n");
 		log("                                 synchronizer chain (async assert, the\n");
-		log("                                 chain synchronizes the deassertion)\n");
+		log("                                 chain synchronizes the deassertion): head\n");
+		log("                                 D tied to c, every stage resets to !c\n");
 		log("  - reset-sync-deassert (OK)     async reset driven by a reset synchronizer\n");
 		log("                                 tail in the destination domain\n");
 		log("  - gray-bus           (OK)      synced bus whose bits are Gray-coded:\n");
@@ -1499,7 +1759,11 @@ struct CdcPass : public Pass {
 		log("                                 domain, and in the destination domain either\n");
 		log("                                 a prefix-XOR decoder chain over all synced\n");
 		log("                                 bits or an $eq compare against a local\n");
-		log("                                 Gray-coded vector (FIFO full/empty style)\n");
+		log("                                 Gray-coded vector (FIFO full/empty style);\n");
+		log("                                 and SAT proves the encoded binary register\n");
+		log("                                 steps by +1/-1 or holds (one Gray bit per clock)\n");
+		log("  - gray-bus-unverified (WARNING) Gray-shaped bus whose one-bit-per-clock\n");
+		log("                                 step could not be proved\n");
 		log("  - unsynchronized-bit (ERROR)   single-bit crossing without a synchronizer\n");
 		log("  - async-declared     (WARNING) unsynchronized crossing between clocks\n");
 		log("                                 declared asynchronous or false-pathed via\n");
@@ -1507,6 +1771,8 @@ struct CdcPass : public Pass {
 		log("  - synced-bus         (WARNING) all bits of a multi-bit crossing use 2+\n");
 		log("                                 stage synchronizers; check Gray coding or\n");
 		log("                                 handshake coherence between the domains\n");
+		log("  (Handshake / multi-cycle-path data buses qualified by a synchronized\n");
+		log("  enable are not recognized: their data bits report unsynchronized-bus.)\n");
 		log("  - unsynchronized-bus (ERROR)   a multi-bit crossing with unsynchronized bits\n");
 		log("  - reset-cdc          (WARNING) asynchronous reset input driven from another\n");
 		log("                                 clock domain or from an external input port\n");

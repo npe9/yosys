@@ -16,10 +16,11 @@
 //   -----------------+-------------------------------------------------------
 //   cdc_sync_2ff     | 1x OK       synchronizer-2ff    (clk_a -> clk_b)
 //   cdc_bare         | 1x ERROR    unsynchronized-bit  (clk_a -> clk_b)
-//   cdc_gray_bus     | 4x OK       gray-bus            (clk_a -> clk_b, 4 bits)
+//   cdc_gray_bus     | 4x WARNING  comb-before-sync    (clk_a -> clk_b, 4 bits: gray_a
+//                    |                                is combinational, not a launch flop)
 //   cdc_reset        | 2x WARNING  reset-cdc           (external port + foreign domain)
-//   cdc_async_fifo   | 8x OK       gray-bus            (two 4-bit gray pointers,
-//                    |                                full/empty EQ compares)
+//   cdc_async_fifo   | 8x WARNING  comb-before-sync    (two 4-bit gray pointers, each a
+//                    |                                combinational encoder output)
 //                    | 1x OK       synchronizer-2ff    (flag, clk_a -> clk_b)
 //   cdc_eq_bin       | 4x WARNING  synced-bus          (4-bit binary pointer,
 //                    |                                EQ compare is not Gray)
@@ -97,7 +98,11 @@ endmodule
 // ---------------------------------------------------------------------------
 // (c) 4-bit Gray counter crossing with per-bit two-flop sync and a Gray
 //     decoder on the far side.
-//     Expect: 4 OK (gray-bus) -- one line per crossing bit.
+//     Expect: 4 WARNING (comb-before-sync) -- one line per crossing bit.
+//     Audit 2026-10-24: gray_a is the encoder's combinational output, so
+//     the synchronizers can sample a multi-bit glitch; this used to be OK
+//     gray-bus.  A registered Gray value whose counter steps by one is OK
+//     gray-bus (tests/verilog/cdc_audit.ys r8_real_gray).
 // ---------------------------------------------------------------------------
 module cdc_gray_bus (
     input  logic clk_a,
@@ -158,7 +163,8 @@ endmodule
 // (e) async FIFO: two clock domains, Gray pointers crossing in both
 //     directions (each synchronized with a 2x4-bit two-flop chain), plus one
 //     properly synchronized single-bit flag crossing.
-//     Expect: 8 OK (gray-bus: wgray->clk_b 4 bits, rgray->clk_a 4 bits,
+//     Expect: 8 WARNING comb-before-sync (audit 2026-10-24: wgray/rgray are
+//     combinational encoder outputs; formerly 8 OK gray-bus: wgray->clk_b 4 bits, rgray->clk_a 4 bits,
 //     recognized via the full/empty EQ compares against the local Gray
 //     pointers) + 1 OK (synchronizer-2ff for the flag).
 // ---------------------------------------------------------------------------

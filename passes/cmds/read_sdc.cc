@@ -181,6 +181,14 @@ struct SdcParser {
 
 	bool is_flag(const std::string &s) { return !s.empty() && s[0] == '-'; }
 
+	// a target no consumer interprets ([get_nets ...], [get_cells ...], an
+	// expression): kept raw, but never silently
+	void warn_target(const std::string &tok, const char *ctx)
+	{
+		log_warning("read_sdc: %s: target %s is not interpreted (only get_ports/get_pins/get_clocks/all_* are); kept unresolved\n",
+				ctx, tok.c_str());
+	}
+
 	double to_double(const std::string &s, bool &ok) {
 		char *end = nullptr;
 		double v = strtod(s.c_str(), &end);
@@ -211,8 +219,11 @@ struct SdcParser {
 			};
 			bool ok;
 			if (a == "-period") {
-				clk.period = to_double(next("-period"), ok);
+				std::string v = next("-period");
+				clk.period = to_double(v, ok);
 				clk.period_set = ok;
+				if (!ok && !v.empty())
+					log_warning("read_sdc: create_clock -period '%s' is not a number (Tcl variables and expressions are not evaluated)\n", v.c_str());
 			} else if (a == "-name") {
 				clk.name = next("-name");
 			} else if (a == "-waveform") {
@@ -231,7 +242,10 @@ struct SdcParser {
 				clk.invert = true;
 			} else if (a == "-source") {
 				bool gok;
-				clk.gen_source = getter_target(next("-source"), gok).pattern;
+				std::string v = next("-source");
+				clk.gen_source = getter_target(v, gok).pattern;
+				if (!gok)
+					warn_target(v, "create_generated_clock -source");
 			} else if (a == "-add") {
 				// merging clocks on one target: recorded as-is; the
 				// consumer sees both clock objects
@@ -244,7 +258,7 @@ struct SdcParser {
 				positional.push_back(a);
 		}
 		if (!generated && !clk.period_set)
-			log_warning("read_sdc: create_clock without -period ignored\n");
+			log_warning("read_sdc: create_clock without a numeric -period ignored\n");
 		else if (generated && clk.gen_source.empty())
 			log_warning("read_sdc: create_generated_clock without -source ignored\n");
 		else {
@@ -311,8 +325,11 @@ struct SdcParser {
 				}
 				bool ok;
 				SdcTarget t = getter_target(args[++i], ok);
-				if (ok)
-					dst.push_back(t);
+				if (!ok)
+					warn_target(args[i], (kind + " " + a).c_str());
+				// kept even when uninterpreted: a -through the consumer cannot
+				// resolve still narrows the exception (never a whole-clock waiver)
+				dst.push_back(t);
 			};
 			// v1 treats rise/fall-qualified endpoints the same
 			if (a == "-from" || a == "-fall_from" || a == "-rise_from")
@@ -348,8 +365,11 @@ struct SdcParser {
 			std::string &a = args[i];
 			bool ok;
 			if (a == "-clock") {
-				if (i + 1 < args.size())
+				if (i + 1 < args.size()) {
 					d.clock = getter_target(args[++i], ok).pattern;
+					if (!ok)
+						warn_target(args[i], output ? "set_output_delay -clock" : "set_input_delay -clock");
+				}
 			} else if (a == "-clock_fall") {
 				d.clock_fall = true;
 			} else if (a == "-add_delay") {
@@ -385,6 +405,8 @@ struct SdcParser {
 					SdcTarget t = getter_target(a, ok);
 					if (ok)
 						d.ports.push_back(t);
+					else
+						warn_target(a, output ? "set_output_delay" : "set_input_delay");
 				}
 			}
 		}
@@ -401,12 +423,17 @@ struct SdcParser {
 				SdcTarget t = getter_target(args[++i], ok);
 				if (ok)
 					m.from.push_back(t);
+				else
+					warn_target(args[i], "set_max_delay -from");
 			} else if ((a == "-to" || a == "-fall_to" || a == "-rise_to") && i + 1 < args.size()) {
 				SdcTarget t = getter_target(args[++i], ok);
 				if (ok)
 					m.to.push_back(t);
+				else
+					warn_target(args[i], "set_max_delay -to");
 			} else if (a == "-through" && i + 1 < args.size()) {
 				i++;	// v1 ignores -through on max_delay
+				log_warning("read_sdc: set_max_delay -through %s is ignored\n", args[i].c_str());
 			} else if (!is_flag(a)) {
 				double v = to_double(a, ok);
 				if (ok && m.delay == 0.0)

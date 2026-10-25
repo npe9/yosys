@@ -22,6 +22,7 @@
 
 #include "kernel/yosys.h"
 #include "kernel/satgen.h"
+#include "passes/ic3/aiger_cert.h"
 
 #include "libs/minisat/Solver.h"
 
@@ -1579,6 +1580,12 @@ struct ExtEngine
 	bool verbose = false;
 	double timeout_s = 0;
 	int depth_max = 20;
+	// every external proof is checked in-tree where a certificate exists:
+	// cert_status is "certified" or "uncertified: <why>" after a proof;
+	// require_cert turns an uncertified proof into undecided
+	bool require_cert = false;
+	std::string cert_status;
+	int n_certified = 0, n_uncertified = 0;
 
 	~ExtEngine()
 	{
@@ -1725,9 +1732,65 @@ struct ExtEngine
 		return false;
 	}
 
+	void certify_witness(const std::string &model_file, const std::string &cert_file)
+	{
+		ic3_cert::Aig model, cert;
+		std::string err;
+		if (!model.parse(model_file, err) || !cert.parse(cert_file, err))
+			cert_status = "uncertified: certificate unreadable (" + err + ")";
+		else if (!ic3_cert::check_witness(model, cert, timeout_s, err))
+			cert_status = "uncertified: certificate rejected, " + err;
+		else
+			cert_status = "certified";
+	}
+
+	void certify_invariant(const std::string &model_file, const std::string &inv_file)
+	{
+		ic3_cert::Aig model, inv;
+		std::string err;
+		if (!model.parse(model_file, err) || !inv.parse(inv_file, err))
+			cert_status = "uncertified: invariant unreadable (" + err + ")";
+		else if (!inv.latch_lit.empty()) {
+			// pdr proved without an invariant (abc simplified bad to a
+			// constant), so inv_get left the design in place: try the
+			// constant-true invariant, i.e. the property holds in every state
+			ic3_cert::Aig top;
+			top.outputs.push_back(1);
+			if (ic3_cert::check_invariant(model, top, timeout_s, err))
+				cert_status = "certified";
+			else
+				cert_status = "uncertified: pdr gave no invariant and the property is not state-independent";
+		} else {
+			// abc's inv_get network is 1 where the invariant is violated;
+			// either polarity that passes the checks is an invariant
+			std::string err2;
+			if (ic3_cert::check_invariant(model, inv, timeout_s, err, true) ||
+					ic3_cert::check_invariant(model, inv, timeout_s, err2, false))
+				cert_status = "certified";
+			else
+				cert_status = "uncertified: invariant not confirmed, " + err;
+		}
+	}
+
+	// a latch-free model: the proof is a combinational validity, checked
+	// directly with the constant-true invariant
+	void certify_combinational(const std::string &model_file)
+	{
+		ic3_cert::Aig model, inv;
+		std::string err;
+		inv.outputs.push_back(1);
+		if (!model.parse(model_file, err))
+			cert_status = "uncertified: model unreadable (" + err + ")";
+		else if (!ic3_cert::check_invariant(model, inv, timeout_s, err))
+			cert_status = "uncertified: combinational check failed, " + err;
+		else
+			cert_status = "certified";
+	}
+
 	// 0 proved, 1 disproved (depth set), 2 undecided (why set)
 	int prove(int k, int &depth, const std::string &cex_file, std::string &why)
 	{
+		cert_status.clear();
 		std::string base = stringf("%s/p%d", dir.c_str(), k);
 		if (!keep_dir.empty())
 			log("ic3: engine %s: p%d: files %s.*\n", name.c_str(), k, base.c_str());
@@ -1774,10 +1837,18 @@ struct ExtEngine
 				cmd += stringf(" --time-limit %lld", lim);
 			if (!extra.empty())
 				cmd += " " + extra;
-			cmd += stringf(" %s > %s.out 2> %s.err", model.c_str(), base.c_str(), base.c_str());
+			if (format == AIGER)
+				cmd += stringf(" %s %s.cert.aag > %s.out 2> %s.err", model.c_str(), base.c_str(), base.c_str(), base.c_str());
+			else
+				cmd += stringf(" %s > %s.out 2> %s.err", model.c_str(), base.c_str(), base.c_str());
 			rc = run(cmd);
-			if (rc == 20)
+			if (rc == 20) {
 				result = 0;
+				if (format == AIGER)
+					certify_witness(base + ".aig", base + ".cert.aag");
+				else
+					cert_status = "uncertified: no in-tree checker for BTOR2 certificates";
+			}
 			else if (rc != 10) {
 				std::string err = last_error(base + ".err");
 				why = stringf("rIC3 rc %d%s%s", rc, err.empty() ? "" : ": ", err.c_str());
@@ -1838,8 +1909,11 @@ struct ExtEngine
 					why = "rIC3 reported unsafe without a readable witness";
 			}
 		} else if (kind == ABC) {
-			std::string cmd = limit_prefix() + stringf("'%s' -c 'read_aiger %s.aig; fold; strash; print_stats; pdr%s; write_cex -a %s.aiw'",
-					bin.c_str(), base.c_str(), lim ? stringf(" -T %lld", lim).c_str() : "", base.c_str());
+			// inv_get + write_aiger: pdr's inductive invariant over the flops,
+			// checked in-tree before the proof is called certified
+			std::string cmd = limit_prefix() + stringf("'%s' -c 'read_aiger %s.aig; fold; strash; print_stats; pdr%s; write_cex -a %s.aiw; "
+					"inv_get -f; strash; write_aiger -s %s.inv.aig'",
+					bin.c_str(), base.c_str(), lim ? stringf(" -T %lld", lim).c_str() : "", base.c_str(), base.c_str());
 			if (!extra.empty())
 				log_warning("ic3: engine abc: -engine-args is ignored (the abc script is fixed).\n");
 			cmd += stringf(" > %s.out 2>&1", base.c_str());
@@ -1870,16 +1944,19 @@ struct ExtEngine
 					write_lines(base + ".cex.aiw", wit, 0, GetSize(wit) - 1);
 					witness_to_yw("aiw2yw", base + ".cex.aiw", base + ".ywa", cex_file, k);
 				}
-			} else if (proved)
+			} else if (proved) {
 				result = 0;
-			else if (no_latches) {
+				certify_invariant(base + ".aig", base + ".inv.aig");
+			} else if (no_latches) {
 				// pdr reports a latch-free network (a combinational check,
 				// often constant once strashed) UNDECIDED; iprove decides it
 				rc = run(limit_prefix() + stringf("'%s' -c 'read_aiger %s.aig; fold; strash; iprove' > %s.comb.out 2>&1",
 						bin.c_str(), base.c_str(), base.c_str()));
 				for (auto &line : read_lines(base + ".comb.out")) {
-					if (line.compare(0, 13, "UNSATISFIABLE") == 0)
+					if (line.compare(0, 13, "UNSATISFIABLE") == 0) {
 						result = 0;
+						certify_combinational(base + ".aig");
+					}
 					else if (line.compare(0, 11, "SATISFIABLE") == 0) {
 						result = 1;
 						depth = 0;
@@ -1972,8 +2049,10 @@ struct ExtEngine
 			} else if (st == "PASSED") {
 				rc = run(common + stringf(" -i -t %d %s.smt2 > %s.ind.out 2>&1", depth_max, base.c_str(), base.c_str()));
 				std::string sti = status(base + ".ind.out");
-				if (sti == "PASSED")
+				if (sti == "PASSED") {
 					result = 0;
+					cert_status = "uncertified: smtbmc k-induction gives no certificate";
+				}
 				else
 					why = stringf("smtbmc: basecase passed to depth %d, induction %s (bounded; not a proof)", depth_max,
 							sti.empty() ? "gave no status" : sti.c_str());
@@ -1987,6 +2066,19 @@ struct ExtEngine
 			log("ic3: engine %s: p%d: export %.2fs, engine %.2fs, rc %d\n", name.c_str(), k,
 					std::chrono::duration<double>(t1 - t0).count(),
 					std::chrono::duration<double>(t2 - t1).count(), rc);
+		if (result == 0) {
+			if (cert_status.empty())
+				cert_status = "uncertified: no certificate";
+			if (cert_status == "certified")
+				n_certified++;
+			else {
+				n_uncertified++;
+				if (require_cert) {
+					why = "proof not counted (-engine-require-cert): " + cert_status;
+					result = 2;
+				}
+			}
+		}
 		return result;
 	}
 };
@@ -2094,6 +2186,24 @@ struct Ic3Pass : Pass
 		log("        stop per engine run (5s grace).  Witnesses replay like native\n");
 		log("        ones: same prep, plus `setundef -init -zero` after -init-zero.\n");
 		log("\n");
+		log("        Every external proof is checked in-tree where a certificate\n");
+		log("        exists and the verdict line says so ([engine <e>, certified] or\n");
+		log("        [engine <e>, uncertified: <why>]): rIC3's AIGER certificate\n");
+		log("        (Certifaiger witness circuit: reset, transition, property, base\n");
+		log("        and step checks) and abc pdr's inductive invariant (inv_get) are\n");
+		log("        verified with SAT against the exported model; latch-free models\n");
+		log("        are checked directly.  rIC3 BTOR2 and smtbmc proofs have no\n");
+		log("        in-tree checker and stay uncertified.\n");
+		log("\n");
+		log("    -check-cert <model> <witness>  /  -check-inv [-negated] <model> <inv>\n");
+		log("        (alone, instead of a proof run) check a Certifaiger witness\n");
+		log("        circuit or an invariant circuit against an AIGER model and log\n");
+		log("        \"certificate check: ok\" or \"... rejected, <check> check failed\"\n");
+		log("\n");
+		log("    -engine-require-cert\n");
+		log("        count an external proof only when it is certified; an uncertified\n");
+		log("        one is undecided\n");
+		log("\n");
 		log("    -format aiger|btor|smt2\n");
 		log("        backend for the external engine (default: aiger for ric3 and\n");
 		log("        abc, btor for btormc, smt2 for smtbmc)\n");
@@ -2129,6 +2239,30 @@ struct Ic3Pass : Pass
 
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		// the in-tree certificate checker on its own (pins, debugging):
+		//   ic3 -check-cert <model.aig> <witness.aag>
+		//   ic3 -check-inv [-negated] <model.aig> <invariant.aig>
+		if (GetSize(args) >= 2 && (args[1] == "-check-cert" || args[1] == "-check-inv")) {
+			bool inv = args[1] == "-check-inv";
+			size_t i = 2;
+			bool negated = false;
+			if (inv && i < args.size() && args[i] == "-negated") {
+				negated = true;
+				i++;
+			}
+			if (i + 2 != args.size())
+				log_cmd_error("ic3 %s needs a model and a %s file.\n", args[1].c_str(), inv ? "invariant" : "certificate");
+			ic3_cert::Aig model, cert;
+			std::string err;
+			if (!model.parse(args[i], err) || !cert.parse(args[i + 1], err))
+				log_cmd_error("ic3: %s\n", err.c_str());
+			bool ok = inv ? ic3_cert::check_invariant(model, cert, 0, err, negated) : ic3_cert::check_witness(model, cert, 0, err);
+			if (ok)
+				log("ic3: certificate check: ok\n");
+			else
+				log("ic3: certificate check: rejected, %s\n", err.c_str());
+			return;
+		}
 		std::string top_name;
 		std::string cex_prefix;
 		bool check_cells = false;
@@ -2218,6 +2352,10 @@ struct Ic3Pass : Pass
 				ext.extra = args[++argidx];
 				continue;
 			}
+			if (args[argidx] == "-engine-require-cert") {
+				ext.require_cert = true;
+				continue;
+			}
 			if (args[argidx] == "-engine-keep" && argidx+1 < args.size()) {
 				ext.keep_dir = args[++argidx];
 				continue;
@@ -2245,7 +2383,7 @@ struct Ic3Pass : Pass
 
 		RTLIL::Module *module;
 		if (!top_name.empty()) {
-			module = design->module(top_name);
+			module = design->module(RTLIL::escape_id(top_name));
 			if (!module)
 				log_error("ic3: no such module: %s\n", top_name.c_str());
 		} else {
@@ -2564,7 +2702,11 @@ struct Ic3Pass : Pass
 						name.c_str(), depth, lowering_tag(cell).c_str());
 				n_undecided++;
 			} else if (result == 0) {
-				log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());
+				if (cex_done && !ext.cert_status.empty())
+					log("ic3: %s: proved%s [engine %s, %s]\n", name.c_str(), lowering_tag(cell).c_str(),
+							engine_name.c_str(), ext.cert_status.c_str());
+				else
+					log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());
 				n_proved++;
 			} else if (result == 1) {
 				log("ic3: %s: disproved (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
@@ -2710,6 +2852,9 @@ struct Ic3Pass : Pass
 
 		log("ic3: %d properties: proved=%d disproved=%d undecided=%d\n",
 				GetSize(props) + GetSize(live_props), n_proved, n_disproved, n_undecided);
+		if (engine_ext)
+			log("ic3: external proofs: %d certified, %d uncertified%s\n", ext.n_certified, ext.n_uncertified,
+					ext.require_cert ? " (not counted: -engine-require-cert)" : "");
 	}
 } Ic3Pass;
 

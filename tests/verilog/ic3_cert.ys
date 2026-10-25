@@ -1,0 +1,56 @@
+# In-tree certificate checker for external ic3 engines (register E0/E7).
+# ic3_cert/m.aag: a 3-bit counter x cycling 0..4 under input a, bad = (x == 6)
+# (true, not 1-inductive).  Witness circuits keep m's latches (mapped by
+# "= <lit>" symbols) and change the bad output:
+#   h_le4  bad | x > 4      the inductive strengthening    -> ok
+#   h_id   bad              identity, not 1-inductive        -> step fails
+#   h_le5  bad | x > 5      5 -> 6 breaks it                 -> step fails
+#   h_ne7  x == 7           weaker than the model property   -> property fails
+#   ric3_cert       rIC3's own certificate                   -> ok
+#   ric3_cert_flip  the same, one AND input flipped          -> rejected
+logger -expect log "certificate check: ok" 1
+ic3 -check-cert ic3_cert/m.aag ic3_cert/h_le4.aag
+logger -check-expected
+logger -expect log "certificate check: rejected, step check failed" 1
+ic3 -check-cert ic3_cert/m.aag ic3_cert/h_id.aag
+logger -check-expected
+logger -expect log "certificate check: rejected, step check failed" 1
+ic3 -check-cert ic3_cert/m.aag ic3_cert/h_le5.aag
+logger -check-expected
+logger -expect log "certificate check: rejected, property check failed" 1
+ic3 -check-cert ic3_cert/m.aag ic3_cert/h_ne7.aag
+logger -check-expected
+logger -expect log "certificate check: ok" 1
+ic3 -check-cert ic3_cert/m.aag ic3_cert/ric3_cert.aag
+logger -check-expected
+logger -expect log "certificate check: rejected" 1
+ic3 -check-cert ic3_cert/m.aag ic3_cert/ric3_cert_flip.aag
+logger -check-expected
+
+# end to end: abc pdr's invariant (inv_get) is verified; with an assumption
+# abc's fold adds a flop the model does not have, so that proof stays
+# uncertified, and -engine-require-cert does not count it
+read_verilog -sv -formal <<EOT
+module c(input clk, input a);
+  reg [2:0] x = 0;
+  always @(posedge clk) if (a) x <= (x == 3'd4) ? 3'd0 : x + 1;
+  always @(posedge clk) assert (x != 3'd6);
+endmodule
+module ca(input clk, input a);
+  reg [2:0] x = 0;
+  always @(posedge clk) x <= x + a;
+  always @(posedge clk) begin assume (x != 3'd5 || !a); assert (x != 3'd6); end
+endmodule
+EOT
+prep
+async2sync
+design -save d
+logger -expect log "proved .*\[engine abc, certified\]" 1
+logger -expect log "external proofs: 1 certified, 0 uncertified" 1
+ic3 -top c -check-cells -init-zero -engine abc
+logger -check-expected
+design -load d
+logger -expect log "engine abc: proof not counted \(-engine-require-cert\): uncertified: " 1
+logger -expect log "1 properties: proved=0 disproved=0 undecided=1" 1
+ic3 -top ca -check-cells -init-zero -engine abc -engine-require-cert
+logger -check-expected

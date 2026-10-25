@@ -1,0 +1,32 @@
+# ic3 -engine <external>: instances of blackbox / unknown cell types (modules
+# missing from the design) are cut before the export; their outputs are free
+# inputs, as in the native engine.  $print cells ($display) are dropped
+# from the export (write_aiger refused them; native ignores them).  Before, write_aiger refused them and every
+# property of such a design was undecided (2109 of OpenTitan's).
+read_verilog -sv -formal <<EOT
+(* blackbox *) module bb(input clk, input a, output y);
+endmodule
+module t(input clk, input a);
+  wire y;
+  bb u_bb(.clk(clk), .a(a), .y(y));
+  reg [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  always @(posedge clk) $display("c=%d", c);
+  always @(posedge clk) begin
+    assert (c != 2'd3 || c == 2'd3);   // independent of the blackbox
+    assert (y == 1'b0);                // the blackbox output is free
+  end
+endmodule
+EOT
+hierarchy -top t
+prep -top t
+async2sync
+design -save d
+logger -expect log "1 blackbox/unknown instance\(s\) cut" 1
+logger -expect log "2 properties: proved=1 disproved=1 undecided=0" 1
+ic3 -check-cells -init-zero -engine abc
+logger -check-expected
+design -load d
+logger -expect log "2 properties: proved=1 disproved=1 undecided=0" 1
+ic3 -check-cells -init-zero
+logger -check-expected

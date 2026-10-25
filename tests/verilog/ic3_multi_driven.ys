@@ -1,0 +1,21 @@
+# A multiply-driven net in a property's cone (two always blocks writing one
+# reg on different events, as OpenTitan's adc_ctrl_fsm_sva_if start_of_reset
+# does) is not checked: SatGen would encode both drivers onto one variable,
+# i.e. ASSUME they agree.  Before, native ic3 "proved" this false assert
+# (abc and rIC3 disprove it: s is 1 after rst_n falls while c counts on).
+read_verilog -sv -formal <<EOT
+module t(input clk, input rst_n);
+  bit s;
+  always @(negedge rst_n) s <= 1;
+  always @(posedge clk) s <= 0;
+  reg [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  always @(posedge clk) assert (!s || c == 2'd0);
+endmodule
+EOT
+prep -top t
+async2sync
+logger -expect log "multiply-driven net .*s .*in the cone of influence: not checked" 1
+logger -expect log "1 properties: proved=0 disproved=0 undecided=1" 1
+ic3 -check-cells -init-zero
+logger -check-expected

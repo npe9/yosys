@@ -1657,6 +1657,24 @@ struct ExtEngine
 			props[k]->attributes[ID(ic3_ext)] = RTLIL::Const(stringf("p%d", k));
 		for (auto c : assumes)
 			c->attributes[ID(ic3_ext)] = RTLIL::Const(std::string("assume"));
+		// instances of blackbox / unknown cell types (modules missing from
+		// the design) cannot be written as AIGER/BTOR2/SMT2.  The native
+		// engine treats the nets they drive as free inputs (it trusts no
+		// driver port but \Y); the export cuts them the same way: deleted
+		// after flatten, their outputs become `setundef -anyseq` inputs
+		std::vector<RTLIL::Cell*> cut;
+		pool<std::string> cut_types;
+		for (auto mod : design->modules())
+			for (auto c : mod->cells()) {
+				if (c->has_attribute(ID(ic3_ext)) || yosys_celltypes.cell_known(c->type))
+					continue;
+				RTLIL::Module *cm = design->module(c->type);
+				if (cm && !cm->get_blackbox_attribute())
+					continue;
+				c->attributes[ID(ic3_ext)] = RTLIL::Const(std::string("cut"));
+				cut.push_back(c);
+				cut_types.insert(c->type.unescape());
+			}
 		{
 			auto quiet = logger().make_debug_scope(true);
 			Pass::call(design, "write_rtlil " + il);
@@ -1665,6 +1683,19 @@ struct ExtEngine
 			c->attributes.erase(ID(ic3_ext));
 		for (auto c : assumes)
 			c->attributes.erase(ID(ic3_ext));
+		for (auto c : cut)
+			c->attributes.erase(ID(ic3_ext));
+		if (!cut.empty()) {
+			std::vector<std::string> v(cut_types.begin(), cut_types.end());
+			std::sort(v.begin(), v.end());
+			std::string list;
+			for (int i = 0; i < GetSize(v) && i < 6; i++)
+				list += (list.empty() ? "" : ", ") + v[i];
+			if (GetSize(v) > 6)
+				list += stringf(", ... (%d types)", GetSize(v));
+			log("ic3: engine %s: %d blackbox/unknown instance(s) cut, their outputs are free inputs as in the native engine: %s\n",
+					name.c_str(), GetSize(cut), list.c_str());
+		}
 		std::string how = kind == RIC3 ? " -e " + sub_engine : kind == SMTBMC ? " -s " + solver : "";
 		if (kind == BTORMC || kind == SMTBMC)
 			how += stringf(" (depth %d)", depth_max);
@@ -1802,7 +1833,9 @@ struct ExtEngine
 					<< "a:ic3_ext=assume a:ic3_ext=p" << k << " %u %d\n";
 			// output ports are not properties: abc's pdr checks every AIGER
 			// output (it disproved plain output ports), rIC3 ignores them
-			ys << "flatten\nchformal -lower\nmemory_map\ndelete -output\n";
+			// $print / $scopeinfo carry no logic the engines can (or need to)
+			// see; the native engine ignores them too
+			ys << "flatten\ndelete a:ic3_ext=cut t:$print t:$scopeinfo\nchformal -lower\nmemory_map\ndelete -output\n";
 			if (init_zero)
 				ys << "setundef -init -zero\n";
 			ys << "setundef -undriven -anyseq\nsetundef -zero\ndffunmap\n";
@@ -2082,6 +2115,72 @@ struct ExtEngine
 		return result;
 	}
 };
+
+// A net with two or more drivers in a property's cone of influence (two
+// always blocks writing one reg on different events, an assign plus a
+// flop, ...).  SatGen encodes every driver onto the same variable, which
+// silently ASSUMES the drivers agree: the over-constrained model can prove
+// a false property (OpenTitan adc_ctrl_fsm_sva_if start_of_reset: native
+// "proved" five asserts that abc and rIC3 disprove at depth 1), and
+// write_aiger keeps one driver while write_smt2 refuses.  Such a property
+// is not checked.  Returns "" or "<net> (driven by <c1>, <c2>)".
+static std::string multi_driven_in_coi(RTLIL::Module *module, const std::vector<RTLIL::Cell*> &seeds)
+{
+	SigMap sigmap(module);
+	auto is_formal = [](IdString type) {
+		return type.in(ID($assert), ID($assume), ID($cover), ID($check), ID($live), ID($fair), ID($print));
+	};
+	dict<RTLIL::SigBit, std::vector<RTLIL::Cell*>> drivers;
+	for (auto cell : module->cells()) {
+		if (is_formal(cell->type))
+			continue;
+		RTLIL::Module *cm = module->design->module(cell->type);
+		bool typed = yosys_celltypes.cell_known(cell->type) || (cm && !cm->get_blackbox_attribute());
+		for (auto &conn : cell->connections())
+			if (typed ? cell->output(conn.first) : conn.first == ID::Y)
+				for (auto bit : sigmap(conn.second))
+					if (bit.wire)
+						drivers[bit].push_back(cell);
+	}
+	pool<RTLIL::SigBit> visited;
+	pool<RTLIL::Cell*> seen;
+	std::vector<RTLIL::SigBit> work;
+	for (auto c : seeds)
+		for (auto port : {ID::A, ID::EN})
+			if (c->hasPort(port))
+				for (auto bit : sigmap(c->getPort(port)))
+					if (bit.wire)
+						work.push_back(bit);
+	while (!work.empty()) {
+		RTLIL::SigBit bit = work.back();
+		work.pop_back();
+		if (!visited.insert(bit).second)
+			continue;
+		auto it = drivers.find(bit);
+		if (it == drivers.end())
+			continue;
+		pool<RTLIL::Cell*> distinct(it->second.begin(), it->second.end());
+		if (GetSize(distinct) > 1 || (bit.wire->port_input && !distinct.empty())) {
+			std::vector<std::string> names;
+			for (auto c : distinct)
+				names.push_back(c->name.unescape());
+			if (bit.wire->port_input)
+				names.push_back("input port");
+			std::sort(names.begin(), names.end());
+			return stringf("%s (driven by %s, %s)", log_signal(bit), names[0].c_str(), names[1].c_str());
+		}
+		for (auto cell : it->second) {
+			if (!seen.insert(cell).second)
+				continue;
+			for (auto &conn : cell->connections())
+				if (cell->input(conn.first))
+					for (auto b : sigmap(conn.second))
+						if (b.wire)
+							work.push_back(b);
+		}
+	}
+	return "";
+}
 
 struct Ic3Pass : Pass
 {
@@ -2554,16 +2653,36 @@ struct Ic3Pass : Pass
 		// harvest from each model every other target it also hits (as
 		// smtbmc does).  Hits are exact (depth = t-1); misses fall through
 		// to k-induction and IC3 with the per-query pre-pass off.
+		dict<RTLIL::Cell*, std::string> multi_driven;
+		{
+			std::vector<RTLIL::Cell*> all = props;
+			all.insert(all.end(), covers.begin(), covers.end());
+			all.insert(all.end(), live_props.begin(), live_props.end());
+			for (auto c : all) {
+				std::vector<RTLIL::Cell*> seeds = {c};
+				seeds.insert(seeds.end(), assumes.begin(), assumes.end());
+				seeds.insert(seeds.end(), fairs.begin(), fairs.end());
+				std::string md = multi_driven_in_coi(module, seeds);
+				if (!md.empty())
+					multi_driven[c] = md;
+			}
+		}
 		dict<RTLIL::Cell*, int> bmc_hit;
 		if (bmc_max > 0 && (!props.empty() || !covers.empty())) {
 			auto t0 = std::chrono::steady_clock::now();
 			auto elapsed = [&]() {
 				return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 			};
-			std::vector<RTLIL::Cell*> targets = props;
+			std::vector<RTLIL::Cell*> targets;
+			for (auto c : props)
+				if (!multi_driven.count(c))
+					targets.push_back(c);
 			int first_cover = GetSize(targets);
-			targets.insert(targets.end(), covers.begin(), covers.end());
+			for (auto c : covers)
+				if (!multi_driven.count(c))
+					targets.push_back(c);
 			int ntargets = GetSize(targets);
+			if (ntargets > 0) {
 			Ic3Solver bs(module, init_zero, max_frames);
 			bs.assume_cells = assumes;
 			bs.extra_seeds = targets;
@@ -2635,6 +2754,7 @@ struct Ic3Pass : Pass
 			}
 			log("ic3: bmc pre-pass: %d of %d target(s) hit within depth %d (%.1fs)\n",
 					GetSize(bmc_hit), ntargets, t - 2, elapsed());
+			}
 		}
 
 		// lowering provenance from sva2check (register v3 A3): printed
@@ -2657,6 +2777,13 @@ struct Ic3Pass : Pass
 			std::string src;
 			if (cell->attributes.count(ID::src))
 				src = cell->attributes.at(ID::src).decode_string();
+			if (multi_driven.count(cell)) {
+				log("ic3: %s: multiply-driven net %s in the cone of influence: not checked (an encoding "
+						"would assume the drivers agree)\n", name.c_str(), multi_driven.at(cell).c_str());
+				log("ic3: %s: undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
+				n_undecided++;
+				continue;
+			}
 
 			Ic3Solver solver(module, init_zero, max_frames);
 			solver.assume_cells = assumes;
@@ -2736,6 +2863,13 @@ struct Ic3Pass : Pass
 		int n_reached = 0, n_unreachable = 0, n_cover_undecided = 0;
 		for (auto cell : covers) {
 			std::string name = cell->name.unescape();
+			if (multi_driven.count(cell)) {
+				log("ic3: %s: multiply-driven net %s in the cone of influence: not checked\n", name.c_str(),
+						multi_driven.at(cell).c_str());
+				log("ic3: %s: cover undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
+				n_cover_undecided++;
+				continue;
+			}
 			RTLIL::Wire *na = module->addWire(NEW_ID);
 			RTLIL::Cell *ncell = module->addNot(NEW_ID, cell->getPort(ID::A), na);
 			RTLIL::Cell *tmp;
@@ -2801,6 +2935,13 @@ struct Ic3Pass : Pass
 			std::string src;
 			if (cell->attributes.count(ID::src))
 				src = cell->attributes.at(ID::src).decode_string();
+			if (multi_driven.count(cell)) {
+				log("ic3: %s: multiply-driven net %s in the cone of influence: not checked\n", name.c_str(),
+						multi_driven.at(cell).c_str());
+				log("ic3: %s: undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
+				n_undecided++;
+				continue;
+			}
 
 			Ic3Solver solver(module, init_zero, max_frames);
 			solver.assume_cells = assumes;

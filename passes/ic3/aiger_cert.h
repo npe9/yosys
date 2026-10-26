@@ -53,6 +53,26 @@ bool check_witness(const Aig &model, const Aig &witness, double timeout_s, std::
 // inv_get writes the network that is 1 where the invariant is violated)
 bool check_invariant(const Aig &model, const Aig &inv, double timeout_s, std::string &why, bool negate = false);
 
+// A native ic3 proof (register E7): the inductive frame as CNF over model
+// latches (clause literal +(l+1): latch l is 1, -(l+1): latch l is 0) and
+// one bad literal of the model.  The native frames block PREDECESSORS of
+// bad states, not bad states themselves, so safety is checked one step
+// shifted:
+//   init    R_s ^ C_s                -> I_s
+//   base    R_s ^ C_s                -> !B_s
+//   step    I_s ^ C_s ^ F_st ^ C_t   -> I_t
+//   safety  I_s ^ C_s ^ F_st ^ C_t   -> !B_t
+// Every reachable state is in I (init, step), B fails in the initial
+// state (base) and in every state with a predecessor (safety).
+bool check_clauses(const Aig &model, int bad, const std::vector<std::vector<int>> &clauses, double timeout_s, std::string &why);
+
+// A native k-induction proof at depth k, re-checked on the model (the
+// certificate is k itself), with constraints on the steps up to and
+// including the failing one:
+//   base  R_0 ^ C_0..C_d -> !B_d                  for d = 0..k-1
+//   step  C_0..C_k ^ !B_0..!B_{k-1} -> !B_k
+bool check_kinduction(const Aig &model, int bad, int k, double timeout_s, std::string &why);
+
 }
 
 YOSYS_NAMESPACE_END

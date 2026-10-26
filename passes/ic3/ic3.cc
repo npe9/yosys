@@ -252,6 +252,30 @@ struct Ic3Solver
 	// state bits whose initial value is an explicit 1 (encode())
 	int n_init_ones = 0;
 
+	// Constraints hold on the steps of a trace up to and including the
+	// failing one, not after it (smtbmc, AIGER).  An unrolling that asks
+	// for bad at step t must not impose the constraints of steps > t: with
+	// gate_constraints, encode() ties the constraints of timeframe t >= 2
+	// to cgate[t], which push_cgates() asserts up to the step asked about.
+	// Without it every timeframe's constraints are permanent, which is right
+	// for the two-frame IC3 queries (bad sits at the last frame) and for
+	// liveness (infinite traces).
+	bool gate_constraints = false;
+	std::vector<int> cgate;
+
+	void push_cgates(std::vector<int> &assumptions, int upto)
+	{
+		for (int t = 2; t <= upto && t < GetSize(cgate); t++)
+			if (cgate[t])
+				assumptions.push_back(cgate[t]);
+	}
+
+	// how the last proof was found (E7 certificates): the IC3 frame that
+	// was inductive (frames[proof_frame] is the invariant), or k-induction
+	int proof_frame = -1;
+	bool proof_kind = false;
+	int proof_k = 0;
+
 	int nsolves;
 	long long n_bad, n_blockq, n_gen, n_init, n_ctg;
 	double t_addclause, t_generalize, t_encode;
@@ -368,15 +392,27 @@ struct Ic3Solver
 							log_id(module), log_id(cell), log_id(cell->type));
 			}
 
-		// assume-flavor checks are permanent constraints at all timeframes
-		for (auto cell : assume_cells)
-			for (int t = 1; t <= ntf; t++) {
+		// assume-flavor checks constrain every timeframe; see
+		// gate_constraints for frames after the step a query asks about
+		cgate.assign(ntf + 1, 0);
+		for (int t = 1; t <= ntf; t++) {
+			std::vector<int> c;
+			for (auto cell : assume_cells) {
 				std::vector<int> a = satgen.importSigSpec(cell->getPort(ID::A), t);
 				std::vector<int> en = satgen.importSigSpec(cell->getPort(ID::EN), t);
 				while (a.size() < en.size()) a.push_back(ez.CONST_TRUE);
 				while (en.size() < a.size()) en.push_back(ez.CONST_FALSE);
-				ez.assume(ez.vec_reduce_and(ez.vec_or(a, ez.vec_not(en))));
+				c.push_back(ez.vec_reduce_and(ez.vec_or(a, ez.vec_not(en))));
 			}
+			if (c.empty())
+				continue;
+			int ct = GetSize(c) == 1 ? c[0] : ez.expression(ezSAT::OpAnd, c);
+			if (t >= 2 && gate_constraints) {
+				cgate[t] = ez.frozen_literal(stringf("cgate%d", t));
+				ez.assume(ez.OR(ct, ez.NOT(cgate[t])));
+			} else
+				ez.assume(ct);
+		}
 
 		// initial state: \init attributes where present (Sx bits stay free),
 		// everything else free.  -init-zero fixes the remaining bits (and
@@ -729,6 +765,7 @@ struct Ic3Solver
 		for (int d = 1; d <= kmax; d++) {
 			std::vector<int> assumptions;
 			push_assum(assumptions, -init_act);
+			push_cgates(assumptions, d);
 			assumptions.push_back(badv.at(d));
 			std::vector<bool> model;
 			bool sat = solve_model(assumptions, states.at(d), model);
@@ -743,6 +780,7 @@ struct Ic3Solver
 		}
 		for (int k = 1; k <= kmax; k++) {
 			std::vector<int> assumptions;
+			push_cgates(assumptions, k + 1);
 			for (int t = 1; t <= k; t++)
 				assumptions.push_back(ez.NOT(badv.at(t)));
 			assumptions.push_back(badv.at(k + 1));
@@ -762,6 +800,7 @@ struct Ic3Solver
 			return 2;
 		Ic3Solver ks(module, init_zero, max_frames);
 		ks.assume_cells = assume_cells;
+		ks.gate_constraints = true;
 		ks.encode(prop, kind_max + 1);
 		return ks.run_kind(kind_max, depth);
 	}
@@ -781,6 +820,21 @@ struct Ic3Solver
 		if (bad_sat(0, 1, model)) {
 			depth = 0;
 			return 1;
+		}
+		// bad_sat(0, 1) also imposed the step-1 (timeframe 2) constraints:
+		// a bad initial state with no constrained successor is still a
+		// counterexample.  Ask once more on a one-frame encoding.
+		if (!assume_cells.empty()) {
+			Ic3Solver zs(module, init_zero, max_frames);
+			zs.assume_cells = assume_cells;
+			zs.encode(prop, 1);
+			std::vector<int> assumptions;
+			zs.push_assum(assumptions, -zs.init_act);
+			assumptions.push_back(zs.badv[1]);
+			if (zs.solve_assum(assumptions)) {
+				depth = 0;
+				return 1;
+			}
 		}
 
 		int n = new_frame();
@@ -804,6 +858,7 @@ struct Ic3Solver
 			for (int i = 1; i <= n-1; i++)
 				if (inductive_at(i)) {
 					depth = i;
+					proof_frame = i;
 					return 0;
 				}
 
@@ -827,6 +882,7 @@ struct Ic3Solver
 			return 2;
 		Ic3Solver bs(module, init_zero, max_frames);
 		bs.assume_cells = assume_cells;
+		bs.gate_constraints = true;
 		bs.encode(prop, bmc_max + 1);
 		for (int t = 1; t <= bmc_max; t++) {
 			std::vector<int> assumptions;
@@ -835,6 +891,7 @@ struct Ic3Solver
 			// allocates the NOT(init) expression and the assumption is
 			// garbage in bs's id namespace -- spurious SAT
 			bs.push_assum(assumptions, -bs.init_act);
+			bs.push_cgates(assumptions, t);
 			assumptions.push_back(bs.badv[t]);
 			std::vector<bool> model;
 			bool sat = bs.solve_model(assumptions, bs.states.at(t), model);
@@ -868,8 +925,11 @@ struct Ic3Solver
 		if (r != 2)
 			return r;
 		r = kind_prepass(prop, depth);
-		if (r != 2)
+		if (r != 2) {
+			proof_kind = r == 0;
+			proof_k = depth;
 			return r;
+		}
 		return prove_core(prop, depth);
 	}
 
@@ -2126,6 +2186,195 @@ struct ExtEngine
 // "proved" five asserts that abc and rIC3 disprove at depth 1), and
 // write_aiger keeps one driver while write_smt2 refuses.  Such a property
 // is not checked.  Returns "" or "<net> (driven by <c1>, <c2>)".
+// Register E7: certificates for native proofs.  The module the native
+// engine ran on is exported ONCE to AIGER by a different encoder than
+// SatGen (chformal -lower, memory_map, techmap, aigmap, write_aiger: the
+// ExtEngine export tail), and every native IC3 proof is checked against
+// that model: its inductive frame, mapped onto the model's latches, must
+// pass ic3_cert::check_clauses.  A proof the checker cannot confirm stays a
+// proof but is labelled uncertified with the reason.
+struct NativeCert
+{
+	ic3_cert::Aig model;
+	std::string error;	// why there is no model ("" = model built)
+	dict<RTLIL::IdString, int> bad_of;	// native check cell -> model bad index
+	dict<std::pair<RTLIL::IdString, int>, int> latch_of;	// native state bit (wire, offset) -> model latch
+	double timeout_s = 0;
+	int n_certified = 0, n_uncertified = 0;
+
+	void build(RTLIL::Design *design, RTLIL::Module *module, bool init_zero)
+	{
+		std::unique_ptr<RTLIL::Design> d(new RTLIL::Design);
+		RTLIL::Module *m = module->clone();
+		d->add(m);
+		m->set_bool_attribute(ID::top);
+		// covers become the inverted asserts the native cover loop proves;
+		// liveness is not certified here; blackbox / unknown instances are
+		// cut (their outputs become free inputs, as in the native engine)
+		std::vector<RTLIL::Cell*> drop, cov;
+		for (auto c : m->cells()) {
+			std::string flavor = c->type == ID($check) && c->parameters.count(ID(FLAVOR))
+					? c->getParam(ID(FLAVOR)).decode_string() : "assert";
+			if (c->type.in(ID($live), ID($fair), ID($print), ID($scopeinfo)) ||
+					(c->type == ID($check) && (flavor == "live" || flavor == "liveness")))
+				drop.push_back(c);
+			else if (c->type == ID($cover) || (c->type == ID($check) && flavor == "cover"))
+				cov.push_back(c);
+			else if (c->type == ID($assert) || (c->type == ID($check) && flavor == "assert"))
+				c->attributes[ID(ic3_cert_id)] = RTLIL::Const(c->name.str());
+			else if (!yosys_celltypes.cell_known(c->type)) {
+				RTLIL::Module *cm = design->module(c->type);
+				if (!cm || cm->get_blackbox_attribute())
+					drop.push_back(c);
+			}
+		}
+		for (auto c : drop)
+			m->remove(c);
+		for (auto c : cov) {
+			RTLIL::Wire *na = m->addWire(NEW_ID);
+			m->addNot(NEW_ID, c->getPort(ID::A), na);
+			RTLIL::Cell *a = m->addAssert(NEW_ID, na, c->getPort(ID::EN));
+			a->attributes[ID(ic3_cert_id)] = RTLIL::Const(c->name.str());
+			m->remove(c);
+		}
+		// a public keep alias per register bit survives the export, and
+		// write_aiger -map names the latch it became
+		SigMap sm(m);
+		dict<RTLIL::SigBit, int> alias_of;
+		std::vector<RTLIL::SigBit> qbits;
+		for (auto c : m->cells())
+			if (c->is_builtin_ff() || c->type == ID($anyinit))
+				for (auto bit : sm(c->getPort(ID::Q)))
+					if (bit.wire && !alias_of.count(bit)) {
+						alias_of[bit] = GetSize(qbits);
+						qbits.push_back(bit);
+					}
+		dict<std::pair<RTLIL::IdString, int>, int> alias_at;
+		for (auto w : m->wires())
+			for (int i = 0; i < GetSize(w); i++) {
+				auto it = alias_of.find(sm(RTLIL::SigBit(w, i)));
+				if (it != alias_of.end())
+					alias_at[{w->name, i}] = it->second;
+			}
+		for (int k = 0; k < GetSize(qbits); k++) {
+			RTLIL::Wire *w = m->addWire(stringf("\\ic3_cert_q%d", k));
+			w->set_bool_attribute(ID::keep);
+			m->connect(w, qbits[k]);
+		}
+
+		std::string dir = make_temp_dir(get_base_tmpdir() + "/yosys_ic3_cert_XXXXXX");
+		std::string base = dir + "/model";
+		try {
+			auto quiet = logger().make_debug_scope(true);
+			Pass::call(d.get(), "chformal -lower");
+			Pass::call(d.get(), "memory_map");
+			if (init_zero)
+				Pass::call(d.get(), "setundef -init -zero");
+			Pass::call(d.get(), "setundef -undriven -anyseq");
+			Pass::call(d.get(), "setundef -zero");
+			Pass::call(d.get(), "dffunmap");
+			Pass::call(d.get(), "techmap");
+			Pass::call(d.get(), "aigmap");
+			Pass::call(d.get(), "setundef -zero");
+			Pass::call(d.get(), "opt_clean");
+			// write_aiger exits on a cell it cannot write (an async FF
+			// left by techmap): refuse here instead
+			for (auto c : m->cells())
+				if (!c->type.in(ID($_AND_), ID($_NOT_), ID($_FF_), ID($_DFF_P_), ID($_DFF_N_), ID($anyinit),
+						ID($anyconst), ID($anyseq), ID($initstate), ID($assert), ID($assume), ID($scopeinfo))) {
+					error = stringf("cell type %s has no AIGER form", log_id(c->type));
+					remove_directory(dir);
+					return;
+				}
+			Pass::call(d.get(), "write_aiger -map " + base + ".map " + base + ".aig");
+		} catch (std::exception &e) {
+			error = stringf("AIGER export failed (%s)", e.what());
+			remove_directory(dir);
+			return;
+		}
+		// write_aiger numbers bads in module->cells() order
+		int k = 0;
+		for (auto c : m->cells())
+			if (c->type == ID($assert)) {
+				if (c->attributes.count(ID(ic3_cert_id)))
+					bad_of[RTLIL::IdString(c->attributes.at(ID(ic3_cert_id)).decode_string())] = k;
+				k++;
+			}
+		std::string err;
+		if (!model.parse(base + ".aig", err)) {
+			error = "AIGER model unreadable (" + err + ")";
+			remove_directory(dir);
+			return;
+		}
+		dict<int, int> latch_of_alias;
+		{
+			std::ifstream f(base + ".map");
+			std::string kind, name;
+			int l, idx;
+			while (f >> kind >> l >> idx >> name) {
+				size_t p = name.find("ic3_cert_q");
+				if (kind == "latch" && p != std::string::npos)
+					latch_of_alias[atoi(name.c_str() + p + 10)] = l;
+			}
+		}
+		remove_directory(dir);
+		for (auto &it : alias_at) {
+			auto lt = latch_of_alias.find(it.second);
+			if (lt != latch_of_alias.end())
+				latch_of[it.first] = lt->second;
+		}
+		log("ic3: -certify: AIGER model of %s: %d latches, %d bads, %d of %d register bits mapped\n",
+				log_id(module), GetSize(model.latch_lit), GetSize(model.bad_lits()),
+				GetSize(latch_of_alias), GetSize(qbits));
+	}
+
+	// "certified" or "uncertified: <why>" for a native proof of `check`
+	std::string certify(RTLIL::Cell *check, const Ic3Solver &solver)
+	{
+		std::string status = check_proof(check, solver);
+		if (status == "certified")
+			n_certified++;
+		else
+			n_uncertified++;
+		return status;
+	}
+
+	std::string check_proof(RTLIL::Cell *check, const Ic3Solver &solver)
+	{
+		if (!error.empty())
+			return "uncertified: " + error;
+		auto bt = bad_of.find(check->name);
+		if (bt == bad_of.end())
+			return "uncertified: check missing from the AIGER model";
+		std::string err;
+		if (solver.proof_kind) {
+			if (!ic3_cert::check_kinduction(model, bt->second, solver.proof_k, timeout_s, err))
+				return "uncertified: " + err;
+			return "certified";
+		}
+		if (solver.proof_frame < 0)
+			return "uncertified: no inductive frame";
+		std::vector<std::vector<int>> clauses;
+		for (auto &cube : solver.frames.at(solver.proof_frame)) {
+			std::vector<int> cl;
+			for (int x = 0; x < GetSize(cube); x++) {
+				if (!cube[x])
+					continue;
+				RTLIL::SigBit b = solver.istate_bits[x];
+				auto lt = b.wire ? latch_of.find({b.wire->name, b.offset}) : latch_of.end();
+				if (lt == latch_of.end())
+					return stringf("uncertified: register bit %s has no AIGER latch", log_signal(b));
+				// the cube is the blocked state; the clause excludes it
+				cl.push_back(cube[x] > 0 ? -(lt->second + 1) : lt->second + 1);
+			}
+			clauses.push_back(cl);
+		}
+		if (!ic3_cert::check_clauses(model, bt->second, clauses, timeout_s, err))
+			return "uncertified: " + err;
+		return "certified";
+	}
+};
+
 static std::string multi_driven_in_coi(RTLIL::Module *module, const std::vector<RTLIL::Cell*> &seeds)
 {
 	SigMap sigmap(module);
@@ -2307,6 +2556,17 @@ struct Ic3Pass : Pass
 		log("        are kept, so a property that folds to a constant is still reported).\n");
 		log("        With -init-zero, uninitialized registers get init 0 first.\n");
 		log("\n");
+		log("    -certify\n");
+		log("        check every native safety proof (asserts, unreachable covers)\n");
+		log("        against an AIGER model of the module written by a different encoder\n");
+		log("        (chformal -lower, memory_map, techmap, aigmap, write_aiger): the\n");
+		log("        inductive IC3 frame must hold initially and be closed under the\n");
+		log("        transition, and the property must hold initially and in every\n");
+		log("        successor of a frame state.  The verdict line says [certified] or\n");
+		log("        [uncertified: <why>].  A k-induction proof is re-checked on the\n");
+		log("        model (base and step at its depth).  Liveness proofs carry no\n");
+		log("        certificate yet and are labelled so.\n");
+		log("\n");
 		log("    -engine-require-cert\n");
 		log("        count an external proof only when it is certified; an uncertified\n");
 		log("        one is undecided\n");
@@ -2376,6 +2636,7 @@ struct Ic3Pass : Pass
 		bool init_zero = false;
 		bool allow_degraded = false;
 		bool preopt = false;
+		bool certify = false;
 		bool verbose = false;
 		int max_frames = 1000;
 		double timeout_s = 0;
@@ -2402,6 +2663,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-check-cells") {
 				check_cells = true;
+				continue;
+			}
+			if (args[argidx] == "-certify") {
+				certify = true;
 				continue;
 			}
 			if (args[argidx] == "-preopt") {
@@ -2751,6 +3016,7 @@ struct Ic3Pass : Pass
 			Ic3Solver bs(module, init_zero, max_frames);
 			bs.assume_cells = assumes;
 			bs.extra_seeds = targets;
+			bs.gate_constraints = true;
 			bs.encode(targets[0], bmc_max + 1);
 			log("ic3: bmc pre-pass: %d assert(s) and %d cover(s) on one %d-step unrolling "
 					"(%d clauses, %d variables, encoded in %.1fs)\n",
@@ -2782,6 +3048,7 @@ struct Ic3Pass : Pass
 						continue;
 					std::vector<int> assumptions;
 					bs.push_assum(assumptions, -bs.init_act);
+					bs.push_cgates(assumptions, t);
 					assumptions.push_back(lits[k]);
 					std::vector<int> watch, idx;
 					for (int j = 0; j < ntargets; j++)
@@ -2828,6 +3095,17 @@ struct Ic3Pass : Pass
 			if (!c->attributes.count(ID(sva_lowering)))
 				return std::string(" [lowering=untagged]");
 			return " [lowering=" + c->attributes.at(ID(sva_lowering)).decode_string() + "]";
+		};
+		NativeCert ncert;
+		bool ncert_on = certify && !engine_ext;
+		if (ncert_on) {
+			ncert.timeout_s = timeout_s;
+			ncert.build(design, module, init_zero);
+			if (!ncert.error.empty())
+				log("ic3: -certify: no AIGER model: %s\n", ncert.error.c_str());
+		}
+		auto cert_tag = [&](RTLIL::Cell *check, const Ic3Solver &solver) -> std::string {
+			return ncert_on ? " [" + ncert.certify(check, solver) + "]" : std::string();
 		};
 		int n_proved = 0, n_disproved = 0, n_undecided = 0;
 		if (engine_ext && !props.empty()) {
@@ -2909,7 +3187,7 @@ struct Ic3Pass : Pass
 					log("ic3: %s: proved%s [engine %s, %s]\n", name.c_str(), lowering_tag(cell).c_str(),
 							engine_name.c_str(), ext.cert_status.c_str());
 				else
-					log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());
+					log("ic3: %s: proved%s%s\n", name.c_str(), lowering_tag(cell).c_str(), cert_tag(cell, solver).c_str());
 				n_proved++;
 			} else if (result == 1) {
 				log("ic3: %s: disproved (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
@@ -2993,7 +3271,7 @@ struct Ic3Pass : Pass
 					solver.export_cex(tmp, stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), depth);
 				}
 			} else if (result == 0) {
-				log("ic3: %s: cover unreachable%s\n", name.c_str(), lowering_tag(cell).c_str());
+				log("ic3: %s: cover unreachable%s%s\n", name.c_str(), lowering_tag(cell).c_str(), cert_tag(cell, solver).c_str());
 				n_unreachable++;
 			} else {
 				log("ic3: %s: cover undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
@@ -3047,7 +3325,12 @@ struct Ic3Pass : Pass
 			ic3_deadline_on = false;
 
 			if (result == 0) {
-				log("ic3: %s: proved%s\n", name.c_str(), lowering_tag(cell).c_str());
+				std::string tag;
+				if (ncert_on) {
+					tag = " [uncertified: no liveness certificate yet]";
+					ncert.n_uncertified++;
+				}
+				log("ic3: %s: proved%s%s\n", name.c_str(), lowering_tag(cell).c_str(), tag.c_str());
 				n_proved++;
 			} else if (result == 1) {
 				log("ic3: %s: disproved (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
@@ -3069,6 +3352,8 @@ struct Ic3Pass : Pass
 
 		log("ic3: %d properties: proved=%d disproved=%d undecided=%d\n",
 				GetSize(props) + GetSize(live_props), n_proved, n_disproved, n_undecided);
+		if (ncert_on)
+			log("ic3: native proofs: %d certified, %d uncertified\n", ncert.n_certified, ncert.n_uncertified);
 		if (engine_ext)
 			log("ic3: external proofs: %d certified, %d uncertified%s\n", ext.n_certified, ext.n_uncertified,
 					ext.require_cert ? " (not counted: -engine-require-cert)" : "");

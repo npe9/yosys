@@ -39,10 +39,18 @@ struct Frame {
 	dict<int, int> var;	// AIGER variable -> ez literal (inputs, latches, gates)
 	dict<int, const std::array<int, 3> *> gate;
 
-	Frame(ezSAT *ez, const Aig *aig) : ez(ez), aig(aig)
+	// with prev: the successor of frame prev, its latches read prev's
+	// next-state functions (built lazily, only in the cone asked for)
+	Frame *prev = nullptr;
+	dict<int, int> latch_idx;
+
+	Frame(ezSAT *ez, const Aig *aig, Frame *prev = nullptr) : ez(ez), aig(aig), prev(prev)
 	{
 		for (auto &a : aig->ands)
 			gate[a[0] >> 1] = &a;
+		if (prev)
+			for (int i = 0; i < GetSize(aig->latch_lit); i++)
+				latch_idx[aig->latch_lit[i] >> 1] = i;
 	}
 	int lit(int l)
 	{
@@ -56,7 +64,10 @@ struct Frame {
 				x = it->second;
 			else {
 				auto git = gate.find(v);
-				if (git == gate.end()) {
+				auto lit_it = prev ? latch_idx.find(v) : latch_idx.end();
+				if (lit_it != latch_idx.end()) {
+					x = prev->lit(aig->latch_next[lit_it->second]);
+				} else if (git == gate.end()) {
 					// an unassigned input or latch: a free variable
 					x = ez->literal();
 				} else {
@@ -376,6 +387,87 @@ bool check_invariant(const Aig &model, const Aig &inv, double timeout_s, std::st
 		Frame ms(ez.get(), &model), is(ez.get(), &inv);
 		int cond = ez->OR(ez->NOT(ez->AND(inv_at(ms, is), ms.constraints())), ms.property());
 		if (!valid(ez.get(), cond, timeout_s, "invariant safety", why))
+			return false;
+	}
+	return true;
+}
+
+bool check_clauses(const Aig &model, int bad, const std::vector<std::vector<int>> &clauses, double timeout_s, std::string &why)
+{
+	const std::vector<int> &bads = model.bad_lits();
+	if (bad < 0 || bad >= GetSize(bads)) {
+		why = stringf("bad %d of %d", bad, GetSize(bads));
+		return false;
+	}
+	for (auto &cl : clauses)
+		for (int l : cl)
+			if (l == 0 || std::abs(l) > GetSize(model.latch_lit)) {
+				why = stringf("clause literal %d names no latch (%d latches)", l, GetSize(model.latch_lit));
+				return false;
+			}
+	auto inv_at = [&](ezSAT *ez, Frame &f) {
+		std::vector<int> conj;
+		for (auto &cl : clauses) {
+			std::vector<int> disj;
+			for (int l : cl) {
+				int x = f.lit(model.latch_lit[std::abs(l) - 1]);
+				disj.push_back(l > 0 ? x : ez->NOT(x));
+			}
+			conj.push_back(disj.empty() ? ez->CONST_FALSE : ez->expression(ezSAT::OpOr, disj));
+		}
+		return conj.empty() ? ez->CONST_TRUE : ez->expression(ezSAT::OpAnd, conj);
+	};
+	// one solver per obligation: the simplifying MiniSat eliminates
+	// variables after a solve, so it takes one query
+	static const char *names[] = {"invariant init", "base", "invariant step", "shifted safety"};
+	for (int k = 0; k < 4; k++) {
+		ezSatPtr ez;
+		Frame ms(ez.get(), &model), mt(ez.get(), &model, &ms);
+		int ante, goal;
+		if (k < 2) {
+			ante = ez->AND(ms.reset(), ms.constraints());
+			goal = k == 0 ? inv_at(ez.get(), ms) : ez->NOT(ms.lit(bads[bad]));
+		} else {
+			ante = ez->AND(inv_at(ez.get(), ms), ez->AND(ms.constraints(), mt.constraints()));
+			goal = k == 2 ? inv_at(ez.get(), mt) : ez->NOT(mt.lit(bads[bad]));
+		}
+		if (!valid(ez.get(), ez->OR(ez->NOT(ante), goal), timeout_s, names[k], why))
+			return false;
+	}
+	return true;
+}
+
+bool check_kinduction(const Aig &model, int bad, int k, double timeout_s, std::string &why)
+{
+	const std::vector<int> &bads = model.bad_lits();
+	if (bad < 0 || bad >= GetSize(bads) || k < 1) {
+		why = stringf("bad %d of %d, k = %d", bad, GetSize(bads), k);
+		return false;
+	}
+	for (int step = 0; step < 2; step++) {
+		ezSatPtr ez;
+		std::vector<std::unique_ptr<Frame>> fr;
+		for (int t = 0; t <= k; t++)
+			fr.emplace_back(new Frame(ez.get(), &model, t ? fr[t-1].get() : nullptr));
+		int cond;
+		if (step == 0) {
+			// one query: some d < k with a constrained path to bad at d
+			std::vector<int> any;
+			int path = fr[0]->reset();
+			for (int d = 0; d < k; d++) {
+				path = ez->AND(path, fr[d]->constraints());
+				any.push_back(ez->AND(path, fr[d]->lit(bads[bad])));
+			}
+			cond = ez->NOT(ez->expression(ezSAT::OpOr, any));
+		} else {
+			std::vector<int> ante;
+			for (int t = 0; t <= k; t++)
+				ante.push_back(fr[t]->constraints());
+			for (int t = 0; t < k; t++)
+				ante.push_back(ez->NOT(fr[t]->lit(bads[bad])));
+			cond = ez->OR(ez->NOT(ez->expression(ezSAT::OpAnd, ante)), ez->NOT(fr[k]->lit(bads[bad])));
+		}
+		if (!valid(ez.get(), cond, timeout_s, step == 0 ? "k-induction base" : "k-induction step", why))
 			return false;
 	}
 	return true;

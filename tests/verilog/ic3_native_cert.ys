@@ -1,0 +1,115 @@
+# ic3 -certify (register E7): every native safety proof is checked against an
+# AIGER model of the module written by a different encoder (chformal -lower,
+# memory_map, techmap, aigmap, write_aiger).  An IC3 proof's inductive frame
+# and a k-induction proof's depth are both re-checked; liveness proofs carry
+# no certificate yet and say so.
+read_verilog -sv -formal <<EOT
+module t(input clk, input rst, input en);
+  reg [3:0] cnt = 0;
+  reg [3:0] sh = 0;
+  always @(posedge clk)
+    if (rst) begin cnt <= 0; sh <= 0; end
+    else if (en) begin cnt <= cnt == 9 ? 0 : cnt + 1; sh <= cnt; end
+  always @* begin
+    p_lt10: assert (cnt < 10);
+    p_sh:   assert (sh < 10);
+    p_bad:  assert (cnt != 7);
+    c_13:   cover (cnt == 13);
+    c_5:    cover (cnt == 5);
+  end
+endmodule
+EOT
+prep -top t
+async2sync
+design -save t
+
+# IC3 frames (-kind 0): two proofs and an unreachable cover, all certified
+logger -expect log "-certify: AIGER model of t: 8 latches, 5 bads, 8 of 8 register bits mapped" 1
+logger -expect log "p_lt10: proved .*\[certified\]" 1
+logger -expect log "p_sh: proved .*\[certified\]" 1
+logger -expect log "p_bad: disproved \(depth 7\)" 1
+logger -expect log "c_13: cover unreachable .*\[certified\]" 1
+logger -expect log "native proofs: 3 certified, 0 uncertified" 1
+ic3 -certify -kind 0
+logger -check-expected
+
+# default k-induction pre-pass: its proofs are re-checked on the model
+design -load t
+logger -expect log "native proofs: 3 certified, 0 uncertified" 1
+ic3 -certify
+logger -check-expected
+
+# -preopt + -certify: the model is written from the simplified copy
+design -load t
+logger -expect log "native proofs: 3 certified, 0 uncertified" 1
+ic3 -certify -preopt -init-zero
+logger -check-expected
+
+# liveness: proved, labelled uncertified
+design -reset
+read_verilog -sv -formal <<EOT
+module l (input logic clk, input logic req);
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) t <= t + 4'd1;
+  wire gnt = t == 4'd0;
+  a_live: assert property (@(posedge clk) req |-> s_eventually gnt);
+endmodule
+EOT
+hierarchy -top l
+sva2check
+proc
+async2sync
+logger -expect log "proved .*\[uncertified: no liveness certificate yet\]" 1
+logger -expect log "native proofs: 0 certified, 1 uncertified" 1
+ic3 -certify -init-zero
+logger -check-expected
+
+# constraints bind the steps up to the failing one, not after it (smtbmc,
+# AIGER): a bad state whose successor violates an assumption is still a
+# counterexample.  The k-induction pre-pass (all 9 frames constrained) used
+# to PROVE p_no4, and the IC3 depth-0 query (frame 2 constrained) p_no0 and
+# c_0 unreachable.
+design -reset
+read_verilog -sv -formal <<EOT
+module f(input clk);
+  reg [3:0] cnt = 0;
+  always @(posedge clk) cnt <= cnt + 1;
+  always @* begin
+    a_no5: assume (cnt != 5);
+    p_no4: assert (cnt != 4);
+  end
+endmodule
+EOT
+prep -top f
+async2sync
+design -save f
+logger -expect log "p_no4: disproved \(depth 4\)" 1
+ic3
+logger -check-expected
+design -load f
+logger -expect log "p_no4: disproved \(depth 4\)" 1
+ic3 -kind 0
+logger -check-expected
+design -load f
+logger -expect log "p_no4: bmc pre-pass hit at depth 4" 1
+ic3 -bmc 8 -kind 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal <<EOT
+module g(input clk);
+  reg [3:0] cnt = 0;
+  always @(posedge clk) cnt <= cnt + 1;
+  always @* begin
+    a_no1: assume (cnt != 1);
+    p_no0: assert (cnt != 0);
+    c_0: cover (cnt == 0);
+  end
+endmodule
+EOT
+prep -top g
+async2sync
+logger -expect log "p_no0: disproved \(depth 0\)" 1
+logger -expect log "c_0: cover reached \(depth 0\)" 1
+ic3 -kind 0
+logger -check-expected

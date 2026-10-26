@@ -2784,6 +2784,17 @@ struct Ic3Pass : Pass
 				n_undecided++;
 				continue;
 			}
+			// -kind 0 -max 0 (a reachability screen): with no k-induction
+			// and no IC3 frame the per-property run can only find a bad
+			// state within one step of init -- what `-bmc 2` already asked
+			// of every property on one shared unrolling -- and can never
+			// prove.  Skip the per-property encoding (it was 97% of the
+			// ladder's ic3 time: csrng 379s for 255 properties).
+			if (!engine_ext && kind_max == 0 && max_frames == 0 && bmc_max >= 2 && !bmc_hit.count(cell)) {
+				log("ic3: %s: undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
+				n_undecided++;
+				continue;
+			}
 
 			Ic3Solver solver(module, init_zero, max_frames);
 			solver.assume_cells = assumes;

@@ -1,0 +1,21 @@
+# -kind 0 -max 0 is a reachability screen: with -bmc >= 2 the batched
+# pre-pass already asks every property for a bad state at depth 0 and 1,
+# which is all the per-property run could find (it never proves at -max 0),
+# so the per-property encoding is skipped (csrng: 387s -> 48s, verdicts
+# identical).  A depth-1 bug is still found; a true property is undecided.
+read_verilog -sv -formal <<EOT
+module t(input clk, input a);
+  reg [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  always @(posedge clk) begin
+    assert (!a);               // fails at depth 1 (sampled a step late)
+    assert (c != 2'd3 || 1'b1); // true
+  end
+endmodule
+EOT
+prep -top t
+async2sync
+logger -expect log "disproved \(depth 1\)" 1
+logger -expect log "2 properties: proved=0 disproved=1 undecided=1" 1
+ic3 -check-cells -init-zero -kind 0 -bmc 2 -max 0
+logger -check-expected

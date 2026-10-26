@@ -22,6 +22,8 @@
 
 #include "kernel/yosys.h"
 #include "kernel/satgen.h"
+#include "kernel/ff.h"
+#include "kernel/ffinit.h"
 #include "passes/ic3/aiger_cert.h"
 
 #include "libs/minisat/Solver.h"
@@ -2299,6 +2301,12 @@ struct Ic3Pass : Pass
 		log("        circuit or an invariant circuit against an AIGER model and log\n");
 		log("        \"certificate check: ok\" or \"... rejected, <check> check failed\"\n");
 		log("\n");
+		log("    -preopt\n");
+		log("        simplify a copy of the module before encoding: opt_expr -keepdc,\n");
+		log("        opt_merge, opt_clean (no x refinement, no FF rewriting; formal cells\n");
+		log("        are kept, so a property that folds to a constant is still reported).\n");
+		log("        With -init-zero, uninitialized registers get init 0 first.\n");
+		log("\n");
 		log("    -engine-require-cert\n");
 		log("        count an external proof only when it is certified; an uncertified\n");
 		log("        one is undecided\n");
@@ -2367,6 +2375,7 @@ struct Ic3Pass : Pass
 		bool check_cells = false;
 		bool init_zero = false;
 		bool allow_degraded = false;
+		bool preopt = false;
 		bool verbose = false;
 		int max_frames = 1000;
 		double timeout_s = 0;
@@ -2393,6 +2402,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-check-cells") {
 				check_cells = true;
+				continue;
+			}
+			if (args[argidx] == "-preopt") {
+				preopt = true;
 				continue;
 			}
 			if (args[argidx] == "-allow-degraded") {
@@ -2491,6 +2504,58 @@ struct Ic3Pass : Pass
 				log_error("ic3: no top module found, use -top to specify one.\n");
 		}
 		(void) check_cells;
+
+		// E1: -preopt simplifies a CLONE of the module before encoding (the
+		// caller's design is left as it is).  Only don't-care-preserving
+		// passes: opt_expr -keepdc (no x refinement, unlike opt -full's
+		// mux_undef), opt_merge, opt_clean; no FF rewriting.  Every formal
+		// cell is kept, so a property that folds to a constant is still
+		// reported (and proved instantly) instead of vanishing.  With
+		// -init-zero, registers without a 0/1 init get init 0 first, the
+		// value the engine gives them anyway, so folding sees it too.
+		std::unique_ptr<RTLIL::Design> preopt_owner;
+		if (preopt) {
+			preopt_owner.reset(new RTLIL::Design);
+			RTLIL::Design *preopt_design = preopt_owner.get();
+			for (auto mod : design->modules())
+				if (mod != module && mod->get_blackbox_attribute())
+					preopt_design->add(mod->clone());
+			RTLIL::Module *m2 = module->clone();
+			preopt_design->add(m2);
+			int before = GetSize(m2->cells());
+			for (auto cell : m2->cells())
+				if (cell->type.in(ID($assert), ID($assume), ID($cover), ID($check), ID($live), ID($fair), ID($initstate)))
+					cell->set_bool_attribute(ID::keep);
+			if (init_zero) {
+				FfInitVals initvals;
+				SigMap sm(m2);
+				initvals.set(&sm, m2);
+				std::vector<RTLIL::Cell*> ffs;
+				for (auto cell : m2->cells())
+					if (cell->is_builtin_ff())
+						ffs.push_back(cell);
+				for (auto cell : ffs) {
+					FfData ff(&initvals, cell);
+					bool changed = false;
+					for (int i = 0; i < ff.width; i++)
+						if (ff.val_init[i] != State::S0 && ff.val_init[i] != State::S1) {
+							ff.val_init.set(i, State::S0);
+							changed = true;
+						}
+					if (changed)
+						ff.emit();
+				}
+			}
+			{
+				auto quiet = logger().make_debug_scope(true);
+				Pass::call_on_module(preopt_design, m2, "opt_expr -keepdc");
+				Pass::call_on_module(preopt_design, m2, "opt_merge");
+				Pass::call_on_module(preopt_design, m2, "opt_clean");
+			}
+			log("ic3: -preopt: %d -> %d cells (opt_expr -keepdc, opt_merge, opt_clean on a copy)\n", before, GetSize(m2->cells()));
+			design = preopt_design;
+			module = m2;
+		}
 
 		// $initstate is 1 in the initial state only.  async2sync gates
 		// every initial-block check with it (`initial assert property`,

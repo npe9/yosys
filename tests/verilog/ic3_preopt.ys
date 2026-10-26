@@ -1,0 +1,23 @@
+# ic3 -preopt simplifies a copy of the module (opt_expr -keepdc, opt_merge,
+# opt_clean) and keeps every formal cell: a property that folds to a constant
+# is still reported, verdicts are unchanged, and the caller's design is not
+# touched (the cell count after ic3 equals the count before).
+read_verilog -sv -formal <<EOT
+module t(input clk, input a);
+  reg [2:0] c = 0;
+  wire dup1 = c[0] & a, dup2 = c[0] & a;
+  always @(posedge clk) c <= c + 1;
+  always @(posedge clk) begin
+    assert (dup1 == dup2);       // folds to a constant after opt_merge
+    assert (c != 3'd5);          // false
+  end
+endmodule
+EOT
+prep -top t
+async2sync
+select -assert-count 17 t:*
+logger -expect log "-preopt: [0-9]+ -> [0-9]+ cells" 1
+logger -expect log "2 properties: proved=1 disproved=1 undecided=0" 1
+ic3 -check-cells -init-zero -preopt
+logger -check-expected
+select -assert-count 17 t:*

@@ -25,6 +25,7 @@
 #include "kernel/ff.h"
 #include "kernel/ffinit.h"
 #include "passes/ic3/aiger_cert.h"
+#include "passes/ic3/smt_bitwuzla.h"
 
 #include "libs/minisat/Solver.h"
 
@@ -1900,7 +1901,11 @@ struct ExtEngine
 			ys << "flatten\ndelete a:ic3_ext=cut t:$print t:$scopeinfo\nchformal -lower\nmemory_map\ndelete -output\n";
 			if (init_zero)
 				ys << "setundef -init -zero\n";
-			ys << "setundef -undriven -anyseq\nsetundef -zero\ndffunmap\n";
+			// -zero first: x constants are 0, as SatGen reads them;
+			// `setundef -undriven -anyseq` alone gives every x constant in
+			// a cell port its own free input (`d9[11:0]` with a 9-bit d9
+			// then differs between two reads)
+			ys << "setundef -zero\nsetundef -undriven -anyseq\ndffunmap\n";
 			if (format == AIGER) {
 				// techmap / aigmap create x constants of their own (an
 				// out-of-range $shiftx)
@@ -2270,8 +2275,9 @@ struct NativeCert
 			Pass::call(d.get(), "memory_map");
 			if (init_zero)
 				Pass::call(d.get(), "setundef -init -zero");
-			Pass::call(d.get(), "setundef -undriven -anyseq");
+			// -zero first, as in the engine export above: x constants are 0
 			Pass::call(d.get(), "setundef -zero");
+			Pass::call(d.get(), "setundef -undriven -anyseq");
 			Pass::call(d.get(), "dffunmap");
 			Pass::call(d.get(), "techmap");
 			Pass::call(d.get(), "aigmap");
@@ -2530,6 +2536,15 @@ struct Ic3Pass : Pass
 		log("            btormc  btor         no      BMC to -depth\n");
 		log("            smtbmc  smt2         yes     basecase + induction, -t <depth>\n");
 		log("\n");
+		log("        -engine bitwuzla runs in-process instead (when this yosys is\n");
+		log("        built with Bitwuzla): the module is lowered to the Functional IR\n");
+		log("        (word-level operators, memories as SMT arrays) and every step is\n");
+		log("        built as Bitwuzla terms through its C API, one incremental solver\n");
+		log("        for all asserts and covers: BMC plus k-induction to -depth, with\n");
+		log("        constraints up to the step asked about.  A k-induction proof is\n");
+		log("        re-checked by -certify; -cex witnesses come from the native\n");
+		log("        unrolling at the depth found.\n");
+		log("\n");
 		log("        A bounded \"no counterexample\" is undecided, never proved.  The\n");
 		log("        -bmc pre-pass still runs natively; -kind / -max / -ctg apply only\n");
 		log("        to native; covers and liveness stay native.  -timeout is a hard\n");
@@ -2748,7 +2763,12 @@ struct Ic3Pass : Pass
 			break;
 		}
 		extra_args(args, argidx, design);
-		bool engine_ext = engine_name != "native";
+		// -engine bitwuzla runs in-process (Bitwuzla's C API on the
+		// Functional IR); every other non-native engine is a process
+		bool engine_smt = engine_name == "bitwuzla";
+		bool engine_ext = engine_name != "native" && !engine_smt;
+		if (engine_smt && ext.depth_max < 1)
+			log_cmd_error("ic3: -depth must be at least 1.\n");
 		if (engine_ext) {
 			std::string err = ext.configure(engine_name, engine_format);
 			if (!err.empty())
@@ -3107,6 +3127,63 @@ struct Ic3Pass : Pass
 		auto cert_tag = [&](RTLIL::Cell *check, const Ic3Solver &solver) -> std::string {
 			return ncert_on ? " [" + ncert.certify(check, solver) + "]" : std::string();
 		};
+		// E8: one word-level BMC / k-induction run over every assert and
+		// cover of the module (a cover is the inverted assert)
+		dict<RTLIL::Cell*, SmtBitwuzlaResult> smt_res;
+		std::string smt_err;
+		if (engine_smt) {
+			std::vector<RTLIL::Cell*> checks;
+			pool<RTLIL::Cell*> cover_set;
+			for (auto c : props)
+				if (!multi_driven.count(c))
+					checks.push_back(c);
+			for (auto c : covers)
+				if (!multi_driven.count(c)) {
+					checks.push_back(c);
+					cover_set.insert(c);
+				}
+			SmtBitwuzlaOptions so;
+			so.init_zero = init_zero;
+			so.depth_max = ext.depth_max;
+			so.timeout_s = timeout_s;
+			std::vector<SmtBitwuzlaResult> res;
+			std::string stats;
+			auto t0 = std::chrono::steady_clock::now();
+			if (!checks.empty())
+				smt_err = smt_bitwuzla_prove(design, module, checks, cover_set, so, res, stats);
+			double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			if (!smt_err.empty())
+				log("ic3: engine bitwuzla: not run: %s\n", smt_err.c_str());
+			else {
+				for (int i = 0; i < GetSize(checks); i++)
+					smt_res[checks[i]] = res[i];
+				log("ic3: engine bitwuzla: %d check(s), BMC / k-induction to depth %d in %.2fs (%s)\n",
+						GetSize(checks), ext.depth_max, secs, stats.c_str());
+			}
+		}
+		// the verdict of the bitwuzla run for one check, in prove()'s
+		// convention; a k-induction proof is recorded on `solver` so
+		// -certify re-checks it on the AIGER model
+		auto smt_verdict = [&](RTLIL::Cell *cell, Ic3Solver &solver, int &depth, const std::string &name) {
+			auto it = smt_res.find(cell);
+			if (it == smt_res.end()) {
+				log("ic3: %s: engine bitwuzla: %s\n", name.c_str(), smt_err.empty() ? "not run" : smt_err.c_str());
+				return 2;
+			}
+			const SmtBitwuzlaResult &r = it->second;
+			depth = r.depth;
+			if (r.verdict == 0) {
+				solver.proof_kind = true;
+				solver.proof_k = std::max(1, r.depth);
+				return 0;
+			}
+			if (r.verdict == 1)
+				return 1;
+			log("ic3: %s: engine bitwuzla: %s\n", name.c_str(), r.verdict == 2
+					? stringf("solver budget exhausted at step %d", r.depth).c_str()
+					: stringf("no counterexample and no induction up to depth %d (bounded; not a proof)", ext.depth_max).c_str());
+			return 2;
+		};
 		int n_proved = 0, n_disproved = 0, n_undecided = 0;
 		if (engine_ext && !props.empty()) {
 			ext.init_zero = init_zero;
@@ -3133,7 +3210,7 @@ struct Ic3Pass : Pass
 			// of every property on one shared unrolling -- and can never
 			// prove.  Skip the per-property encoding (it was 97% of the
 			// ladder's ic3 time: csrng 379s for 255 properties).
-			if (!engine_ext && kind_max == 0 && max_frames == 0 && bmc_max >= 2 && !bmc_hit.count(cell)) {
+			if (!engine_ext && !engine_smt && kind_max == 0 && max_frames == 0 && bmc_max >= 2 && !bmc_hit.count(cell)) {
 				log("ic3: %s: undecided%s\n", name.c_str(), lowering_tag(cell).c_str());
 				n_undecided++;
 				continue;
@@ -3156,6 +3233,8 @@ struct Ic3Pass : Pass
 			if (bmc_hit.count(cell)) {
 				result = 1;
 				depth = bmc_hit.at(cell);
+			} else if (engine_smt) {
+				result = smt_verdict(cell, solver, depth, name);
 			} else if (engine_ext) {
 				std::string why;
 				result = ext.prove(prop_idx, depth,
@@ -3250,6 +3329,8 @@ struct Ic3Pass : Pass
 			if (bmc_hit.count(cell)) {
 				result = 1;
 				depth = bmc_hit.at(cell);
+			} else if (engine_smt) {
+				result = smt_verdict(cell, solver, depth, name);
 			} else {
 				arm();
 				try {

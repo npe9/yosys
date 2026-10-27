@@ -113,3 +113,23 @@ logger -expect log "p_no0: disproved \(depth 0\)" 1
 logger -expect log "c_0: cover reached \(depth 0\)" 1
 ic3 -kind 0
 logger -check-expected
+
+# x constants are 0 in the certificate model, as in the engine: an
+# out-of-range select read twice is one value (with `setundef -undriven
+# -anyseq` first, each x bit was its own free input and the proof was
+# left uncertified)
+design -reset
+read_verilog -sv -formal <<EOT
+module x(input clk, input [7:0] din);
+  reg [8:0] d9 = 0;
+  always @(posedge clk) begin
+    d9 <= {1'b0, din};
+    p_x: assert (d9[11:0] == d9[11:0]);
+  end
+endmodule
+EOT
+prep -top x
+async2sync
+logger -expect log "p_x: proved .*\[certified\]" 1
+ic3 -certify
+logger -check-expected

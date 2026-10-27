@@ -27,9 +27,11 @@ logger -expect log "certificate check: rejected" 1
 ic3 -check-cert ic3_cert/m.aag ic3_cert/ric3_cert_flip.aag
 logger -check-expected
 
-# end to end: abc pdr's invariant (inv_get) is verified; with an assumption
-# abc's fold adds a flop the model does not have, so that proof stays
-# uncertified, and -engine-require-cert does not count it
+# end to end: abc pdr's invariant (inv_get) is verified, also under an
+# assumption (fold -s keeps the model's latches in order and appends its
+# "constraint failed" flop, which reads as 0), so -engine-require-cert
+# counts both proofs; an engine that claims a proof without a readable
+# certificate (a stand-in rIC3 that exits 20) is not counted
 read_verilog -sv -formal <<EOT
 module c(input clk, input a);
   reg [2:0] x = 0;
@@ -50,7 +52,34 @@ logger -expect log "external proofs: 1 certified, 0 uncertified" 1
 ic3 -top c -check-cells -init-zero -engine abc
 logger -check-expected
 design -load d
-logger -expect log "engine abc: proof not counted \(-engine-require-cert\): uncertified: " 1
-logger -expect log "1 properties: proved=0 disproved=0 undecided=1" 1
+logger -expect log "proved .*\[engine abc, certified\]" 1
+logger -expect log "1 properties: proved=1 disproved=0 undecided=0" 1
 ic3 -top ca -check-cells -init-zero -engine abc -engine-require-cert
+logger -check-expected
+design -load d
+!printf '#!/bin/sh\nexit 20\n' > ic3_cert_fake_ric3.tmp && chmod +x ic3_cert_fake_ric3.tmp
+logger -expect log "engine ric3: proof not counted \(-engine-require-cert\): uncertified: certificate unreadable" 1
+logger -expect log "1 properties: proved=0 disproved=0 undecided=1" 1
+ic3 -top ca -check-cells -init-zero -engine ric3 -ric3 ./ic3_cert_fake_ric3.tmp -engine-require-cert
+logger -check-expected
+!rm -f ic3_cert_fake_ric3.tmp
+
+# a latch-free property: pdr proves it over a dummy flop and inv_get's
+# network reads that flop, so the proof is checked as a validity (the
+# battery's tsand1 p1, with its flow: no opt, so abc sees real logic)
+design -reset
+read_verilog -sv -formal <<EOT
+module cz(input logic clk, input logic a, input logic b);
+  p1: assert property (@(posedge clk) always ((a && b) |-> ((a[*1]) and (b[*1]))));
+endmodule
+EOT
+hierarchy -check
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+logger -expect log "p1: proved .*\[engine abc, certified\]" 1
+logger -expect log "external proofs: 1 certified, 0 uncertified" 1
+ic3 -check-cells -init-zero -engine abc -engine-require-cert
 logger -check-expected

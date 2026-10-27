@@ -2010,8 +2010,11 @@ struct ExtEngine
 			}
 		} else if (kind == ABC) {
 			// inv_get + write_aiger: pdr's inductive invariant over the flops,
-			// checked in-tree before the proof is called certified
-			std::string cmd = limit_prefix() + stringf("'%s' -c 'read_aiger %s.aig; fold; strash; print_stats; pdr%s; write_cex -a %s.aiw; "
+			// checked in-tree before the proof is called certified.  fold -s:
+			// without the sequential cleanup the folded latches are the
+			// model's in order (plus fold's own, last), so the invariant's
+			// "pi<k>" names index the model latches
+			std::string cmd = limit_prefix() + stringf("'%s' -c 'read_aiger %s.aig; fold -s; strash; print_stats; pdr%s; write_cex -a %s.aiw; "
 					"inv_get -f; strash; write_aiger -s %s.inv.aig'",
 					bin.c_str(), base.c_str(), lim ? stringf(" -T %lld", lim).c_str() : "", base.c_str(), base.c_str());
 			if (!extra.empty())
@@ -2046,7 +2049,12 @@ struct ExtEngine
 				}
 			} else if (proved) {
 				result = 0;
-				certify_invariant(base + ".aig", base + ".inv.aig");
+				// a latch-free network is proved over a dummy flop, and
+				// inv_get's network then reads it: check the validity directly
+				if (no_latches)
+					certify_combinational(base + ".aig");
+				else
+					certify_invariant(base + ".aig", base + ".inv.aig");
 			} else if (no_latches) {
 				// pdr reports a latch-free network (a combinational check,
 				// often constant once strashed) UNDECIDED; iprove decides it

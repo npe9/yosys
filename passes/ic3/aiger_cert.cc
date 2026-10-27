@@ -346,6 +346,10 @@ bool check_invariant(const Aig &model, const Aig &inv, double timeout_s, std::st
 	// position.  The mapping only decides WHICH formula is checked: any
 	// formula over the model latches that passes the three checks below is
 	// an inductive invariant of the model, however it was derived.
+	// abc's `fold -s` keeps the model latches in order and appends one latch,
+	// "a constraint has failed so far", which is 0 on every step the checks
+	// below consider (all of them assume the constraints), so it reads as 0.
+	int fold_latch = model.constraints.empty() || model.latch_lit.empty() ? -1 : GetSize(model.latch_lit);
 	std::vector<int> imap(inv.inputs.size(), -1);
 	for (int i = 0; i < GetSize(inv.inputs); i++) {
 		auto it = inv.symbols.find(stringf("i%d", i));
@@ -353,6 +357,8 @@ bool check_invariant(const Aig &model, const Aig &inv, double timeout_s, std::st
 			imap[i] = atoi(it->second.c_str() + 2);
 		else
 			imap[i] = i;
+		if (imap[i] == fold_latch)
+			continue;
 		if (imap[i] < 0 || imap[i] >= GetSize(model.latch_lit)) {
 			why = stringf("invariant input %d maps to latch %d of %d", i, imap[i], GetSize(model.latch_lit));
 			return false;
@@ -360,7 +366,7 @@ bool check_invariant(const Aig &model, const Aig &inv, double timeout_s, std::st
 	}
 	auto inv_at = [&](Frame &mf, Frame &iv) {
 		for (int i = 0; i < GetSize(inv.inputs); i++)
-			iv.set(inv.inputs[i], mf.lit(model.latch_lit[imap[i]]));
+			iv.set(inv.inputs[i], imap[i] == fold_latch ? mf.ez->CONST_FALSE : mf.lit(model.latch_lit[imap[i]]));
 		return iv.lit(inv.outputs[0] ^ (negate ? 1 : 0));
 	};
 	{

@@ -5862,6 +5862,13 @@ struct Sva2CheckPass : public Pass {
 				// end pulse (an attempt every tick) fires at some tick
 				// >= t+m+L-1
 				std::vector<std::pair<int, SigSpec>> tresp_chain;
+				// a bounded tail with ranged delays or variable-length
+				// elements (`strong(##[1:$] a ##[3:5] b)`): no single end
+				// pulse is start-anchored, so the tail is compiled per
+				// parse age and each age's end is realigned to the tick
+				// Lmax-1 after its start; (lo, hi, rhs), innermost first
+				std::vector<std::tuple<int, int, SigSpec>> tresp_rchain;
+				int tresp_ramax = 0;   // the tail's static largest end age
 				// an assumed response is a fairness constraint:
 				// G(open -> F b) == GF !(pend && !b) for the pend bit below
 				bool tresp_fair = flavor == "assume" || flavor == "restrict";
@@ -5912,7 +5919,20 @@ struct Sva2CheckPass : public Pass {
 							int lo = comp.seq_min_len(rc), hi = comp.seq_max_len(rc);
 							return lo >= 1 && lo == hi ? lo : -1;
 						};
-						bool ok = !spine.empty() && dc && sva_op(dc) == "true";
+						// the same for the ranged form: a boolean or a
+						// bounded non-empty sequence; returns its max length
+						auto rhs_max = [&](SigSpec r) -> int {
+							Cell *rc = comp.child_cell(r);
+							if (!rc)
+								return 1;
+							pool<Cell *> seen;
+							if (!comp.is_seq_op(sva_op(rc)) || comp.can_empty(rc) || comp.tree_has_locals(rc, seen))
+								return -1;
+							int lo = comp.seq_min_len(rc), hi = comp.seq_max_len(rc);
+							return lo >= 1 && hi >= lo ? hi : -1;
+						};
+						bool spine_ok = !spine.empty() && dc && sva_op(dc) == "true";
+						bool ok = spine_ok;
 						int m = 0, len = 0;
 						std::vector<std::pair<int, SigSpec>> chain;   // (k, rhs), innermost first
 						for (int i = GetSize(spine) - 1; ok && i >= 0; i--) {
@@ -5948,6 +5968,48 @@ struct Sva2CheckPass : public Pass {
 							tev = cc;
 							tresp_chain = chain;
 							tresp_delay = k_sum + m + len - 1;
+						}
+						// the ranged form: some match starts at s >= t+m
+						// exactly when the realigned pulse fires at some
+						// tick >= t+m+A, A the tail's largest end age
+						if (!ok && spine_ok) {
+							bool rok = true;
+							int rm = 0, amax = 0;
+							std::vector<std::tuple<int, int, SigSpec>> rchain;
+							for (int i = GetSize(spine) - 1; rok && i >= 0; i--) {
+								auto dp = comp.ports_of(spine[i]);
+								Cell *bc = comp.child_cell(spine[i]->getPort(dp[1]));
+								int lo = 0, hi = 0;
+								if (bc && sva_op(bc) == "bounds") {
+									auto bp = comp.ports_of(bc);
+									rok = bp.size() >= 2 && comp.const_int(bc->getPort(bp[0]), lo) &&
+											comp.const_int(bc->getPort(bp[1]), hi);
+								} else {
+									rok = !bc && comp.const_int(spine[i]->getPort(dp[1]), lo);
+									hi = lo;
+								}
+								SigSpec r = spine[i]->getPort(dp[2]);
+								int rl = rok ? rhs_max(r) : -1;
+								rok = rok && rl >= 1 && lo >= 0;
+								if (!rok)
+									break;
+								if (i == GetSize(spine) - 1) {
+									rok = hi < 0;
+									rm = lo;
+									amax = rl - 1;
+								} else {
+									rok = hi >= lo;
+									amax += hi + rl - 1;
+								}
+								rchain.push_back({lo, hi, r});
+							}
+							if (rok && amax <= 256) {
+								tresp = true;
+								tev = cc;
+								tresp_rchain = rchain;
+								tresp_ramax = amax;
+								tresp_delay = k_sum + rm + amax;
+							}
 						}
 					}
 					if (cc && (sva_op(cc) == "eventually" || sva_op(cc) == "s_eventually")) {
@@ -6123,7 +6185,61 @@ struct Sva2CheckPass : public Pass {
 					if (tresp_delay > 0)
 						open = comp.delay(open, tresp_delay, "nexttime");
 					SigSpec b1;
-					if (!tresp_chain.empty()) {
+					if (!tresp_rchain.empty()) {
+						// ends per parse age (age = end tick - start tick),
+						// every tick a start; one pulse per age
+						std::map<int, SigSpec> by_age;
+						auto add_ends = [&](SigSpec r, SigSpec st, int base) {
+							Cell *rc = comp.child_cell(r);
+							if (!rc) {
+								SigSpec e = comp.andN({st, comp.reduce1(comp.resolve(r))});
+								by_age[base] = by_age.count(base) ? comp.orN({by_age[base], e}) : e;
+								return;
+							}
+							int saved_budget = comp.split_budget;
+							comp.split_budget = 64;
+							auto sp = comp.seq_ends_split(rc, r, st, Const(1, 1));
+							comp.split_budget = saved_budget;
+							if (!sp.second)
+								log_error("sva2check: strong unbounded sequence in %s needs a liveness obligation (not supported): its bounded tail does not decompose per start.\n", log_id(cell));
+							for (auto &t : sp.first) {
+								int a = base + t.age;
+								by_age[a] = by_age.count(a) ? comp.orN({by_age[a], t.end}) : t.end;
+							}
+						};
+						add_ends(std::get<2>(tresp_rchain[0]), Const(1, 1), 0);
+						for (int i = 1; i < GetSize(tresp_rchain); i++) {
+							std::map<int, SigSpec> prev;
+							prev.swap(by_age);
+							int lo = std::get<0>(tresp_rchain[i]), hi = std::get<1>(tresp_rchain[i]);
+							// starts of this element grouped by age
+							std::map<int, SigSpec> starts;
+							for (auto &pa : prev)
+								for (int d = lo; d <= hi; d++) {
+									SigSpec st = comp.delay(pa.second, d, "strong_resp");
+									int a = pa.first + d;
+									starts[a] = starts.count(a) ? comp.orN({starts[a], st}) : st;
+								}
+							// the element's first tick is its start tick: a
+							// boolean ends at age 0 from it, ## counts ticks
+							for (auto &sa : starts)
+								add_ends(std::get<2>(tresp_rchain[i]), sa.second, sa.first);
+						}
+						// realign every end to its start + A, A the static
+						// bound the open pulse is delayed by (a smaller
+						// actual age is padded, never trimmed)
+						int amax = tresp_ramax;
+						std::vector<SigSpec> al;
+						for (auto &pa : by_age) {
+							if (pa.first < 0 || pa.first > amax)
+								log_error("sva2check: strong unbounded sequence in %s needs a liveness obligation (not supported): a tail parse ends at age %d beyond its bound %d.\n",
+										log_id(cell), pa.first, amax);
+							al.push_back(amax - pa.first > 0 ? comp.delay(pa.second, amax - pa.first, "strong_resp") : pa.second);
+						}
+						b1 = Const(0, 1);
+						for (auto &x : al)
+							b1 = b1 == Const(0, 1) ? x : comp.orN({b1, x});
+					} else if (!tresp_chain.empty()) {
 						// end pulse of the strong sequence's fixed tail with
 						// an attempt every tick: the innermost rhs from
 						// every tick, each outer rhs from the previous end

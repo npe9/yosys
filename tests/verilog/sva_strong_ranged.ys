@@ -1,0 +1,90 @@
+# `ant |-> strong(##[m:$] r0 ##[lo:hi] r1 ...)` -- a bounded ranged tail
+# after the unbounded gap (ibex/OpenTitan prim_alert_rxtx AlertCheck1_A,
+# `strong(##[1:$] sender_is_idle ##[3:5] alert_o)`) was refused: "strong
+# unbounded sequence needs a liveness obligation".  The tail's end pulses
+# are split per match length and realigned to a common age, so one pulse
+# fires exactly when a match started at a fixed offset back; the
+# temporal-response check then waits for it.  A match ending in the window
+# but starting before it does not count (p_c3).
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [1:0] st = 2'd0;            // 0 1 2 3 0 1 ...
+  always_ff @(posedge clk) st <= st + 2'd1;
+  logic [2:0] c = 3'd0;             // 0 1 2 ... 7 7 7
+  always_ff @(posedge clk) if (c != 3'd7) c <= c + 3'd1;
+  wire a = c == 3'd2, b = c == 3'd4;
+  // ranged tail matched every cycle (1 at s, 3 at s+2)
+  p_cyc:   assert property (@(posedge clk) 1'b1 |-> strong(##[1:$] st == 2'd1 ##[1:2] st == 2'd3));
+  // ranged tail never matched (st == 3 is 2 ticks after st == 1, not 1)
+  p_never: assert property (@(posedge clk) 1'b1 |-> strong(##[1:$] st == 2'd1 ##[1:1] st == 2'd3));
+  // one-shot a@2, b@4: attempts before the a see it, later ones do not
+  p_c1:    assert property (@(posedge clk) c == 3'd1 |-> strong(##[1:$] a ##[1:3] b));
+  p_c2m0:  assert property (@(posedge clk) c == 3'd2 |-> strong(##[0:$] a ##[1:3] b));
+  p_c2m1:  assert property (@(posedge clk) c == 3'd2 |-> strong(##[1:$] a ##[1:3] b));
+  // the match a@2..b@4 ends inside the window of an attempt at 3 but
+  // starts before it: no match
+  p_c3:    assert property (@(posedge clk) c == 3'd3 |-> strong(##[1:$] a ##[1:3] b));
+  // the range is honoured: b is 2 after a, [3:4] misses it
+  p_far:   assert property (@(posedge clk) c == 3'd1 |-> strong(##[1:$] a ##[3:4] b));
+  // a variable-length element, then a fixed step
+  p_var:   assert property (@(posedge clk) 1'b1 |-> strong(##[1:$] (st == 2'd0 ##[1:2] st == 2'd2) ##1 st == 2'd3));
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "p_cyc: proved" 1
+logger -expect log "p_never: disproved" 1
+logger -expect log "p_c1: proved" 1
+logger -expect log "p_c2m0: proved" 1
+logger -expect log "p_c2m1: disproved" 1
+logger -expect log "p_c3: disproved" 1
+logger -expect log "p_far: disproved" 1
+logger -expect log "p_var: proved" 1
+ic3 -init-zero
+logger -check-expected
+
+# as an assumption the ranged tail is a fairness constraint; it implies
+# its weakenings and not its strengthenings
+design -reset
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic req, a, b);
+  assume property (@(posedge clk) req |-> strong(##[1:$] a ##[1:2] b));
+  // implied: a at >= t+1, b at >= t+2
+  q_a:   assert property (@(posedge clk) req |-> strong(##[1:$] a));
+  q_b2:  assert property (@(posedge clk) req |-> strong(##[2:$] b));
+  q_same: assert property (@(posedge clk) req |-> strong(##[1:$] a ##[1:2] b));
+  q_wide: assert property (@(posedge clk) req |-> strong(##[1:$] a ##[0:3] b));
+  // not implied
+  q_b3:  assert property (@(posedge clk) req |-> strong(##[3:$] b));
+  q_one: assert property (@(posedge clk) req |-> strong(##[1:$] a ##1 b));
+  q_a2:  assert property (@(posedge clk) req |-> strong(##[2:$] a));
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt -fast
+opt_clean
+logger -expect log "q_a: proved" 1
+logger -expect log "q_b2: proved" 1
+logger -expect log "q_same: proved" 1
+logger -expect log "q_wide: proved" 1
+logger -expect log "q_b3: disproved" 1
+logger -expect log "q_one: disproved" 1
+logger -expect log "q_a2: disproved" 1
+ic3 -init-zero
+logger -check-expected
+
+# an unbounded gap inside the tail stays refused
+design -reset
+logger -expect error "strong unbounded sequence in .* needs a liveness obligation" 1
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic req, a, b);
+  p: assert property (@(posedge clk) req |-> strong(##[1:$] a ##[1:$] b));
+endmodule
+EOT
+prep -top top
+sva2check

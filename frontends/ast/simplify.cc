@@ -10112,6 +10112,43 @@ skip_memory_write:;
 			goto replace_fcall_with_id;
 		}
 
+		// A typedef local to the subroutine (IEEE 1800-2017 13.3, 13.4) is
+		// hoisted like its wires, under the call's prefix and before them, so
+		// a local `p_t v;` resolves to it. Left in the body it reached the
+		// caller's block as a statement (an assertion in an unnamed block).
+		// A local enum type is hoisted too, renamed per call (its items
+		// already carry the call's prefix); its users name it by the
+		// enum_type attribute.
+		{
+			dict<std::string, std::string> enum_rename;
+			for (auto& child : decl->children)
+				if (child->type == AST_ENUM && !child->str.empty())
+					enum_rename[child->str] = prefix_id(prefix, child->str);
+			auto rename_enum_type = [&](AstNode *n) {
+				if (n && n->attributes.count(ID::enum_type) && enum_rename.count(n->attributes.at(ID::enum_type)->str)) {
+					std::string en = enum_rename.at(n->attributes.at(ID::enum_type)->str);
+					n->attributes[ID::enum_type] = AstNode::mkconst_str(n->location, en);
+				}
+			};
+			for (auto& child : decl->children) {
+				rename_enum_type(child.get());
+				if (child->type == AST_TYPEDEF && !child->children.empty())
+					rename_enum_type(child->children[0].get());
+			}
+			for (auto& child : decl->children)
+				if (child->type == AST_ENUM || child->type == AST_TYPEDEF) {
+					current_ast_mod->children.push_back(child->clone());
+					AstNode *td = current_ast_mod->children.back().get();
+					if (td->type == AST_ENUM) {
+						td->str = enum_rename.at(td->str);
+						for (auto& item : td->children)
+							current_scope[item->str] = item.get();
+					}
+					current_scope[td->str] = td;
+					while (td->simplify(true, 1, -1, false)) { }
+				}
+		}
+
 		for (auto& child : decl->children)
 			if (child->type == AST_WIRE || child->type == AST_MEMORY || child->type == AST_PARAMETER || child->type == AST_LOCALPARAM || child->type == AST_ENUM_ITEM)
 			{
@@ -10214,7 +10251,7 @@ skip_memory_write:;
 			}
 
 		for (auto& child : decl->children)
-			if (child->type != AST_WIRE && child->type != AST_MEMORY && child->type != AST_PARAMETER && child->type != AST_LOCALPARAM)
+			if (child->type != AST_WIRE && child->type != AST_MEMORY && child->type != AST_PARAMETER && child->type != AST_LOCALPARAM && child->type != AST_TYPEDEF && child->type != AST_ENUM)
 				new_stmts.push_back(child->clone());
 
 		// A local's declaration initializer (`logic d = 1'b0;`) is parsed
@@ -10798,6 +10835,10 @@ void AstNode::expand_genblock(const std::string &prefix)
 	for (size_t i = 0; i < children.size(); i++) {
 		auto* child = children[i].get();
 		if (!child)
+			continue;
+		// the parent scope prefixed this enum's items (case AST_ENUM below);
+		// prefixing them again here made `\g.g.A` for an item `A` of block g
+		if (type == AST_ENUM && child->type == AST_ENUM_ITEM)
 			continue;
 
 		switch (child->type) {
@@ -11827,6 +11868,20 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 
 		if (stmt->type == AST_TCALL && stmt->str == "\\return") {
 			block->children.clear();
+			continue;
+		}
+
+		// a type local to the function: in scope for the declarations after it
+		if (stmt->type == AST_TYPEDEF || stmt->type == AST_ENUM)
+		{
+			while (stmt->simplify(true, 1, -1, false)) { }
+			current_scope[stmt->str] = stmt.get();
+			if (stmt->type == AST_ENUM)
+				for (auto &item : stmt->children)
+					current_scope[item->str] = item.get();
+			temporary_nodes.push_back(std::move(stmt));
+
+			block->children.erase(block->children.begin());
 			continue;
 		}
 

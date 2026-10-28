@@ -11784,8 +11784,15 @@ bool AstNode::replace_variables(std::map<std::string, AstNode::varinfo_t> &varia
 	}
 	if (type == AST_IDENTIFIER && variables.count(str)) {
 		int offset = variables.at(str).offset, width = variables.at(str).val.size();
+		// `v[i][j]` on a packed multi-dimensional variable (`logic
+		// [1:0][3:0] v;`, `T [1:0][1:0] v;`): the simplify below flattens
+		// the select to one range, as it does for `v[i]` and for lvalues
+		// (was "Memory access in constant function is not supported")
+		AstNode *mdecl = current_scope.count(str) ? current_scope.at(str) : nullptr;
+		bool packed_mdim = !children.empty() && children.at(0)->type == AST_MULTIRANGE && mdecl &&
+				mdecl->type == AST_WIRE && mdecl->unpacked_dimensions == 0 && GetSize(mdecl->dimensions) > 1;
 		if (!children.empty()) {
-			if (children.size() != 1 || children.at(0)->type != AST_RANGE) {
+			if (children.size() != 1 || (children.at(0)->type != AST_RANGE && !packed_mdim)) {
 				if (!must_succeed)
 					return false;
 				input_error("Memory access in constant function is not supported\n%s: ...called from here.\n",
@@ -11794,7 +11801,7 @@ bool AstNode::replace_variables(std::map<std::string, AstNode::varinfo_t> &varia
 			if (!children.at(0)->replace_variables(variables, fcall, must_succeed))
 				return false;
 			while (simplify(true, 1, -1, false)) { }
-			if (!children.at(0)->range_valid) {
+			if (children.size() != 1 || children.at(0)->type != AST_RANGE || !children.at(0)->range_valid) {
 				if (!must_succeed)
 					return false;
 				input_error("Non-constant range\n%s: ... called from here.\n",

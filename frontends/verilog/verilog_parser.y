@@ -3623,7 +3623,10 @@ struct_var:
 	TOK_ID range_or_multirange {
 		AstNodeType scope_type = extra->ast_stack.back()->type;
 		bool in_proc = scope_type == AST_FUNCTION || scope_type == AST_TASK || scope_type == AST_BLOCK;
-		bool packed_dim = extra->astbuf3 && in_proc && extra->astbuf3->type == AST_RANGE;
+		// packed dims (`struct packed {...} [1:0][3:0] v;`) go on the
+		// variable after the hidden typedef, as for `T [1:0][3:0] v;`
+		bool packed_dim = extra->astbuf3 && in_proc &&
+				(extra->astbuf3->type == AST_RANGE || extra->astbuf3->type == AST_MULTIRANGE);
 		if ((!extra->astbuf3 || packed_dim) && ($2 || in_proc) && (extra->astbuf2->type == AST_STRUCT || extra->astbuf2->type == AST_UNION)) {
 			// `struct packed {...} q [N];`: an unpacked array of an
 			// anonymous struct is declared as `typedef struct {...} T;

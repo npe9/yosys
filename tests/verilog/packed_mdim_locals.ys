@@ -1,0 +1,72 @@
+# Multi-dimensional packed locals in procedural scope.
+# (1) `struct packed {...} [1:0][1:0] v;` in a block or function is declared
+#     through the hidden typedef, like `T [1:0][1:0] v;` (it became a memory).
+# (2) constant functions read `v[i][j]` of a packed multi-dimensional local
+#     (was "Memory access in constant function is not supported").
+
+# anonymous struct, two packed dims, in an always_comb block
+read_verilog -sv <<EOT
+module b(input logic [15:0] x, output logic [15:0] y, output logic ok);
+  always_comb begin
+    struct packed { logic [1:0] a; logic [1:0] b; } [1:0][1:0] v;
+    v = x;
+    y = {v[0][0], v[0][1], v[1][0], v[1][1]};
+  end
+  assign ok = y == {x[3:0], x[7:4], x[11:8], x[15:12]};
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+# anonymous struct, two packed dims, in a function: inlined and constant
+design -reset
+read_verilog -sv <<EOT
+module f(input logic [15:0] x, output logic [15:0] y, z, output logic ok);
+  function automatic logic [15:0] f(input logic [15:0] a);
+    struct packed { logic [1:0] a; logic [1:0] b; } [1:0][1:0] v;
+    v = a;
+    return {v[0][0].b, v[0][0].a, v[0][1], v[1][0], v[1][1]};
+  endfunction
+  localparam logic [15:0] K = f(16'h1234);
+  assign y = f(x);
+  assign z = K;
+  assign ok = y == {x[1:0], x[3:2], x[7:4], x[11:8], x[15:12]} && z == 16'h1321;
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+# constant evaluation: typedef'd struct with two packed dims
+design -reset
+read_verilog -sv <<EOT
+module c(output logic [15:0] z, output logic ok);
+  typedef struct packed { logic [1:0] a; logic [1:0] b; } s_t;
+  function automatic logic [15:0] f(input logic [15:0] a);
+    s_t [1:0][1:0] v;
+    v = a;
+    return {v[0][0], v[0][1], v[1][0], v[1][1]};
+  endfunction
+  localparam logic [15:0] K = f(16'h1234);
+  assign z = K;
+  assign ok = z == 16'h4321;
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+# constant evaluation: plain logic, three packed dims, full and partial selects
+design -reset
+read_verilog -sv <<EOT
+module d(output logic [7:0] z, output logic ok);
+  function automatic logic [7:0] f(input logic [11:0] a);
+    logic [2:0][1:0][1:0] v;
+    v = a;
+    return {v[2][1], v[0][0], v[1][0][1], v[1][1][0], v[2][0][1:0]};
+  endfunction
+  localparam logic [7:0] K = f(12'b10_01_11_00_10_01);
+  assign z = K;
+  assign ok = z == 8'b10_01_0_1_01;
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify

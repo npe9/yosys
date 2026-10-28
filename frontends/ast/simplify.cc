@@ -2592,6 +2592,13 @@ static AstNode *constant_cont_driver(AstNode *mod, const std::string &name)
 	return found;
 }
 
+// a user identifier, or a local of an unnamed / for-declaration block
+// (`$unnamed_block$N.x`), which is a user variable under a generated scope
+static bool is_user_scope_name(const std::string &str)
+{
+	return !str.empty() && (str[0] == '\\' || str.rfind("$unnamed_block$", 0) == 0 || str.rfind("$fordecl_block$", 0) == 0);
+}
+
 // block names can be prefixed with an explicit scope during elaboration
 static bool is_autonamed_block(const std::string &str) {
 	size_t last_dot = str.rfind('.');
@@ -5937,7 +5944,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				}
 			}
 
-			if (!str.empty() && str[0] == '\\' && (template_node->type == AST_STRUCT || template_node->type == AST_UNION)) {
+			// a local of an unnamed block is named `$unnamed_block$N.x`: it
+			// took the generic path below, became a bare struct node, and its
+			// member selects (`x.m`) were implicitly declared 1-bit wires
+			if (is_user_scope_name(str) && (template_node->type == AST_STRUCT || template_node->type == AST_UNION)) {
 				// replace instance with wire representing the packed structure
 				AstNode *packed_dims = nullptr;
 				if (type == AST_WIRE && GetSize(children) > 1 && children[1] &&
@@ -6978,7 +6988,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			}
 		}
 		// check if a plausible struct member sss.mmmm
-		if (!str.empty() && str[0] == '\\' && current_scope.count(str)) {
+		if (is_user_scope_name(str) && current_scope.count(str)) {
 			auto item_node = current_scope[str];
 			if (item_node->type == AST_STRUCT_ITEM || item_node->type == AST_STRUCT || item_node->type == AST_UNION) {
 				// Traverse any hierarchical path until the full name for the referenced struct/union is found.

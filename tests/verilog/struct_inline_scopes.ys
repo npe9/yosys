@@ -1,0 +1,63 @@
+# inline (anonymous) struct and enum declarations in an interface body, and
+# an inline enum's declaration initializer anywhere, were syntax errors; the
+# initializer is the initial value (IEEE 1800-2017 6.8).  Inline types in
+# function / block bodies stay a syntax error (local types in subroutines
+# are a separate item: a typedef there fails an assertion in simplify)
+read_verilog -sv -formal <<EOT
+interface ifc(input logic clk, input logic [7:0] x);
+  struct packed { logic [7:0] d; logic v; } is1;
+  enum logic [1:0] {I0, I1, I2} ie = I1;
+  logic started = 1'b0;
+  always_ff @(posedge clk) begin is1 <= {x, 1'b1}; ie <= I2; started <= 1'b1; end
+  p_if: assert property (@(posedge clk) ##1 (is1.d == $past(x) && is1.v && ie == I2));
+  p_if0: assert property (@(posedge clk) !started |-> ie == I1);
+endinterface
+module m(input logic clk, input logic [7:0] x);
+  ifc i0(clk, x);
+  enum logic [1:0] {M0, M1, M2} me = M1;
+  logic started = 1'b0;
+  always_ff @(posedge clk) begin me <= M2; started <= 1'b1; end
+  p_me0: assert property (@(posedge clk) !started |-> me == M1);
+  p_me: assert property (@(posedge clk) me == M1);
+endmodule
+EOT
+hierarchy -check -top m
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+logger -expect log "p_if: proved" 1
+logger -expect log "p_if0: proved" 1
+logger -expect log "p_me0: proved" 1
+logger -expect log "p_me: disproved \(depth 1\)" 1
+ic3 -check-cells -init-zero
+logger -check-expected
+
+# a struct-typed local of an UNNAMED block: it became a bare struct node and
+# `u.d` an implicitly declared 1-bit wire (sv_degraded; q read 7'h0 + 1 bit)
+design -reset
+read_verilog -sv -formal <<EOT
+typedef struct packed { logic [7:0] d; logic [3:0] t; } s_t;
+module u(input logic clk, input logic [7:0] x, output logic [7:0] q, output logic [3:0] qt);
+  always_comb begin
+    s_t v;
+    v = '{d: 8'h5a, t: 4'h3};
+    v.d = v.d + x;
+    q = v.d;
+    qt = v.t;
+  end
+  p_q: assert property (@(posedge clk) q == x + 8'h5a && qt == 4'h3);
+  p_qbad: assert property (@(posedge clk) q == x);
+endmodule
+EOT
+hierarchy -check -top u
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+logger -expect log "p_q: proved" 1
+logger -expect log "p_qbad: disproved \(depth 0\)" 1
+ic3 -check-cells -init-zero
+logger -check-expected

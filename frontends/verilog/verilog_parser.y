@@ -3576,11 +3576,11 @@ struct_var_and_opt_assign:
 		auto wire = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
 		wire->str = extra->ast_stack.back()->children.back()->str;
 		AstNode *scope = extra->ast_stack.back();
-		if (scope->type == AST_MODULE || scope->type == AST_INTERFACE) {
+		if (scope->type == AST_MODULE || scope->type == AST_INTERFACE || scope->type == AST_GENBLOCK) {
 			// a variable declaration assignment is the variable's initial
 			// value (IEEE 1800-2017 6.8), as for `logic x = v;`; it was a
 			// continuous assign, so the variable read as that constant and
-			// its procedural driver was lost
+			// its procedural driver was lost (also inside generate blocks)
 			auto assign = std::make_unique<AstNode>(@$, AST_ASSIGN_LE, std::move(wire), std::move($3));
 			SET_AST_NODE_LOC(assign.get(), @1, @3);
 			auto block = std::make_unique<AstNode>(@$, AST_BLOCK, std::move(assign));

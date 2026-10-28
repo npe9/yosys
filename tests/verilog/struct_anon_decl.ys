@@ -69,3 +69,31 @@ hierarchy -top eq
 equiv_simple -seq 3
 equiv_induct
 equiv_status -assert
+
+# a struct initializer inside a generate block is an initial value too
+# (it was a continuous assign there: p_g was PROVED)
+design -reset
+read_verilog -sv -formal <<EOT
+module gg(input logic clk, input logic [7:0] x);
+  if (1) begin : b
+    struct packed { logic [7:0] d; } gs = 8'h5a;
+    always_ff @(posedge clk) gs.d <= x;
+  end
+  for (genvar k = 0; k < 1; k++) begin : f
+    struct packed { logic [7:0] d; } fs = 8'h5a;
+    always_ff @(posedge clk) fs.d <= x;
+  end
+  p_g: assert property (@(posedge clk) b.gs.d == 8'h5a);
+  p_f: assert property (@(posedge clk) f[0].fs.d == 8'h5a);
+endmodule
+EOT
+hierarchy -check -top gg
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+logger -expect log "p_g: disproved \(depth 1\)" 1
+logger -expect log "p_f: disproved \(depth 1\)" 1
+ic3 -check-cells -init-zero
+logger -check-expected

@@ -77,6 +77,10 @@
 			dict<std::string, AstNode*> pkg_user_types;
 			std::vector<AstNode*> ast_stack;
 			std::unique_ptr<AstNode> astbuf1, astbuf2, astbuf3;
+			// struct_decl: the hidden typedef of an anonymous struct whose
+			// variables are unpacked arrays (empty until the first one)
+			std::string anon_struct_type;
+			int anon_struct_count = 0;
 			size_t bind_mark = 0;
 			AstNode* cell_hack;
 			AstNode* member_hack;
@@ -3435,6 +3439,7 @@ struct_decl:
 	} struct_var_list TOK_SEMICOL {
 		(void)extra->astbuf2.reset();
 		(void)extra->astbuf3.reset();
+		extra->anon_struct_type.clear();
 	}
 	;
 
@@ -3570,13 +3575,50 @@ struct_var_and_opt_assign:
 	struct_var TOK_EQ expr {
 		auto wire = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
 		wire->str = extra->ast_stack.back()->children.back()->str;
-		auto assign = std::make_unique<AstNode>(@$, AST_ASSIGN, std::move(wire), std::move($3));
-		SET_AST_NODE_LOC(assign.get(), @1, @3);
-		extra->ast_stack.back()->children.push_back(std::move(assign));
+		AstNode *scope = extra->ast_stack.back();
+		if (scope->type == AST_MODULE || scope->type == AST_INTERFACE) {
+			// a variable declaration assignment is the variable's initial
+			// value (IEEE 1800-2017 6.8), as for `logic x = v;`; it was a
+			// continuous assign, so the variable read as that constant and
+			// its procedural driver was lost
+			auto assign = std::make_unique<AstNode>(@$, AST_ASSIGN_LE, std::move(wire), std::move($3));
+			SET_AST_NODE_LOC(assign.get(), @1, @3);
+			auto block = std::make_unique<AstNode>(@$, AST_BLOCK, std::move(assign));
+			SET_AST_NODE_LOC(block.get(), @1, @3);
+			auto init = std::make_unique<AstNode>(@$, AST_INITIAL, std::move(block));
+			SET_AST_NODE_LOC(init.get(), @1, @3);
+			scope->children.push_back(std::move(init));
+		} else {
+			auto assign = std::make_unique<AstNode>(@$, AST_ASSIGN, std::move(wire), std::move($3));
+			SET_AST_NODE_LOC(assign.get(), @1, @3);
+			scope->children.push_back(std::move(assign));
+		}
 	};
 
 struct_var:
 	TOK_ID range_or_multirange {
+		if (!extra->astbuf3 && $2 && (extra->astbuf2->type == AST_STRUCT || extra->astbuf2->type == AST_UNION)) {
+			// `struct packed {...} q [N];`: an unpacked array of an
+			// anonymous struct is declared as `typedef struct {...} T;
+			// T q [N];`, so element member selects (`q[i].m`, i dynamic)
+			// see the element type; the cloned struct made a memory whose
+			// element type was lost ("Hierarchical prefix did not resolve")
+			if (extra->anon_struct_type.empty()) {
+				extra->anon_struct_type = stringf("\\__sv_anon_struct_%d", ++extra->anon_struct_count);
+				auto td = std::make_unique<AstNode>(@$, AST_TYPEDEF, extra->astbuf2->clone());
+				td->str = extra->anon_struct_type;
+				extra->ast_stack.back()->children.push_back(std::move(td));
+			}
+			auto var_node = std::make_unique<AstNode>(@1, AST_WIRE);
+			var_node->str = *$1;
+			var_node->is_logic = true;
+			for (auto &a : extra->astbuf2->attributes)
+				var_node->set_attribute(a.first, a.second->clone());
+			extra->addWiretypeNode(&extra->anon_struct_type, var_node.get());
+			rewriteAsMemoryNode(var_node.get(), std::move($2));
+			extra->ast_stack.back()->children.push_back(std::move(var_node));
+			extra->emitStructDefaults(@$, extra->ast_stack.back(), *$1, extra->pending_struct_defaults);
+		} else {
 		auto var_node = extra->astbuf2->clone();
 		var_node->str = *$1;
 		SET_AST_NODE_LOC(var_node.get(), @1, @1);
@@ -3598,6 +3640,7 @@ struct_var:
 			rewriteAsMemoryNode(var_node.get(), std::move(dims));
 		extra->ast_stack.back()->children.push_back(std::move(var_node));
 		extra->emitStructDefaults(@$, extra->ast_stack.back(), *$1, extra->pending_struct_defaults);
+		}
 	};
 
 /////////

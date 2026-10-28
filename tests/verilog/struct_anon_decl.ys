@@ -1,0 +1,71 @@
+# anonymous struct variables (`struct packed {...} v ...;` without a typedef)
+# 1. an unpacked array of one: `q[i].m` with a dynamic i used to be
+#    "Hierarchical prefix did not resolve" (the element type was lost;
+#    cva6 store_buffer, wt_dcache*, scoreboard); now it is declared as
+#    `typedef struct packed {...} T; T q [N];` and matches that form
+# 2. a declaration initializer is the initial value (IEEE 1800-2017 6.8);
+#    it was a continuous assign, so a procedurally driven struct register
+#    read as its initializer (a FALSE PROOF of p_moves)
+read_verilog -sv -formal <<EOT
+module m(input logic clk, input logic [7:0] d, input logic [1:0] p);
+  struct packed { logic [7:0] data; logic valid; } s = '{data: 8'h5a, valid: 1'b0};
+  struct packed { logic [3:0] lo; logic [3:0] hi; } k = '{lo: 4'h3, hi: 4'hc};
+  struct packed { logic [7:0] data; logic valid; } q [3:0] = '{default: '0};
+  always_ff @(posedge clk) begin
+    if (d[0]) s <= '{data: d, valid: 1'b1};
+    if (d[1]) begin q[p].data <= d; q[p].valid <= 1'b1; end
+  end
+  always @(posedge clk) begin
+    p_init: assert (s.valid || s.data == 8'h5a);
+    p_moves: assert (s.data == 8'h5a);
+    p_k: assert (k.lo == 4'h3 && k.hi == 4'hc);
+    p_q: assert (!q[p].valid || q[p].data[1]);
+    p_q0: assert (q[p].data == 8'h00);
+  end
+endmodule
+EOT
+prep
+memory
+async2sync
+logger -expect log "p_init: proved" 1
+logger -expect log "p_moves: disproved \(depth 2\)" 1
+logger -expect log "p_k: proved" 1
+logger -expect log "p_q: proved" 1
+logger -expect log "p_q0: disproved \(depth 2\)" 1
+ic3
+logger -check-expected
+
+# the anonymous form is equivalent to the typedef'd one
+design -reset
+read_verilog -sv <<EOT
+module ga(input logic clk, input logic [1:0] p, r, input logic [7:0] d, output logic [7:0] o, output logic v);
+  struct packed { logic [7:0] address; logic [7:0] data; logic valid; } q_n [3:0], q_q [3:0] = '{default: '0};
+  always_comb begin
+    q_n = q_q;
+    if (d[0]) begin q_n[p].address = d; q_n[p].data = ~d; q_n[p].valid = 1'b1; end
+    if (d[1]) q_n[r].data[3:0] = d[7:4];
+  end
+  always_ff @(posedge clk) q_q <= q_n;
+  assign o = q_q[r].data ^ q_q[p].address; assign v = q_q[r].valid;
+endmodule
+module gb(input logic clk, input logic [1:0] p, r, input logic [7:0] d, output logic [7:0] o, output logic v);
+  typedef struct packed { logic [7:0] address; logic [7:0] data; logic valid; } e_t;
+  e_t q_n [3:0], q_q [3:0] = '{default: '0};
+  always_comb begin
+    q_n = q_q;
+    if (d[0]) begin q_n[p].address = d; q_n[p].data = ~d; q_n[p].valid = 1'b1; end
+    if (d[1]) q_n[r].data[3:0] = d[7:4];
+  end
+  always_ff @(posedge clk) q_q <= q_n;
+  assign o = q_q[r].data ^ q_q[p].address; assign v = q_q[r].valid;
+endmodule
+EOT
+prep
+memory
+flatten
+opt_clean
+equiv_make ga gb eq
+hierarchy -top eq
+equiv_simple -seq 3
+equiv_induct
+equiv_status -assert

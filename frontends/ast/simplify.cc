@@ -7847,9 +7847,43 @@ skip_for_unroll:
 						!child->attributes.count(ID::nosync))
 					mark_auto_nosync(this, child.get());
 
+		// a block-local enum type (`enum {...} e;` or a typedef of one) is
+		// hoisted with the block's wires, renamed after the block so that
+		// copies of the block (loop unrolling) stay distinct; the enum_type
+		// attribute of its users follows. Left in the block it reached
+		// genrtlil (abort).
+		{
+			dict<std::string, std::string> enum_rename;
+			for (auto &child : children)
+				if (child->type == AST_ENUM && !child->str.empty())
+					enum_rename[child->str] = prefix_id(str + ".", child->str);
+			if (!enum_rename.empty()) {
+				auto rename_enum_type = [&](AstNode *n) {
+					if (n && n->attributes.count(ID::enum_type) && enum_rename.count(n->attributes.at(ID::enum_type)->str)) {
+						std::string en = enum_rename.at(n->attributes.at(ID::enum_type)->str);
+						n->attributes[ID::enum_type] = AstNode::mkconst_str(n->location, en);
+					}
+				};
+				for (auto &child : children) {
+					rename_enum_type(child.get());
+					if (child->type == AST_TYPEDEF && !child->children.empty())
+						rename_enum_type(child->children[0].get());
+					if (child->type == AST_ENUM) {
+						child->str = enum_rename.at(child->str);
+						for (auto &item : child->children)
+							current_scope[item->str] = item.get();
+					}
+				}
+			}
+		}
+
 		std::vector<std::unique_ptr<AstNode>> new_children;
 		for (size_t i = 0; i < children.size(); i++)
-			if (children[i]->type == AST_WIRE || children[i]->type == AST_MEMORY || children[i]->type == AST_PARAMETER || children[i]->type == AST_LOCALPARAM || children[i]->type == AST_TYPEDEF) {
+			if (children[i]->type == AST_ENUM) {
+				current_scope[children[i]->str] = children[i].get();
+				current_ast_mod->children.push_back(std::move(children[i]));
+				current_ast_mod->children.back()->simplify(false, stage, -1, false);
+			} else if (children[i]->type == AST_WIRE || children[i]->type == AST_MEMORY || children[i]->type == AST_PARAMETER || children[i]->type == AST_LOCALPARAM || children[i]->type == AST_TYPEDEF) {
 				children[i]->simplify(false, stage, -1, false);
 				current_scope[children[i]->str] = children[i].get();
 				current_ast_mod->children.push_back(std::move(children[i]));

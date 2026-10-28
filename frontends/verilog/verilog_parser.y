@@ -3621,7 +3621,10 @@ struct_var_and_opt_assign:
 
 struct_var:
 	TOK_ID range_or_multirange {
-		if (!extra->astbuf3 && $2 && (extra->astbuf2->type == AST_STRUCT || extra->astbuf2->type == AST_UNION)) {
+		AstNodeType scope_type = extra->ast_stack.back()->type;
+		bool in_proc = scope_type == AST_FUNCTION || scope_type == AST_TASK || scope_type == AST_BLOCK;
+		bool packed_dim = extra->astbuf3 && in_proc && extra->astbuf3->type == AST_RANGE;
+		if ((!extra->astbuf3 || packed_dim) && ($2 || in_proc) && (extra->astbuf2->type == AST_STRUCT || extra->astbuf2->type == AST_UNION)) {
 			// `struct packed {...} q [N];`: an unpacked array of an
 			// anonymous struct is declared as `typedef struct {...} T;
 			// T q [N];`, so element member selects (`q[i].m`, i dynamic)
@@ -3639,7 +3642,12 @@ struct_var:
 			for (auto &a : extra->astbuf2->attributes)
 				var_node->set_attribute(a.first, a.second->clone());
 			extra->addWiretypeNode(&extra->anon_struct_type, var_node.get());
-			rewriteAsMemoryNode(var_node.get(), std::move($2));
+			if (packed_dim)
+				var_node->children.push_back(extra->astbuf3->clone());
+			// in a function, task or block the variable is a local: the
+			// typedef is hoisted with it (a cloned AST_STRUCT was not)
+			if ($2)
+				rewriteAsMemoryNode(var_node.get(), std::move($2));
 			extra->ast_stack.back()->children.push_back(std::move(var_node));
 			extra->emitStructDefaults(@$, extra->ast_stack.back(), *$1, extra->pending_struct_defaults);
 		} else {
@@ -4997,7 +5005,7 @@ rvalue_call_stmt:
 
 // this production creates the obligatory if-else shift/reduce conflict
 behavioral_stmt:
-	defattr | assert | wire_decl | param_decl | localparam_decl | typedef_decl |
+	defattr | assert | wire_decl | param_decl | localparam_decl | typedef_decl | enum_decl | struct_decl |
 	non_opt_delay behavioral_stmt {
 		// stock yosys drops statement delays silently and upstream tests
 		// expect no warning; record the site on the module instead, and

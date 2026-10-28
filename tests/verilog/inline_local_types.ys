@@ -1,0 +1,199 @@
+# inline (anonymous) struct and enum variables in functions, tasks and
+# procedural blocks: `struct packed {...} v;` / `enum {...} e;`
+# 1. syntax errors in a function or block body; now parsed, and a struct
+#    is declared through a hidden typedef that is hoisted with the local
+# 2. a block-local enum (also `typedef enum` in a named block) aborted
+#    in genrtlil; it is hoisted with the block's wires
+
+design -reset
+read_verilog -sv <<EOT
+module i1(input logic [7:0] x, z, output logic [7:0] y, w, output logic ok);
+  function automatic logic [7:0] f(input logic [7:0] a);
+    struct packed { logic [3:0] hi; logic [3:0] lo; } v;
+    enum logic [1:0] {A, B, C} e;
+    v = a;
+    e = C;
+    return {v.lo, v.hi} + e;
+  endfunction
+  assign y = f(x);
+  assign w = f(z);
+  assign ok = y == {x[3:0], x[7:4]} + 8'd2 && w == {z[3:0], z[7:4]} + 8'd2;
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module i2(input logic [7:0] x, output logic [7:0] y, output logic ok);
+  task automatic g(input logic [7:0] a, output logic [7:0] b);
+    enum logic [1:0] {S0, S1, S2} s;
+    s = a[0] ? S2 : S1;
+    b = s;
+  endtask
+  always_comb g(x, y);
+  assign ok = y == (x[0] ? 8'd2 : 8'd1);
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module i3(input logic [7:0] x, output logic [7:0] y, output logic ok);
+  always_comb begin
+    struct packed { logic [3:0] hi; logic [3:0] lo; } v;
+    v = x;
+    y = {v.lo, v.hi};
+  end
+  assign ok = y == {x[3:0], x[7:4]};
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module i4(input logic [7:0] x, output logic [7:0] y, output logic ok);
+  always_comb begin : nb
+    enum logic [1:0] {P, Q, R} e;
+    e = x[0] ? R : Q;
+    y = e;
+  end
+  assign ok = y == (x[0] ? 8'd2 : 8'd1);
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module i6(input logic [7:0] x, output logic [7:0] y, output logic ok);
+  function automatic logic [7:0] f(input logic [7:0] a);
+    struct packed { logic [3:0] hi; logic [3:0] lo; } v = a;
+    enum logic [1:0] {A, B, C} e = B;
+    return {v.lo, v.hi} + e;
+  endfunction
+  assign y = f(x);
+  assign ok = y == {x[3:0], x[7:4]} + 8'd1;
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module j3(input logic [7:0] x, output logic [7:0] y, output logic ok);
+  always_comb begin : nb
+    typedef enum logic [1:0] {P, Q, R} e_t;
+    e_t e;
+    e = x[0] ? R : Q;
+    y = e;
+  end
+  assign ok = y == (x[0] ? 8'd2 : 8'd1);
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module l1(input logic [7:0] x, output logic [7:0] y, output logic ok);
+  always_comb begin
+    y = 0;
+    for (int i = 0; i < 2; i++) begin : it
+      enum logic [1:0] {P, Q, R} e;
+      e = x[i] ? R : Q;
+      y = y + e;
+    end
+  end
+  assign ok = y == (x[0] ? 8'd2 : 8'd1) + (x[1] ? 8'd2 : 8'd1);
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module l2(input logic [7:0] x, output logic [7:0] y, output logic ok);
+  function automatic logic [7:0] f(input logic [7:0] a);
+    logic [7:0] r;
+    begin : inner
+      enum logic [1:0] {P, Q, R} e;
+      struct packed { logic [3:0] hi; logic [3:0] lo; } v;
+      e = a[0] ? R : Q;
+      v = a;
+      r = {v.lo, v.hi} + e;
+    end
+    return r;
+  endfunction
+  assign y = f(x);
+  assign ok = y == {x[3:0], x[7:4]} + (x[0] ? 8'd2 : 8'd1);
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module m1(input logic [15:0] x, output logic [15:0] y, output logic ok);
+  always_comb begin
+    struct packed { logic [3:0] hi; logic [3:0] lo; } [1:0] v;
+    v = x;
+    y = {v[0].lo, v[0].hi, v[1].lo, v[1].hi};
+  end
+  assign ok = y == {x[3:0], x[7:4], x[11:8], x[15:12]};
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module m2(input logic [15:0] x, output logic [15:0] y, output logic ok);
+  function automatic logic [15:0] f(input logic [15:0] a);
+    struct packed { logic [3:0] hi; logic [3:0] lo; } q [2];
+    q[0] = a[7:0];
+    q[1] = a[15:8];
+    return {q[0].lo, q[0].hi, q[1].lo, q[1].hi};
+  endfunction
+  assign y = f(x);
+  assign ok = y == {x[3:0], x[7:4], x[11:8], x[15:12]};
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+design -reset
+read_verilog -sv <<EOT
+module m4(input logic [15:0] x, output logic [15:0] y, output logic ok);
+  function automatic logic [15:0] f(input logic [15:0] a);
+    struct packed { logic [3:0] hi; logic [3:0] lo; } [1:0] v;
+    v = a;
+    return {v[0].lo, v[0].hi, v[1].lo, v[1].hi};
+  endfunction
+  assign y = f(x);
+  assign ok = y == {x[3:0], x[7:4], x[11:8], x[15:12]};
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify
+
+# constant evaluation
+design -reset
+read_verilog -sv <<EOT
+module i5(output logic [7:0] y, output logic ok);
+  function automatic logic [7:0] f(input logic [7:0] a);
+    struct packed { logic [3:0] hi; logic [3:0] lo; } v;
+    enum logic [1:0] {A, B, C} e;
+    v = a;
+    e = C;
+    return {v.lo, v.hi} + e;
+  endfunction
+  localparam logic [7:0] K = f(8'h12);
+  assign y = K;
+  assign ok = y == 8'h23;
+endmodule
+EOT
+prep
+sat -prove ok 1 -verify

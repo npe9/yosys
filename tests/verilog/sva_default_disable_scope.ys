@@ -1,0 +1,50 @@
+# `default disable iff` is per module, interface or program (IEEE 16.15),
+# as `default clocking` is (14.12).  The parser reset the default clocking
+# at each new scope but not the default disable, so a `default disable
+# iff (rst)` in one module disabled every later module's assertions on
+# their own `rst`: a silent false proof (pb, pi, pg below were proved).
+read_verilog -sv -formal <<EOT
+module a(input clk);
+  logic [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  wire rst = c == 2'd2;
+  default disable iff (rst);
+  // the default applies here: c == 2 is exactly when rst masks it
+  pa: assert property (@(posedge clk) c != 2'd2);
+endmodule
+module b(input clk);
+  logic [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  wire rst = c == 2'd2;
+  pb: assert property (@(posedge clk) c != 2'd2);
+  property q; @(posedge clk) c != 2'd2; endproperty
+  pq: assert property (q);
+endmodule
+interface i(input clk);
+  logic [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  wire rst = c == 2'd2;
+  pi: assert property (@(posedge clk) c != 2'd2);
+endinterface
+program g(input clk);
+  logic [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  wire rst = c == 2'd2;
+  pg: assert property (@(posedge clk) c != 2'd2);
+endprogram
+module top(input clk);
+  a ua(clk); b ub(clk); i ui(clk); g ug(clk);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+flatten
+logger -expect log "ua.pa: proved" 1
+logger -expect log "ub.pb: disproved \(depth 2\)" 1
+logger -expect log "ub.pq: disproved \(depth 2\)" 1
+logger -expect log "ui.pi: disproved \(depth 2\)" 1
+logger -expect log "ug.pg: disproved \(depth 2\)" 1
+ic3 -init-zero
+logger -check-expected

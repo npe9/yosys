@@ -1111,6 +1111,9 @@ module:
 		// unclocked assertions (an undriven implicit clock net)
 		extra->sva_default_clock.reset();
 		extra->sva_global_clock.reset();
+		// so is `default disable iff` (IEEE 16.15): it leaked into the next
+		// module, interface or program, and disabled its assertions
+		extra->sva_default_disable.reset();
 		mod->str = *$4;
 		append_attr(mod, std::move($1));
 	} module_header_imports module_para_opt module_args_opt TOK_SEMICOL module_body TOK_ENDMODULE opt_label opt_semi {
@@ -1144,6 +1147,9 @@ program:
 		// unclocked assertions (an undriven implicit clock net)
 		extra->sva_default_clock.reset();
 		extra->sva_global_clock.reset();
+		// so is `default disable iff` (IEEE 16.15): it leaked into the next
+		// module, interface or program, and disabled its assertions
+		extra->sva_default_disable.reset();
 		mod->str = *$4;
 		append_attr(mod, std::move($1));
 	} module_header_imports module_para_opt module_args_opt TOK_SEMICOL module_body TOK_ENDPROGRAM opt_label opt_semi {
@@ -1798,6 +1804,9 @@ interface:
 		// unclocked assertions (an undriven implicit clock net)
 		extra->sva_default_clock.reset();
 		extra->sva_global_clock.reset();
+		// so is `default disable iff` (IEEE 16.15): it leaked into the next
+		// module, interface or program, and disabled its assertions
+		extra->sva_default_disable.reset();
 		intf->str = *$3;
 		extra->interface_names.insert(*$3);
 	} module_header_imports module_para_opt module_args_opt TOK_SEMICOL interface_body TOK_ENDINTERFACE opt_label opt_semi {

@@ -3967,6 +3967,8 @@ struct SvaCompiler {
 						prop_dispatch(port(nargs - 1), child(nargs - 1), start)})});
 			return r;
 		}
+		if (op == "strong" && weak_strong.count(n))
+			return prop_dispatch(port(0), child(0), start);
 		if (op == "strong") {
 			bool saved = strong_ctx;
 			strong_ctx = true;
@@ -4625,6 +4627,9 @@ struct SvaCompiler {
 	// Inside an explicit strong(...): an unbounded sequence there needs a
 	// liveness obligation, not the weak monitor below.
 	bool strong_ctx = false;
+	// strong() nodes compiled as their weak form: the eventuality is a
+	// separate $live twin (the strong goto response below)
+	pool<Cell *> weak_strong;
 
 	// IEEE 1800-2017 16.12.2: a sequence in property position of an
 	// assert/assume is weak.  For a BOUNDED sequence weak and strong agree
@@ -4673,6 +4678,22 @@ struct SvaCompiler {
 				return false;
 			if (GetSize(bp) >= 2 && (!const_int(b->getPort(bp[1]), hi) || hi != 1))
 				return false;
+			return true;
+		};
+		// b[->N], N a constant (lo == hi, or a single bound)
+		auto is_goto_n = [&](Cell *c, int &gn) -> bool {
+			if (!c || sva_op(c) != "[->]" || kid(c, 0))
+				return false;
+			Cell *b = kid(c, 1);
+			if (!b || sva_op(b) != "bounds")
+				return false;
+			auto bp = ports_of(b);
+			int lo, hi;
+			if (bp.empty() || !const_int(b->getPort(bp[0]), lo) || lo < 1 || lo > 1024)
+				return false;
+			if (GetSize(bp) >= 2 && (!const_int(b->getPort(bp[1]), hi) || hi != lo))
+				return false;
+			gn = lo;
 			return true;
 		};
 		// ## cycle: k exact (lo == hi) or [lo:$] (hi = -1)
@@ -4751,14 +4772,24 @@ struct SvaCompiler {
 				c = boolv(n, 0);
 				body = kid(n, 1);
 			}
-			if (is_goto1(body)) {
+			int gn = 0;
+			if (is_goto_n(body, gn)) {
 				SigSpec b = boolv(body, 0);
+				// the pending count set of shape (b) below; N = 1 is
+				// one pend bit
 				SigSpec cur;
 				feedback([&](SigSpec q) {
-					cur = orN({start, q});
-					return andN({cur, c, mod->Not(NEW_ID, b)});
-				}, "wpend", 1);
-				fail = andN({cur, mod->Not(NEW_ID, c)});
+					SigSpec st = start;
+					if (gn > 1)
+						st.append(Const(0, gn - 1));
+					cur = mod->Or(NEW_ID, st, q);
+					SigSpec up = Const(0, 1);
+					if (gn > 1)
+						up.append(cur.extract(0, gn - 1));
+					SigSpec nx = mod->Mux(NEW_ID, cur, up, b);
+					return mod->Mux(NEW_ID, Const(0, gn), nx, c);
+				}, "wpend", gn);
+				fail = andN({reduce1(cur), mod->Not(NEW_ID, c)});
 				note("goto");
 				return true;
 			}
@@ -4936,18 +4967,30 @@ struct SvaCompiler {
 				}
 				cur_n = kid(cur_n, 0);
 			}
-			if (ok && is_goto1(cur_n)) {
+			int gn = 0;
+			if (ok && is_goto_n(cur_n, gn)) {
 				std::reverse(elems.begin(), elems.end());
 				SigSpec b = boolv(cur_n, 0);
+				// b[->N]: bit j of the pending set is "some attempt has
+				// seen j b's" (the start tick included); attempts with
+				// the same count have the same future, so the set is
+				// exact.  A b moves every attempt up one; the attempts at
+				// N-1 reach the goto end.  N = 1 is the single pend bit.
 				SigSpec cur;
 				feedback([&](SigSpec q) {
-					cur = orN({start, q});
-					return andN({cur, mod->Not(NEW_ID, b)});
-				}, "wpend", 1);
+					SigSpec st = start;
+					if (gn > 1)
+						st.append(Const(0, gn - 1));
+					cur = mod->Or(NEW_ID, st, q);
+					SigSpec up = Const(0, 1);
+					if (gn > 1)
+						up.append(cur.extract(0, gn - 1));
+					return mod->Mux(NEW_ID, cur, up, b);
+				}, "wpend", gn);
 				// the attempts merged at the goto end move as one token
 				// through the elements; an element that fails stops the
 				// token, so each attempt reports its first failure once
-				SigSpec tok = andN({cur, b});
+				SigSpec tok = andN({cur[gn - 1], b});
 				SigSpec f = Const(0, 1);
 				for (auto &el : elems) {
 					tok = delay(tok, el.first, "wgoto");
@@ -5832,6 +5875,51 @@ struct Sva2CheckPass : public Pass {
 				// assertion already attempts at every tick, so the outer
 				// always adds nothing -- it is `s_eventually p` here.
 				// (Nested, or in an initial block, it is not; those stay loud.)
+				// a root instance of a property declaration whose body is an
+				// implication with a liveness-shaped consequent (caliptra
+				// ecc_pm_ctrl `property p(cmd, count); $rose(..) |->
+				// strong(x[->count] ##1 y)`, `|-> s_eventually b`): the body
+				// spliced through the actuals, so the shape recognizers below
+				// see it as if written inline.  Other instances compile
+				// through the declaration as before.
+				for (int guard = 0; guard < 8 && body && comp.decl_by_name(sva_op(body)); guard++) {
+					Cell *dbody = nullptr;
+					std::vector<Wire *> dformals;
+					if (!comp.lookup_decl(body, dbody, dformals) || !dbody)
+						break;
+					Cell *ub = comp.unwrap_spec(dbody);
+					if (!ub)
+						break;
+					bool inst = comp.decl_by_name(sva_op(ub)) != nullptr;
+					bool live = false;
+					if (sva_op(ub) == "|->" || sva_op(ub) == "|=>") {
+						auto up = comp.ports_of(ub);
+						Cell *cc = up.size() == 2 ? comp.child_cell(ub->getPort(up[1])) : nullptr;
+						for (int d = 0; d < 16 && cc && (sva_op(cc) == "nexttime" || sva_op(cc) == "s_nexttime"); d++) {
+							auto np = comp.ports_of(cc);
+							Cell *a = np.empty() ? nullptr : comp.child_cell(cc->getPort(np[0]));
+							Cell *b = np.size() > 1 ? comp.child_cell(cc->getPort(np[1])) : nullptr;
+							cc = b ? b : a;
+						}
+						std::string cop = cc ? sva_op(cc) : "";
+						live = cop == "strong" || cop == "eventually" || cop == "s_eventually" ||
+								cop == "s_until" || cop == "s_until_with";
+					}
+					if (!inst && !live)
+						break;
+					std::vector<SigSpec> acts = comp.inst_actuals(body);
+					if (GetSize(acts) != GetSize(dformals))
+						log_error("sva2check: instance of %s has %d actuals, declaration has %d formals.\n",
+								sva_op(body).c_str(), GetSize(acts), GetSize(dformals));
+					std::vector<Wire *> fs;
+					for (int i = 0; i < GetSize(dformals); i++) {
+						comp.subst[dformals[i]] = acts[i];
+						if (dformals[i])
+							fs.push_back(dformals[i]);
+					}
+					dict<Cell *, Cell *> memo;
+					body = fs.empty() ? ub : comp.splice_tree(ub, fs, memo);
+				}
 				if (flavor == "assert" && body && sva_op(body) == "always" &&
 						!(cell->getParam(ID::TRG_ENABLE).as_bool() && cell->getParam(ID::TRG_WIDTH).as_int() == 0)) {
 					auto ap = comp.ports_of(body);
@@ -6068,6 +6156,65 @@ struct Sva2CheckPass : public Pass {
 							nsu = cc;
 							nsu_op = sva_op(cc);
 							cc->setParam(ID(OP), std::string(nsu_op == "s_until" ? "until" : "until_with"));
+						}
+					}
+				}
+				// `ant |-> strong(b[->N] ##k1 r1 ...)`, b a boolean, N a
+				// constant and the tail bounded (caliptra ecc_pm_ctrl
+				// `strong(x[->count] ##1 y)`): the goto end is unique, so
+				// strong == weak && "b occurs N times from the start
+				// tick" (past the N-th b the tail is bounded, where weak
+				// and strong agree on infinite traces).  The main check
+				// compiles the weak form; a "<name>$live" twin carries
+				// the count obligation.
+				Cell *sgo = nullptr;
+				SigSpec sgo_b;
+				int sgo_n = 0;
+				if (flavor == "assert" && !liveness && !tresp && !nsu && body &&
+						(sva_op(body) == "|->" || sva_op(body) == "|=>")) {
+					auto ip = comp.ports_of(body);
+					Cell *cc = ip.size() == 2 ? comp.child_cell(body->getPort(ip[1])) : nullptr;
+					auto sp = cc && sva_op(cc) == "strong" ? comp.ports_of(cc) : std::vector<IdString>();
+					Cell *g = sp.size() == 1 ? comp.child_cell(cc->getPort(sp[0])) : nullptr;
+					bool ok = g != nullptr;
+					while (ok && sva_op(g) == "##" && comp.ports_of(g).size() == 3) {
+						auto dp = comp.ports_of(g);
+						Cell *bc = comp.child_cell(g->getPort(dp[1]));
+						int lo = 0, hi = 0;
+						if (bc && sva_op(bc) == "bounds") {
+							auto bp = comp.ports_of(bc);
+							ok = bp.size() >= 2 && comp.const_int(bc->getPort(bp[0]), lo) &&
+									comp.const_int(bc->getPort(bp[1]), hi);
+						} else {
+							ok = !bc && comp.const_int(g->getPort(dp[1]), lo);
+							hi = lo;
+						}
+						ok = ok && lo >= 0 && hi >= lo;
+						Cell *rc = comp.child_cell(g->getPort(dp[2]));
+						if (ok && rc) {
+							pool<Cell *> seen;
+							ok = comp.is_seq_op(sva_op(rc)) && comp.seq_max_len(rc) >= 0 &&
+									!comp.tree_has_locals(rc, seen);
+						}
+						g = ok ? comp.child_cell(g->getPort(dp[0])) : nullptr;
+						ok = ok && g;
+					}
+					if (ok && sva_op(g) == "[->]") {
+						auto gp = comp.ports_of(g);
+						Cell *bc = gp.size() == 2 ? comp.child_cell(g->getPort(gp[1])) : nullptr;
+						int lo = 0, hi = 0;
+						if (gp.size() == 2 && !comp.child_cell(g->getPort(gp[0])) && bc && sva_op(bc) == "bounds") {
+							auto bp = comp.ports_of(bc);
+							bool bok = !bp.empty() && comp.const_int(bc->getPort(bp[0]), lo);
+							hi = lo;
+							if (bok && bp.size() >= 2)
+								bok = comp.const_int(bc->getPort(bp[1]), hi);
+							if (bok && lo >= 1 && hi == lo && lo <= 65535) {
+								sgo = cc;
+								sgo_b = g->getPort(gp[0]);
+								sgo_n = lo;
+								comp.weak_strong.insert(cc);
+							}
 						}
 					}
 				}
@@ -6660,6 +6807,58 @@ struct Sva2CheckPass : public Pass {
 						return mod->And(NEW_ID, mod->Not(NEW_ID, b1), mod->Or(NEW_ID, open, q));
 					}, "nsu_pend", 1);
 					SigSpec la = mod->Or(NEW_ID, mod->Not(NEW_ID, pend), b1);
+					if (dop == "disable_iff")
+						la = mod->Or(NEW_ID, dsig, la);
+					RTLIL::Cell *live = mod->addCell(cell->name.str() + "$live", ID($check));
+					live->parameters = cell->parameters;
+					live->connections_ = cell->connections_;
+					live->attributes = cell->attributes;
+					live->setParam(ID(FLAVOR), std::string("liveness"));
+					live->setPort(ID(A), c2f_live(la));
+					live->setPort(ID(EN), SigSpec(State::S1));
+					live->attributes[ID(sva2check)] = Const(1, 1);
+				}
+				if (sgo) {
+					comp.weak_strong.erase(sgo);
+					if (comp.multiclock)
+						log_error("sva2check: strong goto in a multi-clock property is not supported in %s.\n", log_id(cell));
+					if (once)
+						log_error("sva2check: strong goto in an initial-block check %s is not supported.\n", log_id(cell));
+					pool<Cell *> seen;
+					if (comp.tree_has_locals(body, seen))
+						log_error("sva2check: local variables with a strong goto are not supported in %s.\n", log_id(cell));
+					auto ip = comp.ports_of(body);
+					SigSpec open = comp.seq_dispatch(body->getPort(ip[0]),
+							comp.child_cell(body->getPort(ip[0])), root, Const(1, 1));
+					if (sva_op(body) == "|=>") {
+						open = comp.delay(open, 1, "impl");
+						if (comp.can_empty(comp.child_cell(body->getPort(ip[0]))))
+							open = comp.orN({open, root});
+					}
+					// c = the b's from the latest attempt's start tick on
+					// (saturating at N), pend = some attempt seen and c < N.
+					// A = b || !pend is exact under GF A: with b infinitely
+					// often every attempt sees N; otherwise, past the last
+					// b, an attempt from then on never does (pend stays),
+					// and with none the latest attempt (which sees the
+					// fewest b's) decides.  A newer attempt resetting c can
+					// not hide an older one's failure: the older sees a
+					// superset of its b's.
+					SigSpec bx = comp.reduce1(comp.resolve(sgo_b));
+					int w = 1;
+					while ((1 << w) <= sgo_n)
+						w++;
+					SigSpec nv = Const(sgo_n, w);
+					Wire *cq = comp.wn("sgoto_cnt", w);
+					SigSpec bw = {Const(0, w - 1), bx};
+					SigSpec inc = mod->Mux(NEW_ID, mod->Add(NEW_ID, cq, bw), cq, mod->Eq(NEW_ID, cq, nv));
+					SigSpec cur = mod->Mux(NEW_ID, inc, bw, open);
+					comp.ffd(comp.dis_gate(cur), cq, false);
+					Wire *sq = comp.wn("sgoto_seen", 1);
+					SigSpec scur = comp.orN({open, SigSpec(sq)});
+					comp.ffd(comp.dis_gate(scur), sq, false);
+					SigSpec pend = comp.andN({scur, mod->Lt(NEW_ID, cur, nv)});
+					SigSpec la = mod->Or(NEW_ID, bx, mod->Not(NEW_ID, pend));
 					if (dop == "disable_iff")
 						la = mod->Or(NEW_ID, dsig, la);
 					RTLIL::Cell *live = mod->addCell(cell->name.str() + "$live", ID($check));

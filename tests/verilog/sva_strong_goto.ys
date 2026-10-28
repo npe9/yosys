@@ -1,0 +1,194 @@
+# `ant |-> strong(b[->N] ##k1 r1 ...)` (caliptra ecc_pm_ctrl
+# `strong(x[->count] ##1 y)`, count 384/576) was refused: "strong
+# unbounded sequence needs a liveness obligation".  The goto end is
+# unique, so strong == weak && "N b's from the start tick": the main
+# check is the weak form, a <name>$live twin the count obligation.  The
+# weak form of b[->N] (N > 1) was "no finite bound": it is a pending set
+# of N bits ("some attempt has seen j b's"), exact since attempts with
+# the same count share their future.  A root instance of a property
+# declaration with such a body (caliptra writes it as `property p(cmd,
+# count)`) is spliced through its actuals first, as are the other
+# liveness shapes (s_eventually, strong(##[m:$] ..), s_until), which
+# were refused the same way through a declaration.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] c = 4'd0;             // 0 1 2 ... 15 15 15
+  always_ff @(posedge clk) if (c != 4'd15) c <= c + 4'd1;
+  wire x = c == 4'd2 || c == 4'd4 || c == 4'd6;   // three x's, then none
+  wire y = c == 4'd7 || c == 4'd5;
+  // from c==1: x at 2,4,6 -> 3rd at 6, y at 7: holds
+  g_ok:   assert property (@(posedge clk) c == 4'd1 |-> strong(x[->3] ##1 y));
+  // 2nd x at 4, y at 5: holds
+  g_ok2:  assert property (@(posedge clk) c == 4'd0 |-> strong(x[->2] ##1 y));
+  // the goto counts the start tick: from c==2 the 2nd x is at 4
+  g_st:   assert property (@(posedge clk) c == 4'd2 |-> strong(x[->2] ##1 y));
+  // from c==3 only two x's remain: the strong form fails (liveness) ...
+  g_few:  assert property (@(posedge clk) c == 4'd3 |-> strong(x[->3] ##1 y));
+  // ... the weak form holds
+  w_few:  assert property (@(posedge clk) c == 4'd3 |-> x[->3] ##1 y);
+  // the weak part still binds: 3rd x at 6 needs y at 7 -- ##2 misses
+  g_tail: assert property (@(posedge clk) c == 4'd1 |-> strong(x[->3] ##2 y));
+  // no tail
+  g_bare: assert property (@(posedge clk) c == 4'd0 |-> strong(x[->3]));
+  g_bare4: assert property (@(posedge clk) c == 4'd0 |-> strong(x[->4]));
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt -fast
+opt_clean
+logger -expect log "g_ok: proved" 1
+logger -expect log "g_ok\$live: proved" 1
+logger -expect log "g_ok2: proved" 1
+logger -expect log "g_ok2\$live: proved" 1
+logger -expect log "g_st: proved" 1
+logger -expect log "g_st\$live: proved" 1
+logger -expect log "g_few: proved" 1
+logger -expect log "g_few\$live: disproved" 1
+logger -expect log "w_few: proved" 1
+logger -expect log "g_tail: disproved" 1
+logger -expect log "g_tail\$live: proved" 1
+logger -expect log "g_bare\$live: proved" 1
+logger -expect log "g_bare4\$live: disproved" 1
+ic3 -init-zero
+logger -check-expected
+
+# free inputs: x infinitely often (fairness) discharges the count part
+design -reset
+read_verilog -sv -formal <<EOT
+module top (input logic clk, rst, req, x, y);
+  assume property (@(posedge clk) s_eventually x);   // x infinitely often
+  // with x infinitely often the count part always holds; the weak tail
+  // does not (y free): disproved
+  f_tail: assert property (@(posedge clk) req |-> strong(x[->2] ##1 y));
+  // the count part alone holds
+  f_cnt:  assert property (@(posedge clk) req |-> strong(x[->5]));
+  // with a disable that can hold forever the obligation is discharged
+  f_dis:  assert property (@(posedge clk) disable iff (rst) req |-> strong(x[->2]));
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt -fast
+opt_clean
+logger -expect log "f_tail: disproved" 1
+logger -expect log "f_tail\$live: proved" 1
+logger -expect log "f_cnt\$live: proved" 1
+logger -expect log "f_dis: proved" 1
+logger -expect log "f_dis\$live: proved" 1
+ic3 -init-zero
+logger -check-expected
+
+# without fairness x may stop: the count part fails by a lasso
+design -reset
+read_verilog -sv -formal <<EOT
+module top2 (input logic clk, req, x);
+  // no fairness: x may stop -- disproved by a lasso
+  h_cnt: assert property (@(posedge clk) req |-> strong(x[->2]));
+  // the weak form holds (it never fails on a finite prefix)
+  h_w:   assert property (@(posedge clk) req |-> x[->2]);
+endmodule
+EOT
+hierarchy -top top2
+sva2check
+proc
+async2sync
+logger -expect log "h_cnt\$live: disproved" 1
+logger -expect log "h_w: proved" 1
+ic3 -init-zero
+logger -check-expected
+
+# through property declarations: the same verdicts as inline
+design -reset
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [3:0] c = 4'd0;
+  always_ff @(posedge clk) if (c != 4'd15) c <= c + 4'd1;
+  wire x = c == 4'd2 || c == 4'd4 || c == 4'd6;
+  wire y = c == 4'd7 || c == 4'd5;
+  property pg(s, n, k);  c == s |-> strong(x[->n] ##1 y); endproperty
+  property pe(s, m);     c == s |-> s_eventually (c == m); endproperty
+  property pr(s);        c == s |-> strong(##[1:$] x ##[1:2] y); endproperty
+  property pu(s);        c == s |-> (c != 4'd9) s_until (c == 4'd8); endproperty
+  i_ok:  assert property (@(posedge clk) c == 4'd1 |-> strong(x[->3] ##1 y));
+  d_ok:  assert property (@(posedge clk) pg(4'd1, 3, 0));
+  i_few: assert property (@(posedge clk) c == 4'd3 |-> strong(x[->3] ##1 y));
+  d_few: assert property (@(posedge clk) pg(4'd3, 3, 0));
+  d_e1:  assert property (@(posedge clk) pe(4'd1, 4'd15));
+  d_e2:  assert property (@(posedge clk) pe(4'd3, 4'd2));
+  d_r1:  assert property (@(posedge clk) pr(4'd1));
+  d_r2:  assert property (@(posedge clk) pr(4'd6));
+  d_u1:  assert property (@(posedge clk) pu(4'd1));
+  d_u2:  assert property (@(posedge clk) pu(4'd9));
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt -fast
+opt_clean
+logger -expect log "i_ok: proved" 1
+logger -expect log "i_ok\$live: proved" 1
+logger -expect log "d_ok: proved" 1
+logger -expect log "d_ok\$live: proved" 1
+logger -expect log "i_few: proved" 1
+logger -expect log "i_few\$live: disproved" 1
+logger -expect log "d_few: proved" 1
+logger -expect log "d_few\$live: disproved" 1
+logger -expect log "d_e1: proved" 1
+logger -expect log "d_e2: disproved" 1
+logger -expect log "d_r1: proved" 1
+logger -expect log "d_r2: disproved" 1
+logger -expect log "d_u1: proved" 1
+logger -expect log "d_u1\$live: proved" 1
+logger -expect log "d_u2: disproved" 1
+logger -expect log "d_u2\$live: disproved" 1
+ic3 -init-zero
+logger -check-expected
+
+# the weak b[->N] tail equals the antecedent-goto form over free inputs, overlapping attempts (ab)
+design -reset
+read_verilog -sv -formal <<EOT
+module top (input logic clk, req, x, y);
+  assume property (@(posedge clk) req |-> x[->3] ##1 y);
+  e: assert property (@(posedge clk) req ##0 x[->3] |=> y);
+  // sanity: a different count is not implied
+  n: assert property (@(posedge clk) req ##0 x[->2] |=> y);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt -fast
+opt_clean
+logger -expect log "e: proved" 1
+logger -expect log "n: disproved" 1
+ic3 -init-zero
+logger -check-expected
+
+# the weak b[->N] tail equals the antecedent-goto form over free inputs, overlapping attempts (ba)
+design -reset
+read_verilog -sv -formal <<EOT
+module top (input logic clk, req, x, y);
+  assume property (@(posedge clk) req ##0 x[->3] |=> y);
+  e: assert property (@(posedge clk) req |-> x[->3] ##1 y);
+  // sanity: a different count is not implied
+  n: assert property (@(posedge clk) req ##0 x[->2] |=> y);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt -fast
+opt_clean
+logger -expect log "e: proved" 1
+logger -expect log "n: disproved" 1
+ic3 -init-zero
+logger -check-expected

@@ -1,0 +1,44 @@
+# ic3 -init-zero and constant-driven bits that carry an x init
+# A variable with a declaration initializer of which only a slice is ever
+# assigned: proc makes the unassigned bits a constant connection and leaves
+# their init x.  ic3 pinned those (constant) bits to 0 under -init-zero, so
+# the initial state was `1 == 0`, UNSAT, and every property of the module
+# was vacuously PROVED (also with -bmc / -kind).  p_w, p_pa, p_s are false.
+read_verilog -sv -formal <<EOT
+typedef struct packed { logic [7:0] data; logic [3:0] tag; } s_t;
+module m(input logic clk, input logic [7:0] x);
+  logic [15:0] w = 16'h5a5a;
+  logic [1:0][7:0] pa = {8'h5a, 8'h5a};
+  s_t s = '{data: 8'h5a, tag: 4'h9};
+  always_ff @(posedge clk) begin w[7:0] <= x; pa[0] <= x; s.data <= x; end
+  p_w: assert property (@(posedge clk) w[7:0] == 8'h5a);
+  p_pa: assert property (@(posedge clk) pa[0] == 8'h5a);
+  p_s: assert property (@(posedge clk) s.data == 8'h5a);
+  p_hi: assert property (@(posedge clk) w[15:8] == 8'h5a && pa[1] == 8'h5a && s.tag == 4'h9);
+endmodule
+EOT
+hierarchy -check -top m
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+design -save prepped
+logger -expect log "p_w: disproved \(depth 1\)" 1
+logger -expect log "p_pa: disproved \(depth 1\)" 1
+logger -expect log "p_s: disproved \(depth 1\)" 1
+logger -expect log "p_hi: proved" 1
+logger -expect log "ic3: 10 init bit\(s\) on constant-driven wires disagree" 1
+ic3 -check-cells -init-zero
+logger -check-expected
+
+design -load prepped
+logger -expect log "p_w: disproved \(depth 1\)" 1
+logger -expect log "p_hi: proved" 1
+ic3 -check-cells -init-zero -kind 3
+logger -check-expected
+
+design -load prepped
+logger -expect log "p_w: bmc pre-pass hit at depth 1" 1
+ic3 -check-cells -init-zero -bmc 3
+logger -check-expected

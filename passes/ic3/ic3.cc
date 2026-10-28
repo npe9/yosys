@@ -433,7 +433,13 @@ struct Ic3Solver
 			RTLIL::SigSpec l, r;
 			for (int i = 0; i < lhs.size(); i++) {
 				RTLIL::SigSpec bit = lhs.extract(i, 1);
-				if (!satgen.initial_state.check_all(bit))
+				// a constant-driven bit is no state bit (check_all passes
+				// constants): pinning it made the initial state UNSAT and
+				// every property in the module vacuously PROVED (-init-zero
+				// pinned the Sx init of a never-assigned slice of a packed
+				// `logic [1:0][7:0] pa = ...` whose bits proc had made the
+				// constant 8'h5a, so `1 == 0`; BMC and k-induction too)
+				if (bit[0].wire == nullptr || !satgen.initial_state.check_all(bit))
 					continue;
 				if (rhs[i] != RTLIL::State::S0 && rhs[i] != RTLIL::State::S1) {
 					if (!init_zero)
@@ -3001,6 +3007,33 @@ struct Ic3Pass : Pass
 			log("ic3: registers without a 0/1 \\init value start at zero (explicit \\init values are kept).\n");
 		else
 			log("ic3: registers without \\init attribute have a free initial state.\n");
+		{
+			// init bits on constant-driven wire bits are no state and are
+			// ignored; one that disagrees with its constant made the initial
+			// state UNSAT before that, and every property vacuously PROVED
+			SigMap sm(module);
+			int conflicts = 0;
+			for (auto wire : module->wires()) {
+				if (!wire->attributes.count(ID::init))
+					continue;
+				RTLIL::Const iv = wire->attributes.at(ID::init);
+				RTLIL::SigSpec sig = sm(wire);
+				for (int i = 0; i < GetSize(sig) && i < GetSize(iv); i++) {
+					if (sig[i].wire)
+						continue;
+					RTLIL::State want = iv[i];
+					if (want != RTLIL::State::S0 && want != RTLIL::State::S1) {
+						if (!init_zero)
+							continue;
+						want = RTLIL::State::S0;
+					}
+					if ((sig[i].data == RTLIL::State::S0 || sig[i].data == RTLIL::State::S1) && sig[i].data != want)
+						conflicts++;
+				}
+			}
+			if (conflicts)
+				log("ic3: %d init bit(s) on constant-driven wires disagree with the constant; ignored, they are no state.\n", conflicts);
+		}
 
 		// Batched BMC pre-pass (-bmc N).  The per-query pre-pass built a
 		// fresh N+1-step unrolling for every check: on the Deburster FVIP

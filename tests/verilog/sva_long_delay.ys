@@ -1,0 +1,41 @@
+# a fixed `##k` past 128 ticks (caliptra ecc_pm_ctrl `##delay`, 792) was
+# "## delay bound too large": the register chain was capped at 128 for
+# every bounded delay.  A fixed delay is k registers and one tap (the
+# chain the unbounded `##[k:$]` builds uncapped), so it is taken up to
+# 1024; a ranged one inside a sequence keeps the cap (a ranged tail
+# window is a deadline counter, unchanged)
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a);
+  logic [129:0] sr = '0;            // a, 1..130 ticks back
+  always_ff @(posedge clk) sr <= {sr[128:0], a};
+  // overlapping attempts every tick: sr[129] is a, 130 ticks later
+  p_ok:  assert property (@(posedge clk) a |-> ##130 sr[129]);
+  p_off: assert property (@(posedge clk) a |-> ##129 sr[129]);
+  p_seq: assert property (@(posedge clk) a |-> 1'b1 ##130 sr[129] ##1 1'b1);
+  p_aa:  assert property (@(posedge clk) a |-> ##130 a);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt -fast
+opt_clean
+# (IC3 alone is slow to relate two 130-deep chains; k-induction at
+# the chain depth proves it and BMC finds the deep counterexamples)
+logger -expect log "p_ok: proved" 1
+logger -expect log "p_off: disproved \(depth 129\)" 1
+logger -expect log "p_seq: proved" 1
+logger -expect log "p_aa: disproved \(depth 130\)" 1
+ic3 -init-zero -bmc 132 -kind 132
+logger -check-expected
+
+design -reset
+logger -expect error "## delay bound 200 too large" 1
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, b);
+  p: assert property (@(posedge clk) a ##[150:200] b |-> a);
+endmodule
+EOT
+hierarchy -top top
+sva2check

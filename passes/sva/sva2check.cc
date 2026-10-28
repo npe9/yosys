@@ -2225,8 +2225,11 @@ struct SvaCompiler {
 				}
 				if (slots_mode)
 					t_age = age_window(age, lo, nslots - 1);
-			} else if (hi <= 128) {
+			} else if (hi <= 128 || (lo == hi && hi <= 1024 && !slots_mode)) {
 				// single register chain with one tap per admissible offset
+				// (a fixed ##k is k registers and one tap: the same chain
+				// the unbounded form builds for its lo, uncapped there;
+				// caliptra ecc_pm_ctrl `##delay` = 792)
 				t_start = lo == 0 ? s_end : Const(0, 1);
 				SigSpec tap = s_end;
 				for (int k = 1; k <= hi; k++) {

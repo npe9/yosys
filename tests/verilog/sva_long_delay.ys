@@ -29,6 +29,84 @@ logger -expect log "p_seq: proved" 1
 logger -expect log "p_aa: disproved \(depth 130\)" 1
 ic3 -init-zero -bmc 132 -kind 132
 logger -check-expected
+design -reset
+
+# A fixed ##k past the 1024-tick register chain (caliptra
+# fv_ecc_pm_ctrl_abstract `##INV_DLY`, 21287 ticks) used to stop the file
+# ("sequence ... is N ticks long (max 1024)").  It compiles as a 3-entry
+# countdown CAM; a fourth start inside a k-tick window is dropped and
+# fails the <name>$overflow twin, so the main verdict is exact when the
+# twin proves.  -long_delay_min 4 moves the threshold so the engine legs
+# stay short; the last leg is the real threshold (lowering only).
+
+# free inputs: disproved at the CAM's depth; four starts in a row exceed it
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, input logic b, input logic c);
+  a_d: assert property (@(posedge clk) a |-> ##6 b);
+  a_t: assert property (@(posedge clk) a |=> ##5 b ##1 c);
+endmodule
+EOT
+hierarchy -top top
+sva2check -long_delay_min 4
+proc
+async2sync
+logger -expect log "a_d: disproved \(depth 6\) \[lowering=exact:if-a_d\$overflow\]" 1
+logger -expect log "a_t: disproved \(depth 7\) \[lowering=exact:if-a_t\$overflow\]" 1
+logger -expect log "a_d\$overflow: capacity exceeded \(depth 3\)" 1
+logger -expect log "a_t\$overflow: capacity exceeded \(depth 4\)" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# closed design: c counts 0..7.  a_p due response proved, a_f the wrong
+# value disproved at depth 6, a_x the same cancelled by a disable before
+# its deadline proved (the entry is cleared), a_m a start every other
+# tick (an entry coming due is reused at once: 3 entries suffice), a_o
+# four starts in a row (main proved, twin exceeded), a_s a tail after the
+# delay (the deadline extends the same CAM)
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [2:0] c = 3'd0;
+  always_ff @(posedge clk) c <= c + 3'd1;
+  a_p: assert property (@(posedge clk) c == 3'd0 |-> ##6 c == 3'd6);
+  a_f: assert property (@(posedge clk) c == 3'd0 |-> ##6 c == 3'd5);
+  a_x: assert property (@(posedge clk) disable iff (c == 3'd3) c == 3'd0 |-> ##6 c == 3'd5);
+  a_m: assert property (@(posedge clk) !c[0] |-> ##6 !c[0]);
+  a_o: assert property (@(posedge clk) c < 3'd4 |-> ##6 (c >= 3'd6 || c <= 3'd1));
+  a_s: assert property (@(posedge clk) c == 3'd0 |-> ##6 c == 3'd6 ##1 c == 3'd7);
+endmodule
+EOT
+hierarchy -top top
+sva2check -long_delay_min 4
+proc
+async2sync
+logger -expect log "a_p: proved \[lowering=exact:if-a_p\$overflow\]" 1
+logger -expect log "a_f: disproved \(depth 6\) \[lowering=exact:if-a_f\$overflow\]" 1
+logger -expect log "a_x: proved \[lowering=exact:if-a_x\$overflow\]" 1
+logger -expect log "a_m: proved \[lowering=exact:if-a_m\$overflow\]" 1
+logger -expect log "a_o: proved \[lowering=exact:if-a_o\$overflow\]" 1
+logger -expect log "a_s: proved \[lowering=exact:if-a_s\$overflow\]" 1
+logger -expect log "a_[pfxms]\$overflow: proved" 5
+logger -expect log "a_o\$overflow: capacity exceeded \(depth 3\)" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# the real threshold: ##1100 with a tail lowers to a handful of registers
+# (a chain would be 1101) plus the twin
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, input logic b, input logic c, input logic r);
+  a_b: assert property (@(posedge clk) disable iff (r) a |-> ##1100 b ##1 c);
+endmodule
+EOT
+hierarchy -top top
+logger -expect log "a_b: ##1100 past the 1024-tick register chain compiled as a 3-entry countdown CAM" 1
+sva2check
+proc
+opt_clean
+select -assert-max 30 t:$dff
+select -assert-count 1 t:$check a:sva_capacity %i
+logger -check-expected
 
 design -reset
 logger -expect error "## delay bound 200 too large" 1

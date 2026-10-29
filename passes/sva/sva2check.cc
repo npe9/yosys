@@ -538,6 +538,115 @@ struct SvaCompiler {
 		return s;
 	}
 
+	// A fixed delay past the register-chain cap (2026-10-29; caliptra
+	// fv_ecc_pm_ctrl_abstract `##INV_DLY`, 21287 ticks: a chain is one
+	// register per tick, and the consequent needs two of them, the
+	// token and the deadline).  A token stream delayed by k: a CAM of
+	// long_delay_slots entries, each a pend bit and a countdown; a token
+	// takes a free entry (or one coming due this tick), an entry due
+	// (count 0) emits the delayed token and frees.  Tokens inserted at
+	// distinct ticks never share an entry, so with no more than
+	// long_delay_slots tokens in any k-tick window the output is exactly
+	// s delayed by k.  A token arriving with every entry busy is dropped
+	// and pulses cam_overflow (the <name>$overflow twin): a dropped token
+	// loses its obligation (its end and its deadline both stay low), so
+	// a disproof is always real and a proof exact when the twin proves.
+	// Pend bits are attempt state (disable-gated, safe for the early
+	// check: all-zero means no token in flight); counts are data.
+	int long_delay_min = 1024;    // SVA_LONG_DELAY_MIN (tests) lowers it
+	int long_delay_slots = 3;
+	std::map<std::pair<SigSpec, int>, SigSpec> long_delay_memo;
+	bool long_delay_ok(int k)
+	{
+		return k > long_delay_min && !slots_mode && dyn_gate.empty() && !c2f &&
+				!island_mode && !in_island;
+	}
+	SigSpec long_delay(SigSpec s, int k)
+	{
+		log_assert(GetSize(s) == 1 && k > 0);
+		// the key looks through `x & 1'b1` (andN's constant seed, a
+		// constant gate or true lhs): the consequent's token and its
+		// deadline then share one CAM instead of two in lockstep, which
+		// the engine would have to prove equal
+		for (bool more = true; more && s.is_wire();) {
+			more = false;
+			for (auto c : mod->cells()) {
+				if (c->type != ID($and) || c->getPort(ID::Y) != s)
+					continue;
+				SigSpec a = c->getPort(ID::A), b = c->getPort(ID::B);
+				if (GetSize(a) == 1 && GetSize(b) == 1 && a.is_fully_const() && a.as_bool())
+					s = b, more = true;
+				else if (GetSize(a) == 1 && GetSize(b) == 1 && b.is_fully_const() && b.as_bool())
+					s = a, more = true;
+				break;
+			}
+		}
+		auto key = std::make_pair(s, k);
+		auto it = long_delay_memo.find(key);
+		if (it != long_delay_memo.end())
+			return it->second;
+		// a shorter CAM on the same token (the consequent's leading ##K,
+		// then its deadline K + tail): extend it by a register chain, so
+		// the two stay one CAM (two CAMs in lockstep are an equivalence
+		// the engine has to prove; ic3 did not within minutes)
+		int best = 0;
+		for (auto &e : long_delay_memo)
+			if (e.first.first == s && e.first.second < k && k - e.first.second <= 1024)
+				best = std::max(best, e.first.second);
+		if (best) {
+			SigSpec out = delay(long_delay_memo.at(std::make_pair(s, best)), k - best, "ldl_tail");
+			long_delay_memo[key] = out;
+			return out;
+		}
+		int w = 1;
+		while ((1 << w) <= k)
+			w++;
+		std::vector<Wire *> pv, cv;
+		std::vector<SigSpec> due;
+		SigSpec out = Const(0, 1);
+		for (int i = 0; i < long_delay_slots; i++) {
+			Wire *p = wn("ldl_pend", 1), *c = wn("ldl_cnt", w);
+			SigSpec d = andN({SigSpec(p), mod->Eq(NEW_ID, SigSpec(c), Const(0, w))});
+			out = orN({out, d});
+			pv.push_back(p);
+			cv.push_back(c);
+			due.push_back(d);
+		}
+		SigSpec taken = Const(0, 1);
+		for (int i = 0; i < long_delay_slots; i++) {
+			SigSpec free_i = orN({mod->Not(NEW_ID, SigSpec(pv[i])), due[i]});
+			SigSpec take = andN({s, free_i, mod->Not(NEW_ID, taken)});
+			taken = orN({taken, free_i});
+			SigSpec np = orN({take, andN({SigSpec(pv[i]), mod->Not(NEW_ID, due[i])})});
+			ffd(dis_gate(np), pv[i], true);
+			SigSpec nc = mod->Mux(NEW_ID, mod->Sub(NEW_ID, SigSpec(cv[i]), Const(1, w)), Const(k - 1, w), take);
+			mod->addDff(NEW_ID, clk, nc.extract(0, w), cv[i], clk_pos);
+		}
+		SigSpec ovf = andN({s, mod->Not(NEW_ID, taken)});
+		cam_overflow = cam_overflow.empty() ? ovf : orN({cam_overflow, ovf});
+		log("sva2check: %s: ##%d past the %d-tick register chain compiled as a %d-entry countdown CAM (exact if %s$overflow proves).\n",
+				check_name.c_str(), k, long_delay_min, long_delay_slots, check_name.c_str());
+		long_delay_memo[key] = out;
+		return out;
+	}
+	// the ticks of a sequence's fixed `##k` delays past long_delay_min,
+	// through `##` nodes only (a long delay elsewhere keeps the length cap)
+	int long_fixed_sum(Cell *n)
+	{
+		if (!n || sva_op(n) != "##")
+			return 0;
+		auto ps = ports_of(n);
+		bool lead2 = GetSize(ps) == 2;
+		int sum = 0, k;
+		SigSpec cyc = n->getPort(ps[lead2 ? 0 : 1]);
+		if (!child_cell(cyc) && const_int(cyc, k) && long_delay_ok(k))
+			sum += k;
+		if (!lead2)
+			sum += long_fixed_sum(child_cell(n->getPort(ps[0])));
+		sum += long_fixed_sum(child_cell(n->getPort(ps[lead2 ? 1 : 2])));
+		return sum;
+	}
+
 	// The token of a `##k` gap carried k ticks; inside `b throughout ...`
 	// (dyn_gate set) b must hold at every gap tick (LRM 16.9.9): the
 	// ticks strictly between the lhs end and the tail start.  Without a
@@ -2516,6 +2625,8 @@ struct SvaCompiler {
 				}
 				if (slots_mode)
 					t_age = age_window(lhs_age, lo, nslots - 1);
+			} else if (lo == hi && long_delay_ok(hi)) {
+				t_start = long_delay(s_end, hi);
 			} else if (hi <= 128 || (lo == hi && hi <= 1024 && !slots_mode)) {
 				// single register chain with one tap per admissible offset
 				// (a fixed ##k is k registers and one tap: the same chain
@@ -5921,7 +6032,10 @@ struct SvaCompiler {
 			log_error("sva2check: sequence in %s used in property position has no finite bound.\n", log_id(n));
 		if (len > 64 && minl != len)
 			log_error("sva2check: variable-length sequence in %s (%d to %d ticks) used in property position exceeds the 64-tick window.\n", log_id(n), minl, len);
-		if (len > 1024)
+		// the cap counts chain registers: long fixed delays go through
+		// the countdown CAM (long_delay), as does the deadline then
+		bool long_exp = len - 1 > long_delay_min && minl == len && long_delay_ok(len - 1);
+		if (len > 1024 && !(long_exp && len - long_fixed_sum(n) <= 1024))
 			log_error("sva2check: sequence in %s used in property position is %d ticks long (max 1024).\n", log_id(n), len);
 		int deadline = len - 1;
 		// A variable-length sequence: the window [t, t+deadline] of the
@@ -6013,7 +6127,8 @@ struct SvaCompiler {
 		SigSpec any = Const(0, 1);
 		for (int k = 0; k <= len - std::max(minl, 1); k++)
 			any = orN({any, k == 0 ? end : delay(end, k, "strong_win")});
-		return andN({delay(start, deadline, "strong_expire"), mod->Not(NEW_ID, any)});
+		SigSpec expire = long_exp ? long_delay(start, deadline) : delay(start, deadline, "strong_expire");
+		return andN({expire, mod->Not(NEW_ID, any)});
 	}
 };
 
@@ -6023,7 +6138,7 @@ struct Sva2CheckPass : public Pass {
 	void help() override
 	{
 		log("\n");
-		log("    sva2check [-expose_bad] [-exact] [-early] [-clk2fflogic] [selection]\n");
+		log("    sva2check [-expose_bad] [-exact] [-early] [-clk2fflogic] [-long_delay_min N] [selection]\n");
 		log("\n");
 		log("Compile the $sva property trees under assert-flavor $check cells into\n");
 		log("synchronous monitor hardware (single-clock spec subset: ## delays and\n");
@@ -6074,6 +6189,12 @@ struct Sva2CheckPass : public Pass {
 		log("clk2fflogic are evaluated at every step on current values: assumptions\n");
 		log("over-constrain between ticks (false proofs).  Required for multi-clock\n");
 		log("properties and cross-clock .matched.\n");
+		log("\n");
+		log("A fixed ##k past 1024 ticks compiles as a 3-entry countdown CAM\n");
+		log("instead of a k-register chain; a fourth start inside a k-tick window\n");
+		log("is dropped and fails the <name>$overflow twin, so the main verdict is\n");
+		log("exact when the twin proves.  -long_delay_min N moves the 1024\n");
+		log("threshold (tests; also env SVA_LONG_DELAY_MIN).\n");
 		log("\n");
 		log("With -expose_bad, additionally create a module output port per\n");
 		log("converted check named bad_<check> driven by EN && !A, for AIGER\n");
@@ -6187,8 +6308,14 @@ struct Sva2CheckPass : public Pass {
 		bool exact_mode = false;
 		bool early_opt = false;
 		bool c2f = false;
+		int long_delay_min = getenv("SVA_LONG_DELAY_MIN") ? std::max(1, atoi(getenv("SVA_LONG_DELAY_MIN"))) : 1024;
 		std::vector<std::string> sub_args;
-		for (auto &arg : args) {
+		for (size_t ai = 0; ai < args.size(); ai++) {
+			auto &arg = args[ai];
+			if (arg == "-long_delay_min" && ai + 1 < args.size()) {
+				long_delay_min = std::max(1, atoi(args[++ai].c_str()));
+				continue;
+			}
 			if (arg == "-expose_bad") {
 				expose_bad = true;
 				continue;
@@ -6328,6 +6455,7 @@ struct Sva2CheckPass : public Pass {
 					log("sva2check-debug: check %s\n", log_id(cell));
 				comp.exact_mode = exact_mode;
 				comp.c2f = c2f;
+				comp.long_delay_min = long_delay_min;
 				{
 					std::string fl = cell->getParam(ID(FLAVOR)).decode_string();
 					comp.early_fail = early_opt || getenv("SVA_EARLY") || fl == "assume" || fl == "restrict";

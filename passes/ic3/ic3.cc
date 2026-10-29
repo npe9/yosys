@@ -3297,9 +3297,9 @@ struct Ic3Pass : Pass
 			if (result == 1 && cell->get_bool_attribute(ID(sva_capacity))) {
 				// sva2check's $overflow twin: not a design counterexample --
 				// the check it belongs to is not exact on this trace
-				log("ic3: %s: capacity exceeded (depth %d): more distinct local-variable captures were "
-						"live than sva2check tracks for this check; the verdict of the check it "
-						"belongs to is not exact%s\n",
+				log("ic3: %s: capacity exceeded (depth %d): more attempts were in flight (distinct "
+						"local-variable captures, or starts inside a long ##k) than sva2check tracks for "
+						"this check; the verdict of the check it belongs to is not exact%s\n",
 						name.c_str(), depth, lowering_tag(cell).c_str());
 				n_undecided++;
 			} else if (result == 0) {

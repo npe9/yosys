@@ -830,6 +830,34 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 			continue;
 		}
 
+		// whole-array read of a 1-D unpacked parameter array (a function's
+		// unpacked-array argument bound to a package constant: OpenTitan
+		// aes_sbox_dom `aes_mvm(data_i, A2X)`; `m = P`): the same element
+		// concatenation, whose element reads fold to the pattern's values.
+		// The parameter has no value of its own as one constant, so read
+		// bare it was an undriven wire
+		if (child->type == AST_IDENTIFIER && !in_lvalue && !(node_is_assign && i == 0) && child->children.empty() && child->id2ast &&
+				(child->id2ast->type == AST_PARAMETER || child->id2ast->type == AST_LOCALPARAM) && !opaque_call &&
+				child->id2ast->unpacked_dimensions == 1 && !child->id2ast->dimensions.empty() &&
+				child->id2ast->dimensions[0].range_width >= 1 && child->id2ast->dimensions[0].range_width <= 4096) {
+			const auto &dim = child->id2ast->dimensions[0];
+			auto loc = child->location;
+			auto ref = child->clone();
+			child->type = AST_CONCAT;
+			child->str.clear();
+			child->id2ast = nullptr;
+			child->is_signed = false;
+			for (int j = 0; j < dim.range_width; j++) {
+				auto elem = ref->clone();
+				elem->children.push_back(std::make_unique<AstNode>(loc, AST_RANGE,
+						AstNode::mkconst_int(loc, dim.range_right + j, true)));
+				elem->integer = 1;
+				elem->basic_prep = false;
+				child->children.push_back(std::move(elem));
+			}
+			continue;
+		}
+
 		rewrite_whole_array_refs(child, node_is_assign && i == 0, procedural);
 	}
 	for (auto &attr : node->attributes)

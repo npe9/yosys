@@ -1,0 +1,56 @@
+# A whole read of a 1-D unpacked parameter array (OpenTitan aes_sbox_dom
+# `aes_mvm(data_i, A2X)`: a function's unpacked-array argument bound to a
+# package constant) was "Read of parameter `\A2X' did not fold to a
+# constant" and read as an undriven wire.  It reads as its elements, lowest
+# index in the LSBs, like a whole memory read; the pattern's leftmost value
+# is the left index (IEEE 1800-2017 10.9.1).
+read_verilog -sv <<EOT
+package pk;
+  parameter logic [7:0] A2X [8] = '{8'h98, 8'hf3, 8'hf2, 8'h48, 8'h09, 8'h81, 8'ha9, 8'hff};
+  function automatic logic [7:0] mvm(logic [7:0] b, logic [7:0] a [8]);
+    logic [7:0] r;
+    r = '0;
+    for (int i = 0; i < 8; i++)
+      if (b[7-i]) r ^= a[i];
+    return r;
+  endfunction
+endpackage
+module top (input logic [7:0] d, output logic [7:0] o, output logic [7:0] o1, output logic [7:0] o3);
+  import pk::*;
+  localparam logic [7:0] Q [3:1] = '{8'h11, 8'h22, 8'h33};
+  logic [7:0] m [3:1];
+  assign o = mvm(d, A2X);
+  always_comb begin m = Q; o1 = m[1]; o3 = m[3]; end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+sat -verify -set d 8'h80 -prove o 8'h98
+sat -verify -set d 8'h01 -prove o 8'hff
+sat -verify -set d 8'h03 -prove o 8'h56
+sat -verify -prove o1 8'h33 -prove o3 8'h11
+
+# connected whole to an unpacked-array port: as a memory connection is
+design -reset
+read_verilog -sv <<EOT
+module sub (input logic [7:0] in [3], output logic [7:0] a, output logic [7:0] c);
+  assign a = in[0];
+  assign c = in[2];
+endmodule
+module top (output logic [7:0] a, output logic [7:0] c, output logic [7:0] ma, output logic [7:0] mc);
+  localparam logic [7:0] Q [3] = '{8'h11, 8'h22, 8'h33};
+  logic [7:0] m [3];
+  assign m[0] = 8'h11;
+  assign m[1] = 8'h22;
+  assign m[2] = 8'h33;
+  sub u (.in(Q), .a(a), .c(c));
+  sub v (.in(m), .a(ma), .c(mc));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+sat -verify -prove a 8'h11 -prove c 8'h33 -prove ma 8'h11 -prove mc 8'h33

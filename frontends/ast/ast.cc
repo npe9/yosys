@@ -1496,8 +1496,27 @@ AST_INTERNAL::process_and_replace_module(RTLIL::Design *design,
 static void rename_in_package_stmts(AstNode *pkg)
 {
 	std::unordered_set<std::string> idents;
-	for (auto& item : pkg->children)
+	// the items of the package's enums too (`case (t) SecdedHsiao:` in
+	// cva6 prim_secded_pkg::get_synd_width): they sit under an AST_ENUM,
+	// and left bare a call from outside the package read them as implicit
+	// wires (the constant call "did not evaluate", the inlined one read 0).
+	// Not those of an imported package's clones (`import i3c_consts_pkg::*`
+	// in i3c_pkg): the clones are dropped again, and the item keeps its
+	// own package's name
+	std::function<void(AstNode*)> collect_enum_items = [&](AstNode *node) {
+		for (auto& c : node->children) {
+			if (!c || c->type == AST_FUNCTION || c->type == AST_TASK)
+				continue;
+			if (c->type == AST_ENUM_ITEM)
+				idents.insert(c->str);
+			collect_enum_items(c.get());
+		}
+	};
+	for (auto& item : pkg->children) {
 		idents.insert(item->str);
+		if (item->type != AST_FUNCTION && item->type != AST_TASK && !item->attributes.count(IdString("\\pkg_scope_clone")))
+			collect_enum_items(item.get());
+	}
 	std::function<void(std::unique_ptr<AstNode>&)> rename =
 		[&rename, &idents, pkg](std::unique_ptr<AstNode>& node) {
 			for (auto& child : node->children) {

@@ -1,0 +1,73 @@
+# A package function reading its package's enum items (cva6
+# prim_secded_pkg::get_synd_width: `unique case (sd_type) SecdedHsiao:`)
+# called package-qualified from a module that does not import the
+# package: the items were left bare in the body, so they were implicit
+# wires -- the constant call "did not evaluate" and an inlined call read
+# 0.  They are qualified like the package's parameters.
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+package pk;
+  typedef enum int { SecdedHsiao, SecdedOther } st_e;
+  function automatic int gsw(st_e sd_type, int width);
+    unique case (sd_type)
+      SecdedHsiao:
+        unique case (width)
+          32: return 7;
+          64: return 8;
+          default: return 0;
+        endcase
+      default: return 0;
+    endcase
+  endfunction
+  function automatic int gfw(st_e sd_type, int width);
+    return width + gsw(sd_type, width);
+  endfunction
+  function automatic int is_h(int s);
+    return (s == SecdedHsiao) ? 1 : 2;
+  endfunction
+endpackage
+module top (input logic [31:0] x, output logic [31:0] a, output logic [31:0] b, output logic [31:0] c, output logic [31:0] d);
+  localparam int unsigned SW = pk::gsw(pk::SecdedHsiao, 64);
+  localparam int unsigned FW = pk::gfw(pk::SecdedHsiao, 32);
+  assign a = SW;
+  assign b = FW;
+  assign c = pk::is_h(x);
+  assign d = pk::gsw(pk::SecdedOther, 64);
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+sat -verify -prove a 8 -prove b 39 -prove d 0
+sat -verify -set x 0 -prove c 1
+sat -verify -set x 1 -prove c 2
+
+# a package importing another package's enum: its function reads the
+# imported item under that package's name (OpenTitan i3c_pkg `ccc inside
+# {GETMWL}` from i3c_consts_pkg), and its own item qualified
+design -reset
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+package ca;
+  typedef enum logic [7:0] { ENEC = 8'h80, GETMWL = 8'h8b } ccc_e;
+endpackage
+package cb;
+  import ca::*;
+  typedef enum int { Loc0, Loc1 } l_e;
+  function automatic logic is_get(logic [7:0] ccc);
+    return ccc inside {GETMWL};
+  endfunction
+  function automatic int lv(int s);
+    return (s == Loc1) ? 5 : 6;
+  endfunction
+endpackage
+module top (input logic [7:0] x, output logic a, output logic [31:0] b);
+  assign a = cb::is_get(x);
+  assign b = cb::lv(1);
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+sat -verify -set x 8'h8b -prove a 1 -prove b 5
+sat -verify -set x 8'h80 -prove a 0

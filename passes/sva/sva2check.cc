@@ -3266,9 +3266,12 @@ struct SvaCompiler {
 		// matched at any c tick.)
 		SigSpec b = andN({reduce1(body), gate_now(gate)});
 		m = std::max(m, 1);
+		// K+1 run-length bits and O(K) next-state logic: linear, like the
+		// k registers of a fixed ##k, so the same 1024 bound (it was 65,
+		// refusing caliptra scalar_blinding's busy_o[*110])
 		int K = (hi >= 0 ? hi : m) - 1;
-		if (K > 64)
-			log_error("sva2check: consecutive repetition bound %d is too large (max 65).\n", hi);
+		if (K > 1023)
+			log_error("sva2check: consecutive repetition bound %d is too large (max 1024).\n", hi >= 0 ? hi : m);
 		Wire *sw = wn("run_set", K + 1);
 		std::vector<SigBit> cur;
 		for (int c = 0; c <= K; c++)
@@ -5591,8 +5594,12 @@ struct SvaCompiler {
 		// the 64-tick cap bounds the rotating copies of a VARIABLE-length
 		// sequence; a fixed-length one has a one-tick window and is exact
 		// at any length (caliptra doe: 73 ticks of `[*DLY_RND]` runs)
-		if (len < 0 || (len > 64 && minl != len) || len > 1024)
-			log_error("sva2check: sequence in %s used in property position has no finite bound (max %d ticks).\n", log_id(n), len);
+		if (len < 0)
+			log_error("sva2check: sequence in %s used in property position has no finite bound.\n", log_id(n));
+		if (len > 64 && minl != len)
+			log_error("sva2check: variable-length sequence in %s (%d to %d ticks) used in property position exceeds the 64-tick window.\n", log_id(n), minl, len);
+		if (len > 1024)
+			log_error("sva2check: sequence in %s used in property position is %d ticks long (max 1024).\n", log_id(n), len);
 		int deadline = len - 1;
 		// A variable-length sequence: the window [t, t+deadline] of the
 		// attempt started at t also sees the ends of LATER attempts, which

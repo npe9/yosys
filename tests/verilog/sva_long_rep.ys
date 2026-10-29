@@ -1,0 +1,86 @@
+# a consecutive repetition b[*k] past 65 (caliptra scalar_blinding
+# `busy_o[*SCA_DLY]`, 110) was refused "too large (max 65)".  Its
+# run-length set is k bits and O(k) logic, linear like a fixed ##k, so it
+# is taken up to 1024.  The design is closed (a free-running counter, no
+# inputs), so `sim` decides each property exactly within the run (BMC
+# takes minutes at depth 125).  ic3 BMC agrees on the depths: f_rep 111,
+# f_loc 114.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [7:0] c = 0;
+  always_ff @(posedge clk) c <= c + 8'd1;
+  wire b = c < 8'd200;
+  property tl; logic [7:0] v; (c == 8'd3, v = c) |-> ##1 b[*110] ##1 c == v + 8'd111; endproperty
+  t_rep: assert property (@(posedge clk) c == 8'd0 |-> ##1 b[*110] ##1 c == 8'd111);
+  t_loc: assert property (@(posedge clk) tl);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt_clean
+sim -clock clk -n 250 -zinit -assert
+
+design -reset
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [7:0] c = 0;
+  always_ff @(posedge clk) c <= c + 8'd1;
+  wire b = c < 8'd200;
+  property fl; logic [7:0] v; (c == 8'd3, v = c) |-> ##1 b[*110] ##1 c == v + 8'd110; endproperty
+  f_rep: assert property (@(posedge clk) c == 8'd0 |-> ##1 b[*110] ##1 c == 8'd112);
+  f_loc: assert property (@(posedge clk) fl);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt_clean
+design -save r
+sim -clock clk -n 110 -zinit -assert
+design -load r
+logger -expect warning "Assertion top\.f_rep .* failed" 1
+sim -clock clk -n 111 -zinit
+logger -check-expected
+design -load r
+logger -expect warning "Assertion top\.f_loc .* failed" 1
+sim -clock clk -n 114 -zinit
+logger -check-expected
+
+# b drops at c == 200, inside the run of the attempt at c == 100; the
+# failure is reported at the run's deadline (210; BMC agrees), the known lateness of
+# the deadline-only check (PLAN class F5, register D5)
+design -reset
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [7:0] c = 0;
+  always_ff @(posedge clk) c <= c + 8'd1;
+  wire b = c < 8'd200;
+  f_brk: assert property (@(posedge clk) c == 8'd100 |-> ##1 b[*110]);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt_clean
+design -save k
+sim -clock clk -n 209 -zinit -assert
+design -load k
+logger -expect warning "Assertion top\.f_brk .* failed" 1
+sim -clock clk -n 210 -zinit
+logger -check-expected
+
+# a RANGED run past the window in property position stays refused (its
+# rotating copies are capped at 64; only ##[m:M] has a deadline form)
+design -reset
+logger -expect error "variable-length sequence .* \(102 to 122 ticks\) used in property position exceeds the 64-tick window" 1
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic b, c);
+  p: assert property (@(posedge clk) c |-> ##1 b[*100:120] ##1 c);
+endmodule
+EOT
+hierarchy -top top
+sva2check

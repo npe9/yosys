@@ -1,0 +1,79 @@
+# local variables over a fixed window past 64 ticks (caliptra doe
+# `##DLY_256`, 73 ticks) were refused: "exceed the 64-tick local-variable
+# window".  The per-attempt slot ring is sized by the window, so a window
+# up to 128 ticks is taken, and the per-end split takes a fixed `##k`
+# past 64 (one compile; only a range multiplies them).
+#
+# The design is closed (a free-running 2-bit counter, no inputs), so its
+# one trace is all its behaviour and `sim` decides each property exactly
+# within the run; ic3 needs minutes for the 71-slot ring.  An attempt
+# starts every tick, so all slots are live at once: a slot read off by
+# one sees a neighbour's capture (c one apart).
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [1:0] c = '0;
+  always_ff @(posedge clk) c <= c + 2'd1;
+  property ok;   logic [1:0] v; (1'b1, v = c) ##70 1'b1 |-> c == v + 2'd2; endproperty
+  property one;  logic [1:0] v; (c == 2'd1, v = c) ##70 1'b1 |-> c == v + 2'd2; endproperty
+  // a local read inside the window as well as at its end
+  property mid;  logic [1:0] v; (1'b1, v = c) ##35 c == v + 2'd3 ##35 1'b1 |-> c == v + 2'd2; endproperty
+  property midn; logic [1:0] v; (1'b1, v = c) ##35 c != v + 2'd3 ##35 1'b1 |-> 1'b0; endproperty
+  p_ok:   assert property (@(posedge clk) ok);
+  p_one:  assert property (@(posedge clk) one);
+  p_mid:  assert property (@(posedge clk) mid);
+  p_midn: assert property (@(posedge clk) midn);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+# (no `opt`: it folds the uninitialised constant-1 age registers of a
+# constant-true antecedent; register item fe54)
+proc
+async2sync
+opt_clean
+sim -clock clk -n 95 -zinit -assert
+
+# false twins: each first fails at its window end (ic3 BMC agrees:
+# p_off depth 70, p_onef depth 71); one step earlier nothing fails
+design -reset
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [1:0] c = '0;
+  always_ff @(posedge clk) c <= c + 2'd1;
+  property off;  logic [1:0] v; (1'b1, v = c) ##70 1'b1 |-> c == v + 2'd1; endproperty
+  property onef; logic [1:0] v; (c == 2'd1, v = c) ##70 1'b1 |-> c == v + 2'd3; endproperty
+  property midf; logic [1:0] v; (1'b1, v = c) ##35 c == v + 2'd3 ##35 1'b1 |-> 1'b0; endproperty
+  p_off:  assert property (@(posedge clk) off);
+  p_onef: assert property (@(posedge clk) onef);
+  p_midf: assert property (@(posedge clk) midf);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt_clean
+design -save w
+sim -clock clk -n 69 -zinit -assert
+design -load w
+logger -expect warning "Assertion top\.p_off .* failed" 1
+logger -expect warning "Assertion top\.p_midf .* failed" 1
+sim -clock clk -n 70 -zinit
+logger -check-expected
+design -load w
+logger -expect warning "Assertion top\.p_onef .* failed" 1
+logger -expect warning "Assertion top\.p_off .* failed" 3
+logger -expect warning "Assertion top\.p_midf .* failed" 3
+sim -clock clk -n 71 -zinit
+logger -check-expected
+
+design -reset
+logger -expect error "local variables over a 131-tick sequence .* exceed the 128-tick local-variable window" 1
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic [7:0] c);
+  property q; logic [7:0] v; (1'b1, v = c) ##130 1'b1 |-> c != v; endproperty
+  p: assert property (@(posedge clk) q);
+endmodule
+EOT
+hierarchy -top top
+sva2check

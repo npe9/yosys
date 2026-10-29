@@ -1570,6 +1570,23 @@ struct SvaCompiler {
 		return acc;
 	}
 
+	// Per-attempt local-variable slots: one slot per tick of the longest
+	// match, since a new attempt may start every tick.  Cost is about
+	// l x (sum of local widths) flip-flops, an l-way read mux per local
+	// read, and l age registers per tick of each delay inside the window
+	// (age_window).  128 covers the fixed caliptra windows (doe 73 ticks,
+	// scalar_blinding 112) at 3-4x the old 64; unlike a plain fixed ##k
+	// (a register chain, 1024) the slots are not linear in l alone.
+	static constexpr int LOCALS_WINDOW = 128;
+	void check_locals_window(int l, Cell *n)
+	{
+		if (l < 0)
+			log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(n));
+		if (l > LOCALS_WINDOW)
+			log_error("sva2check: local variables over a %d-tick sequence in %s exceed the %d-tick local-variable window.\n",
+					l, log_id(n), LOCALS_WINDOW);
+	}
+
 	// enable per-attempt slot mode with an l-slot ring
 	void init_slots(int l)
 	{
@@ -1978,10 +1995,7 @@ struct SvaCompiler {
 			pool<Cell *> seen;
 			if (tree_has_locals(dbody, seen)) {
 				int l = seq_max_len(dbody);
-				if (l < 0)
-					log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(dbody));
-				if (l > 64)
-					log_error("sva2check: local variables over a %d-tick sequence in %s exceed the 64-tick local-variable window.\n", l, log_id(dbody));
+				check_locals_window(l, dbody);
 				init_slots(l);
 			}
 		}
@@ -2150,7 +2164,9 @@ struct SvaCompiler {
 					return finish({{SvaEnd{seq_end(n, start, gate), -1}}, false});
 				lo = hi = k;
 			}
-			if (hi < 0 || hi > 64 || hi - lo + 1 > split_budget)
+			// a fixed ##k is one compile and a k-register tap; only a
+			// range multiplies the tail compiles
+			if (hi < 0 || (hi > 64 && lo != hi) || hi > 1024 || hi - lo + 1 > split_budget)
 				return finish({{SvaEnd{seq_end(n, start, gate), -1}}, false});
 			std::pair<std::vector<SvaEnd>, bool> lhs;
 			if (lead2)
@@ -6914,10 +6930,7 @@ struct Sva2CheckPass : public Pass {
 						bool had_slots = comp.slots_mode;
 						if (comp.tree_has_locals(body, seen)) {
 							int l = comp.seq_max_len(body);
-							if (l < 0)
-								log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(body));
-							if (l > 64)
-								log_error("sva2check: local variables over a %d-tick sequence in %s exceed the 64-tick local-variable window.\n", l, log_id(body));
+							comp.check_locals_window(l, body);
 							comp.init_slots(l);
 						}
 						fail = comp.prop_dispatch(SigSpec(), body, root);
@@ -6949,10 +6962,7 @@ struct Sva2CheckPass : public Pass {
 						if (dbody && !comp.until_locals_match(dbody, ul) && !comp.goto_locals_match(dbody, gl) &&
 								comp.tree_has_locals(dbody, seen)) {
 							int l = comp.seq_max_len(dbody);
-							if (l < 0)
-								log_error("sva2check: local variables over an unbounded sequence in %s.\n", log_id(dbody));
-							if (l > 64)
-								log_error("sva2check: local variables over a %d-tick sequence in %s exceed the 64-tick local-variable window.\n", l, log_id(dbody));
+							comp.check_locals_window(l, dbody);
 							comp.init_slots(l);
 						}
 						fail = comp.prop_dispatch(body_sig, nullptr, root);

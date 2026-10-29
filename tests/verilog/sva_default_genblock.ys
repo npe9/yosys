@@ -1,0 +1,68 @@
+# A generate block is a scope of its own for `default disable iff` and
+# `default clocking` (IEEE 16.15: a scope uses its own default, else its
+# parent's).  OpenTitan wraps assertions in `if (1) begin ... end` for
+# exactly this (prim_alert_rxtx_async_assert_fpv, adc_ctrl_fsm_sva_if).
+# The parser kept a block's default after the block (p_after was proved),
+# and the scope-wide retrofit then gave it to assertions before the block
+# too (p_before was proved).  Here `c != 2` holds only under rst2 and
+# `c != 1` only under rst1, so each verdict names the disable it got.
+read_verilog -sv -formal <<EOT
+module top(input clk);
+  logic [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  wire rst1 = c == 2'd1;
+  wire rst2 = c == 2'd2;
+  p_before: assert property (@(posedge clk) c != 2'd2);
+  if (1) begin : g
+    p_in_before: assert property (@(posedge clk) c != 2'd2);
+    default disable iff (rst2);
+    p_in_after: assert property (@(posedge clk) c != 2'd2);
+    // a nested block without its own inherits g's
+    if (1) begin : n
+      p_nested: assert property (@(posedge clk) c != 2'd2);
+    end
+    // a nested block's own replaces g's, before and after it
+    if (1) begin : o
+      p_own_before: assert property (@(posedge clk) c != 2'd1);
+      default disable iff (rst1);
+      p_own_after: assert property (@(posedge clk) c != 2'd1);
+    end
+  end
+  p_after: assert property (@(posedge clk) c != 2'd2);
+  // the module's default, declared after this block, reaches into it
+  if (1) begin : m
+    p_mod: assert property (@(posedge clk) c != 2'd1);
+  end
+  for (genvar i = 0; i < 2; i++) begin : f
+    default disable iff (rst2);
+    p_for: assert property (@(posedge clk) c != 2'd2);
+  end
+  // a block's default clocking stays in the block
+  if (1) begin : h
+    q_in: assert property (c == 2'd1 |=> c == 2'd2);
+    default clocking @(posedge clk); endclocking
+  end
+  q_after: assert property (c == 2'd1 |=> c == 2'd2);
+  default disable iff (rst1);
+  p_end: assert property (@(posedge clk) c != 2'd1);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt_clean
+logger -expect log "ic3: p_before: disproved \(depth 2\)" 1
+logger -expect log "ic3: g.p_in_before: proved" 1
+logger -expect log "ic3: g.p_in_after: proved" 1
+logger -expect log "ic3: g.n.p_nested: proved" 1
+logger -expect log "ic3: g.o.p_own_before: proved" 1
+logger -expect log "ic3: g.o.p_own_after: proved" 1
+logger -expect log "ic3: p_after: disproved \(depth 2\)" 1
+logger -expect log "ic3: m.p_mod: proved" 1
+logger -expect log "ic3: f\[[01]\].p_for: proved" 2
+logger -expect log "ic3: h.q_in: proved" 1
+logger -expect log "ic3: q_after: not checked" 1
+logger -expect log "ic3: p_end: proved" 1
+ic3 -init-zero
+logger -check-expected

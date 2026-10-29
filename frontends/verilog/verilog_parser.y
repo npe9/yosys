@@ -104,6 +104,15 @@
 			// in a concurrent assertion means this event
 			std::unique_ptr<AstNode> sva_global_clock;
 			std::unique_ptr<AstNode> sva_default_disable;
+			// IEEE 16.15: a generate block is a scope of its own for the
+			// defaults; it inherits the enclosing ones unless it declares
+			// its own.  One frame per open generate block: the enclosing
+			// defaults (restored at its end) and whether it declared one.
+			struct SvaDefaultsFrame {
+				std::unique_ptr<AstNode> clk, dis;
+				bool own_clk = false, own_dis = false;
+			};
+			std::vector<SvaDefaultsFrame> sva_default_frames;
 			// IEEE 1800-2009 17.2: checker formal ports (identifier with an
 			// optional default-expression child) collected while parsing a
 			// checker header, plus the enclosing default clocking/disable
@@ -597,41 +606,76 @@
 		return owned;
 	}
 
-	// IEEE 16.16 / 16.15: a module's default clocking and default disable
+	// IEEE 16.16 / 16.15: a scope's default clocking and default disable
 	// iff apply to every concurrent assertion in the scope without its own,
-	// wherever they are declared.  sva_property_spec tags a property parsed
-	// before the default (sv_pending_dclk / sv_pending_ddis); at the end of
-	// the scope the tagged ones get the default as if it had come first
+	// wherever they are declared.  sva_property_spec tags every property
+	// without its own clock / disable (sv_pending_dclk / sv_pending_ddis),
+	// whatever default it took when parsed; at the end of the scope the
+	// tagged ones get the scope's default as if it had come first
 	// (caliptra fv_ecc_dsa_sequencer declares it after its assumptions:
-	// they had no clock, "placeholder:no sampling clock")
-	static void sva_retrofit_defaults(AstNode *n, ParseState *extra)
+	// they had no clock, "placeholder:no sampling clock").  A generate
+	// block resolves only the kinds it declares itself and leaves the rest
+	// tagged for the enclosing scope (do_clk / do_dis); a module, program
+	// or interface resolves both.
+	static void sva_retrofit_defaults(AstNode *n, ParseState *extra, bool do_clk = true, bool do_dis = true)
 	{
 		for (auto &ch : n->children) {
 			if (!ch)
 				continue;
-			bool pc = ch->attributes.count(ID(sv_pending_dclk)) != 0;
-			bool pd = ch->attributes.count(ID(sv_pending_ddis)) != 0;
-			ch->attributes.erase(ID(sv_pending_dclk));
-			ch->attributes.erase(ID(sv_pending_ddis));
+			bool pc = do_clk && ch->attributes.count(ID(sv_pending_dclk)) != 0;
+			bool pd = do_dis && ch->attributes.count(ID(sv_pending_ddis)) != 0;
+			if (pc)
+				ch->attributes.erase(ID(sv_pending_dclk));
+			if (pd)
+				ch->attributes.erase(ID(sv_pending_ddis));
 			bool ac = pc && extra->sva_default_clock;
 			bool ad = pd && extra->sva_default_disable;
 			if (ac || ad) {
 				if (ch->type == AST_SVA && ch->str == "spec" && ch->children.size() == 3) {
-					if (ac && ch->children[0] && ch->children[0]->type == AST_SVA && ch->children[0]->str == "no_clock")
+					if (ac)
 						ch->children[0] = extra->sva_default_clock->clone();
-					if (ad && ch->children[1] && ch->children[1]->type == AST_SVA && ch->children[1]->str == "no_disable")
+					if (ad)
 						ch->children[1] = extra->sva_default_disable->clone();
 				} else {
 					Location loc = ch->location;
 					auto spec = mk_sva(loc, "spec");
 					spec->children.push_back(ac ? extra->sva_default_clock->clone() : mk_sva(loc, "no_clock"));
 					spec->children.push_back(ad ? extra->sva_default_disable->clone() : mk_sva(loc, "no_disable"));
+					// a kind left for the enclosing scope stays on the spec
+					// (else that scope would wrap the body a second time)
+					for (auto id : {ID(sv_pending_dclk), ID(sv_pending_ddis)})
+						if (ch->attributes.count(id)) {
+							spec->set_attribute(id, ch->attributes.at(id)->clone());
+							ch->attributes.erase(id);
+						}
 					spec->children.push_back(std::move(ch));
 					ch = std::move(spec);
 				}
 			}
-			sva_retrofit_defaults(ch.get(), extra);
+			sva_retrofit_defaults(ch.get(), extra, do_clk, do_dis);
 		}
+	}
+
+	// generate block entry / exit: see SvaDefaultsFrame
+	static void sva_enter_default_scope(ParseState *extra)
+	{
+		ParseState::SvaDefaultsFrame fr;
+		if (extra->sva_default_clock)
+			fr.clk = extra->sva_default_clock->clone();
+		if (extra->sva_default_disable)
+			fr.dis = extra->sva_default_disable->clone();
+		extra->sva_default_frames.push_back(std::move(fr));
+	}
+
+	static void sva_exit_default_scope(AstNode *block, ParseState *extra)
+	{
+		log_assert(!extra->sva_default_frames.empty());
+		auto &fr = extra->sva_default_frames.back();
+		if (fr.own_clk || fr.own_dis)
+			sva_retrofit_defaults(block, extra, fr.own_clk, fr.own_dis);
+		extra->sva_default_clock = std::move(fr.clk);
+		extra->sva_default_disable = std::move(fr.dis);
+		extra->sva_default_frames.pop_back();
 	}
 
 	static std::unique_ptr<AstNode> sva_add(std::unique_ptr<AstNode> n, std::unique_ptr<AstNode> child)
@@ -6380,7 +6424,9 @@ gen_block:
 	} opt_label {
 		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_GENBLOCK));
 		node->str = $3 ? *$3 : std::string();
+		sva_enter_default_scope(extra);
 	} module_gen_body TOK_END opt_label {
+		sva_exit_default_scope(extra->ast_stack.back(), extra);
 		extra->exitTypeScope();
 		checkLabelsMatch(@7, "Begin label", $3.get(), $7.get());
 		SET_AST_NODE_LOC(extra->ast_stack.back(), @1, @7);
@@ -6391,7 +6437,9 @@ gen_block:
 gen_stmt_block:
 	{
 		(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_GENBLOCK));
+		sva_enter_default_scope(extra);
 	} gen_stmt_or_module_body_stmt {
+		sva_exit_default_scope(extra->ast_stack.back(), extra);
 		SET_AST_NODE_LOC(extra->ast_stack.back(), @2, @2);
 		extra->ast_stack.pop_back();
 	} | gen_block;
@@ -7125,11 +7173,11 @@ sva_property_spec:
 		auto clock = std::move($1);
 		auto dis = std::move($2);
 		auto body = std::move($3);
-		// no default yet: tag for the end-of-scope retrofit (a checker's
-		// body takes its defaults at expansion instead)
-		bool pend_clk = !clock && !extra->sva_default_clock && extra->current_ast_mod && !extra->in_checker;
-		bool pend_dis = !dis && !extra->sva_default_disable && !extra->in_property_decl &&
-				extra->current_ast_mod && !extra->in_checker;
+		// no clock / disable of its own: tag for the end-of-scope retrofit,
+		// which gives it the default of the innermost scope declaring one
+		// (a checker's body takes its defaults at expansion instead)
+		bool pend_clk = !clock && extra->current_ast_mod && !extra->in_checker;
+		bool pend_dis = !dis && !extra->in_property_decl && extra->current_ast_mod && !extra->in_checker;
 		if (!clock && extra->sva_default_clock)
 			clock = extra->sva_default_clock->clone();
 		if (!dis && extra->sva_default_disable && !extra->in_property_decl)
@@ -7922,10 +7970,14 @@ clocking_decl:
 	} |
 	TOK_DEFAULT TOK_CLOCKING TOK_ID sva_at_clock TOK_SEMICOL clocking_items TOK_ENDCLOCKING opt_label {
 		extra->sva_default_clock = $4->clone();
+		if (!extra->sva_default_frames.empty())
+			extra->sva_default_frames.back().own_clk = true;
 		checkLabelsMatch(@7, "Clocking block label", $3.get(), $8.get());
 	} |
 	TOK_DEFAULT TOK_CLOCKING sva_at_clock TOK_SEMICOL clocking_items TOK_ENDCLOCKING opt_label {
 		extra->sva_default_clock = $3->clone();
+		if (!extra->sva_default_frames.empty())
+			extra->sva_default_frames.back().own_clk = true;
 	};
 
 clocking_items:
@@ -7981,4 +8033,6 @@ sva_inside_items:
 sva_default_disable:
 	TOK_DEFAULT TOK_DISABLE TOK_IFF expr TOK_SEMICOL {
 		extra->sva_default_disable = sva_add(mk_sva(@$, "disable_iff"), std::move($4));
+		if (!extra->sva_default_frames.empty())
+			extra->sva_default_frames.back().own_dis = true;
 	};

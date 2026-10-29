@@ -1,0 +1,85 @@
+# Cover of a sequence with local variables (OpenTitan tlul_assert
+# b2bReqWithSameAddr / b2bSameSource) used to be refused.  A bounded
+# sequence covers through the per-attempt slots, as an assert antecedent;
+# the goto shape `b ##0 (1'b1, v = e) ##1 g[->1] ##0 B` through the goto
+# CAM, whose hits are the failures of `b ##0 (...) ##1 g[->1] |-> !B`.
+# A goto cover is reached only on a real match; "unreachable" is exact
+# when <name>$overflow proves.  Each cover is reached at the depth its
+# assert twin (a_sa, a_ss) is disproved.
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic av, input logic ar, input logic [1:0] x, input logic [1:0] y, input logic rst);
+  sequence sa; logic [1:0] p; (av && ar, p = x) ##1 av && p == x; endsequence
+  sequence ss; logic [1:0] p; (av && ar, p = x) ##1 av[->1] ##0 p == x; endsequence
+  sequence so; logic [1:0] p; (av, p = x) ##1 ar[->1] ##0 p == y; endsequence
+  logic [1:0] ss_p;
+  c_sa: cover property (@(posedge clk) sa);
+  a_sa: assert property (@(posedge clk) sa |-> 1'b0);
+  c_ss: cover property (@(posedge clk) ss);
+  a_ss: assert property (@(posedge clk) (av && ar, ss_p = x) ##1 av[->1] |-> ss_p != x);
+  c_so: cover property (@(posedge clk) so);
+  c_sd: cover property (@(posedge clk) disable iff (rst) ss);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_sa: disproved \(depth 1\)" 1
+logger -expect log "c_sa: cover reached \(depth 1\) \[lowering=exact\]" 1
+logger -expect log "a_ss: disproved \(depth 1\)" 1
+logger -expect log "c_ss: cover reached \(depth 1\) \[lowering=exact:if-c_ss\$overflow\]" 1
+logger -expect log "c_ss\$overflow: proved" 1
+logger -expect log "c_so\$overflow: capacity exceeded \(depth 3\)" 1
+logger -expect log "c_sd: cover reached \(depth 1\)" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# closed design: c counts 0, 1, 2, 3, 0, ...  gr: v = 0 at c == 0, the
+# first c == 2 two ticks later; gu never holds; gd is disabled at c == 1
+# (the CAM entry is cleared: exact); g2: B fails at the first g (c == 1)
+# and would hold at the second (c == 3), which [->1] does not reach
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [1:0] c = 2'd0;
+  always_ff @(posedge clk) c <= c + 2'd1;
+  sequence gr; logic [1:0] v; (c == 2'd0, v = c) ##1 (c == 2'd2)[->1] ##0 c == v + 2'd2; endsequence
+  sequence gu; logic [1:0] v; (c == 2'd0, v = c) ##1 (c == 2'd2)[->1] ##0 c == v; endsequence
+  sequence g2; logic [1:0] v; (c == 2'd0, v = c) ##1 c[0][->1] ##0 c == v + 2'd3; endsequence
+  sequence br; logic [1:0] v; (c == 2'd0, v = c) ##2 c == v + 2'd2; endsequence
+  sequence bu; logic [1:0] v; (c == 2'd0, v = c) ##2 c == v + 2'd1; endsequence
+  c_gr: cover property (@(posedge clk) gr);
+  c_gu: cover property (@(posedge clk) gu);
+  c_gd: cover property (@(posedge clk) disable iff (c == 2'd1) gr);
+  c_g2: cover property (@(posedge clk) g2);
+  c_br: cover property (@(posedge clk) br);
+  c_bu: cover property (@(posedge clk) bu);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "c_gr: cover reached \(depth 2\) \[lowering=exact:if-c_gr\$overflow\]" 1
+logger -expect log "c_gu: cover unreachable \[lowering=exact:if-c_gu\$overflow\]" 1
+logger -expect log "c_gd: cover unreachable \[lowering=exact:if-c_gd\$overflow\]" 1
+logger -expect log "c_g2: cover unreachable \[lowering=exact:if-c_g2\$overflow\]" 1
+logger -expect log "c_br: cover reached \(depth 2\) \[lowering=exact\]" 1
+logger -expect log "c_bu: cover unreachable \[lowering=exact\]" 1
+logger -expect log "c_g[rud2]\$overflow: proved" 4
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# an unbounded sequence with locals outside the goto shape stays refused
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, input logic [1:0] x, input logic [1:0] y);
+  sequence su; logic [1:0] p; (a, p = x) ##[1:$] p == y; endsequence
+  c_su: cover property (@(posedge clk) su);
+endmodule
+EOT
+hierarchy -top top
+logger -expect log "top/c_su: cover of an unbounded sequence with local variables not supported" 1
+sva2check
+design -reset
+logger -check-expected

@@ -3617,17 +3617,9 @@ struct SvaCompiler {
 		return true;
 	}
 
-	bool goto_locals_match(Cell *body, GotoLocals &m)
+	// `b ##0 (1'b1, v = e, ...) ##1 g[->1]`: the goto antecedent shape
+	bool goto_locals_ant(Cell *ant, GotoLocals &m)
 	{
-		if (!allow_until_locals || !body || multiclock || island_mode)
-			return false;
-		std::string iop = sva_op(body);
-		if (iop != "|->" && iop != "|=>")
-			return false;
-		auto bp = ports_of(body);
-		if (GetSize(bp) != 2)
-			return false;
-		Cell *ant = child_cell(body->getPort(bp[0]));
 		if (!ant || sva_op(ant) != "##")
 			return false;
 		auto ap = ports_of(ant);
@@ -3651,7 +3643,41 @@ struct SvaCompiler {
 		m.g = gt->getPort(gp[0]);
 		m.b.clear();
 		m.caps.clear();
-		if (!goto_locals_lhs(ant->getPort(ap[0]), m) || m.caps.empty())
+		return goto_locals_lhs(ant->getPort(ap[0]), m) && !m.caps.empty();
+	}
+
+	// neither g, nor any b, nor any captured expression reads a capture
+	bool goto_locals_clean(GotoLocals &m)
+	{
+		for (auto &cap : m.caps) {
+			pool<Wire *> seen;
+			if (cone_reads(m.g, cap.first, seen))
+				return false;
+			for (auto &bb : m.b) {
+				seen.clear();
+				if (cone_reads(bb, cap.first, seen))
+					return false;
+			}
+			for (auto &other : m.caps) {
+				seen.clear();
+				if (cone_reads(other.second, cap.first, seen))
+					return false;
+			}
+		}
+		return true;
+	}
+
+	bool goto_locals_match(Cell *body, GotoLocals &m)
+	{
+		if (!allow_until_locals || !body || multiclock || island_mode)
+			return false;
+		std::string iop = sva_op(body);
+		if (iop != "|->" && iop != "|=>")
+			return false;
+		auto bp = ports_of(body);
+		if (GetSize(bp) != 2)
+			return false;
+		if (!goto_locals_ant(child_cell(body->getPort(bp[0])), m))
 			return false;
 		// consequent: [##k] B[*n], B boolean
 		SigSpec con = body->getPort(bp[1]);
@@ -3684,25 +3710,37 @@ struct SvaCompiler {
 		if (cc || m.k + m.n > 1024)
 			return false;
 		m.B = con;
-		for (auto &cap : m.caps) {
-			pool<Wire *> seen;
-			if (cone_reads(m.g, cap.first, seen))
-				return false;
-			for (auto &bb : m.b) {
-				seen.clear();
-				if (cone_reads(bb, cap.first, seen))
-					return false;
-			}
-			for (auto &other : m.caps) {
-				seen.clear();
-				if (cone_reads(other.second, cap.first, seen))
-					return false;
-			}
-		}
-		return true;
+		return goto_locals_clean(m);
 	}
 
-	SigSpec goto_locals_fail(GotoLocals &m, const std::vector<Wire *> &formals, SigSpec start)
+	// The cover of the goto shape (2026-10-29; OpenTitan tlul_assert
+	// b2bSameSource): `cover (b ##0 (1'b1, v = e, ...) ##1 g[->1] ##0 B)`
+	// with boolean B.  Its hits are the failures of the landed assert
+	// `b ##0 (...) ##1 g[->1] |-> !B` (goto_locals_fail with `hit`): the
+	// CAM entry released at the first g with B over its own tuple.  A hit
+	// is always a real match (an entry holds a real capture; a merged one
+	// has the same future); "unreachable" is exact only when the
+	// <name>$overflow twin proves, as for the asserts.
+	bool goto_cover_match(Cell *s, GotoLocals &m)
+	{
+		if (!s || multiclock || island_mode || sva_op(s) != "##")
+			return false;
+		auto sp = ports_of(s);
+		int d = -1;
+		if (GetSize(sp) != 3 || child_cell(s->getPort(sp[1])) || !const_int(s->getPort(sp[1]), d) || d != 0 ||
+				child_cell(s->getPort(sp[2])))
+			return false;
+		m.b.clear();
+		m.caps.clear();
+		if (!goto_locals_ant(child_cell(s->getPort(sp[0])), m))
+			return false;
+		m.k = 0;
+		m.n = 1;
+		m.B = s->getPort(sp[2]);
+		return goto_locals_clean(m);
+	}
+
+	SigSpec goto_locals_fail(GotoLocals &m, const std::vector<Wire *> &formals, SigSpec start, bool hit = false)
 	{
 		std::vector<Wire *> fl = formals;
 		for (auto &cap : m.caps)
@@ -3747,7 +3785,7 @@ struct SvaCompiler {
 			std::vector<SigSpec> dl = {rel};
 			for (int d = 1; d <= last; d++)
 				dl.push_back(reg(dl.back(), "goto_rel"));
-			SigSpec nb = mod->Not(NEW_ID, B_at(SigSpec(vv)));
+			SigSpec nb = hit ? B_at(SigSpec(vv)) : mod->Not(NEW_ID, B_at(SigSpec(vv)));
 			for (int j = 0; j < m.n; j++)
 				fail = orN({fail, andN({dl[m.k + j], nb})});
 			// the tuple is still needed after this tick: a release less
@@ -7128,15 +7166,30 @@ struct Sva2CheckPass : public Pass {
 					}
 					// an implication body covers its non-vacuous successes
 					bool impl_cover = sbody && (sva_op(sbody) == "|->" || sva_op(sbody) == "|=>");
+					// a sequence with local variables (2026-10-29, OpenTitan
+					// tlul_assert): the goto shape through the goto CAM
+					// (goto_cover_match), a bounded one through the
+					// per-attempt slots, as an assert antecedent
+					bool cover_locals = false;
+					SvaCompiler::GotoLocals gcov;
+					bool goto_cover = false;
 					if (sbody) {
 						pool<Cell *> seen;
 						int l = comp.seq_max_len(sbody);
 						if (!impl_cover && !cover_shaped(sbody))
 							why = "cover of a property operator (" + sva_op(sbody) + ")";
-						else if (comp.tree_has_locals(sbody, seen))
-							why = impl_cover ? "cover of an implication with local variables"
-									: "cover of a sequence with local variables";
-						else if (!impl_cover && l > 1024)
+						else if (comp.tree_has_locals(sbody, seen)) {
+							cover_locals = true;
+							if (impl_cover)
+								why = "cover of an implication with local variables";
+							else if (!c2f && comp.goto_cover_match(sbody, gcov))
+								goto_cover = true;
+							else if (l < 0)
+								why = "cover of an unbounded sequence with local variables";
+							else if (l > SvaCompiler::LOCALS_WINDOW)
+								why = stringf("cover of a %d-tick sequence with local variables (window %d)",
+										l, SvaCompiler::LOCALS_WINDOW);
+						} else if (!impl_cover && l > 1024)
 							why = "cover of a sequence longer than 1024 ticks";
 						// an unbounded sequence covers through its match
 						// pulse like a bounded one: reachability is
@@ -7160,6 +7213,32 @@ struct Sva2CheckPass : public Pass {
 					SigSpec hit;
 					if (impl_cover) {
 						hit = impl_hit;
+					} else if (goto_cover) {
+						// pend bits are disable-gated: exact under disable iff
+						hit = comp.goto_locals_fail(gcov, std::vector<Wire *>(), root, true);
+					} else if (cover_locals) {
+						comp.refuse_empty_prop(sbody);
+						bool had_slots = comp.slots_mode;
+						if (!body)
+							// a bare declaration name: inline_decl gives the
+							// body's locals their slots, as for an antecedent
+							hit = comp.seq_dispatch(body_sig, nullptr, root, Const(1, 1));
+						else {
+							if (!comp.slots_mode)
+								comp.init_slots(comp.seq_max_len(sbody));
+							hit = comp.seq_end(sbody, root, Const(1, 1));
+						}
+						if (!had_slots && comp.slots_mode) {
+							comp.slots_mode = false;
+							comp.nslots = 0;
+							comp.age = SigSpec();
+							comp.slotfiles.clear();
+							comp.pending_wr.clear();
+						}
+						int sl = comp.seq_max_len(sbody);
+						if (disable && sva_op(disable) == "disable_iff" && sl > 1)
+							comp.approx("cover-disable-at-match", std::string(log_id(cell)) +
+									": an attempt disabled before its match tick still counts");
 					} else if (sbody) {
 						comp.refuse_empty_prop(sbody);
 						hit = comp.seq_end(sbody, root, Const(1, 1));

@@ -597,6 +597,43 @@
 		return owned;
 	}
 
+	// IEEE 16.16 / 16.15: a module's default clocking and default disable
+	// iff apply to every concurrent assertion in the scope without its own,
+	// wherever they are declared.  sva_property_spec tags a property parsed
+	// before the default (sv_pending_dclk / sv_pending_ddis); at the end of
+	// the scope the tagged ones get the default as if it had come first
+	// (caliptra fv_ecc_dsa_sequencer declares it after its assumptions:
+	// they had no clock, "placeholder:no sampling clock")
+	static void sva_retrofit_defaults(AstNode *n, ParseState *extra)
+	{
+		for (auto &ch : n->children) {
+			if (!ch)
+				continue;
+			bool pc = ch->attributes.count(ID(sv_pending_dclk)) != 0;
+			bool pd = ch->attributes.count(ID(sv_pending_ddis)) != 0;
+			ch->attributes.erase(ID(sv_pending_dclk));
+			ch->attributes.erase(ID(sv_pending_ddis));
+			bool ac = pc && extra->sva_default_clock;
+			bool ad = pd && extra->sva_default_disable;
+			if (ac || ad) {
+				if (ch->type == AST_SVA && ch->str == "spec" && ch->children.size() == 3) {
+					if (ac && ch->children[0] && ch->children[0]->type == AST_SVA && ch->children[0]->str == "no_clock")
+						ch->children[0] = extra->sva_default_clock->clone();
+					if (ad && ch->children[1] && ch->children[1]->type == AST_SVA && ch->children[1]->str == "no_disable")
+						ch->children[1] = extra->sva_default_disable->clone();
+				} else {
+					Location loc = ch->location;
+					auto spec = mk_sva(loc, "spec");
+					spec->children.push_back(ac ? extra->sva_default_clock->clone() : mk_sva(loc, "no_clock"));
+					spec->children.push_back(ad ? extra->sva_default_disable->clone() : mk_sva(loc, "no_disable"));
+					spec->children.push_back(std::move(ch));
+					ch = std::move(spec);
+				}
+			}
+			sva_retrofit_defaults(ch.get(), extra);
+		}
+	}
+
 	static std::unique_ptr<AstNode> sva_add(std::unique_ptr<AstNode> n, std::unique_ptr<AstNode> child)
 	{
 		if (child)
@@ -1121,6 +1158,7 @@ module:
 			err_at_loc(@9, "Missing details for module port `%s'.",
 					extra->port_stubs.begin()->first.c_str());
 		SET_AST_NODE_LOC(extra->ast_stack.back(), @2, @$);
+		sva_retrofit_defaults(extra->ast_stack.back(), extra);
 		extra->ast_stack.pop_back();
 		log_assert(extra->ast_stack.size() == 1);
 		checkLabelsMatch(@12, "Module name", $4.get(), $12.get());
@@ -1157,6 +1195,7 @@ program:
 			err_at_loc(@9, "Missing details for program port `%s'.",
 					extra->port_stubs.begin()->first.c_str());
 		SET_AST_NODE_LOC(extra->ast_stack.back(), @2, @$);
+		sva_retrofit_defaults(extra->ast_stack.back(), extra);
 		extra->ast_stack.pop_back();
 		log_assert(extra->ast_stack.size() == 1);
 		checkLabelsMatch(@12, "Program name", $4.get(), $12.get());
@@ -1813,6 +1852,7 @@ interface:
 		if (extra->port_stubs.size() != 0)
 			err_at_loc(@8, "Missing details for module port `%s'.",
 				extra->port_stubs.begin()->first.c_str());
+		sva_retrofit_defaults(extra->ast_stack.back(), extra);
 		extra->ast_stack.pop_back();
 		log_assert(extra->ast_stack.size() == 1);
 		extra->current_ast_mod = nullptr;
@@ -4605,7 +4645,11 @@ sva_concurrent:
 					ty = mode->assert_assumes ? AST_LIVE : AST_FAIR;
 				else if (dir == 'r')
 					ty = AST_FAIR;
-				body = std::move(body->children[0]);
+				auto inner = std::move(body->children[0]);
+				for (auto id : {ID(sv_pending_dclk), ID(sv_pending_ddis)})
+					if (body->attributes.count(id))
+						inner->set_attribute(id, body->attributes.at(id)->clone());
+				body = std::move(inner);
 			}
 			auto node = std::make_unique<AstNode>(@$, ty, std::move(body));
 			if ($7)
@@ -7081,6 +7125,11 @@ sva_property_spec:
 		auto clock = std::move($1);
 		auto dis = std::move($2);
 		auto body = std::move($3);
+		// no default yet: tag for the end-of-scope retrofit (a checker's
+		// body takes its defaults at expansion instead)
+		bool pend_clk = !clock && !extra->sva_default_clock && extra->current_ast_mod && !extra->in_checker;
+		bool pend_dis = !dis && !extra->sva_default_disable && !extra->in_property_decl &&
+				extra->current_ast_mod && !extra->in_checker;
 		if (!clock && extra->sva_default_clock)
 			clock = extra->sva_default_clock->clone();
 		if (!dis && extra->sva_default_disable && !extra->in_property_decl)
@@ -7099,6 +7148,10 @@ sva_property_spec:
 				$$->children.push_back(mk_sva(@$, "no_disable"));
 			$$->children.push_back(std::move(body));
 		}
+		if (pend_clk)
+			$$->set_attribute(ID(sv_pending_dclk), AstNode::mkconst_int(@$, 1, false));
+		if (pend_dis)
+			$$->set_attribute(ID(sv_pending_ddis), AstNode::mkconst_int(@$, 1, false));
 	};
 
 sva_at_clock:

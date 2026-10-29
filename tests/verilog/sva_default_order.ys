@@ -1,0 +1,41 @@
+# A module's `default clocking` and `default disable iff` apply to every
+# concurrent assertion in it without its own (IEEE 16.16, 16.15), wherever
+# the default is declared.  Assertions before the declaration had no
+# clock ("placeholder:no sampling clock"; a boolean one lowered as an
+# immediate check) and no disable.  Each pair below is the same property
+# before and after the defaults: the verdicts must agree.
+read_verilog -sv -formal <<EOT
+module t(input clk);
+  logic [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  wire rst = c == 2'd3;
+  property q; c == 2'd1 |=> c == 2'd2; endproperty
+  b_imp:  assert property (c == 2'd1 |=> c == 2'd2);
+  b_bool: assert property (c != 2'd3);
+  b_bad:  assert property (c == 2'd0 |=> c == 2'd2);
+  b_decl: assert property (q);
+  b_own:  assert property (disable iff (1'b0) c != 2'd3);
+  default clocking @(posedge clk); endclocking
+  default disable iff (rst);
+  a_imp:  assert property (c == 2'd1 |=> c == 2'd2);
+  a_bool: assert property (c != 2'd3);
+  a_bad:  assert property (c == 2'd0 |=> c == 2'd2);
+  a_decl: assert property (q);
+  a_own:  assert property (disable iff (1'b0) c != 2'd3);
+endmodule
+EOT
+proc
+sva2check
+async2sync
+logger -expect log "b_imp: proved \[lowering=exact\]" 1
+logger -expect log "a_imp: proved \[lowering=exact\]" 1
+logger -expect log "b_bool: proved \[lowering=exact\]" 1
+logger -expect log "a_bool: proved \[lowering=exact\]" 1
+logger -expect log "b_bad: disproved \(depth 1\)" 1
+logger -expect log "a_bad: disproved \(depth 1\)" 1
+logger -expect log "b_decl: proved \[lowering=exact\]" 1
+logger -expect log "a_decl: proved \[lowering=exact\]" 1
+logger -expect log "b_own: disproved \(depth 3\)" 1
+logger -expect log "a_own: disproved \(depth 3\)" 1
+ic3 -init-zero
+logger -check-expected

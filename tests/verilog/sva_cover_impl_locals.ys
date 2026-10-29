@@ -1,0 +1,70 @@
+# Covers of an implication with local variables (core-v-verif uvma_cvxif
+# cov_commit_for_issue, cov_commit_one_cycle) used to be refused, and the
+# asserts `(b, v = e) |-> ##[0:$] B(v)` stopped the file with "local
+# variables over an unbounded sequence".  A bounded implication covers as
+# its fused sequence R ##0 P / R ##1 P (LRM 16.14.8); an eventual response
+# `L |-> / |=> ##[m:$] B` (and the sequence `L ##[m:$] B`) through a CAM
+# whose hit is B with some attempt's own tuple, exact "unreachable" when
+# <name>$overflow proves.  The weak assert never fails (LRM 16.12.2).
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic b, input logic cv, input logic [1:0] x, input logic [1:0] y);
+  property e0; logic [1:0] v; (b, v = x) |-> ##[0:$] (cv && y == v); endproperty
+  property e1; logic [1:0] v; (b, v = x) |=> ##[0:$] (cv && y == v); endproperty
+  sequence es; logic [1:0] v; (b, v = x) ##[1:$] (cv && y == v); endsequence
+  property eo; logic [1:0] v; (b, v = x) |=> ##[0:$] (y == v && cv && !b); endproperty
+  property bi; logic [1:0] v; (cv, v = x) |=> (cv && x != v) || !cv; endproperty
+  c_e0: cover property (@(posedge clk) e0);
+  c_e1: cover property (@(posedge clk) e1);
+  c_es: cover property (@(posedge clk) es);
+  c_eo: cover property (@(posedge clk) eo);
+  c_bi: cover property (@(posedge clk) bi);
+  a_w:  assert property (@(posedge clk) e0);
+endmodule
+EOT
+hierarchy -top top
+logger -expect log "a_w: unbounded sequence in property position compiled with weak semantics" 1
+sva2check
+proc
+async2sync
+logger -expect log "c_e0: cover reached \(depth 0\) \[lowering=exact:if-c_e0\$overflow\]" 1
+logger -expect log "c_e1: cover reached \(depth 1\) \[lowering=exact:if-c_e1\$overflow\]" 1
+logger -expect log "c_es: cover reached \(depth 1\) \[lowering=exact:if-c_es\$overflow\]" 1
+logger -expect log "c_eo\$overflow: capacity exceeded \(depth 3\)" 1
+logger -expect log "c_bi: cover reached \(depth 1\) \[lowering=exact\]" 1
+logger -expect log "a_w: proved \[lowering=exact:const\]" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# closed design: c counts 0, 1, 2, 3, 0, ...  er: v = 0 at c == 0, B at
+# c == 3; eu: B never holds; ed: every attempt is disabled at c == 1
+# before its B (exact: the CAM entry is cleared); the bounded implication
+# reached / unreachable
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [1:0] c = 2'd0;
+  always_ff @(posedge clk) c <= c + 2'd1;
+  property er; logic [1:0] v; (c == 2'd0, v = c) |-> ##[0:$] (c == v + 2'd3); endproperty
+  property eu; logic [1:0] v; (c == 2'd0, v = c) |-> ##[0:$] (c == v + 2'd1 && c == 2'd3); endproperty
+  property br; logic [1:0] v; (c == 2'd0, v = c) |=> c == v + 2'd1; endproperty
+  property bu; logic [1:0] v; (c == 2'd0, v = c) |=> c == v; endproperty
+  c_er: cover property (@(posedge clk) er);
+  c_eu: cover property (@(posedge clk) eu);
+  c_ed: cover property (@(posedge clk) disable iff (c == 2'd1) er);
+  c_br: cover property (@(posedge clk) br);
+  c_bu: cover property (@(posedge clk) bu);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "c_er: cover reached \(depth 3\) \[lowering=exact:if-c_er\$overflow\]" 1
+logger -expect log "c_eu: cover unreachable \[lowering=exact:if-c_eu\$overflow\]" 1
+logger -expect log "c_ed: cover unreachable \[lowering=exact:if-c_ed\$overflow\]" 1
+logger -expect log "c_e[rud]\$overflow: proved" 3
+logger -expect log "c_br: cover reached \(depth 1\) \[lowering=exact\]" 1
+logger -expect log "c_bu: cover unreachable \[lowering=exact\]" 1
+ic3 -init-zero
+design -reset
+logger -check-expected

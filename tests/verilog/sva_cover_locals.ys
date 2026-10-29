@@ -11,11 +11,11 @@ module top (input logic clk, input logic av, input logic ar, input logic [1:0] x
   sequence sa; logic [1:0] p; (av && ar, p = x) ##1 av && p == x; endsequence
   sequence ss; logic [1:0] p; (av && ar, p = x) ##1 av[->1] ##0 p == x; endsequence
   sequence so; logic [1:0] p; (av, p = x) ##1 ar[->1] ##0 p == y; endsequence
-  logic [1:0] ss_p;
+  property ssa; logic [1:0] p; (av && ar, p = x) ##1 av[->1] |-> p != x; endproperty
   c_sa: cover property (@(posedge clk) sa);
   a_sa: assert property (@(posedge clk) sa |-> 1'b0);
   c_ss: cover property (@(posedge clk) ss);
-  a_ss: assert property (@(posedge clk) (av && ar, ss_p = x) ##1 av[->1] |-> ss_p != x);
+  a_ss: assert property (@(posedge clk) ssa);
   c_so: cover property (@(posedge clk) so);
   c_sd: cover property (@(posedge clk) disable iff (rst) ss);
 endmodule
@@ -71,10 +71,11 @@ ic3 -init-zero
 design -reset
 logger -check-expected
 
-# an unbounded sequence with locals outside the goto shape stays refused
+# an unbounded sequence with locals outside the goto and eventual-response
+# shapes stays refused
 read_verilog -sv -formal <<EOT
-module top (input logic clk, input logic a, input logic [1:0] x, input logic [1:0] y);
-  sequence su; logic [1:0] p; (a, p = x) ##[1:$] p == y; endsequence
+module top (input logic clk, input logic a, input logic b, input logic [1:0] x, input logic [1:0] y);
+  sequence su; logic [1:0] p; (a, p = x) ##1 b[*1:$] ##1 p == y; endsequence
   c_su: cover property (@(posedge clk) su);
 endmodule
 EOT

@@ -2015,6 +2015,12 @@ struct SvaCompiler {
 			GotoLocals gl;
 			if (goto_locals_match(dbody, gl))
 				return goto_locals_fail(gl, dformals, start);
+			pool<Cell *> wseen;
+			if (tree_has_locals(dbody, wseen) && weak_true_impl(dbody)) {
+				log("sva2check: %s: unbounded sequence in property position compiled with weak semantics (unbounded delay).\n",
+						check_name.c_str());
+				return Const(0, 1);
+			}
 		}
 		if (dbody && !slots_mode) {
 			pool<Cell *> seen;
@@ -3880,8 +3886,80 @@ struct SvaCompiler {
 		return reads;
 	}
 
-	// returns A (the liveness "property holds" level)
-	SigSpec ev_locals_live(EvLocals &m, SigSpec start)
+	// The cover of an eventual response to captured locals (2026-10-29;
+	// core-v-verif uvma_cvxif cov_commit_for_issue): the sequence
+	// `b ##0 (1'b1, v = e, ...) ##[m:$] B` or the implication
+	// `b ##0 (...) |-> / |=> ##[m:$] B` (its non-vacuous successes, LRM
+	// 16.14.8), B boolean, total offset 0 or 1.  A hit is "B with some
+	// attempt's own tuple at or after its offset": ev_locals_live in
+	// cover mode.  Hits are real; "unreachable" is exact when the
+	// <name>$overflow twin proves.
+	bool ev_cover_match(Cell *s, EvLocals &m)
+	{
+		if (!s || multiclock || island_mode)
+			return false;
+		std::string op = sva_op(s);
+		auto ps = ports_of(s);
+		auto unb = [&](SigSpec cyc, int &lo) -> bool {
+			Cell *cc = child_cell(cyc);
+			if (!cc)
+				return false;
+			std::string cop = sva_op(cc);
+			if (cop == "##[*]" || cop == "##[+]") {
+				lo = cop == "##[+]" ? 1 : 0;
+				return true;
+			}
+			if (cop != "bounds")
+				return false;
+			auto bp = ports_of(cc);
+			int hi = 0;
+			return GetSize(bp) >= 2 && const_int(cc->getPort(bp[0]), lo) &&
+					const_int(cc->getPort(bp[1]), hi) && hi < 0;
+		};
+		SigSpec lhs, B;
+		int off = 0, lo = -1;
+		if (op == "##" && GetSize(ps) == 3) {
+			if (!unb(s->getPort(ps[1]), lo))
+				return false;
+			lhs = s->getPort(ps[0]);
+			B = s->getPort(ps[2]);
+			off = lo;
+		} else if ((op == "|->" || op == "|=>") && GetSize(ps) == 2) {
+			Cell *q = child_cell(s->getPort(ps[1]));
+			while (q && sva_op(q) == "weak")
+				q = child_cell(q->getPort(ID(A)));
+			// `##[m:$] B`: the two-port leading form or `true ##[m:$] B`
+			if (!q || sva_op(q) != "##")
+				return false;
+			auto qp = ports_of(q);
+			bool q2 = GetSize(qp) == 2;
+			if (!q2) {
+				Cell *qt = GetSize(qp) == 3 ? child_cell(q->getPort(qp[0])) : nullptr;
+				if (!qt || sva_op(qt) != "true")
+					return false;
+			}
+			if (!unb(q->getPort(qp[q2 ? 0 : 1]), lo))
+				return false;
+			lhs = s->getPort(ps[0]);
+			B = q->getPort(qp[q2 ? 1 : 2]);
+			off = lo + (op == "|=>" ? 1 : 0);
+		} else
+			return false;
+		if (off > 1 || child_cell(B) || decl_for_wire(resolve(B)))
+			return false;
+		m.next = off == 1;
+		m.lhs = GotoLocals();
+		if (!goto_locals_lhs(lhs, m.lhs) || m.lhs.caps.empty())
+			return false;
+		m.B = B;
+		m.lhs.g = Const(0, 1);
+		return goto_locals_clean(m.lhs);
+	}
+
+	// returns A (the liveness "property holds" level); with `hit`, the
+	// cover mode: the pulse "some attempt's B holds with its tuple now"
+	// (the entry clears there: one hit per attempt is enough to reach)
+	SigSpec ev_locals_live(EvLocals &m, SigSpec start, SigSpec *hit = nullptr)
 	{
 		std::vector<Wire *> fl;
 		for (auto &cap : m.lhs.caps)
@@ -3939,6 +4017,13 @@ struct SvaCompiler {
 		}
 		SigSpec ovf = andN({need, mod->Not(NEW_ID, taken)});
 		cam_overflow = cam_overflow.empty() ? ovf : orN({cam_overflow, ovf});
+		if (hit) {
+			SigSpec h = m.next ? Const(0, 1) : andN({cap, B_at(tup)});
+			for (int i = 0; i < K; i++)
+				h = orN({h, andN({SigSpec(pend[i]), B_at(SigSpec(val[i]))})});
+			*hit = h;
+			return SigSpec();
+		}
 		// the focus cursor
 		int w = 1;
 		while ((1 << w) < K)
@@ -5182,6 +5267,66 @@ struct SvaCompiler {
 	{
 		if (can_empty(n))
 			log_error("sva2check: sequence in %s is used as a property but can match empty (LRM 16.13.22).\n", log_id(n));
+	}
+
+	// `R |-> P` / `R |=> P` with a sequence or Boolean P, as the sequence
+	// `R ##0 P` / `R ##1 P`: the implication's non-vacuous successes
+	// (16.14.8) are exactly that sequence's matches.  The cover of an
+	// implication with locals goes through it to the sequence-with-locals
+	// lowering.  nullptr when P is not sequence-shaped or R can be empty.
+	Cell *fuse_impl(Cell *c)
+	{
+		std::string op = sva_op(c);
+		auto ps = ports_of(c);
+		if ((op != "|->" && op != "|=>") || GetSize(ps) != 2)
+			return nullptr;
+		Cell *a = child_cell(c->getPort(ps[0]));
+		if (a && (!seq_shaped(a) || can_empty(a)))
+			return nullptr;
+		SigSpec qport = c->getPort(ps[1]);
+		Cell *q = child_cell(qport);
+		while (q && (sva_op(q) == "strong" || sva_op(q) == "weak")) {
+			qport = q->getPort(ID(A));
+			q = child_cell(qport);
+		}
+		if (q && !seq_shaped(q))
+			return nullptr;
+		return new_sva("##", {c->getPort(ps[0]), Const(op == "|=>" ? 1 : 0, 32), qport}, c);
+	}
+
+	// `R |-> ##[m:$] Q` / `R |=> ##[m:$] Q` under weak semantics (an
+	// assert / assume, LRM 16.12.2): a leading unbounded delay can always
+	// still place Q in an extension of the trace, so the implication
+	// never fails (shape (d) of weak_unbounded_fail).  Used for bodies with
+	// locals, which would otherwise hit the slot window refusal.
+	bool weak_true_impl(Cell *c)
+	{
+		std::string op = sva_op(c);
+		auto ps = ports_of(c);
+		if ((op != "|->" && op != "|=>") || GetSize(ps) != 2 || strong_ctx)
+			return false;
+		Cell *q = child_cell(c->getPort(ps[1]));
+		while (q && sva_op(q) == "weak")
+			q = child_cell(q->getPort(ID(A)));
+		if (!q || sva_op(q) != "##")
+			return false;
+		auto qp = ports_of(q);
+		bool q2 = GetSize(qp) == 2;
+		if (!q2) {
+			Cell *qt = GetSize(qp) == 3 ? child_cell(q->getPort(qp[0])) : nullptr;
+			if (!qt || sva_op(qt) != "true")
+				return false;
+		}
+		Cell *cc = child_cell(q->getPort(qp[q2 ? 0 : 1]));
+		if (!cc)
+			return false;
+		std::string cop = sva_op(cc);
+		if (cop == "##[*]" || cop == "##[+]")
+			return true;
+		auto bp = ports_of(cc);
+		int lo = 0, hi = 0;
+		return cop == "bounds" && GetSize(bp) >= 2 && const_int(cc->getPort(bp[0]), lo) &&
+				const_int(cc->getPort(bp[1]), hi) && hi < 0;
 	}
 
 	// cover of an implication (register v3 D4): IEEE 1800-2017 16.14.3
@@ -7173,6 +7318,9 @@ struct Sva2CheckPass : public Pass {
 					bool cover_locals = false;
 					SvaCompiler::GotoLocals gcov;
 					bool goto_cover = false;
+					SvaCompiler::EvLocals evc;
+					bool ev_cover = false;
+					bool fused = false;
 					if (sbody) {
 						pool<Cell *> seen;
 						int l = comp.seq_max_len(sbody);
@@ -7180,7 +7328,22 @@ struct Sva2CheckPass : public Pass {
 							why = "cover of a property operator (" + sva_op(sbody) + ")";
 						else if (comp.tree_has_locals(sbody, seen)) {
 							cover_locals = true;
-							if (impl_cover)
+							if (!c2f && comp.ev_cover_match(sbody, evc)) {
+								ev_cover = true;
+								impl_cover = false;
+							} else if (impl_cover) {
+								// a bounded implication: its fused sequence
+								Cell *fz = comp.fuse_impl(sbody);
+								if (fz) {
+									sbody = fz;
+									impl_cover = false;
+									fused = true;
+									l = comp.seq_max_len(sbody);
+								}
+							}
+							if (ev_cover)
+								;
+							else if (impl_cover)
 								why = "cover of an implication with local variables";
 							else if (!c2f && comp.goto_cover_match(sbody, gcov))
 								goto_cover = true;
@@ -7216,10 +7379,12 @@ struct Sva2CheckPass : public Pass {
 					} else if (goto_cover) {
 						// pend bits are disable-gated: exact under disable iff
 						hit = comp.goto_locals_fail(gcov, std::vector<Wire *>(), root, true);
+					} else if (ev_cover) {
+						comp.ev_locals_live(evc, root, &hit);
 					} else if (cover_locals) {
 						comp.refuse_empty_prop(sbody);
 						bool had_slots = comp.slots_mode;
-						if (!body)
+						if (!body && !fused)
 							// a bare declaration name: inline_decl gives the
 							// body's locals their slots, as for an antecedent
 							hit = comp.seq_dispatch(body_sig, nullptr, root, Const(1, 1));
@@ -7320,6 +7485,10 @@ struct Sva2CheckPass : public Pass {
 						// a named property under default clocking arrives
 						// here with its body inlined into the spec
 						fail = comp.goto_locals_fail(gl, std::vector<Wire *>(), root);
+					} else if (pool<Cell *> wseen; body && comp.tree_has_locals(body, wseen) && comp.weak_true_impl(body)) {
+						log("sva2check: %s: unbounded sequence in property position compiled with weak semantics (unbounded delay).\n",
+								log_id(cell));
+						fail = Const(0, 1);
 					} else if (body) {
 						pool<Cell *> seen;
 						bool had_slots = comp.slots_mode;
@@ -7355,7 +7524,7 @@ struct Sva2CheckPass : public Pass {
 						SvaCompiler::UntilLocals ul;
 						SvaCompiler::GotoLocals gl;
 						if (dbody && !comp.until_locals_match(dbody, ul) && !comp.goto_locals_match(dbody, gl) &&
-								comp.tree_has_locals(dbody, seen)) {
+								comp.tree_has_locals(dbody, seen) && !comp.weak_true_impl(comp.unwrap_spec(dbody))) {
 							int l = comp.seq_max_len(dbody);
 							comp.check_locals_window(l, dbody);
 							comp.init_slots(l);
@@ -7388,8 +7557,13 @@ struct Sva2CheckPass : public Pass {
 				if (dop == "disable_iff") {
 					dsig = comp.reduce1(disable->getPort(ID(A)));
 					// an assertion holds while disabled; a cover is NOT hit
-					new_a = flavor == "cover" ? mod->And(NEW_ID, mod->Not(NEW_ID, dsig), new_a)
-							: mod->Or(NEW_ID, dsig, new_a);
+					if (flavor != "cover" && !liveness && !fairness && fail.is_fully_const() && !fail.as_bool())
+						// never fails (a weak unbounded consequent): keep
+						// the constant visible to the provenance tag
+						new_a = Const(1, 1);
+					else
+						new_a = flavor == "cover" ? mod->And(NEW_ID, mod->Not(NEW_ID, dsig), new_a)
+								: mod->Or(NEW_ID, dsig, new_a);
 				}
 
 				if (once && (strong_until || fairness))

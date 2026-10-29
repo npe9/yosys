@@ -56,6 +56,33 @@ IdString concat_name(RTLIL::Cell *cell, IdString const &object_name, const std::
 	return concat_views(prefix, cell->name.c_str(), separator, object_name_view);
 }
 
+// remove the frontend's "Identifier `NAME' is implicitly declared." entries
+// for a joined hierarchical reference from the module's sv_degraded list
+// (entries are "<reason> @file:line", joined by "; ")
+static void drop_hierref_degradation(RTLIL::Module *module, IdString name)
+{
+	IdString attr = IdString("\\sv_degraded");
+	if (!module->attributes.count(attr))
+		return;
+	std::string cur = module->attributes.at(attr).decode_string();
+	std::string prefix = stringf("Identifier `%s' is implicitly declared. @", name.c_str());
+	std::string out;
+	size_t pos = 0;
+	while (pos <= cur.size()) {
+		size_t next = cur.find("; ", pos);
+		std::string entry = cur.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+		if (!entry.empty() && entry.compare(0, prefix.size(), prefix) != 0)
+			out += (out.empty() ? "" : "; ") + entry;
+		if (next == std::string::npos)
+			break;
+		pos = next + 2;
+	}
+	if (out.empty())
+		module->attributes.erase(attr);
+	else
+		module->attributes[attr] = RTLIL::Const(out);
+}
+
 template<class T>
 IdString map_name(RTLIL::Cell *cell, T *object, const std::string &separator = ".")
 {
@@ -145,6 +172,24 @@ struct FlattenWorker
 			RTLIL::Wire *new_wire = nullptr;
 			if (tpl_wire->name[0] == '\\') {
 				RTLIL::Wire *hier_wire = module->wire(concat_name(cell, tpl_wire->name, separator));
+				// an implicit wire the Verilog frontend made for a downward
+				// hierarchical reference (sv_hierref): it is one bit, so
+				// only a one-bit target is joined (widening it would leave
+				// the reads on its bit 0); joined, the reference is no
+				// longer a free wire and its "implicitly declared"
+				// degradation is dropped from the module
+				if (hier_wire != nullptr && hier_wire->get_bool_attribute(ID(sv_hierref)) &&
+						hier_wire->get_bool_attribute(ID::hierconn)) {
+					if (GetSize(hier_wire) != GetSize(tpl_wire) || GetSize(hier_wire) != 1) {
+						log_warning("Hierarchical reference %s.%s is not joined to %s.%s (width %d, not 1); it stays a free wire.\n",
+							module, hier_wire, tpl, tpl_wire, GetSize(tpl_wire));
+						hier_wire->attributes.erase(ID::hierconn);
+						hier_wire = nullptr;
+					} else {
+						hier_wire->attributes.erase(ID(sv_hierref));
+						drop_hierref_degradation(module, hier_wire->name);
+					}
+				}
 				if (hier_wire != nullptr && hier_wire->get_bool_attribute(ID::hierconn)) {
 					hier_wire->attributes.erase(ID::hierconn);
 					if (GetSize(hier_wire) < GetSize(tpl_wire)) {

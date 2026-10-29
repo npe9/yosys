@@ -1,0 +1,69 @@
+# A downward hierarchical reference into an instance (OpenTitan's FpvSecCm
+# `$rose(u_fsm.err_o) |-> ##[0:N] alert`, and `assign
+# u_cnt.unused_assert_connected = 1'b1`) was an implicit undriven wire: a
+# free input, so ic3 -allow-degraded "disproved" checks that hold.  The
+# frontend marks it hierconn; flatten joins it to the instance's one-bit
+# wire of that name and drops its "implicitly declared" degradation.
+read_verilog -sv -formal <<EOT
+module leaf (input logic clk, input logic e, output logic err_o);
+  logic q = 1'b0;
+  logic unused_assert_connected;
+  always_ff @(posedge clk) q <= e;
+  assign err_o = q;
+endmodule
+module mid (input logic clk, input logic e);
+  leaf u_leaf (.clk(clk), .e(e), .err_o());
+endmodule
+module top (input logic clk, input logic rst_ni, input logic e, output logic alert);
+  mid u_mid (.clk(clk), .e(e));
+  leaf u_off (.clk(clk), .e(1'b0), .err_o());
+  for (genvar i = 0; i < 1; i++) begin : g
+    leaf u_l (.clk(clk), .e(1'b0), .err_o());
+  end
+  assign alert = 1'b0;
+  assign u_off.unused_assert_connected = 1'b1;
+  a_off:  assert property (@(posedge clk) disable iff (!rst_ni) !u_off.err_o);
+  a_rise: assert property (@(posedge clk) disable iff (!rst_ni) $rose(u_off.err_o) |-> ##[0:3] alert);
+  a_gen:  assert property (@(posedge clk) disable iff (!rst_ni) !g[0].u_l.err_o);
+  a_two:  assert property (@(posedge clk) disable iff (!rst_ni) !u_mid.u_leaf.err_o);
+  a_conn: assert property (@(posedge clk) u_off.unused_assert_connected);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+flatten
+select -assert-none A:sv_degraded
+select -assert-none a:hierconn
+opt_clean
+async2sync
+logger -expect log "a_off: proved" 1
+logger -expect log "a_rise: proved" 1
+logger -expect log "a_gen: proved" 1
+logger -expect log "a_two: disproved \(depth 1\)" 1
+logger -expect log "a_conn: proved" 1
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# no target of that name, and a wider target: each stays a degraded free
+# wire, and ic3 refuses the design
+read_verilog -sv -formal <<EOT
+module leaf (input logic clk, output logic [3:0] st);
+  assign st = 4'd0;
+endmodule
+module top (input logic clk);
+  leaf u (.clk(clk), .st());
+  a_nope: assert property (@(posedge clk) !u.nope);
+  a_wide: assert property (@(posedge clk) u.st == 1'b0);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+logger -expect warning "Hierarchical reference top.u.st is not joined to leaf.st \(width 4, not 1\)" 1
+flatten
+select -assert-any A:sv_degraded
+logger -check-expected
+logger -expect error "refusing a design that carries sv_degraded" 1
+ic3 -init-zero

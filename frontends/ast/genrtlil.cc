@@ -1842,13 +1842,24 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				if (never_implicit)
 					degrade(location.to_loc(), "Identifier `%s' did not resolve (a package-qualified or element-member name is never an implicit net).\n", str.c_str());
 				else if (!is_sequence_method_name(str) && !sva_decl_ref) {
-					if (flag_autowire)
+					if (flag_autowire) {
 						// upstream's own leniency under `default_nettype wire`;
 						// dotted names included: interface-port members
 						// (`intf.driver`) are implicit wires here by design,
 						// resolved by the hierarchy pass
 						degrade_warn(location.to_loc(), "Identifier `%s' is implicitly declared.\n", str);
-					else {
+						// a downward hierarchical reference into an instance
+						// (`u_fsm.err_o`, OpenTitan's FpvSecCm assertions,
+						// `assign u_cnt.unused_assert_connected = 1'b1`):
+						// flatten joins it to the instance's wire of that
+						// name (hierconn) and, when the widths agree, drops
+						// this degradation; left unjoined it stays a
+						// degraded free wire
+						if (str.find('.') != std::string::npos) {
+							wire->set_bool_attribute(ID::hierconn);
+							wire->set_bool_attribute(ID(sv_hierref));
+						}
+					} else {
 						degrade(location.to_loc(), "Identifier `%s' is implicitly declared; a 1-bit wire is implied.\n", str.c_str());
 					}
 				}

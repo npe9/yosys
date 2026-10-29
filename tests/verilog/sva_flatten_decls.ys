@@ -1,0 +1,47 @@
+# sva2check after flatten: every instance's property/sequence declarations
+# share the flattened module under the same NAME, and a bare reference
+# `assert property (q)` is a wire `\ub.q`.  The single per-module map took
+# one instance's `q` for all instances and missed `\ub.q`: the check fell
+# to an immediate check of the undriven wire (`[lowering=immediate]`,
+# disproved at depth 0 even when true).  Declarations are now looked up
+# per flattened-instance scope.
+read_verilog -sv -formal <<EOT
+module up(input clk);
+  logic [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  property q; @(posedge clk) c == 2'd1 |=> c == 2'd2; endproperty
+  sequence s; @(posedge clk) c == 2'd3; endsequence
+  pq: assert property (q);
+  pi: assert property (@(posedge clk) q);
+  pm: assert property (@(posedge clk) s.triggered |=> c == 2'd0);
+endmodule
+module dn(input clk);
+  logic [1:0] c = 0;
+  always @(posedge clk) c <= c - 1;
+  // same names as in `up`, different meaning: q is false here
+  property q; @(posedge clk) c == 2'd1 |=> c == 2'd2; endproperty
+  sequence s; @(posedge clk) c == 2'd3; endsequence
+  pq: assert property (q);
+  pm: assert property (@(posedge clk) s.triggered |=> c == 2'd2);
+endmodule
+module top(input clk);
+  up u1(clk);
+  dn d1(clk);
+  up u2(clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+sva2check
+async2sync
+logger -expect log "u1.pq: proved" 1
+logger -expect log "u1.pi: proved" 1
+logger -expect log "u1.pm: proved" 1
+logger -expect log "u2.pq: proved" 1
+logger -expect log "u2.pi: proved" 1
+logger -expect log "u2.pm: proved" 1
+logger -expect log "d1.pq: disproved \(depth 4\)" 1
+logger -expect log "d1.pm: proved" 1
+ic3 -init-zero
+logger -check-expected

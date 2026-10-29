@@ -128,6 +128,50 @@ static SigSpec gclk_past(Module *mod, SigSpec d, State init)
 	return w;
 }
 
+// The flattened-instance scope of an object: `ub.uc.` for an object
+// flatten moved up from instance ub.uc, "" otherwise.  Public names carry
+// it in \\hdlname ("ub uc q"); private ones as `$flatten\\ub.\\uc.$...`.
+static std::string flat_scope(const RTLIL::NamedObject *obj)
+{
+	std::string hn = obj->get_string_attribute(ID::hdlname);
+	if (!hn.empty()) {
+		size_t sp = hn.rfind(' ');
+		if (sp == std::string::npos)
+			return "";
+		std::string r = hn.substr(0, sp);
+		for (auto &ch : r)
+			if (ch == ' ')
+				ch = '.';
+		return r + ".";
+	}
+	std::string nm = obj->name.str();
+	const std::string fl = "$flatten";
+	if (nm.compare(0, fl.size(), fl) != 0)
+		return "";
+	nm = nm.substr(fl.size());
+	size_t pos = nm.find(".$");
+	if (pos == std::string::npos)
+		return "";
+	std::string r;
+	for (char ch : nm.substr(0, pos))
+		if (ch != '\\')
+			r += ch;
+	return r + ".";
+}
+
+// The name of an object inside its flattened-instance scope (`q` of
+// `\\ub.q`, hdlname "ub q"); the full name when it was not flattened.
+static std::string flat_local_name(const RTLIL::NamedObject *obj)
+{
+	std::string hn = obj->get_string_attribute(ID::hdlname);
+	if (!hn.empty()) {
+		size_t sp = hn.rfind(' ');
+		if (sp != std::string::npos)
+			return "\\" + hn.substr(sp + 1);
+	}
+	return obj->name.str();
+}
+
 struct SvaCompiler {
 	Module *mod;
 	SigSpec clk;
@@ -201,6 +245,8 @@ struct SvaCompiler {
 	// every verdict printer can show it next to PROVED/DIS.  With -exact
 	// an approximation is an error instead of a warning.
 	std::string check_name;
+	// flattened-instance scope of the check being compiled (flat_scope)
+	std::string scope;
 	bool exact_mode = false;
 	// report a sequence failure at the tick its last thread dies (LRM)
 	// rather than at its deadline: on for assume/restrict (the late form
@@ -702,6 +748,10 @@ struct SvaCompiler {
 				if (bit.is_wire())
 					driven.insert(bit.wire);
 		for (Wire *w : scan) {
+			// after flatten, another instance's method wire belongs to
+			// that instance's declaration of the same name
+			if (flat_scope(w) != scope)
+				continue;
 			if (lowered.count(w)) {
 				if (w->attributes.count(ID(sva_matched_dest))) {
 					std::string here = stringf("%s%s", clk_pos ? "posedge " : "negedge ", log_signal(clk));
@@ -712,7 +762,7 @@ struct SvaCompiler {
 				}
 				continue;
 			}
-			std::string nm = w->name.str();
+			std::string nm = flat_local_name(w);
 			for (int m = 0; m < 2; m++) {
 				const char *suf = m ? ".matched" : ".triggered";
 				size_t sl = strlen(suf);
@@ -1950,7 +2000,7 @@ struct SvaCompiler {
 					return nullptr;
 			} else if (s[i].data != State::S0)
 				return nullptr;
-		return rep ? decl_by_name(rep->name.str()) : nullptr;
+		return rep ? decl_by_name(flat_local_name(rep)) : nullptr;
 	}
 
 	// Exact per-offset compile of a `lhs ##[lo:hi] tail` chain under
@@ -5459,8 +5509,15 @@ struct Sva2CheckPass : public Pass {
 		{
 			fold_x_compares(mod);
 
-			// named sequence/property/let declarations visible to instances
-			dict<std::string, Cell *> decls;
+			// named sequence/property/let declarations visible to instances,
+			// per flattened instance scope: after `flatten` every instance's
+			// declarations share the module, under the same NAME (`q` of
+			// ub and of uc), and a bare reference is a wire `\\ub.q`.  One
+			// map per scope; a check compiles against its own scope's map
+			// (a single map took the last instance's `q` for every
+			// instance, and missed `\\ub.q`: the check fell to an
+			// immediate check of the undriven wire, a false disproof)
+			dict<std::string, dict<std::string, Cell *>> scoped_decls;
 			for (auto cell : mod->cells())
 				if (cell->type == "\\$sva") {
 					std::string op = sva_op(cell);
@@ -5469,9 +5526,10 @@ struct Sva2CheckPass : public Pass {
 						std::string nm = cell->getParam(ID(NAME).c_str()).decode_string();
 						if (!nm.empty() && nm[0] == '\\')
 							nm = nm.substr(1);
-						decls[nm] = cell;
+						scoped_decls[flat_scope(cell)][nm] = cell;
 					}
 				}
+			dict<std::string, Cell *> no_decls;
 
 			// E1: ## next to an empty-capable operand, once per module and
 			// before the declaration-body scan so new cells are protected
@@ -5482,7 +5540,8 @@ struct Sva2CheckPass : public Pass {
 			pool<Cell *> decl_bodies;
 			{
 				std::vector<Cell *> stack;
-				for (auto &it : decls) {
+				for (auto &sd : scoped_decls)
+				for (auto &it : sd.second) {
 					Cell *decl = it.second;
 					// the declaration cell too: a bare-name reference
 					// (`assert property (p)`) puts it on the root chain,
@@ -5515,7 +5574,10 @@ struct Sva2CheckPass : public Pass {
 
 			pool<Cell *> lowered_sv;
 			pool<Wire *> lowered_methods;
-			pool<Cell *> sv_templates = SvaCompiler(mod, SigSpec(), true, "$probe", &decls).formal_sampled_value_cells();
+			pool<Cell *> sv_templates;
+			for (auto &sd : scoped_decls)
+				for (auto c : SvaCompiler(mod, SigSpec(), true, "$probe", &sd.second).formal_sampled_value_cells())
+					sv_templates.insert(c);
 			pool<Cell *> done_checks;
 			// one $check per snapshot pass: processing it removes its
 			// consumed $sva tree, so a per-check fresh selected_cells()
@@ -5551,7 +5613,10 @@ struct Sva2CheckPass : public Pass {
 					continue;
 				}
 
+				std::string cscope = flat_scope(cell);
+				dict<std::string, Cell *> &decls = scoped_decls.count(cscope) ? scoped_decls.at(cscope) : no_decls;
 				SvaCompiler comp(mod, SigSpec(), true, stringf("$sva%s", log_id(cell)), &decls);
+				comp.scope = cscope;
 				comp.check_name = log_id(cell);
 				if (getenv("SVA_DEBUG_OPS"))
 					log("sva2check-debug: check %s\n", log_id(cell));
@@ -5572,13 +5637,17 @@ struct Sva2CheckPass : public Pass {
 					// undriven wire named after the declaration as the A port
 					std::string cn;
 					if (aport.size() == 1 && aport[0].is_wire())
-						cn = aport[0].wire->name.str();
+						cn = flat_local_name(aport[0].wire);
 					if (cn.empty())
-						cn = log_id(cell);
+						cn = flat_local_name(cell);
 					if (!cn.empty() && cn[0] == '\\')
 						cn = cn.substr(1);
 					if (decls.count(cn))
 						topcell = decls[cn];
+					if (!topcell && aport.size() == 1 && aport[0].is_wire() &&
+							aport[0].wire->get_bool_attribute(ID(sva_decl_name)))
+						log_error("sva2check: property body `%s' of %s names a declaration that is not in its scope; it would be checked as a free input.\n",
+								log_id(aport[0].wire), log_id(cell));
 				}
 				if (!topcell) {
 					// Plain expression property (no temporal operators): the
@@ -5788,7 +5857,7 @@ struct Sva2CheckPass : public Pass {
 						break;
 					if (body_sig.empty() || !body_sig[0].is_wire())
 						break;
-					std::string cn = body_sig[0].wire->name.str();
+					std::string cn = flat_local_name(body_sig[0].wire);
 					if (!cn.empty() && cn[0] == '\\')
 						cn = cn.substr(1);
 					auto it = decls.find(cn);

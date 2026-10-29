@@ -1407,6 +1407,80 @@ struct SvaCompiler {
 		return false;
 	}
 
+	// true when s reads a local variable anywhere in its combinational
+	// cone: the frontend gives `c != v + 3` as a plain $ne on the port,
+	// so the port's own bits are not the local (fe52: a check of the bits
+	// alone skipped the per-age split and read the slot at the wrong age).
+	// `is_local` defaults to every `assign` target of the module plus the
+	// live slot files and instance-body locals.
+	pool<Wire *> module_locals;
+	bool module_locals_built = false;
+	bool sig_reads_locals(SigSpec s, const pool<Wire *> *only = nullptr)
+	{
+		if (!module_locals_built) {
+			module_locals_built = true;
+			for (auto c : mod->cells())
+				if (c->type == ID($sva) && sva_op(c) == "assign") {
+					SigSpec a = c->getPort(ID(A));
+					for (auto bit : a)
+						if (bit.is_wire())
+							module_locals.insert(bit.wire);
+				}
+		}
+		auto is_local = [&](Wire *w) {
+			if (only)
+				return only->count(w) > 0;
+			return module_locals.count(w) || slotfiles.count(w) || clone_lmap.count(w);
+		};
+		pool<Wire *> seen;
+		std::vector<SigSpec> work = {s};
+		while (!work.empty()) {
+			SigSpec x = work.back();
+			work.pop_back();
+			for (auto bit : x) {
+				if (!bit.is_wire())
+					continue;
+				if (is_local(bit.wire))
+					return true;
+				if (!seen.insert(bit.wire).second)
+					continue;
+				auto it = expr_drv.find(bit.wire);
+				if (it == expr_drv.end())
+					continue;
+				for (auto &conn : it->second->connections())
+					if (conn.first != ID(Y) && conn.first != ID(DATA))
+						work.push_back(conn.second);
+			}
+		}
+		return false;
+	}
+
+	// true when the tree captures a local or reads ANY local of the
+	// module in an expression port -- a consequent or ## tail reads the
+	// locals its antecedent / lhs captured, which tree_uses_locals (this
+	// tree's own captures only) does not see
+	bool tree_touches_locals(Cell *n)
+	{
+		pool<Cell *> seen;
+		std::function<bool(Cell *)> walk = [&](Cell *c) -> bool {
+			if (!c || !seen.insert(c).second)
+				return false;
+			if (sva_op(c) == "assign")
+				return true;
+			if (Cell *d = decl_by_name(sva_op(c)))
+				if (walk(d))
+					return true;
+			for (auto pr : ports_of(c)) {
+				SigSpec ps = c->getPort(pr);
+				Cell *d = child_cell(ps);
+				if (d ? walk(d) : sig_reads_locals(ps))
+					return true;
+			}
+			return false;
+		};
+		return walk(n);
+	}
+
 	// true when the tree captures local variables OR reads one in an
 	// expression port (a wire targeted by an `assign` cell of this tree)
 	dict<Cell *, bool> tul_memo;
@@ -1448,10 +1522,8 @@ struct SvaCompiler {
 					Cell *d = child_cell(c->getPort(pr));
 					if (d && uses(d))
 						return true;
-					if (!d)
-						for (auto bit : c->getPort(pr))
-							if (bit.is_wire() && locals.count(bit.wire))
-								return true;
+					if (!d && sig_reads_locals(c->getPort(pr), &locals))
+						return true;
 				}
 				return false;
 			};
@@ -2012,7 +2084,15 @@ struct SvaCompiler {
 	// subsequence could not be decomposed (variable-length non-repetition
 	// or budget exhaustion); the caller then falls back to the merged
 	// multi-hot window (documented approximation).
-	struct SvaEnd { SigSpec end; int age; };
+	// pend: the same-tick local writes visible at this end (a |-> read
+	// in the end tick must see them); pend_ok false when they are not
+	// known (a multi-tick leaf or repetition body that captures)
+	struct SvaEnd {
+		SigSpec end;
+		int age;
+		dict<Wire *, std::pair<SigSpec, SigSpec>> pend = {};
+		bool pend_ok = true;
+	};
 	std::pair<std::vector<SvaEnd>, bool> seq_ends_split(Cell *n, SigSpec nport,
 			SigSpec start, SigSpec gate, int depth = 0)
 	{
@@ -2029,7 +2109,7 @@ struct SvaCompiler {
 			static std::vector<Wire *> no_formals;
 			SigSpec e = andN({start, gate_now(gate),
 					reduce1(splice_expr(nport, no_formals, false))});
-			return finish({{SvaEnd{e, 0}}, true});
+			return finish({{SvaEnd{e, 0, pending_wr}}, true});
 		}
 		if (depth > 64 || split_budget <= 0)
 			return finish({{SvaEnd{seq_end(n, start, gate), -1}}, false});
@@ -2074,7 +2154,7 @@ struct SvaCompiler {
 				return finish({{SvaEnd{seq_end(n, start, gate), -1}}, false});
 			std::pair<std::vector<SvaEnd>, bool> lhs;
 			if (lead2)
-				lhs = {{SvaEnd{andN({start, gate_now(gate)}), 0}}, true};
+				lhs = {{SvaEnd{andN({start, gate_now(gate)}), 0, pending_wr}}, true};
 			else {
 				lhs = seq_ends_split(child(0), port(0), start, gate, depth + 1);
 				if (!lhs.second)
@@ -2101,12 +2181,15 @@ struct SvaCompiler {
 					for (int j = 0; j < le.age + k; j++)
 						age = age_tick(age);
 					slot_epoch++;
-					pending_wr.clear();
+					// a ##0 tail starts in the lhs end tick and sees its
+					// writes; a later tail starts after they registered
+					if (k == 0 && !le.pend_ok) { ok = false; break; }
+					pending_wr = k == 0 ? le.pend : dict<Wire *, std::pair<SigSpec, SigSpec>>();
 					auto te = seq_ends_split(child(lead2 ? 1 : 2), port(lead2 ? 1 : 2),
 							k == 0 ? le.end : gap_delay(le.end, k, gate, "dspl"), gate, depth + 1);
 					if (!te.second) { ok = false; break; }
 					for (auto &t : te.first)
-						r.push_back(SvaEnd{t.end, le.age + k + t.age});
+						r.push_back(SvaEnd{t.end, le.age + k + t.age, t.pend, t.pend_ok});
 				}
 			}
 			clone_cmap = saved_cmap;
@@ -2151,8 +2234,43 @@ struct SvaCompiler {
 			std::vector<SvaEnd> r;
 			// no empty end: an empty match has no tick (LRM 16.9.2.1); the
 			// enclosing ## accounts for it (rewrite_empty_delays)
-			for (int c = std::max(m, 1); c <= hi; c++)
-				r.push_back(SvaEnd{per_copy[c - 1], c * bl - 1});
+			bool body_caps = false;
+			if (bc) {
+				pool<Cell *> seen;
+				body_caps = tree_has_locals(bc, seen);
+			}
+			for (int c = std::max(m, 1); c <= hi; c++) {
+				int a = c * bl - 1;
+				r.push_back(SvaEnd{per_copy[c - 1], a,
+						a == 0 && !body_caps ? pending_wr : dict<Wire *, std::pair<SigSpec, SigSpec>>(), !body_caps});
+			}
+			return finish({r, true});
+		}
+		if (op == "seq_match") {
+			// per end of the body: capture in that end's tick at that
+			// end's age; the end then carries the capture as a pending
+			// write (a same-tick read sees it)
+			auto b = seq_ends_split(child(0), port(0), start, gate, depth + 1);
+			if (!b.second)
+				return finish({{SvaEnd{seq_end(n, start, gate), -1}}, false});
+			Cell *m0 = GetSize(ports) >= 2 ? child(1) : nullptr;
+			if (!m0 || sva_op(m0) != "matches")
+				return finish(b);
+			SigSpec entry_age = age;
+			auto saved_pending = pending_wr;
+			std::vector<SvaEnd> r;
+			for (auto &e : b.first) {
+				age = entry_age;
+				for (int j = 0; j < e.age; j++)
+					age = age_tick(age);
+				slot_epoch++;
+				pending_wr = e.pend;
+				capture_matches(m0, e.end);
+				r.push_back(SvaEnd{e.end, e.age, pending_wr, e.pend_ok});
+			}
+			age = entry_age;
+			pending_wr = saved_pending;
+			slot_epoch++;
 			return finish({r, true});
 		}
 		if (op == "throughout") {
@@ -2170,9 +2288,74 @@ struct SvaCompiler {
 			return finish(seq_ends_split(child(1), port(1), start, gate, depth + 1));
 		}
 		int lmin = seq_min_len(n), lmax = seq_max_len(n);
-		if (lmin >= 0 && lmin == lmax && lmax <= 64)
-			return finish({{SvaEnd{seq_end(n, start, gate), lmax - 1}}, true});
+		if (lmin >= 0 && lmin == lmax && lmax <= 64) {
+			SigSpec e = seq_end(n, start, gate);
+			if (lmax <= 1)
+				return finish({{SvaEnd{e, lmax - 1, pending_wr}}, true});
+			pool<Cell *> seen;
+			bool caps = tree_has_locals(n, seen);
+			return finish({{SvaEnd{e, lmax - 1, {}, !caps}}, true});
+		}
 		return finish({{SvaEnd{seq_end(n, start, gate), -1}}, false});
+	}
+
+	void capture_matches(Cell *m0, SigSpec fire)
+	{
+		for (auto mp : ports_of(m0)) {
+			Cell *a = child_cell(m0->getPort(mp));
+			if (a && sva_op(a) == "assign")
+				capture_local(a, fire);
+		}
+	}
+
+	// `( seq , x = e ... )` captures at each end of seq, in the slot of the
+	// attempt that started seq: the age at that end, not the entry age
+	// (fe52: a consequent reads at the end's age, so an entry-age capture
+	// after a multi-tick body landed in another attempt's slot).  A fixed
+	// body ends at age L-1; a variable one captures per end of its split.
+	void seq_match_captures(Cell *n, Cell *m0, Cell *body, SigSpec bport,
+			SigSpec start, SigSpec gate, SigSpec end)
+	{
+		int lmin = body ? seq_min_len(body) : 1;
+		int lmax = body ? seq_max_len(body) : 1;
+		if (!slots_mode || island_mode || (lmin == 1 && lmax == 1)) {
+			capture_matches(m0, end);
+			return;
+		}
+		SigSpec entry_age = age;
+		if (lmin >= 1 && lmin == lmax) {
+			for (int j = 0; j < lmax - 1; j++)
+				age = age_tick(age);
+			slot_epoch++;
+			capture_matches(m0, end);
+			age = entry_age;
+			slot_epoch++;
+			return;
+		}
+		auto saved_pending = pending_wr;
+		dict<Cell *, Cell *> saved_cmap = clone_cmap;
+		dict<Cell *, pool<IdString>> saved_stubbed = stubbed_ports;
+		int saved_budget = split_budget;
+		split_budget = 64;
+		auto sp = seq_ends_split(body, bport, start, gate);
+		split_budget = saved_budget;
+		clone_cmap = saved_cmap;
+		stubbed_ports = saved_stubbed;
+		if (!sp.second)
+			log_error("sva2check: local variable assignment after a variable-length sequence that does not decompose per end tick is not supported (%s).\n", log_id(n));
+		for (auto &e : sp.first) {
+			if (e.age < 0)
+				log_error("sva2check: internal: sequence end without an age in %s.\n", log_id(n));
+			age = entry_age;
+			for (int j = 0; j < e.age; j++)
+				age = age_tick(age);
+			slot_epoch++;
+			pending_wr = e.pend;
+			capture_matches(m0, e.end);
+		}
+		age = entry_age;
+		pending_wr = saved_pending;
+		slot_epoch++;
 	}
 
 	// end pulse: "some parse of this sequence, started by `start`, gated to
@@ -2253,6 +2436,17 @@ struct SvaCompiler {
 			// must see the gate there.
 			bool gap_gate = !dyn_gate.empty();
 			SigSpec g_gap = gap_gate ? gate_now(gate) : SigSpec();
+			// the tail's age counts from the lhs END: a fixed lhs of l
+			// ticks ends l-1 ticks after the start (a variable one goes
+			// through the split below, or the documented merged window)
+			SigSpec lhs_age = age;
+			if (slots_mode && !lead2) {
+				Cell *lc = child(0);
+				int l0 = lc ? seq_min_len(lc) : 1, l1 = lc ? seq_max_len(lc) : 1;
+				if (l0 == l1 && l1 > 1)
+					for (int j = 0; j < l1 - 1; j++)
+						lhs_age = age_tick(lhs_age);
+			}
 			auto step = [&](SigSpec tok, bool at_gap) -> SigSpec {
 				return reg(at_gap && gap_gate ? andN({tok, g_gap}) : tok, "delay");
 			};
@@ -2274,7 +2468,7 @@ struct SvaCompiler {
 					}, "delay_trig", 1);
 				}
 				if (slots_mode)
-					t_age = age_window(age, lo, nslots - 1);
+					t_age = age_window(lhs_age, lo, nslots - 1);
 			} else if (hi <= 128 || (lo == hi && hi <= 1024 && !slots_mode)) {
 				// single register chain with one tap per admissible offset
 				// (a fixed ##k is k registers and one tap: the same chain
@@ -2288,7 +2482,7 @@ struct SvaCompiler {
 						t_start = orN({t_start, tap});
 				}
 				if (slots_mode)
-					t_age = age_window(age, lo, hi);
+					t_age = age_window(lhs_age, lo, hi);
 			} else {
 				log_error("sva2check: ## delay bound %d too large in %s.\n", hi, log_id(n));
 			}
@@ -2307,15 +2501,8 @@ struct SvaCompiler {
 			// approximation).
 			if (split_ranges && hi >= 0 && !in_split) {
 				Cell *tailc = child(ti);
-				auto sig_uses_locals = [&](SigSpec s) {
-					for (auto bit : s)
-						if (bit.is_wire() && (slotfiles.count(bit.wire) || clone_lmap.count(bit.wire)))
-							return true;
-					return false;
-				};
 				Cell *lhsc = lead2 ? nullptr : child(0);
-				bool tailu = (tailc && tree_uses_locals(tailc)) ||
-						sig_uses_locals(n->getPort(ports[ti]));
+				bool tailu = tailc ? tree_touches_locals(tailc) : sig_reads_locals(n->getPort(ports[ti]));
 				bool lhsvar = false;
 				if (lhsc) {
 					int l0 = seq_min_len(lhsc), l1 = seq_max_len(lhsc);
@@ -2735,13 +2922,8 @@ struct SvaCompiler {
 			SigSpec end = seq_dispatch(port(0), child(0), start, gate);
 			if (GetSize(ports) >= 2) {
 				Cell *m0 = child(1);   // original matches cell (clone ports are shells)
-				if (m0 && sva_op(m0) == "matches") {
-					for (auto mp : ports_of(m0)) {
-						Cell *a = child_cell(m0->getPort(mp));
-						if (a && sva_op(a) == "assign")
-							capture_local(a, end);
-					}
-				}
+				if (m0 && sva_op(m0) == "matches")
+					seq_match_captures(n, m0, child(0), port(0), start, gate, end);
 			}
 			return end;
 		}
@@ -3927,6 +4109,64 @@ struct SvaCompiler {
 						clk_pos = saved_pos;
 						return r;
 					}
+				}
+			}
+			if (slots_mode && !island_mode && !multiclock && child(0)) {
+				// a consequent that touches locals runs per antecedent end
+				// at that end's age, with that end's same-tick writes
+				// visible to a |-> read (fe52: after `(1, v = c) ##3 1`
+				// the consequent read the slot of the attempt starting
+				// now, age 0, and a capture in the antecedent's last tick
+				// was invisible to `|-> w == c`)
+				Cell *ac = child(0);
+				bool multi = !(seq_min_len(ac) == 1 && seq_max_len(ac) == 1);
+				Cell *cc = child(1);
+				bool cons = cc ? tree_touches_locals(cc) : sig_reads_locals(n->getPort(ports[1]));
+				if (multi && cons) {
+					SigSpec entry_age = age;
+					auto saved_pending = pending_wr;
+					dict<Cell *, Cell *> saved_cmap = clone_cmap;
+					dict<Cell *, pool<IdString>> saved_stubbed = stubbed_ports;
+					int saved_budget = split_budget;
+					split_budget = 64;
+					auto sp = seq_ends_split(ac, port(0), start, Const(1, 1));
+					split_budget = saved_budget;
+					if (!sp.second)
+						log_error("sva2check: local variables in the consequent of %s after an antecedent that does not decompose per end tick are not supported.\n", log_id(n));
+					SigSpec r = Const(0, 1);
+					int ncomp = 0;
+					auto one = [&](SigSpec cs, int a, const dict<Wire *, std::pair<SigSpec, SigSpec>> &pend) {
+						if (ncomp++ > 0) {
+							// fresh stubs: the consequent re-splices at this age
+							clone_cmap = saved_cmap;
+							stubbed_ports = saved_stubbed;
+						}
+						age = entry_age;
+						for (int j = 0; j < a; j++)
+							age = age_tick(age);
+						slot_epoch++;
+						pending_wr = pend;
+						r = orN({r, prop_dispatch(port(1), child(1), cs)});
+					};
+					for (auto &e : sp.first) {
+						if (e.age < 0)
+							log_error("sva2check: internal: antecedent end without an age in %s.\n", log_id(n));
+						if (shift)
+							one(delay(e.end, 1, "impl"), e.age + 1, {});
+						else {
+							if (!e.pend_ok)
+								log_error("sva2check: local variables read by the consequent of %s in the tick a multi-tick antecedent element captures them are not supported.\n", log_id(n));
+							one(e.end, e.age, e.pend);
+						}
+					}
+					if (shift && can_empty(ac))
+						one(start, 0, saved_pending);
+					age = entry_age;
+					pending_wr = saved_pending;
+					clone_cmap = saved_cmap;
+					stubbed_ports = saved_stubbed;
+					slot_epoch++;
+					return r;
 				}
 			}
 			if (!slots_mode || !shift)

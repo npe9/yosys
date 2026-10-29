@@ -1,0 +1,113 @@
+# A local variable read after a multi-tick prefix read the slot of the
+# wrong attempt (fe52).  `seq_dispatch` of an antecedent restores the
+# attempt age and the same-tick writes to their entry state, so the
+# consequent read the slot of the attempt starting NOW, and a capture in
+# the antecedent's last tick was invisible to a `|->` read in that tick.
+# Inside a sequence, the parser gives `c != v + 3` as a plain $ne on the
+# ## port, and the locals test looked at the port's own bits, so the
+# per-age split was skipped.  Each true property below has a false twin
+# (off by one in the value) whose depth is where its first attempt ends.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [6:0] c = '0;
+  always_ff @(posedge clk) c <= c + 7'd1;
+  property t1; logic [6:0] v; (1'b1, v = c) ##3 1'b1 |-> c == v + 7'd3; endproperty
+  property f1; logic [6:0] v; (1'b1, v = c) ##3 1'b1 |-> c == v + 7'd2; endproperty
+  property t2; logic [6:0] v; (c == 7'd20, v = c) ##3 1'b1 |-> c == v + 7'd3; endproperty
+  property f2; logic [6:0] v; (c == 7'd20, v = c) ##3 1'b1 |-> c == v + 7'd4; endproperty
+  property t3; logic [6:0] v; (1'b1, v = c) ##1 1'b1 ##2 c != v + 7'd3 |-> 1'b0; endproperty
+  property f3; logic [6:0] v; (1'b1, v = c) ##1 1'b1 ##2 c != v + 7'd2 |-> 1'b0; endproperty
+  property t4; logic [6:0] w; 1'b1 ##3 (1'b1, w = c) |-> w == c; endproperty
+  property f4; logic [6:0] w; 1'b1 ##3 (1'b1, w = c) |-> w != c; endproperty
+  property t5; logic [6:0] w; 1'b1 ##3 (1'b1, w = c) |-> ##2 c == w + 7'd2; endproperty
+  property f5; logic [6:0] w; 1'b1 ##3 (1'b1, w = c) |-> ##2 c == w + 7'd3; endproperty
+  property t6; logic [6:0] v; (1'b1, v = c) ##2 1'b1 |=> c == v + 7'd3; endproperty
+  property f6; logic [6:0] v; (1'b1, v = c) ##2 1'b1 |=> c == v + 7'd2; endproperty
+  property t7; logic [6:0] v, w; (1'b1, v = c) ##3 (1'b1, w = v) |-> c == w + 7'd3; endproperty
+  property f7; logic [6:0] v, w; (1'b1, v = c) ##3 (1'b1, w = v) |-> c == w + 7'd4; endproperty
+  property t8; logic [6:0] w; 1'b1 ##1 (1'b1, w = c) |-> 1'b1 ##2 c == w + 7'd2; endproperty
+  property f8; logic [6:0] w; 1'b1 ##1 (1'b1, w = c) |-> 1'b1 ##2 c == w + 7'd1; endproperty
+  // false only through the value one attempt captured (c == 5 at 5)
+  property f9; logic v; (1'b1, v = (c == 7'd5)) ##3 1'b1 |-> !v; endproperty
+  p_t1: assert property (@(posedge clk) t1);
+  p_f1: assert property (@(posedge clk) f1);
+  p_t2: assert property (@(posedge clk) t2);
+  p_f2: assert property (@(posedge clk) f2);
+  p_t3: assert property (@(posedge clk) t3);
+  p_f3: assert property (@(posedge clk) f3);
+  p_t4: assert property (@(posedge clk) t4);
+  p_f4: assert property (@(posedge clk) f4);
+  p_t5: assert property (@(posedge clk) t5);
+  p_f5: assert property (@(posedge clk) f5);
+  p_t6: assert property (@(posedge clk) t6);
+  p_f6: assert property (@(posedge clk) f6);
+  p_t7: assert property (@(posedge clk) t7);
+  p_f7: assert property (@(posedge clk) f7);
+  p_t8: assert property (@(posedge clk) t8);
+  p_f8: assert property (@(posedge clk) f8);
+  p_f9: assert property (@(posedge clk) f9);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt_clean
+logger -expect log "ic3: p_t[1-8]: proved" 8
+logger -expect log "ic3: p_f1: disproved \(depth 3\)" 1
+logger -expect log "ic3: p_f2: disproved \(depth 23\)" 1
+logger -expect log "ic3: p_f3: disproved \(depth 3\)" 1
+logger -expect log "ic3: p_f4: disproved \(depth 3\)" 1
+logger -expect log "ic3: p_f5: disproved \(depth 5\)" 1
+logger -expect log "ic3: p_f6: disproved \(depth 3\)" 1
+logger -expect log "ic3: p_f7: disproved \(depth 3\)" 1
+logger -expect log "ic3: p_f8: disproved \(depth 3\)" 1
+logger -expect log "ic3: p_f9: disproved \(depth 8\)" 1
+ic3 -init-zero -bmc 30 -kind 12
+logger -check-expected
+
+# a match item on a multi-tick sequence, `(s, v = c)`, captures in the slot
+# of the attempt that started s (the age at s's end), per end for a
+# variable-length s; it was an entry-age capture, consistent only with the
+# old entry-age reads (the fuzz gate's `(cnt[0] ##2 a, v0 = ...) |=> ...`
+# was refused after fe52; build3 disproves m_t3)
+design -reset
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [6:0] c = 0;
+  always_ff @(posedge clk) c <= c + 7'd1;
+  property t1; logic [6:0] v; ((1'b1 ##2 1'b1), v = c) ##1 1'b1 |-> c == v + 7'd1; endproperty
+  property f1; logic [6:0] v; ((1'b1 ##2 1'b1), v = c) ##1 1'b1 |-> c == v + 7'd3; endproperty
+  property t2; logic [6:0] v; ((1'b1 ##[1:2] 1'b1), v = c) |-> v == c; endproperty
+  property f2; logic [6:0] v; ((1'b1 ##[1:2] 1'b1), v = c) |-> v != c; endproperty
+  property t3; logic [6:0] v, s; ((1'b1, s = c) ##[1:2] 1'b1, v = c) |=> c - s == 7'd2 || c - s == 7'd3; endproperty
+  property f3; logic [6:0] v, s; ((1'b1, s = c) ##[1:2] 1'b1, v = c) |=> c - s == 7'd2; endproperty
+  property t4; logic [6:0] v; ((c[0] ##2 1'b1), v = c) |=> c == v + 7'd1 && v[0]; endproperty
+  property f4; logic [6:0] v; ((c[0] ##2 1'b1), v = c) |=> c == v + 7'd1 && !v[0]; endproperty
+  property t5; logic [6:0] v; ((1'b1 ##2 1'b1), v = c) ##0 (v != c) |-> 1'b0; endproperty
+  property f5; logic [6:0] v; ((1'b1 ##2 1'b1), v = c) ##0 (v == c) |-> 1'b0; endproperty
+  m_t1: assert property (@(posedge clk) t1);
+  m_f1: assert property (@(posedge clk) f1);
+  m_t2: assert property (@(posedge clk) t2);
+  m_f2: assert property (@(posedge clk) f2);
+  m_t3: assert property (@(posedge clk) t3);
+  m_f3: assert property (@(posedge clk) f3);
+  m_t4: assert property (@(posedge clk) t4);
+  m_f4: assert property (@(posedge clk) f4);
+  m_t5: assert property (@(posedge clk) t5);
+  m_f5: assert property (@(posedge clk) f5);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt_clean
+logger -expect log "ic3: m_t[1-5]: proved" 5
+logger -expect log "ic3: m_f1: disproved \(depth 3\)" 1
+logger -expect log "ic3: m_f2: disproved \(depth 1\)" 1
+logger -expect log "ic3: m_f3: disproved \(depth 3\)" 1
+logger -expect log "ic3: m_f4: disproved \(depth 4\)" 1
+logger -expect log "ic3: m_f5: disproved \(depth 2\)" 1
+ic3 -init-zero -bmc 30 -kind 12
+logger -check-expected

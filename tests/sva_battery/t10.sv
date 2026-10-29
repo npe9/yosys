@@ -29,6 +29,8 @@ module t10 (input logic clk);
       ##1 (block_msg == result);
   endproperty
 
-  p_crypt_a: assert property (p_crypt);   // DIS @11
+  // (PROVED: result-4 = tracked+1 = next block_msg; a DIS @11 here was
+  // the same-tick read of tracked before its write landed, fixed in fe52)
+  p_crypt_a: assert property (p_crypt);   // PROVED
   p_crypt_b: assert property (p_cryptb);  // DIS @11
 endmodule

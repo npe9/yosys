@@ -1,0 +1,45 @@
+# a multi-clock consequent reading locals after a multi-tick antecedent
+# read each local at the entry age: the slot of the attempt starting at
+# the antecedent's end tick, not the one that matched (the single-clock
+# fe52 shape on the island handoff).  True properties failed.
+#
+# A $global_clock counter drives both clocks: ca every 2 steps, cb every
+# 4.  The antecedents are one-shot (c == 5 recurs only after 128 ca
+# ticks), so the one attempt within the bound is all the behaviour, and
+# BMC to 40 decides it: true ones stay undecided (no counterexample), false
+# twins fail at their exact depth.  (IC3 does not prove the island state
+# within minutes.)
+read_verilog -sv -formal <<EOT
+module top;
+  logic [7:0] g = 0;
+  always @($global_clock) g <= g + 8'd1;
+  wire ca = g[0];
+  wire cb = g[1];
+  logic [6:0] c = 0;
+  always @(posedge ca) c <= c + 7'd1;
+  property tv; logic [6:0] v, w; @(posedge ca) (c == 7'd5, v = c) ##2 (1'b1, w = c) |-> @(posedge cb) v == 7'd5; endproperty
+  property tw; logic [6:0] v, w; @(posedge ca) (c == 7'd5, v = c) ##2 (1'b1, w = c) |-> @(posedge cb) w == 7'd7; endproperty
+  property fw; logic [6:0] v, w; @(posedge ca) (c == 7'd5, v = c) ##2 (1'b1, w = c) |-> @(posedge cb) w == 7'd6; endproperty
+  property tl; logic [6:0] w; @(posedge ca) c == 7'd5 ##2 (1'b1, w = c) |-> @(posedge cb) w == 7'd7; endproperty
+  property tn; logic [6:0] v, w; @(posedge ca) (c == 7'd5, v = c) ##2 (1'b1, w = c) |=> @(posedge cb) w == v + 7'd2; endproperty
+  property tr; logic [6:0] v, w; @(posedge ca) (c == 7'd5, v = c) ##[1:2] (1'b1, w = c) |-> @(posedge cb) w - v == 7'd1 || w - v == 7'd2; endproperty
+  property fr; logic [6:0] v, w; @(posedge ca) (c == 7'd5, v = c) ##[1:2] (1'b1, w = c) |-> @(posedge cb) w - v == 7'd1; endproperty
+  a_tv: assert property (tv);
+  a_tw: assert property (tw);
+  a_fw: assert property (fw);
+  a_tl: assert property (tl);
+  a_tn: assert property (tn);
+  a_tr: assert property (tr);
+  a_fr: assert property (fr);
+endmodule
+EOT
+hierarchy -top top
+sva2check -clk2fflogic
+proc
+clk2fflogic
+opt_clean
+logger -expect log "ic3: a_t[a-z]: undecided" 5
+logger -expect log "ic3: a_fw: disproved \(depth 18\)" 1
+logger -expect log "ic3: a_fr: disproved \(depth 18\)" 1
+ic3 -init-zero -bmc 40 -kind 0 -max 0
+logger -check-expected

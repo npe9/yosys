@@ -3900,7 +3900,49 @@ struct SvaCompiler {
 					: andN({start, mod->Not(NEW_ID, reduce1(resolve(port(0))))});
 			SigSpec c_start = op == "#=#" ? delay(ant_end, 1, "fol") : ant_end;
 			SigSpec f_p;
-			if (!slots_mode || op != "#=#") {
+			Cell *pc = child(1);
+			bool p_locals = slots_mode && !island_mode && !multiclock && sc && lmax > 1 &&
+					(pc ? tree_touches_locals(pc) : sig_reads_locals(n->getPort(ports[1])));
+			if (p_locals) {
+				// the consequent runs at the end's age with the end's
+				// same-tick writes (#-#) or one tick later (#=#), as for
+				// |->/|=> (fe52); it read at the entry age, which gave
+				// false proofs as well as false disproofs
+				SigSpec entry_age = age;
+				auto saved_pending = pending_wr;
+				dict<Cell *, Cell *> saved_cmap = clone_cmap;
+				dict<Cell *, pool<IdString>> saved_stubbed = stubbed_ports;
+				int saved_budget = split_budget;
+				split_budget = 64;
+				auto sp = seq_ends_split(sc, port(0), start, Const(1, 1));
+				split_budget = saved_budget;
+				if (!sp.second)
+					log_error("sva2check: local variables in the consequent of %s after an antecedent that does not decompose per end tick are not supported.\n", log_id(n));
+				bool fsh = op == "#=#";
+				f_p = Const(0, 1);
+				int ncomp = 0;
+				for (auto &e : sp.first) {
+					if (e.age < 0)
+						log_error("sva2check: internal: antecedent end without an age in %s.\n", log_id(n));
+					if (!fsh && !e.pend_ok)
+						log_error("sva2check: local variables read by the consequent of %s in the tick a multi-tick antecedent element captures them are not supported.\n", log_id(n));
+					if (ncomp++ > 0) {
+						clone_cmap = saved_cmap;
+						stubbed_ports = saved_stubbed;
+					}
+					age = entry_age;
+					for (int j = 0; j < e.age + (fsh ? 1 : 0); j++)
+						age = age_tick(age);
+					slot_epoch++;
+					pending_wr = fsh ? dict<Wire *, std::pair<SigSpec, SigSpec>>() : e.pend;
+					f_p = orN({f_p, prop_dispatch(port(1), child(1), fsh ? delay(e.end, 1, "fol") : e.end)});
+				}
+				age = entry_age;
+				pending_wr = saved_pending;
+				clone_cmap = saved_cmap;
+				stubbed_ports = saved_stubbed;
+				slot_epoch++;
+			} else if (!slots_mode || op != "#=#") {
 				f_p = prop_dispatch(port(1), child(1), c_start);
 			} else {
 				SigSpec saved_age = age;
@@ -4090,12 +4132,64 @@ struct SvaCompiler {
 							return r;
 						};
 						std::vector<SigSpec> fails;
+						// the antecedent-end view of each local: its slot
+						// read at the age of the end that matched, with
+						// that end's same-tick writes (after a multi-tick
+						// antecedent the entry age read the slot of the
+						// attempt starting at the end tick; fe52 shape).
+						// Two ends in one tick are two obligations for one
+						// pending slot: a collision failure below
+						dict<Wire *, SigSpec> endview;
+						SigSpec multi_end = Const(0, 1);
+						if (slots_mode && !slotfiles.empty()) {
+							Cell *ac = child(0);
+							bool multi = ac && !(seq_min_len(ac) == 1 && seq_max_len(ac) == 1);
+							if (!multi) {
+								for (auto &kv : slotfiles)
+									endview[kv.first] = local_read(kv.first);
+							} else {
+								SigSpec entry_age = age;
+								auto saved_pending = pending_wr;
+								dict<Cell *, Cell *> saved_cmap = clone_cmap;
+								dict<Cell *, pool<IdString>> saved_stubbed = stubbed_ports;
+								int saved_budget = split_budget;
+								split_budget = 64;
+								auto sp = seq_ends_split(ac, port(0), start, Const(1, 1));
+								split_budget = saved_budget;
+								clone_cmap = saved_cmap;
+								stubbed_ports = saved_stubbed;
+								if (!sp.second)
+									log_error("sva2check: local variables in a multi-clock consequent of %s after an antecedent that does not decompose per end tick are not supported.\n", log_id(n));
+								SigSpec seen = Const(0, 1);
+								for (auto &e : sp.first) {
+									if (e.age < 0)
+										log_error("sva2check: internal: antecedent end without an age in %s.\n", log_id(n));
+									if (!e.pend_ok)
+										log_error("sva2check: local variables read by the multi-clock consequent of %s in the tick a multi-tick antecedent element captures them are not supported.\n", log_id(n));
+									age = entry_age;
+									for (int j = 0; j < e.age; j++)
+										age = age_tick(age);
+									slot_epoch++;
+									pending_wr = e.pend;
+									for (auto &kv : slotfiles) {
+										SigSpec v = local_read(kv.first);
+										endview[kv.first] = endview.count(kv.first)
+												? mod->Mux(NEW_ID, endview[kv.first], v, e.end) : v;
+									}
+									multi_end = orN({multi_end, andN({seen, e.end})});
+									seen = orN({seen, e.end});
+								}
+								age = entry_age;
+								pending_wr = saved_pending;
+								slot_epoch++;
+							}
+						}
 						// locals of a pending obligation: the antecedent-
 						// end view of each local, captured with its match
 						dict<Wire *, SigSpec> held;
 						if (slots_mode)
 							for (auto &kv : slotfiles) {
-								SigSpec ov = local_read(kv.first);
+								SigSpec ov = endview.at(kv.first);
 								Wire *lw = wn("mclocal", ov.size());
 								lw->attributes[ID::init] = Const(0, ov.size());
 								SigSpec lnext = mod->Mux(NEW_ID, SigSpec(lw), gpast(ov, "mcantlocal"), match_now);
@@ -4111,6 +4205,8 @@ struct SvaCompiler {
 							approx("mc-locals-pending-collision", log_id(n));
 							fails.push_back(mod->And(NEW_ID, pend_in,
 									mod->And(NEW_ID, pendw, mod->Not(NEW_ID, iedge))));
+							if (!multi_end.is_fully_zero())
+								fails.push_back(mod->And(NEW_ID, gpast(multi_end, "mcmulti"), oedge));
 						}
 						SigSpec r_pend = island(pend_next, [&](Wire *xw) { return held.at(xw); });
 						// the island verdict at an inner tick: its fail
@@ -4125,7 +4221,7 @@ struct SvaCompiler {
 							SigSpec o_idle = opos ? mod->Not(NEW_ID, oclk) : oclk;
 							SigSpec i_idle = ipos ? mod->Not(NEW_ID, SigSpec(iclk[0])) : SigSpec(iclk[0]);
 							SigSpec spec = andN({ant_end, o_idle, i_idle});
-							SigSpec r_spec = island(spec, [&](Wire *xw) { return local_read(xw); });
+							SigSpec r_spec = island(spec, [&](Wire *xw) { return endview.count(xw) ? endview.at(xw) : local_read(xw); });
 							// was the attempt that fails at this inner tick
 							// (started `off` inner ticks ago) started at a
 							// coinciding outer tick?  q[j]: that fact for

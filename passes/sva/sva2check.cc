@@ -468,10 +468,32 @@ struct SvaCompiler {
 	// thread survives; counters, slot files and feedback state can sit at
 	// zero while a thread still waits, and disable the early check.
 	std::vector<std::pair<SigSpec, bool>> *ff_log = nullptr;
-	Cell *ffd(SigSpec d, SigSpec q, bool safe)
+	// Monitor state starts at 0: no attempt is in flight before time 0.
+	// Without an init the register is x, which opt_dff may resolve to a
+	// constant (a constant-1 D, the age bit of a constant-true
+	// antecedent, folded to 1 made attempts "start" before time 0 and fail
+	// at depth 0 after `opt`; a free ring phase could start past the
+	// slot count).  Sampled data ($past chains, slot files) keeps no init.
+	static void init_zero(SigSpec q)
+	{
+		for (auto &c : q.chunks()) {
+			if (!c.wire)
+				continue;
+			Const iv = c.wire->attributes.count(ID::init) ?
+					c.wire->attributes.at(ID::init) : Const(State::Sx, c.wire->width);
+			if (GetSize(iv) < c.wire->width)
+				iv.resize(c.wire->width, State::Sx);
+			for (int i = 0; i < c.width; i++)
+				iv.set(c.offset + i, State::S0);
+			c.wire->attributes[ID::init] = iv;
+		}
+	}
+	Cell *ffd(SigSpec d, SigSpec q, bool safe, bool data = false)
 	{
 		if (ff_log)
 			ff_log->push_back({d, safe});
+		if (!data)
+			init_zero(q);
 		return mod->addDff(NEW_ID, clk, d, q, clk_pos);
 	}
 
@@ -496,13 +518,13 @@ struct SvaCompiler {
 	SigSpec reg(SigSpec d, const char *role)
 	{
 		// a compile-time age bit that can never be hot stays the constant
-		// 0 (monitor registers carry no init attribute, so the fold also
-		// keeps a never-hot age from reading free at step 0 without
-		// -init-zero); the hot-age count in local_read relies on it
+		// 0 (no register at all); the hot-age count in local_read relies
+		// on it
 		if (strcmp(role, "age") == 0 && d.is_fully_const() && d.as_const().is_fully_zero())
 			return Const(0, d.size());
 		Wire *q = wn(role, d.size());
-		ffd(strcmp(role, "past") == 0 ? d : dis_gate(d), q, true);
+		bool past = strcmp(role, "past") == 0;
+		ffd(past ? d : dis_gate(d), q, true, past);
 		return q;
 	}
 
@@ -1765,7 +1787,7 @@ struct SvaCompiler {
 			if (sf.dff[k])
 				sf.dff[k]->setPort(ID(D), next);
 			else
-				sf.dff[k] = ffd(next, sf.q[k], false);
+				sf.dff[k] = ffd(next, sf.q[k], false, true);
 		}
 		pending_wr[xw] = {we, e};
 		slot_epoch++;
@@ -2871,6 +2893,7 @@ struct SvaCompiler {
 				Wire *ph = wn("att_phase", w);
 				SigSpec wrap = mod->Eq(NEW_ID, SigSpec(ph), Const(span - 1, w));
 				SigSpec nxt = mod->Mux(NEW_ID, mod->Add(NEW_ID, SigSpec(ph), Const(1, w)), Const(0, w), wrap);
+				init_zero(SigSpec(ph));
 				mod->addDff(NEW_ID, clk, nxt.extract(0, w), ph, clk_pos);
 				SigSpec r = Const(0, 1);
 				for (int i = 0; i < span; i++)
@@ -5511,6 +5534,7 @@ struct SvaCompiler {
 			Wire *ph = wn("ssf_phase", w);
 			SigSpec wrap = mod->Eq(NEW_ID, SigSpec(ph), Const(copies - 1, w));
 			SigSpec nxt = mod->Mux(NEW_ID, mod->Add(NEW_ID, SigSpec(ph), Const(1, w)), Const(0, w), wrap);
+			init_zero(SigSpec(ph));
 			mod->addDff(NEW_ID, clk, nxt.extract(0, w), ph, clk_pos);
 			SigSpec fail = Const(0, 1);
 			for (int i = 0; i < copies; i++) {

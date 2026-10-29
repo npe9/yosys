@@ -1,0 +1,55 @@
+# sva2check monitor state (age / delay / phase registers) starts at 0:
+# no attempt is in flight before time 0.  It carried no init, so it was x,
+# and `opt` (opt_dff) resolved a constant-1 next state -- the age bit of a
+# constant-true antecedent -- to the constant 1: attempts "started"
+# before time 0, and true properties failed at depth 0 in any flow
+# running opt after sva2check.  Each flow below must give the same
+# verdicts: true properties proved, false twins at their exact depth.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [6:0] c = 0;
+  always_ff @(posedge clk) c <= c + 7'd1;
+  property tl; logic [6:0] v; (1'b1, v = c) |-> ##3 c == v + 7'd3; endproperty
+  property fl; logic [6:0] v; (1'b1, v = c) |-> ##3 c == v + 7'd2; endproperty
+  t_loc: assert property (@(posedge clk) tl);
+  f_loc: assert property (@(posedge clk) fl);
+  t_del: assert property (@(posedge clk) 1'b1 |-> ##3 c == $past(c, 3) + 7'd3);
+  f_del: assert property (@(posedge clk) 1'b1 |-> ##3 c == $past(c, 3) + 7'd2);
+  t_seq: assert property (@(posedge clk) 1'b1 ##2 1'b1 |-> c - $past(c, 2) == 7'd2);
+  f_seq: assert property (@(posedge clk) 1'b1 ##2 1'b1 |-> c >= 7'd3);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+design -save m
+
+opt
+opt_clean
+logger -expect log "ic3: t_[a-z]+: proved" 3
+logger -expect log "ic3: f_loc: disproved \(depth 3\)" 1
+logger -expect log "ic3: f_del: disproved \(depth 3\)" 1
+logger -expect log "ic3: f_seq: disproved \(depth 2\)" 1
+ic3 -bmc 8 -kind 8
+logger -check-expected
+
+design -load m
+opt -full
+opt_dff -sat
+opt_clean
+logger -expect log "ic3: t_[a-z]+: proved" 3
+logger -expect log "ic3: f_loc: disproved \(depth 3\)" 1
+logger -expect log "ic3: f_del: disproved \(depth 3\)" 1
+logger -expect log "ic3: f_seq: disproved \(depth 2\)" 1
+ic3 -init-zero -bmc 8 -kind 8
+logger -check-expected
+
+design -load m
+prep -top top
+logger -expect log "ic3: t_[a-z]+: proved" 3
+logger -expect log "ic3: f_loc: disproved \(depth 3\)" 1
+logger -expect log "ic3: f_del: disproved \(depth 3\)" 1
+logger -expect log "ic3: f_seq: disproved \(depth 2\)" 1
+ic3 -bmc 8 -kind 8
+logger -check-expected

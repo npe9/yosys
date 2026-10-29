@@ -1,0 +1,105 @@
+# `assert property (disable iff (r) name_p)` with a bare property name
+# under default clocking (the caliptra form) lost its disable: the walk
+# into the declaration reset it.  Asserts got spurious counterexamples;
+# an assume became stronger than written and gave FALSE PROOFS (a_f).
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  default clocking @(posedge clk); endclocking
+  logic [1:0] t = 2'd0;
+  always_ff @(posedge clk) t <= t + 2'd1;
+  property sp; t == 2'd1 |-> t == 2'd0; endproperty
+  property sq; t == 2'd1 |=> t == 2'd0; endproperty
+  property s2; sp; endproperty
+  property ip; disable iff (t == 2'd1) t == 2'd1 |-> t == 2'd0; endproperty
+  logic [1:0] w = 2'd0;               // saturates: w == 0 never returns
+  always_ff @(posedge clk) if (w != 2'd3) w <= w + 2'd1;
+  property lp; w == 2'd1 |-> s_eventually (w == 2'd0); endproperty
+  a_s0: assert property (sp);
+  a_s1: assert property (disable iff (t == 2'd1) sp);
+  a_s2: assert property (disable iff (t == 2'd2) sq);
+  a_two: assert property (disable iff (t == 2'd1) s2);
+  a_in: assert property (ip);
+  a_l0: assert property (lp);
+  a_l: assert property (disable iff (w == 2'd2) lp);
+  a_ex: assert property (@(posedge clk) disable iff (t == 2'd1) sp);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_s0: disproved \(depth 1\)" 1
+logger -expect log "a_s1: proved" 1
+logger -expect log "a_s2: proved" 1
+logger -expect log "a_two: proved" 1
+logger -expect log "a_in: proved" 1
+logger -expect log "a_l0: disproved" 1
+logger -expect log "a_l: proved" 1
+logger -expect log "a_ex: proved" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic r, input logic x);
+  default clocking @(posedge clk); endclocking
+  property ap; !x; endproperty
+  u0: assume property (disable iff (r) ap);
+  a_f: assert property (!x);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_f: disproved \(depth 0\)" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# a disable both outside and inside stays refused (LRM 16.12), as for an
+# instance with actuals
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  default clocking @(posedge clk); endclocking
+  logic [1:0] t = 2'd0;
+  always_ff @(posedge clk) t <= t + 2'd1;
+  property ip; disable iff (t == 2'd1) t == 2'd1 |-> t == 2'd0; endproperty
+  a_nest: assert property (disable iff (t == 2'd3) ip);
+endmodule
+EOT
+hierarchy -top top
+logger -expect log "top/a_nest: disable iff both outside and inside" 1
+sva2check
+proc
+async2sync
+logger -check-expected
+design -reset
+logger -check-expected
+
+# a scope default is overridden by a declaration's own disable iff (LRM
+# 16.15; cv32e40p interrupt_assert: `default disable iff !rst_ni` and a
+# property with its own); with no
+# disable of its own the declaration takes the default
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  default clocking @(posedge clk); endclocking
+  logic [1:0] t = 2'd0;
+  always_ff @(posedge clk) t <= t + 2'd1;
+  default disable iff (t == 2'd3);
+  property ip; disable iff (t == 2'd1) t == 2'd1 |-> t == 2'd0; endproperty
+  property dp; t == 2'd3 |-> t == 2'd0; endproperty
+  property np; t == 2'd1 |-> t == 2'd0; endproperty
+  a_dn: assert property (ip);
+  a_dd: assert property (dp);
+  a_dnp: assert property (np);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_dn: proved" 1
+logger -expect log "a_dd: proved" 1
+logger -expect log "a_dnp: disproved \(depth 1\)" 1
+ic3 -init-zero

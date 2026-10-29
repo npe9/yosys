@@ -39,7 +39,10 @@
 //     pending-bit FF on the property clock, D = !b && (open || pend) with
 //     open = antecedent end (|=> delayed one tick onto the first window
 //     tick); FLAVOR "liveness", A = !pend || b (ic3: bad = pend && !b).
-//     Locals and named-decls reject as in v1
+//     Named decls reject as in v1.  Locals captured in a single-tick
+//     antecedent and read by b lower to a per-attempt CAM with a focus
+//     cursor (ev_locals_live) and an <name>$overflow twin; other locals
+//     reject
 //   multi-clock (requires -clk2fflogic and the clk2fflogic prep): the
 //     direct consequent of |->/|=> may be a `clocked` sub-sequence on a
 //     different clock (optionally under strong/weak): it compiles as its
@@ -3775,6 +3778,143 @@ struct SvaCompiler {
 		return fail;
 	}
 
+	// Locals in a temporal response (2026-10-29; caliptra
+	// fv_ecc_dsa_ctrl wr_core_addr_eventually_in_memory):
+	//   b ##0 (1'b1, v1 = e1, ...) [##0 ...] |->/|=> (s_)eventually B
+	// with single-tick boolean b, plain boolean B reading a captured
+	// local, and neither b nor any e reading one.  Each attempt's
+	// obligation is "B with its own tuple at some tick of its window",
+	// so the single pend bit of the plain temporal response (one b clears
+	// every outstanding window) does not apply.  A CAM of
+	// ev_locals_slots entries, each a pend bit plus the tuple, clears an
+	// entry at the first tick its B holds.  A capture equal to a pending
+	// entry that survives the tick has the same future and is merged;
+	// with every entry pending it pulses cam_overflow (the
+	// <name>$overflow twin, as for the until / goto shapes).
+	//   One liveness check stays exact through a focus cursor that holds
+	// while its entry is pending and unmet and otherwise steps to the
+	// next entry: A = !(pend_f && !B(val_f)).  A cycle with !A at every
+	// state (the engine's gfp) keeps the cursor and its entry, whose
+	// tuple is held, so one attempt is never satisfied.  Conversely a
+	// stuck entry catches the cursor within ev_locals_slots ticks (or
+	// another stuck entry does).
+	struct EvLocals {
+		GotoLocals lhs;   // b and caps (g, B, k, n unused)
+		SigSpec B;
+		bool next = false;   // |=>
+	};
+	int ev_locals_slots = 3;
+
+	bool ev_locals_match(Cell *body, Cell *tev, int bidx, EvLocals &m)
+	{
+		if (!allow_until_locals || !body || !tev || multiclock || island_mode)
+			return false;
+		std::string iop = sva_op(body);
+		if (iop != "|->" && iop != "|=>")
+			return false;
+		auto bp = ports_of(body);
+		auto ep = ports_of(tev);
+		if (GetSize(bp) != 2 || bidx >= GetSize(ep))
+			return false;
+		m.next = iop == "|=>";
+		m.lhs = GotoLocals();
+		if (!goto_locals_lhs(body->getPort(bp[0]), m.lhs) || m.lhs.caps.empty())
+			return false;
+		m.B = tev->getPort(ep[bidx]);
+		if (child_cell(m.B) || decl_for_wire(resolve(m.B)))
+			return false;
+		bool reads = false;
+		for (auto &cap : m.lhs.caps) {
+			pool<Wire *> seen;
+			if (cone_reads(m.B, cap.first, seen))
+				reads = true;
+			for (auto &bb : m.lhs.b) {
+				seen.clear();
+				if (cone_reads(bb, cap.first, seen))
+					return false;
+			}
+			for (auto &other : m.lhs.caps) {
+				seen.clear();
+				if (cone_reads(other.second, cap.first, seen))
+					return false;
+			}
+		}
+		return reads;
+	}
+
+	// returns A (the liveness "property holds" level)
+	SigSpec ev_locals_live(EvLocals &m, SigSpec start)
+	{
+		std::vector<Wire *> fl;
+		for (auto &cap : m.lhs.caps)
+			fl.push_back(cap.first);
+		auto ex = [&](SigSpec raw) { return splice_expr(raw, fl, false); };
+		SigSpec cap = start;
+		for (auto &bb : m.lhs.b)
+			cap = andN({cap, reduce1(resolve(ex(bb)))});
+		SigSpec tup;
+		int tw = 0;
+		for (auto &c : m.lhs.caps) {
+			SigSpec e = resolve(ex(c.second));
+			if (GetSize(e) > c.first->width)
+				e = e.extract(0, c.first->width);
+			else if (GetSize(e) < c.first->width)
+				e.extend_u0(c.first->width, false);
+			tup.append(e);
+			tw += c.first->width;
+		}
+		auto B_at = [&](SigSpec val) -> SigSpec {
+			SubstGuard gd(this);
+			int off = 0;
+			for (auto &c : m.lhs.caps) {
+				gd.bind(c.first, val.extract(off, c.first->width));
+				off += c.first->width;
+			}
+			return reduce1(resolve(ex(m.B)));
+		};
+		// |-> includes the end tick: an attempt satisfied there opens
+		// nothing; |=> opens on the next tick, whose B the entry reads
+		SigSpec ins = m.next ? cap : andN({cap, mod->Not(NEW_ID, B_at(tup))});
+		int K = ev_locals_slots;
+		std::vector<SigSpec> surv;
+		std::vector<Wire *> pend, val;
+		SigSpec dup = Const(0, 1);
+		for (int i = 0; i < K; i++) {
+			Wire *pb = wn("ev_pend", 1);
+			Wire *vv = wn("ev_val", tw);
+			SigSpec sv = andN({SigSpec(pb), mod->Not(NEW_ID, B_at(SigSpec(vv)))});
+			dup = orN({dup, andN({sv, mod->Eq(NEW_ID, SigSpec(vv), tup)})});
+			surv.push_back(sv);
+			pend.push_back(pb);
+			val.push_back(vv);
+		}
+		SigSpec need = andN({ins, mod->Not(NEW_ID, dup)});
+		SigSpec taken = Const(0, 1);
+		for (int i = 0; i < K; i++) {
+			SigSpec fr = mod->Not(NEW_ID, surv[i]);
+			SigSpec take = andN({need, fr, mod->Not(NEW_ID, taken)});
+			taken = orN({taken, fr});
+			// all-zero = no attempt pending; disable cancels pending ones
+			ffd(dis_gate(orN({surv[i], take})), pend[i], true);
+			// data, not attempt state: never cleared
+			mod->addDff(NEW_ID, clk, mod->Mux(NEW_ID, SigSpec(val[i]), tup, take), val[i], clk_pos);
+		}
+		SigSpec ovf = andN({need, mod->Not(NEW_ID, taken)});
+		cam_overflow = cam_overflow.empty() ? ovf : orN({cam_overflow, ovf});
+		// the focus cursor
+		int w = 1;
+		while ((1 << w) < K)
+			w++;
+		Wire *fq = wn("ev_focus", w);
+		SigSpec bad = Const(0, 1);
+		for (int i = 0; i < K; i++)
+			bad = orN({bad, andN({mod->Eq(NEW_ID, SigSpec(fq), Const(i, w)), surv[i]})});
+		SigSpec inc = mod->Add(NEW_ID, SigSpec(fq), Const(1, w));
+		inc = mod->Mux(NEW_ID, inc, Const(0, w), mod->Eq(NEW_ID, SigSpec(fq), Const(K - 1, w)));
+		ffd(mod->Mux(NEW_ID, inc, SigSpec(fq), bad), SigSpec(fq), false);
+		return mod->Not(NEW_ID, bad);
+	}
+
 	// The fixed failure offset of a property (register v3 F10): ticks from
 	// an attempt's start to the tick its failure is reported, when that is
 	// the same for every attempt; -1 when it varies.  Mirrors prop_fail.
@@ -6201,6 +6341,13 @@ struct Sva2CheckPass : public Pass {
 				Cell *clock = nullptr, *disable = nullptr, *body = nullptr;
 				SigSpec body_sig, body_const;
 				bool bad = false;
+				// a disable iff on a spec whose body is a bare declaration
+				// name: the walk continues into the declaration and resets
+				// `disable` there, so keep it (fe57: `assert property
+				// (disable iff (r) name_p)` under default clocking lost its
+				// disable -- spurious counterexamples on asserts, and an
+				// over-strong assume gave FALSE PROOFS)
+				std::vector<Cell *> walked_dis;
 				for (int guard = 0; guard < 64 && !hoist_clock; guard++) {
 					clock = nullptr, disable = nullptr, body = nullptr;
 					body_sig = SigSpec(), body_const = SigSpec();
@@ -6246,6 +6393,8 @@ struct Sva2CheckPass : public Pass {
 					auto it = decls.find(cn);
 					if (it == decls.end())
 						break;
+					if (disable && sva_op(disable) == "disable_iff")
+						walked_dis.push_back(disable);
 					chain.emplace_back(it->second, std::vector<Wire *>(), std::vector<SigSpec>());
 					auto dp = comp.ports_of(it->second);
 					Cell *next = dp.empty() ? nullptr : comp.child_cell(it->second->getPort(dp[0]));
@@ -6262,8 +6411,35 @@ struct Sva2CheckPass : public Pass {
 					clock = hoist_clock;
 					body = spec;
 				}
+				// The disables met along the walk and the final one: an
+				// explicit disable iff overrides a scope default (LRM 16.15:
+				// cv32e40p's `default disable iff !rst_ni` with a declaration
+				// carrying its own); two explicit ones are a nested disable
+				// (LRM 16.12).  The walk stops without a reset when the
+				// declaration body is not itself a spec, so the final one
+				// can repeat a walked one.
+				if (!walked_dis.empty()) {
+					if (disable && sva_op(disable) == "disable_iff" &&
+							std::find(walked_dis.begin(), walked_dis.end(), disable) == walked_dis.end())
+						walked_dis.push_back(disable);
+					std::vector<Cell *> expl;
+					for (Cell *d : walked_dis)
+						if (!d->get_bool_attribute(ID(sv_default_disable)))
+							expl.push_back(d);
+					if (GetSize(expl) > 1) {
+						unsupported++;
+						log("Skipping %s/%s: disable iff both outside and inside the property instance.\n",
+								log_id(mod), log_id(cell));
+						cell->attributes[ID(sva_lowering)] = Const(std::string("placeholder:nested disable iff"));
+						continue;
+					}
+					disable = expl.empty() ? walked_dis.back() : expl[0];
+				}
 				if (outer_disable && sva_op(outer_disable) == "disable_iff") {
-					if (disable && sva_op(disable) == "disable_iff") {
+					bool inner = disable && sva_op(disable) == "disable_iff";
+					bool odef = outer_disable->get_bool_attribute(ID(sv_default_disable));
+					bool idef = inner && disable->get_bool_attribute(ID(sv_default_disable));
+					if (inner && !odef && !idef) {
 						// LRM 16.12: no disable iff inside a nested instance
 						unsupported++;
 						log("Skipping %s/%s: disable iff both outside and inside the property instance.\n",
@@ -6271,7 +6447,9 @@ struct Sva2CheckPass : public Pass {
 						cell->attributes[ID(sva_lowering)] = Const(std::string("placeholder:nested disable iff"));
 						continue;
 					}
-					disable = outer_disable;
+					// an explicit disable overrides a scope default (16.15)
+					if (!inner || !odef || idef)
+						disable = outer_disable;
 				}
 				if (bad || (!body && body_sig.empty() && body_const.empty())) {
 					unsupported++;
@@ -6696,6 +6874,12 @@ struct Sva2CheckPass : public Pass {
 				SigSpec new_a;
 				bool strong_until = false;
 				bool fairness = false;
+				SvaCompiler::EvLocals evm;
+				bool evl = false;
+				if (tresp && !tresp_fair && tresp_delay == 0 && tresp_chain.empty() && tresp_rchain.empty()) {
+					pool<Cell *> seen;
+					evl = comp.tree_has_locals(body, seen) && comp.ev_locals_match(body, tev, tresp_bidx, evm);
+				}
 				SigSpec su_p, su_q;
 				if ((flavor == "assume" || flavor == "restrict") && body &&
 						(sva_op(body) == "eventually" || sva_op(body) == "s_eventually")) {
@@ -6738,6 +6922,11 @@ struct Sva2CheckPass : public Pass {
 					// -expose_bad
 					new_a = comp.reduce1(psig);
 					fail = mod->Not(NEW_ID, new_a);
+				} else if (tresp && evl) {
+					// locals in the response: per-attempt CAM (ev_locals_live)
+					new_a = comp.ev_locals_live(evm, Const(1, 1));
+					fail = mod->Not(NEW_ID, new_a);
+					liveness = true;
 				} else if (tresp) {
 					// Violation of (a |=> F b) is an attempt whose antecedent
 					// completes at t with no b from t+1 on (|->: from t on,

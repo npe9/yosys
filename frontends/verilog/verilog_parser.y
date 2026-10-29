@@ -8033,6 +8033,8 @@ sva_inside_items:
 sva_default_disable:
 	TOK_DEFAULT TOK_DISABLE TOK_IFF expr TOK_SEMICOL {
 		extra->sva_default_disable = sva_add(mk_sva(@$, "disable_iff"), std::move($4));
+		// marks a default (LRM 16.15: an explicit disable iff overrides it)
+		extra->sva_default_disable->set_attribute(ID(sv_default_disable), AstNode::mkconst_int(@$, 1, false));
 		if (!extra->sva_default_frames.empty())
 			extra->sva_default_frames.back().own_dis = true;
 	};

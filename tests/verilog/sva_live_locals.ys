@@ -1,0 +1,88 @@
+# Locals in a temporal response (caliptra fv_ecc_dsa_ctrl
+# wr_core_addr_eventually_in_memory): `b ##0 (1'b1, v = e) |-> s_eventually
+# B(v)` used to be refused.  Each attempt waits for B with its own v, so
+# the single pend bit of the plain response is wrong here; a per-attempt
+# CAM with a focus cursor keeps one exact liveness check, and more
+# distinct pending values than entries are reported by <name>$overflow.
+# a_t1: obligations can be pending at every tick, each satisfied within 4
+# (a plain OR over the entries would disprove it); a_f4: one value
+# starves while the others keep clearing.
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic go, input logic [1:0] a, input logic x, input logic rst);
+  default clocking @(posedge clk); endclocking
+  logic [1:0] c = 2'd0;
+  always_ff @(posedge clk) c <= c + 2'd1;
+  property t1_p; logic [1:0] v; go ##0 (1'b1, v = a) |-> s_eventually (c == v); endproperty
+  property f1_p; logic [1:0] v; go ##0 (1'b1, v = a) |-> s_eventually (a == v + 2'd1); endproperty
+  property t2_p; logic [1:0] v; go ##0 (1'b1, v = a) |=> s_eventually (c == v); endproperty
+  property f2_p; logic [1:0] v; go ##0 (1'b1, v = a) |-> s_eventually (c == v && x); endproperty
+  property f4_p; logic [1:0] v; go ##0 (1'b1, v = a) |-> s_eventually (c == v && v != 2'd3); endproperty
+  a_t1: assert property (t1_p);
+  a_f1: assert property (f1_p);
+  a_t2: assert property (t2_p);
+  a_f2: assert property (disable iff (rst) f2_p);
+  a_f4: assert property (f4_p);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_t1: proved \[lowering=exact:if-a_t1\$overflow\]" 1
+logger -expect log "a_t1\$overflow: proved" 1
+logger -expect log "a_f1: disproved" 1
+logger -expect log "a_t2: proved" 1
+logger -expect log "a_t2\$overflow: capacity exceeded \(depth 3\)" 1
+logger -expect log "a_f2: disproved" 1
+logger -expect log "a_f4: disproved" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# closed design, one attempt at t == 1: a response that never comes
+# (a_nd), cancelled by a disable before it is due (a_dis), and one that
+# comes at t == 3 (a_ok); dedup: three equal pending captures stay one
+# entry
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  default clocking @(posedge clk); endclocking
+  logic [1:0] t = 2'd0;
+  always_ff @(posedge clk) if (t != 2'd3) t <= t + 2'd1;
+  logic [1:0] u = 2'd0;
+  always_ff @(posedge clk) u <= u + 2'd1;
+  logic [1:0] k; assign k = 2'd0;
+  property p; logic [1:0] v; t == 2'd1 ##0 (1'b1, v = t) |-> s_eventually (t == v - 2'd1); endproperty
+  property q; logic [1:0] v; t == 2'd1 ##0 (1'b1, v = t) |-> s_eventually (t == v + 2'd2); endproperty
+  property dd; logic [1:0] v; u != 2'd0 ##0 (1'b1, v = k) |-> s_eventually (u == v); endproperty
+  a_nd:  assert property (p);
+  a_dis: assert property (disable iff (t == 2'd2) p);
+  a_ok:  assert property (q);
+  a_dd:  assert property (dd);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "a_nd: disproved" 1
+logger -expect log "a_dis: proved" 1
+logger -expect log "a_ok: proved" 1
+logger -expect log "a_dd: proved" 1
+logger -expect log "a_dd\$overflow: proved" 1
+ic3 -init-zero
+design -reset
+logger -check-expected
+
+# a capture after a multi-tick prefix stays refused
+logger -expect error "local variables in a \|-> temporal response are not supported" 1
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic go, input logic [1:0] a);
+  default clocking @(posedge clk); endclocking
+  logic [1:0] c = 2'd0;
+  always_ff @(posedge clk) c <= c + 2'd1;
+  property r; logic [1:0] v; go ##1 (1'b1, v = a) |-> s_eventually (c == v); endproperty
+  a_r: assert property (r);
+endmodule
+EOT
+hierarchy -top top
+sva2check

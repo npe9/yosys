@@ -2,12 +2,12 @@ read_verilog -sv -formal struct_param_import.sv
 hierarchy -top wild
 proc
 flatten
-select -assert-none a:sv_degraded
+select -assert-none A:sv_degraded
 ic3 -check-cells
 design -reset
 
 read_verilog -sv -formal struct_param_import.sv
 hierarchy -top named
 proc
-select -assert-none a:sv_degraded
+select -assert-none A:sv_degraded
 ic3 -check-cells

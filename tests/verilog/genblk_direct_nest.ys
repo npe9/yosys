@@ -18,6 +18,6 @@ read_verilog -sv -formal genblk_direct_nest_ref.sv
 hierarchy -top ref_top
 proc
 flatten
-select -assert-none a:sv_degraded
+select -assert-none A:sv_degraded
 async2sync
 ic3 -check-cells -init-zero

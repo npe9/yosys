@@ -1,0 +1,26 @@
+# Register v3 B5 marks survive flatten: a degraded submodule, inlined,
+# leaves its reasons on the parent, so ic3 still refuses the design
+read_verilog -sv -formal <<EOT
+module sub(input clk, output o);
+	assign o = undeclared_x;
+endmodule
+module mid(input clk, output o1, output o2);
+	sub u1(.clk(clk), .o(o1));
+	sub u2(.clk(clk), .o(o2));   // a second instance: the reason is not repeated
+endmodule
+module top(input clk);
+	wire o1, o2;
+	mid u(.clk(clk), .o1(o1), .o2(o2));
+	always @(posedge clk) a: assert (o1 == 1'b0);
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-mod-count 1 A:sv_degraded
+flatten
+select -assert-mod-count 1 A:sv_degraded
+select -assert-mod-count 1 top
+async2sync
+logger -expect log "design carries sv_degraded: top: Identifier `\\undeclared_x' is implicitly declared. @<inlined>:2" 1
+logger -expect error "refusing a design that carries sv_degraded" 1
+ic3 -init-zero

@@ -56,6 +56,43 @@ IdString concat_name(RTLIL::Cell *cell, IdString const &object_name, const std::
 	return concat_views(prefix, cell->name.c_str(), separator, object_name_view);
 }
 
+// Register v3 B5 marks (sv_degraded reasons, sv_permissive) live on the
+// module where the leniency fired; ic3 refuses a design in which any module
+// carries one. Inlined, the template is deleted with its marks, so a free
+// wire in a submodule left a flattened design looking clean: the parent
+// takes the template's reasons (each keeps its @file:line; repeats from
+// further instances are not added again)
+static void inherit_degradation(RTLIL::Module *module, RTLIL::Module *tpl)
+{
+	IdString attr = IdString("\\sv_degraded");
+	if (tpl->attributes.count(attr)) {
+		std::string cur = module->attributes.count(attr) ? module->attributes.at(attr).decode_string() : std::string();
+		pool<std::string> have;
+		for (size_t pos = 0; pos <= cur.size(); ) {
+			size_t next = cur.find("; ", pos);
+			have.insert(cur.substr(pos, next == std::string::npos ? std::string::npos : next - pos));
+			if (next == std::string::npos)
+				break;
+			pos = next + 2;
+		}
+		std::string add = tpl->attributes.at(attr).decode_string();
+		for (size_t pos = 0; pos <= add.size(); ) {
+			size_t next = add.find("; ", pos);
+			std::string entry = add.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+			if (!entry.empty() && !have.count(entry)) {
+				cur += (cur.empty() ? "" : "; ") + entry;
+				have.insert(entry);
+			}
+			if (next == std::string::npos)
+				break;
+			pos = next + 2;
+		}
+		module->attributes[attr] = RTLIL::Const(cur);
+	}
+	if (tpl->get_bool_attribute(IdString("\\sv_permissive")))
+		module->set_bool_attribute(IdString("\\sv_permissive"));
+}
+
 // remove the frontend's "Identifier `NAME' is implicitly declared." entries
 // for a joined hierarchical reference from the module's sv_degraded list
 // (entries are "<reason> @file:line", joined by "; ")
@@ -153,6 +190,8 @@ struct FlattenWorker
 
 	void flatten_cell(RTLIL::Design *design, RTLIL::Module *module, RTLIL::Cell *cell, RTLIL::Module *tpl, SigMap &sigmap, std::vector<RTLIL::Cell*> &new_cells, const std::string &separator)
 	{
+		inherit_degradation(module, tpl);
+
 		// Copy the contents of the flattened cell
 
 		dict<IdString, IdString> memory_map;

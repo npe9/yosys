@@ -2085,13 +2085,25 @@ static void subst_known_reads(AstNode *node, const dict<std::string, int> &known
 	}
 }
 
+// eval_known_int / eval_known_const fold a throwaway copy of an expression,
+// but simplify runs in the live context: inlining a call there inserted its
+// argument and body statements into the enclosing block (current_block) and
+// its wires into the module, before the named block's locals were renamed.
+// The stale copy read the locals as module-level implicit wires (a false
+// sv_degraded mark; `p = f(u)` in `always_comb begin : b logic u; ..`, or a
+// genvar in a generate loop's always block). While probing, a call that
+// does not evaluate as a constant function is left as is (not a constant).
+static int probe_eval_depth = 0;
+
 static bool eval_known_int(AstNode *expr, const dict<std::string, int> &known, int &out)
 {
 	if (!expr)
 		return false;
 	auto copy = expr->clone();
 	subst_known_reads(copy.get(), known, false);
+	probe_eval_depth++;
 	while (copy->simplify(true, 1, -1, false)) { }
+	probe_eval_depth--;
 	if (copy->type != AST_CONSTANT)
 		return false;
 	out = copy->asInt(true);
@@ -2106,7 +2118,9 @@ static std::unique_ptr<AstNode> eval_known_const(AstNode *expr, const dict<std::
 		return nullptr;
 	auto copy = expr->clone();
 	subst_known_reads(copy.get(), known, false);
+	probe_eval_depth++;
 	while (copy->simplify(true, 1, -1, false)) { }
+	probe_eval_depth--;
 	if (copy->type != AST_CONSTANT || !copy->bits_only_01())
 		return nullptr;
 	return copy;
@@ -10032,6 +10046,11 @@ skip_memory_write:;
 			}
 			if (newNode)
 				goto apply_newNode;
+		}
+
+		if (probe_eval_depth > 0) {
+			recursion_counter--;
+			return did_something;
 		}
 
 		size_t arg_count = 0;

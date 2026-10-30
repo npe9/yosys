@@ -1,0 +1,41 @@
+# A call in a statement is inlined once. The known-value probe
+# (eval_known_int, run on a named block before its locals are renamed)
+# used to inline it a second time into the enclosing block, reading the
+# block's locals and the loop genvar as module-level implicit wires
+read_verilog -sv -formal <<EOT
+module top(input logic [3:0] a, output logic [3:0] p);
+	function automatic logic [3:0] inc(logic [3:0] x);
+		return x + 4'd1;
+	endfunction
+	always_comb begin : blk
+		logic [3:0] u;
+		u = a;
+		p = inc(u);
+	end
+	logic [3:0] lo [4];
+	assign lo[0] = a;
+	for (genvar k = 1; k < 4; k++) begin : g
+		logic [3:0] r;
+		if (1) begin : gi
+			always_comb begin : pr
+				r = inc(lo[k-1] + k);
+				r = inc(r);
+			end
+		end
+		assign lo[k] = r;
+	end
+	always_comb begin
+		a0: assert (p == a + 4'd1);
+		a1: assert (lo[3] == a + 4'd12);
+	end
+endmodule
+EOT
+select -assert-none A:sv_degraded
+select -assert-none top/w:u top/w:k top/w:r
+# 7 calls, each with an argument and a result wire
+select -assert-count 14 top/w:inc$func$*
+hierarchy -top top
+proc
+flatten
+async2sync
+ic3 -check-cells -init-zero

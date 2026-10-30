@@ -6995,10 +6995,12 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		// `pkg::P.member` on a struct-typed package parameter: the members
 		// were registered in the package under `P.member` only; register
 		// them under the qualified name the module sees (register v3 D13:
-		// cva6 `cva6_config_pkg::cva6_cfg.XLEN` autowired, a silent 0)
-		if (!str.empty() && str[0] == '\\' && !current_scope.count(str) && str.find("::") != std::string::npos) {
+		// cva6 `cva6_config_pkg::cva6_cfg.XLEN` autowired, a silent 0).
+		// The same for an imported `P.member` (`import tlul_pkg::*;
+		// TL_A_USER_DEFAULT.data_intg`): the import brings in `P` alone
+		if (!str.empty() && str[0] == '\\' && !current_scope.count(str) && str.find('.') != std::string::npos) {
 			size_t q = str.rfind("::");
-			size_t dot = str.find('.', q);
+			size_t dot = str.find('.', q == std::string::npos ? 0 : q);
 			if (dot != std::string::npos) {
 				std::string pname = str.substr(0, dot);
 				if (current_scope.count(pname)) {

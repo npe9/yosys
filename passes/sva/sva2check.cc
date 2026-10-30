@@ -6724,7 +6724,16 @@ struct Sva2CheckPass : public Pass {
 					auto dp = comp.ports_of(it->second);
 					Cell *next = dp.empty() ? nullptr : comp.child_cell(it->second->getPort(dp[0]));
 					if (!next) {
+						// a declaration whose body is a plain boolean
+						// (`sequence S; a == b; endsequence`, no temporal
+						// operator) has no $sva cell: that signal is the
+						// body (it was "malformed spec", not checked)
+						SigSpec db = dp.empty() ? SigSpec() : it->second->getPort(dp[0]);
 						body_sig = SigSpec();
+						if (!db.empty() && db.is_fully_const())
+							body_const = db;
+						else if (!db.empty())
+							body_sig = db;
 						break;
 					}
 					spec = next;

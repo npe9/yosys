@@ -1,0 +1,69 @@
+# A sequence/property declaration whose body is a plain boolean (no
+# temporal operator) used as the whole property: `assert property
+# (@(posedge clk) S)` with `sequence S; a == b; endsequence`. The
+# declaration has no $sva body cell, and sva2check refused it as
+# "malformed spec" (not checked). The body signal (or constant) is now
+# the property. True and false bodies, constants, a property
+# declaration, an alias, disable iff, a cover, arguments, and a
+# per-iteration declaration in a generate loop.
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic d, input logic rst);
+	logic q = 0, nq = 1;
+	always_ff @(posedge clk) begin q <= d; nq <= !d; end
+	logic [1:0] k;
+	assign k = 2'b10;
+	sequence S_true; q != nq; endsequence
+	sequence S_false; q == nq; endsequence
+	sequence S_one; 1'b1; endsequence
+	sequence S_zero; 1'b0; endsequence
+	property P_true; q ^ nq; endproperty
+	sequence S_alias; S_true; endsequence
+	sequence S_rst; q == nq || rst; endsequence
+	sequence SA(x, y); x == y; endsequence
+	a_true: assert property (@(posedge clk) S_true);
+	a_one: assert property (@(posedge clk) S_one);
+	a_prop: assert property (@(posedge clk) P_true);
+	a_alias: assert property (@(posedge clk) S_alias);
+	a_dis: assert property (@(posedge clk) disable iff (!rst) S_rst);
+	c_true: cover property (@(posedge clk) S_true);
+	for (genvar i = 0; i < 2; i++) begin : g
+		sequence S; k[i] == i; endsequence
+		a_s: assert property (@(posedge clk) S);
+		a_i: assert property (@(posedge clk) SA(k[i], i));
+	end
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+select -assert-none A:sv_degraded
+select -assert-none t:$check a:sva_lowering=placeholder* %i
+async2sync
+logger -expect log "9 properties: proved=9 disproved=0 undecided=0" 1
+logger -expect log "c_true: cover reached" 1
+ic3 -init-zero -kind 0 -bmc 4
+logger -check-expected
+design -reset
+
+# the false ones are disproved (not vacuously proved)
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic d);
+	logic q = 0, nq = 1;
+	always_ff @(posedge clk) begin q <= d; nq <= !d; end
+	sequence S_false; q == nq; endsequence
+	sequence S_zero; 1'b0; endsequence
+	sequence SA(x, y); x == y; endsequence
+	a_false: assert property (@(posedge clk) S_false);
+	a_zero: assert property (@(posedge clk) S_zero);
+	a_n: assert property (@(posedge clk) SA(q, q == nq));
+	c_false: cover property (@(posedge clk) S_false);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "3 properties: proved=0 disproved=3 undecided=0" 1
+logger -expect log "c_false: cover unreachable" 1
+ic3 -init-zero -kind 0 -bmc 4
+logger -check-expected

@@ -30,9 +30,12 @@
 #include "libs/minisat/Solver.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <fstream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 #ifndef _WIN32
 #include <sys/wait.h>
 #endif
@@ -52,6 +55,71 @@ static void ic3_check_deadline()
 	if (ic3_deadline_on && std::chrono::steady_clock::now() > ic3_deadline)
 		throw Ic3Timeout();
 }
+
+// One watchdog thread for the whole process: a solve under -timeout arms it
+// with its solver and the deadline, and disarms it when the solve returns.
+// (A thread per SAT call cost ~12% on the battery: IC3 makes many small calls.)
+struct Ic3Watchdog
+{
+	std::mutex mtx;
+	std::condition_variable cv;
+	Minisat::Solver *target = nullptr;
+	std::chrono::steady_clock::time_point deadline;
+	uint64_t generation = 0;
+	bool quit = false;
+	std::thread th;
+
+	Ic3Watchdog() : th([this]() { run(); }) {}
+	~Ic3Watchdog()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			quit = true;
+		}
+		cv.notify_one();
+		th.join();
+	}
+	void run()
+	{
+		std::unique_lock<std::mutex> lock(mtx);
+		while (!quit) {
+			if (!target) {
+				cv.wait(lock);
+				continue;
+			}
+			uint64_t gen = generation;
+			if (cv.wait_until(lock, deadline, [&]() { return quit || generation != gen; }))
+				continue;
+			target->interrupt();
+			target = nullptr;
+		}
+	}
+	void arm(Minisat::Solver *s, std::chrono::steady_clock::time_point dl)
+	{
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			target = s;
+			deadline = dl;
+			generation++;
+		}
+		cv.notify_one();
+	}
+	// after disarm() returns the watchdog no longer touches the solver
+	void disarm()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			target = nullptr;
+			generation++;
+		}
+		cv.notify_one();
+	}
+	static Ic3Watchdog &get()
+	{
+		static Ic3Watchdog w;
+		return w;
+	}
+};
 
 // ezSAT backend on the plain (non-simplifying) in-tree MiniSat solver.
 // The default ezMiniSAT uses SimpSolver whose variable elimination re-runs
@@ -148,26 +216,26 @@ struct Ic3MiniSat : public ezSAT
 
 		// Under -timeout a single solve must not overrun the budget (the
 		// deadline used to be checked only between SAT calls: one hard
-		// solve on a ~5M-clause unrolling ran past it).  Solve in
-		// propagation-budget slices and check the deadline between them;
-		// learnt clauses survive across slices, and an interrupted solve
-		// leaves the solver at level 0, reusable for the next query.
+		// solve on a ~5M-clause unrolling ran past it).  Solve once and let
+		// a watchdog interrupt it at the deadline.  This used to solve in
+		// 2^21-propagation slices instead, but each slice restarted the
+		// search at level 0, and a model of an unrolling with more variables
+		// than that never fit in one slice: easy satisfiable queries on the
+		// 2.4M-variable tlul_assert pre-pass spun until the deadline.
 		if (!ic3_deadline_on) {
 			if (!minisat_solver->solve(assumps))
 				return false;
 		} else {
-			while (1) {
-				ic3_check_deadline();
-				minisat_solver->setPropBudget(1 << 21);
-				Minisat::lbool r = minisat_solver->solveLimited(assumps);
-				if (r == Minisat::lbool((uint8_t)0))
-					break;
-				if (r == Minisat::lbool((uint8_t)1)) {
-					minisat_solver->budgetOff();
-					return false;
-				}
-			}
-			minisat_solver->budgetOff();
+			ic3_check_deadline();
+			Ic3Watchdog &watchdog = Ic3Watchdog::get();
+			watchdog.arm(minisat_solver, ic3_deadline);
+			Minisat::lbool r = minisat_solver->solveLimited(assumps);
+			watchdog.disarm();
+			minisat_solver->clearInterrupt();
+			if (r == Minisat::lbool((uint8_t)2))
+				throw Ic3Timeout();
+			if (r == Minisat::lbool((uint8_t)1))
+				return false;
 		}
 
 		modelValues.clear();

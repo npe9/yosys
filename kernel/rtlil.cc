@@ -1571,7 +1571,7 @@ bool RTLIL::Module::reprocess_if_necessary(RTLIL::Design *)
 	return false;
 }
 
-bool RTLIL::Module::resolve_hierrefs(RTLIL::Design *)
+bool RTLIL::Module::resolve_hierrefs(RTLIL::Design *, const pool<RTLIL::Module*> *)
 {
 	return false;
 }

@@ -553,7 +553,7 @@ void check_cell_connections(const RTLIL::Module &module, RTLIL::Cell &cell, RTLI
 }
 
 bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check, bool flag_simcheck, bool flag_smtcheck,
-		   std::vector<std::string> &libdirs)
+		   std::vector<std::string> &libdirs, const pool<RTLIL::Module*> *used_modules = nullptr)
 {
 	bool did_something = false;
 	std::map<RTLIL::Cell*, std::pair<int, int>> array_cells;
@@ -680,8 +680,9 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 
 	// with its instances derived (a round in which nothing changed here),
 	// a module's wider downward hierarchical references can be declared at
-	// their targets' widths (AstModule)
-	if (!did_something && module->resolve_hierrefs(design))
+	// their targets' widths, and its upward references (a bound checker's
+	// `target.sig`) turned into input ports (AstModule)
+	if (!did_something && module->resolve_hierrefs(design, used_modules))
 		return true;
 
 	for (auto &it : array_cells)
@@ -1239,8 +1240,9 @@ struct HierarchyPass : public Pass {
 					used_modules.insert(mod);
 			}
 
+			pool<RTLIL::Module*> used_pool(used_modules.begin(), used_modules.end());
 			for (auto module : used_modules) {
-				if (expand_module(design, module, flag_check, flag_simcheck, flag_smtcheck, libdirs))
+				if (expand_module(design, module, flag_check, flag_simcheck, flag_smtcheck, libdirs, top_mod ? &used_pool : nullptr))
 					did_something = true;
 			}
 

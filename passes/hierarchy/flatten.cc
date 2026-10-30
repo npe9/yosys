@@ -382,10 +382,55 @@ struct FlattenWorker
 			module->rename(scopeinfo, cell_name);
 	}
 
+	// An upward reference in a bound checker (`bind dut chk_m u_chk(..)`,
+	// chk_m reading `dut.sig`) was turned into an input port by hierarchy
+	// (AstModule::resolve_hierrefs, sv_upward_ref = the path below the
+	// parent). Connect it in this parent before any cell is inlined, so a
+	// path that goes on down (`dut.u_sub.cnt`) is a downward reference here
+	// that the inlining of u_sub joins. An instance whose parent lacks the
+	// target keeps a free input, recorded as a degradation.
+	static void connect_upward_refs(RTLIL::Design *design, RTLIL::Module *module)
+	{
+		for (auto cell : module->cells()) {
+			RTLIL::Module *tpl = design->module(cell->type);
+			if (!tpl)
+				continue;
+			for (auto port : tpl->ports) {
+				RTLIL::Wire *pw = tpl->wire(port);
+				if (!pw || !pw->port_input || !pw->attributes.count(ID(sv_upward_ref)) || cell->hasPort(port))
+					continue;
+				std::string rest = pw->attributes.at(ID(sv_upward_ref)).decode_string();
+				RTLIL::IdString rest_id = RTLIL::escape_id(rest);
+				RTLIL::Wire *src = module->wire(rest_id);
+				if (!src && rest.find('.') != std::string::npos) {
+					src = module->addWire(rest_id, GetSize(pw));
+					src->is_signed = pw->is_signed;
+					src->set_bool_attribute(ID::hierconn);
+					src->set_bool_attribute(ID(sv_hierref));
+				}
+				bool dotted = rest.find('.') != std::string::npos;
+				if (!src || GetSize(src) != GetSize(pw) || (!dotted && src->get_bool_attribute(ID(sv_hierref)))) {
+					log_warning("Upward reference %s.%s is not connected in %s (no %d-bit `%s' there); it stays a free input.\n",
+							log_id(cell), log_id(port), log_id(module), GetSize(pw), rest.c_str());
+					IdString attr = IdString("\\sv_degraded");
+					std::string cur = module->attributes.count(attr) ? module->attributes.at(attr).decode_string() : std::string();
+					cur += (cur.empty() ? "" : "; ") + stringf("Upward reference `%s' of %s is not connected (no %d-bit `%s' here). @cell %s",
+							log_id(port), log_id(cell->type), GetSize(pw), rest.c_str(), log_id(cell));
+					module->attributes[attr] = RTLIL::Const(cur);
+					continue;
+				}
+				log("Connecting upward reference %s.%s to %s.%s.\n", log_id(cell), log_id(port), log_id(module), log_id(src));
+				cell->setPort(port, src);
+			}
+		}
+	}
+
 	void flatten_module(RTLIL::Design *design, RTLIL::Module *module, pool<RTLIL::Module*> &used_modules, const std::string &separator)
 	{
 		if (!design->selected(module) || module->get_blackbox_attribute(ignore_wb))
 			return;
+
+		connect_upward_refs(design, module);
 
 		SigMap sigmap(module);
 		std::vector<RTLIL::Cell*> worklist = module->selected_cells();

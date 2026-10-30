@@ -1915,6 +1915,105 @@ bool AstModule::reprocess_if_necessary(RTLIL::Design *design)
 	return false;
 }
 
+// a derived module's source name (`$paramod\dut\W=..` and
+// `$paramod$<sha1>\dut` are both `\dut`)
+static std::string source_module_name(RTLIL::IdString id)
+{
+	std::string s = id.str();
+	if (s.rfind("$paramod", 0) != 0)
+		return s;
+	size_t b = s.find('\\');
+	if (b == std::string::npos)
+		return s;
+	size_t e = s.find('\\', b + 1);
+	return s.substr(b, e == std::string::npos ? std::string::npos : e - b);
+}
+
+// the wire a downward path (`u_a.g[0].u_b.sig`) names below `mod`, through
+// instance names (generate scopes included) to a non-blackbox module's wire
+static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod, std::string rest)
+{
+	for (int depth = 0; depth < 64 && mod; depth++) {
+		// the longest instance-name prefix of the remaining path
+		RTLIL::Cell *cell = nullptr;
+		size_t cut = std::string::npos;
+		for (size_t dot = rest.find('.'); dot != std::string::npos; dot = rest.find('.', dot + 1))
+			if (RTLIL::Cell *c = mod->cell(RTLIL::escape_id(rest.substr(0, dot))))
+				cell = c, cut = dot;
+		if (!cell)
+			return nullptr;
+		RTLIL::Module *sub = design->module(cell->type);
+		rest = rest.substr(cut + 1);
+		if (!sub || sub->get_blackbox_attribute())
+			return nullptr;
+		if (rest.find('.') == std::string::npos || sub->wire(RTLIL::escape_id(rest)))
+			return sub->wire(RTLIL::escape_id(rest));
+		mod = sub;
+	}
+	return nullptr;
+}
+
+static bool wire_is_driven(RTLIL::Module *mod, RTLIL::Wire *wire)
+{
+	auto hits = [wire](const RTLIL::SigSpec &sig) {
+		for (auto &chunk : sig.chunks())
+			if (chunk.wire == wire)
+				return true;
+		return false;
+	};
+	for (auto &conn : mod->connections())
+		if (hits(conn.first))
+			return true;
+	for (auto cell : mod->cells())
+		for (auto &conn : cell->connections())
+			if (cell->output(conn.first) && hits(conn.second))
+				return true;
+	bool driven = false;
+	for (auto &it : mod->processes) {
+		std::function<void(RTLIL::CaseRule*)> walk = [&](RTLIL::CaseRule *cs) {
+			for (auto &act : cs->actions)
+				driven |= hits(act.first);
+			for (auto sw : cs->switches)
+				for (auto c : sw->cases)
+					walk(c);
+		};
+		walk(&it.second->root_case);
+		for (auto sync : it.second->syncs)
+			for (auto &act : sync->actions)
+				driven |= hits(act.first);
+	}
+	return driven;
+}
+
+// whether the parents seen this round may not be the final ones: a module in
+// use instantiates one with parameters not yet derived into a `$paramod`
+// module, or one is no longer instantiated at all
+static bool pending_parent_derivation(RTLIL::Design *design, const std::vector<std::pair<RTLIL::Module*, RTLIL::Cell*>> &parents,
+		const pool<RTLIL::Module*> *used_modules)
+{
+	pool<RTLIL::IdString> names, instantiated;
+	for (auto &pc : parents)
+		names.insert(pc.first->name);
+	for (auto mod : design->modules())
+		for (auto c : mod->cells())
+			if (names.count(c->type))
+				instantiated.insert(c->type);
+	// a parent no longer instantiated (this round derived its instances
+	// into a `$paramod` module that the round's used set does not hold yet)
+	for (auto &pc : parents)
+		if (!instantiated.count(pc.first->name) && !pc.first->get_bool_attribute(ID::top) &&
+				!pc.first->get_bool_attribute(ID::initial_top))
+			return true;
+	for (auto mod : design->modules()) {
+		if (used_modules && !used_modules->count(mod))
+			continue;
+		for (auto c : mod->cells())
+			if (names.count(c->type) && !c->parameters.empty() && c->type.str().rfind("$paramod", 0) != 0)
+				return true;
+	}
+	return false;
+}
+
 // Downward hierarchical references (`u_ctrl.state_q`): the Verilog frontend
 // makes an implicit one-bit wire for each (sv_hierref + hierconn), which
 // flatten joins to the instance's wire.  A wider (or signed) target cannot
@@ -1925,60 +2024,121 @@ bool AstModule::reprocess_if_necessary(RTLIL::Design *design)
 // members), still marked for flatten's join.  Paths go through instance
 // names (generate scopes included: `g[0].u_l.err_o`) down to a wire; a
 // reference to a memory, a blackbox or a missing name stays implicit.
-bool AstModule::resolve_hierrefs(RTLIL::Design *design)
+//
+// Upward references (IEEE 1800-2017 23.8; a checker bound into its target,
+// `bind sha512_core fv_m u_fv(..)` reading `sha512_core.zeroize`): when the
+// first component is not an instance here but is the module name of every
+// module instantiating this one, the rest is looked up from that parent.
+// Such a read becomes an input port of the target's width, connected in
+// each parent to the target (or, for a path that goes on down, to a
+// downward reference there, which flatten then joins).  A reference this
+// module drives, or one that does not resolve the same way in every parent,
+// stays implicit.
+bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module*> *used_modules)
 {
 	if (get_bool_attribute(ID(sv_hierrefs_resolved)))
 		return false;
-	struct Target { std::string name; int width; bool is_signed; };
+	struct Target { std::string name; int width; bool is_signed; std::string up_rest; };
 	std::vector<Target> targets;
-	bool any_wide = false;
+	bool any_wide = false, any_up = false;
+	std::vector<std::pair<RTLIL::Module*, RTLIL::Cell*>> parents;
+	bool parents_known = false;
 	for (auto wire : wires()) {
 		if (!wire->get_bool_attribute(ID(sv_hierref)) || wire->port_id)
 			continue;
-		std::string rest = wire->name.str().substr(1);
-		RTLIL::Module *mod = this;
-		RTLIL::Wire *target = nullptr;
-		for (int depth = 0; depth < 64 && mod && !target; depth++) {
-			// the longest instance-name prefix of the remaining path
-			RTLIL::Cell *cell = nullptr;
-			size_t cut = std::string::npos;
-			for (size_t dot = rest.find('.'); dot != std::string::npos; dot = rest.find('.', dot + 1))
-				if (RTLIL::Cell *c = mod->cell(RTLIL::escape_id(rest.substr(0, dot))))
-					cell = c, cut = dot;
-			if (!cell)
-				break;
-			RTLIL::Module *sub = design->module(cell->type);
-			rest = rest.substr(cut + 1);
-			if (!sub || sub->get_blackbox_attribute())
-				break;
-			if (rest.find('.') == std::string::npos || sub->wire(RTLIL::escape_id(rest)))
-				target = sub->wire(RTLIL::escape_id(rest));
-			mod = sub;
-		}
+		std::string path = wire->name.str().substr(1);
+		RTLIL::Wire *target = walk_hierref_down(design, this, path);
 		// a target that is itself an unresolved reference in the child
-		if (!target || target->get_bool_attribute(ID(sv_hierref)))
+		if (target && !target->get_bool_attribute(ID(sv_hierref))) {
+			targets.push_back({wire->name.str(), target->width, target->is_signed, std::string()});
+			if (target->width != 1 || target->is_signed)
+				any_wide = true;
 			continue;
-		targets.push_back({wire->name.str(), target->width, target->is_signed});
-		if (target->width != 1 || target->is_signed)
-			any_wide = true;
+		}
+		if (target)
+			continue;
+		// upward: `<parent module name>.<rest>`
+		size_t dot = path.find('.');
+		if (dot == std::string::npos || cell(RTLIL::escape_id(path.substr(0, dot))))
+			continue;
+		std::string head = RTLIL::escape_id(path.substr(0, dot)), rest = path.substr(dot + 1);
+		if (!parents_known) {
+			for (auto mod : design->modules()) {
+				// only modules in use (the undervived base of a
+				// parametric target also holds the bound instance)
+				if (used_modules && !used_modules->count(mod))
+					continue;
+				for (auto c : mod->cells())
+					if (c->type == name)
+						parents.push_back({mod, c});
+			}
+			parents_known = true;
+		}
+		if (parents.empty() || wire_is_driven(this, wire))
+			continue;
+		// a parent still awaiting its derivation (`dut #(.W(3)) u_dut` not
+		// yet turned into `$paramod\dut\W=..` this round): its width may
+		// not be the one used; come back in the next round
+		if (pending_parent_derivation(design, parents, used_modules))
+			return false;
+		int width = -1;
+		bool is_signed = false, ok = true;
+		for (auto &pc : parents) {
+			RTLIL::Module *parent = pc.first;
+			if (source_module_name(parent->name) != head) {
+				ok = false;
+				break;
+			}
+			RTLIL::Wire *t = rest.find('.') == std::string::npos ? parent->wire(RTLIL::escape_id(rest)) :
+					walk_hierref_down(design, parent, rest);
+			if (!t || t->get_bool_attribute(ID(sv_hierref)) || (width >= 0 && (t->width != width || t->is_signed != is_signed))) {
+				ok = false;
+				break;
+			}
+			// a downward reference wire already in the parent must agree
+			if (rest.find('.') != std::string::npos)
+				if (RTLIL::Wire *pw = parent->wire(RTLIL::escape_id(rest)))
+					if (pw->width != t->width) {
+						ok = false;
+						break;
+					}
+			width = t->width, is_signed = t->is_signed;
+		}
+		if (!ok || width < 1)
+			continue;
+		targets.push_back({wire->name.str(), width, is_signed, rest});
+		any_up = true;
 	}
-	if (!any_wide) {
+	if (!any_wide && !any_up) {
 		set_bool_attribute(ID(sv_hierrefs_resolved));
 		return false;
 	}
 	loadconfig();
 	auto new_ast = ast->clone();
 	auto loc = ast->location;
+	int max_port_id = 0;
+	for (auto &child : new_ast->children)
+		if (child->type == AST_WIRE && child->port_id > max_port_id)
+			max_port_id = child->port_id;
 	for (auto &t : targets) {
 		auto wire = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE,
 				AstNode::mkconst_int(loc, t.width - 1, true), AstNode::mkconst_int(loc, 0, true)));
 		wire->str = t.name;
 		wire->is_signed = t.is_signed;
-		wire->set_attribute(ID::hierconn, AstNode::mkconst_int(loc, 1, false));
-		wire->set_attribute(ID(sv_hierref), AstNode::mkconst_int(loc, 1, false));
+		if (t.up_rest.empty()) {
+			wire->set_attribute(ID::hierconn, AstNode::mkconst_int(loc, 1, false));
+			wire->set_attribute(ID(sv_hierref), AstNode::mkconst_int(loc, 1, false));
+			log("Hierarchical reference %s.%s resolved to %d%s bits; rederiving the module.\n",
+					log_id(name), log_id(t.name), t.width, t.is_signed ? " signed" : "");
+		} else {
+			wire->is_input = true;
+			wire->port_id = ++max_port_id;
+			// flatten connects it in each instantiating module
+			wire->set_attribute(ID(sv_upward_ref), AstNode::mkconst_str(loc, t.up_rest));
+			log("Upward reference %s.%s resolved to %d%s bits in %d instantiating module(s); rederiving the module with an input port.\n",
+					log_id(name), log_id(t.name), t.width, t.is_signed ? " signed" : "", GetSize(parents));
+		}
 		new_ast->children.push_back(std::move(wire));
-		log("Hierarchical reference %s.%s resolved to %d%s bits; rederiving the module.\n",
-				log_id(name), log_id(t.name), t.width, t.is_signed ? " signed" : "");
 	}
 	bool intf_done = get_bool_attribute(ID::interfaces_replaced_in_module);
 	RTLIL::Module *new_module = process_and_replace_module(design, this, new_ast.get(), NULL);

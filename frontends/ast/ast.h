@@ -413,7 +413,7 @@ namespace AST
 		std::string derive_common(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, std::unique_ptr<AstNode>* new_ast_out, bool quiet = false);
 		void expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Module *> &local_interfaces) override;
 		bool reprocess_if_necessary(RTLIL::Design *design) override;
-		bool resolve_hierrefs(RTLIL::Design *design) override;
+		bool resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module*> *used_modules = nullptr) override;
 		RTLIL::Module *clone() const override;
 		void loadconfig() const;
 	};

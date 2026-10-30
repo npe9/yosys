@@ -1,0 +1,31 @@
+read_verilog -sv -formal hier_ref_bind_up.sv
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+# each assert proves only if it reads the real signal (a free wire disproves)
+ic3 -check-cells -init-zero
+design -reset
+
+# the checker read alone (the target not in the design): stays degraded
+read_verilog -sv -formal hier_ref_bind_up.sv
+hierarchy -top chk_m
+proc
+select -assert-any A:sv_degraded
+design -reset
+
+# a written upward reference, and a checker under two module types: both
+# stay free wires, and the flattened top carries their degradation
+read_verilog -sv -formal hier_ref_bind_up_neg.sv
+hierarchy -top top
+proc
+flatten
+select -assert-mod-count 1 A:sv_degraded
+select -assert-any top/u_dut.u_wr.dut.zeroize top/u_other.u_two.dut.zeroize
+sva2check
+async2sync
+logger -expect log "design carries sv_degraded: top: Identifier `\\dut.zeroize' is implicitly declared" 1
+logger -expect error "refusing a design that carries sv_degraded" 1
+ic3 -check-cells -init-zero

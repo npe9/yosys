@@ -1202,8 +1202,11 @@ static bool param_has_no_default(const AstNode* param) {
 	// Children are the default value slot followed by an optional wiretype
 	// and an optional packed range from the declared type.
 	log_assert(children.size() <= 3);
+	// A typed one keeps a placeholder value marked sv_no_default (the
+	// parser); an override replaces it.
 	return children.empty() ||
-		(children.size() == 1 && children[0]->type == AST_RANGE);
+		(children.size() == 1 && children[0]->type == AST_RANGE) ||
+		children[0]->attributes.count(ID(sv_no_default));
 }
 
 static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool defer, std::unique_ptr<AstNode> original_ast = NULL, bool quiet = false)
@@ -2634,7 +2637,9 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 		}
 		continue;
 	rewrite_parameter:
-		if (param_has_no_default(child.get()))
+		// no value slot (a typed one keeps its placeholder slot)
+		if (param_has_no_default(child.get()) &&
+				!(!child->children.empty() && child->children[0]->attributes.count(ID(sv_no_default))))
 			child->children.insert(child->children.begin(), nullptr);
 		if ((it->second.flags & RTLIL::CONST_FLAG_REAL) != 0) {
 			child->children[0] = std::make_unique<AstNode>(loc, AST_REALVALUE);

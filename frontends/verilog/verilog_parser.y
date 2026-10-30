@@ -3323,6 +3323,10 @@ single_param_decl:
 		// Keep a placeholder value when a packed range is also stored.
 		if (decl->children.size() <= 1)
 			decl->children.erase(decl->children.begin());
+		else
+			// a typed parameter (`parameter int unsigned N`): the
+			// placeholder is not a default (param_has_no_default)
+			decl->children[0]->set_attribute(ID(sv_no_default), AstNode::mkconst_int(@1, 1, false));
 	};
 
 param_unpacked:

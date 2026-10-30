@@ -1,0 +1,29 @@
+# A typed parameter without a default (`parameter int unsigned N`) kept a
+# placeholder 0 that looked like a default: the module was elaborated at
+# read time with N = 0 (i3c_dat_cache: `$clog2(N)'('b0)` became a
+# zero-size cast, a read error). It is now deferred like an untyped one,
+# and elaborated with the instance's override.
+read_verilog -sv <<EOT
+module m #(parameter int unsigned N, parameter [3:0] Q, localparam int unsigned W = $clog2(N)) (output [W-1:0] o, output [3:0] q);
+	assign o = W'('b0) | W'(Q);
+	assign q = Q;
+endmodule
+module top(output [2:0] o, output [3:0] q);
+	m #(.N(8), .Q(4'd5)) u(.o(o), .q(q));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-count 1 top/o
+sat -verify -prove o 3'd5 -prove q 4'd5 top
+design -reset
+
+# not overridden: an error, not a silent 0
+read_verilog -sv <<EOT
+module m #(parameter int unsigned N) (output [7:0] o);
+	assign o = N;
+endmodule
+EOT
+logger -expect error "Parameter `\\N' has no default value and has not been overridden" 1
+hierarchy -top m

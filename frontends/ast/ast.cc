@@ -2196,8 +2196,15 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 		{
 			size_t sep = tbase.rfind("::");
 			if (sep != std::string::npos) {
-				std::string scope = "\\" + tbase.substr(0, sep), leaf = "\\" + tbase.substr(sep + 2);
-				AstModule *am = dynamic_cast<AstModule*>(design->module(RTLIL::IdString(scope)));
+				std::string scope = tbase.substr(0, sep), leaf = "\\" + tbase.substr(sep + 2);
+				// a derived parent is already a `$paramod...` name; a parametric
+				// one that is not yet derived is stored as `$abstract\name`.
+				// Missing it here used to fall through to any package typedef
+				// with the same leaf name (OpenTitan's many `state_e`).
+				AstModule *am = nullptr;
+				for (auto cand_scope : {scope[0] == '$' ? scope : "\\" + scope, "$abstract\\" + scope})
+					if ((am = dynamic_cast<AstModule*>(design->module(RTLIL::IdString(cand_scope)))) != nullptr)
+						break;
 				if (am && am->ast)
 					for (auto& cand : am->ast->children)
 						if (cand->type == AST_TYPEDEF && cand->str == leaf) {
@@ -2217,11 +2224,15 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 					cname.compare(cname.size() - tbase.size(), tbase.size(), tbase) == 0 &&
 					cname.compare(cname.size() - tbase.size() - 2, 2, "::") == 0);
 		};
-		for (auto& cand : new_ast->children)
-			if (cand->type == AST_TYPEDEF && matches(cand->str)) {
-				resolved = cand.get();
-				break;
-			}
+		// (only when the qualifier did not name it: the child also holds
+		// package typedefs, and a `pkg::state_e` suffix match would replace
+		// the parent's own `state_e`)
+		if (!resolved)
+			for (auto& cand : new_ast->children)
+				if (cand->type == AST_TYPEDEF && matches(cand->str)) {
+					resolved = cand.get();
+					break;
+				}
 		// not the child's own typedef: a compilation-unit (file-scope)
 		// typedef, or a package's (register v3 D0)
 		if (!resolved)
@@ -2346,8 +2357,17 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 		}
 		rewritten.insert(child->str);
 	}
+	// brought typedefs / parameters go just before the first rewritten type
+	// parameter, so value parameters declared ahead of it (`Cfg` in
+	// `#(Cfg, type w_t)`, whose members a brought `logic [Cfg.W-1:0]`
+	// reads) stay declared first
+	size_t at = 0;
+	while (at < new_ast->children.size() && !(new_ast->children[at]->type == AST_TYPEDEF && rewritten.count(new_ast->children[at]->str)))
+		at++;
+	if (at == new_ast->children.size())
+		at = 0;
 	for (auto& e : enum_clones)
-		new_ast->children.insert(new_ast->children.begin(), std::move(e));
+		new_ast->children.insert(new_ast->children.begin() + at, std::move(e));
 
 	para_counter = 0;
 	for (auto& child : new_ast->children) {

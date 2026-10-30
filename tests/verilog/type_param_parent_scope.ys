@@ -1,0 +1,71 @@
+# A type parameter whose actual is a module-local typedef of a PARAMETRIC
+# parent (OpenTitan `PRIM_FLOP_SPARSE_FSM(u_state_regs, ..., state_e, Idle)`
+# inside csrng_cmd_stage).  The actual reaches derive as `\stage::state_e`
+# (abstract parent) or `$paramod\stage\P=...::state_e` (derived parent);
+# neither was found, and the bare-name fallback took a package's
+# `state_e` (decoy_pkg's 9-bit one here), resizing the ports and making
+# is_undefined_state true for every value.
+logger -werror "Resizing cell port"
+read_verilog -sv <<EOT
+package decoy_pkg;
+  typedef enum logic [8:0] {X0 = 9'd0, X1 = 9'd3} state_e;
+endpackage
+module sp #(parameter int Width = 1, parameter type StateEnumT = logic [Width-1:0])
+           (input StateEnumT state_i, output StateEnumT state_o, output logic err_o);
+  assign state_o = StateEnumT'(state_i);
+  function automatic logic is_undefined_state(StateEnumT sig);
+    logic is_defined = 1'b0;
+    for (int i = 0, StateEnumT t = t.first(); i < t.num(); i += 1, t = t.next())
+      is_defined |= (sig === t);
+    return ~is_defined;
+  endfunction
+  assign err_o = is_undefined_state(state_o);
+endmodule
+module stage #(parameter int P = 1) (input logic [7:0] d, output logic [7:0] q, output logic e);
+  localparam int StateWidth = 8;
+  typedef enum logic [StateWidth-1:0] {Idle = 8'b11110101, Flush = 8'b01011011} state_e;
+  state_e state_q;
+  sp #(.StateEnumT(state_e), .Width($bits(state_e))) u_state_regs (.state_i(state_e'(d)), .state_o(state_q), .err_o(e));
+  assign q = state_q;
+endmodule
+module top (input logic [7:0] d, output logic [7:0] q, output logic e, output logic [7:0] q1, output logic e1);
+  stage #(.P(2)) u (.d, .q, .e);
+  stage u1 (.d, .q(q1), .e(e1));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-count 1 w:u.u_state_regs.state_o
+sat -set d 8'b11110101 -prove e 0 -prove e1 0 -verify
+sat -set d 8'b01011011 -prove e 0 -prove e1 0 -verify
+sat -set d 8'h03 -prove e 1 -prove e1 1 -verify
+sat -set d 8'h00 -prove e 1 -prove e1 1 -verify
+sat -prove q d -prove q1 d -verify
+design -reset
+
+# The parent typedefs a struct type actual brings along read a member of
+# the parent's struct parameter (pulp axi_xbar_intf `typedef logic
+# [Cfg.AxiDataWidth/8-1:0] strb_t`). They must be inserted after the
+# child's own value parameters, or `Cfg.W` is an undeclared identifier.
+read_verilog -sv <<EOT
+package cfg_pkg;
+  typedef struct packed { int unsigned W; int unsigned N; } cfg_t;
+endpackage
+module child #(parameter cfg_pkg::cfg_t Cfg = '0, parameter type w_t = logic) (input w_t i, output w_t o);
+  assign o = i;
+endmodule
+module parent #(parameter cfg_pkg::cfg_t Cfg = '{W: 16, N: 2}) (input logic [15:0] d, input logic [1:0] s, output logic [15:0] q, output logic [1:0] r);
+  typedef logic [Cfg.W-1:0] data_t;
+  typedef logic [Cfg.W/8-1:0] strb_t;
+  typedef struct packed { data_t data; strb_t strb; } w_t;
+  w_t a, b;
+  assign a = '{data: d, strb: s};
+  child #(.Cfg(Cfg), .w_t(w_t)) u (.i(a), .o(b));
+  assign q = b.data; assign r = b.strb;
+endmodule
+EOT
+hierarchy -top parent
+proc
+flatten
+sat -prove q d -prove r s -verify

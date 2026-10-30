@@ -274,6 +274,7 @@ namespace AST
 		std::unique_ptr<AstNode> readmem(bool is_readmemh, std::string mem_filename, AstNode *memory, int start_addr, int finish_addr, bool unconditional_init);
 		void expand_genblock(const std::string &prefix);
 		void label_genblks(std::set<std::string>& existing, int &counter);
+		void label_conditional_branches(std::set<std::string>& existing, int &counter);
 		void mem2reg_as_needed_pass1(dict<AstNode*, pool<std::string>> &mem2reg_places,
 				dict<AstNode*, uint32_t> &mem2reg_flags, dict<AstNode*, uint32_t> &proc_flags, uint32_t &status_flags);
 		bool mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod, AstNode *block, AstNode* async_block);

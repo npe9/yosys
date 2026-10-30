@@ -11098,14 +11098,45 @@ void AstNode::expand_genblock(const std::string &prefix)
 
 // add implicit AST_GENBLOCK names according to IEEE 1364-2005 Section 12.4.3 or
 // IEEE 1800-2017 Section 27.6
+static bool is_directly_nested(AstNode *node)
+{
+	return node->type == AST_GENBLOCK && node->str.empty() && node->get_bool_attribute(ID(sv_gen_wrapper)) &&
+			node->children.size() == 1 && (node->children[0]->type == AST_GENIF || node->children[0]->type == AST_GENCASE);
+}
+
+// IEEE 1800-2017 27.5: a generate block of a conditional construct that holds
+// nothing but another conditional construct, without begin/end, is not a scope
+// of its own; the inner construct's blocks belong to the outer one (so the
+// blocks of `if .. else if .. else` are siblings and share its implicit name)
+void AstNode::label_conditional_branches(std::set<std::string>& existing, int &counter)
+{
+	auto label_branch = [&](AstNode *branch) {
+		if (is_directly_nested(branch))
+			branch->children[0]->label_conditional_branches(existing, counter);
+		else
+			branch->label_genblks(existing, counter);
+	};
+	for (auto& child : children) {
+		if (child->type == AST_COND || child->type == AST_CONDX || child->type == AST_CONDZ)
+			for (auto& item : child->children)
+				label_branch(item.get());
+		else
+			label_branch(child.get());
+	}
+}
+
 void AstNode::label_genblks(std::set<std::string>& existing, int &counter)
 {
 	switch (type) {
 	case AST_GENIF:
-	case AST_GENFOR:
 	case AST_GENCASE:
 		// seeing a proper generate control flow construct increments the
 		// counter once
+		++counter;
+		label_conditional_branches(existing, counter);
+		break;
+
+	case AST_GENFOR:
 		++counter;
 		for (auto& child : children)
 			child->label_genblks(existing, counter);

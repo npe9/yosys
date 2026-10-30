@@ -1,0 +1,23 @@
+read_verilog -sv genblk_direct_nest.sv
+hierarchy -top top
+select -assert-count 1 top/g_many.w
+select -assert-count 0 top/genblk1.g_many.w
+select -assert-count 0 top/g_zero.w top/g_one.w
+select -assert-count 1 top/g_then.w
+select -assert-count 0 top/genblk2.g_then.w
+select -assert-count 1 top/g_arm.w
+select -assert-count 0 top/g_dflt.w
+select -assert-count 1 top/genblk4.g_inner.w
+select -assert-count 1 top/genblk5.b
+select -assert-count 0 top/genblk5.a
+select -assert-count 1 top/genblk6.c
+design -reset
+
+# the reference through the chain resolves: no free wire, and both asserts prove
+read_verilog -sv -formal genblk_direct_nest_ref.sv
+hierarchy -top ref_top
+proc
+flatten
+select -assert-none a:sv_degraded
+async2sync
+ic3 -check-cells -init-zero

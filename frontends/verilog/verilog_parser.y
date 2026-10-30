@@ -6436,7 +6436,10 @@ gen_block:
 // result is wrapped in a genblock only if necessary
 gen_stmt_block:
 	{
-		(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_GENBLOCK));
+		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_GENBLOCK));
+		// no begin/end: a lone conditional construct in here is directly nested
+		// (IEEE 1800-2017 27.5); label_genblks gives such a wrapper no scope
+		node->set_attribute(ID(sv_gen_wrapper), AstNode::mkconst_int(@$, 1, false));
 		sva_enter_default_scope(extra);
 	} gen_stmt_or_module_body_stmt {
 		sva_exit_default_scope(extra->ast_stack.back(), extra);

@@ -1,0 +1,15 @@
+read_verilog -sv -formal hier_ref_upward.sv
+hierarchy -top top
+# one module-level reference wire per upward target, none per loop iteration
+select -assert-count 1 top/u_core.en_q
+select -assert-count 0 top/g_loop[0].u_core.en_q top/g_loop[1].u_core.en_q
+select -assert-count 1 top/u_core.flag
+select -assert-count 0 top/g_loop[0].g_in.u_core.flag
+select -assert-count 1 top/g_loop[0].u_leaf.s
+select -assert-count 1 top/g_loop[1].u_leaf.s
+proc
+flatten
+select -assert-none a:sv_degraded
+async2sync
+# proved only if each reference reads its real target
+ic3 -check-cells -init-zero

@@ -11061,10 +11061,38 @@ void AstNode::expand_genblock(const std::string &prefix)
 							degrade(child->location.to_loc(), "Identifier `%s' is implicitly declared under `default_nettype none; a 1-bit wire is implied.\n", identifier_str.c_str());
 						}
 						std::string wire_name = prefix_id(prefix, identifier_str);
-						auto auto_wire = std::make_unique<AstNode>(child->location, AST_AUTOWIRE);
-						auto_wire->str = wire_name;
-						current_scope[wire_name] = auto_wire.get();
-						current_ast_mod->children.push_back(std::move(auto_wire));
+						// IEEE 1800-2017 23.8: a dotted name whose first
+						// component is an instance of an enclosing scope (not
+						// of this one) is a hierarchical reference resolved
+						// upward, not a net of this scope; name it in the
+						// scope holding the instance (`u_core.sig` in a
+						// generate loop is the module's `u_core.sig`, which
+						// flatten joins to the instance's wire)
+						size_t head_end = identifier_str.find('.');
+						if (head_end != std::string::npos) {
+							std::string head = identifier_str.substr(0, head_end);
+							auto is_cell = [](const std::string &name) {
+								auto it = current_scope.find(name);
+								return it != current_scope.end() && it->second && it->second->type == AST_CELL;
+							};
+							if (!is_cell(prefix_id(prefix, head))) {
+								for (size_t ppos = prefix.size() - 1; ppos != std::string::npos; ) {
+									size_t dot = ppos ? prefix.rfind('.', ppos - 1) : std::string::npos;
+									std::string outer = dot == std::string::npos ? std::string() : prefix.substr(0, dot + 1);
+									if (is_cell(outer.empty() ? head : prefix_id(outer, head))) {
+										wire_name = outer.empty() ? identifier_str : prefix_id(outer, identifier_str);
+										break;
+									}
+									ppos = dot;
+								}
+							}
+						}
+						if (current_scope.count(wire_name) == 0) {
+							auto auto_wire = std::make_unique<AstNode>(child->location, AST_AUTOWIRE);
+							auto_wire->str = wire_name;
+							current_scope[wire_name] = auto_wire.get();
+							current_ast_mod->children.push_back(std::move(auto_wire));
+						}
 					}
 				}
 			}

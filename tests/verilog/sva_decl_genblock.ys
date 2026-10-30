@@ -1,0 +1,42 @@
+# Sequence/property declarations in generate blocks are named in their
+# scope (`g[1].S`), and so are references from the same block, from a
+# nested block, `.triggered`, and a sequence instance. Before, a reference
+# in a generate block became the free net `g.S` (prim_alert_sender's
+# gen_async_assert.PingSigInt_S), and bare declaration names would make
+# every loop iteration read the first one's declaration. Each assert
+# below is true only with its own iteration's declaration (k[i] == i)
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic e, input logic p, input logic n);
+	logic [1:0] k;
+	assign k = 2'b10;
+	logic q;
+	always_ff @(posedge clk) q <= (p == n);
+	sequence M; e; endsequence
+	for (genvar i = 0; i < 2; i++) begin : g
+		sequence S; k[i] == i; endsequence
+		sequence SA(x); x == i; endsequence
+		property P; @(posedge clk) k[i] == i; endproperty
+		a_seq:  assert property (@(posedge clk) 1'b1 |-> S);
+		a_inst: assert property (@(posedge clk) SA(k[i]));
+		a_prop: assert property (P);
+		a_trig: assert property (@(posedge clk) S.triggered);
+		a_mod:  assert property (@(posedge clk) M |-> e);
+		if (1) begin : gin
+			a_nest: assert property (@(posedge clk) 1'b1 |-> S);
+		end
+	end
+	if (1) begin : gen_a
+		sequence S1; p == n [*2]; endsequence
+		sequence S2; p == n; endsequence
+		a_or: assert property (@(posedge clk) S1 or S2 |=> q);
+	end
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-none A:sv_degraded
+sva2check
+flatten
+async2sync
+logger -expect log "13 properties: proved=13 disproved=0 undecided=0" 1
+ic3 -check-cells -init-zero

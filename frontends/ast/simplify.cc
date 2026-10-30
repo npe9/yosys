@@ -489,6 +489,53 @@ static bool is_sequence_method_ref(const std::string &str)
 // frontend leaves it as an identifier; its implicit wire is how sva2check
 // finds the declaration by name, so it is not an implicit NET and must not
 // trip `default_nettype none`.  Declarations in this module or in a package.
+// Sequence/property/let declarations of the generate blocks expand_genblock
+// is renaming, innermost last: bare name -> scoped name. A declaration in a
+// generate block is named in its scope (`g[1].S`), like a wire, and so is
+// a reference from the same block. Before, a reference became the free net
+// `g.S` (the declaration was still inside the block, not yet in the
+// module: prim_alert_sender's gen_async_assert.PingSigInt_S), and keeping
+// the declarations' bare names instead made every iteration of a generate
+// loop read the first iteration's declaration.
+static std::vector<dict<std::string, std::string>> genblock_sva_decls;
+
+static bool is_sva_decl_ref(const std::string &str);
+static std::string prefix_id(const std::string &prefix, const std::string &str);
+
+static bool rename_local_sva_decl_ref(std::string &str, const std::string &prefix)
+{
+	for (auto it = genblock_sva_decls.rbegin(); it != genblock_sva_decls.rend(); ++it) {
+		auto hit = it->find(str);
+		if (hit != it->end()) {
+			str = hit->second;
+			return true;
+		}
+		for (const char *suf : {".triggered", ".matched"}) {
+			size_t sl = strlen(suf);
+			if (str.size() > sl && str.compare(str.size() - sl, sl, suf) == 0) {
+				auto stem = it->find(str.substr(0, str.size() - sl));
+				if (stem != it->end()) {
+					str = stem->second + suf;
+					return true;
+				}
+			}
+		}
+	}
+	// a declaration of an enclosing generate block, already moved into the
+	// module under its scoped name (a nested named block is expanded after
+	// its parent): innermost enclosing scope first
+	if (str.find('.') == std::string::npos && !prefix.empty()) {
+		for (size_t dot = prefix.rfind('.', prefix.size() - 2); dot != std::string::npos; dot = dot ? prefix.rfind('.', dot - 1) : std::string::npos) {
+			std::string cand = prefix_id(prefix.substr(0, dot + 1), str);
+			if (is_sva_decl_ref(cand)) {
+				str = cand;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 static bool is_sva_decl_ref(const std::string &str)
 {
 	std::string name = (!str.empty() && str[0] == '\\') ? str.substr(1) : str;
@@ -10867,6 +10914,34 @@ std::unique_ptr<AstNode> AstNode::readmem(bool is_readmemh, std::string mem_file
 // prefix is carried forward, but resolution of their children is deferred
 void AstNode::expand_genblock(const std::string &prefix)
 {
+	// popped on every exit, including an input_error unwinding through here
+	struct DeclScope {
+		bool on;
+		DeclScope(AstNode *node, const std::string &prefix) : on(node->type == AST_GENBLOCK) {
+			if (!on)
+				return;
+			genblock_sva_decls.emplace_back();
+			std::string scoped = prefix_id(prefix, "\\x");
+			scoped.pop_back(); // the scope's name prefix, e.g. `\g[1].`
+			for (auto &child : node->children) {
+				if (!child || child->type != AST_SVA || child->children.empty() || !child->children[0])
+					continue;
+				if (child->str != "sequence_decl" && child->str != "property_decl" && child->str != "let_decl")
+					continue;
+				std::string &name = child->children[0]->str;
+				if (name.compare(0, scoped.size(), scoped) == 0)
+					continue; // already named in this scope
+				std::string full = prefix_id(prefix, name);
+				genblock_sva_decls.back()[name] = full;
+				name = full;
+			}
+		}
+		~DeclScope() { if (on) genblock_sva_decls.pop_back(); }
+	} decl_scope(this, prefix);
+
+	// a sequence instance `S(x)` keeps its arguments, expanded below
+	if (type == AST_IDENTIFIER || type == AST_FCALL)
+		rename_local_sva_decl_ref(str, prefix);
 	if (type == AST_IDENTIFIER || type == AST_FCALL || type == AST_TCALL || type == AST_WIRETYPE || type == AST_PREFIX) {
 		log_assert(!str.empty());
 
@@ -10971,6 +11046,8 @@ void AstNode::expand_genblock(const std::string &prefix)
 			break;
 
 		case AST_IDENTIFIER:
+			if (rename_local_sva_decl_ref(child->str, prefix))
+				break;
 			if (!child->str.empty() && prefix.size() > 0) {
 				bool is_resolved = false;
 				std::string identifier_str = child->str;

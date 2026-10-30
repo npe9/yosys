@@ -173,16 +173,18 @@ struct FlattenWorker
 			if (tpl_wire->name[0] == '\\') {
 				RTLIL::Wire *hier_wire = module->wire(concat_name(cell, tpl_wire->name, separator));
 				// an implicit wire the Verilog frontend made for a downward
-				// hierarchical reference (sv_hierref): it is one bit, so
-				// only a one-bit target is joined (widening it would leave
-				// the reads on its bit 0); joined, the reference is no
-				// longer a free wire and its "implicitly declared"
-				// degradation is dropped from the module
+				// hierarchical reference (sv_hierref): it is one bit, unless
+				// hierarchy declared it at its target's width
+				// (AstModule::resolve_hierrefs), so a target of the same
+				// width is joined (widening it here would leave the reads,
+				// sized and folded at width 1, on its bit 0); joined, the
+				// reference is no longer a free wire and its "implicitly
+				// declared" degradation is dropped from the module
 				if (hier_wire != nullptr && hier_wire->get_bool_attribute(ID(sv_hierref)) &&
 						hier_wire->get_bool_attribute(ID::hierconn)) {
-					if (GetSize(hier_wire) != GetSize(tpl_wire) || GetSize(hier_wire) != 1) {
-						log_warning("Hierarchical reference %s.%s is not joined to %s.%s (width %d, not 1); it stays a free wire.\n",
-							module, hier_wire, tpl, tpl_wire, GetSize(tpl_wire));
+					if (GetSize(hier_wire) != GetSize(tpl_wire)) {
+						log_warning("Hierarchical reference %s.%s is not joined to %s.%s (width %d, not %d); it stays a free wire.\n",
+							module, hier_wire, tpl, tpl_wire, GetSize(tpl_wire), GetSize(hier_wire));
 						hier_wire->attributes.erase(ID::hierconn);
 						hier_wire = nullptr;
 					} else {

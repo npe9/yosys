@@ -1571,6 +1571,11 @@ bool RTLIL::Module::reprocess_if_necessary(RTLIL::Design *)
 	return false;
 }
 
+bool RTLIL::Module::resolve_hierrefs(RTLIL::Design *)
+{
+	return false;
+}
+
 RTLIL::IdString RTLIL::Module::derive(RTLIL::Design*, const dict<RTLIL::IdString, RTLIL::Const> &, bool mayfail)
 {
 	if (mayfail)

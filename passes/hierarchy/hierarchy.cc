@@ -678,6 +678,12 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 	if (module->reprocess_if_necessary(design))
 		return true;
 
+	// with its instances derived (a round in which nothing changed here),
+	// a module's wider downward hierarchical references can be declared at
+	// their targets' widths (AstModule)
+	if (!did_something && module->resolve_hierrefs(design))
+		return true;
+
 	for (auto &it : array_cells)
 	{
 		RTLIL::Cell *cell = it.first;

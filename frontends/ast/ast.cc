@@ -1915,6 +1915,79 @@ bool AstModule::reprocess_if_necessary(RTLIL::Design *design)
 	return false;
 }
 
+// Downward hierarchical references (`u_ctrl.state_q`): the Verilog frontend
+// makes an implicit one-bit wire for each (sv_hierref + hierconn), which
+// flatten joins to the instance's wire.  A wider (or signed) target cannot
+// be joined: every read was already sized, and constant comparisons folded,
+// at width 1.  Once the module's instances are derived, the targets are
+// known: rederive the module from its AST with each resolved reference
+// declared at the target's width (as expand_interfaces does for interface
+// members), still marked for flatten's join.  Paths go through instance
+// names (generate scopes included: `g[0].u_l.err_o`) down to a wire; a
+// reference to a memory, a blackbox or a missing name stays implicit.
+bool AstModule::resolve_hierrefs(RTLIL::Design *design)
+{
+	if (get_bool_attribute(ID(sv_hierrefs_resolved)))
+		return false;
+	struct Target { std::string name; int width; bool is_signed; };
+	std::vector<Target> targets;
+	bool any_wide = false;
+	for (auto wire : wires()) {
+		if (!wire->get_bool_attribute(ID(sv_hierref)) || wire->port_id)
+			continue;
+		std::string rest = wire->name.str().substr(1);
+		RTLIL::Module *mod = this;
+		RTLIL::Wire *target = nullptr;
+		for (int depth = 0; depth < 64 && mod && !target; depth++) {
+			// the longest instance-name prefix of the remaining path
+			RTLIL::Cell *cell = nullptr;
+			size_t cut = std::string::npos;
+			for (size_t dot = rest.find('.'); dot != std::string::npos; dot = rest.find('.', dot + 1))
+				if (RTLIL::Cell *c = mod->cell(RTLIL::escape_id(rest.substr(0, dot))))
+					cell = c, cut = dot;
+			if (!cell)
+				break;
+			RTLIL::Module *sub = design->module(cell->type);
+			rest = rest.substr(cut + 1);
+			if (!sub || sub->get_blackbox_attribute())
+				break;
+			if (rest.find('.') == std::string::npos || sub->wire(RTLIL::escape_id(rest)))
+				target = sub->wire(RTLIL::escape_id(rest));
+			mod = sub;
+		}
+		// a target that is itself an unresolved reference in the child
+		if (!target || target->get_bool_attribute(ID(sv_hierref)))
+			continue;
+		targets.push_back({wire->name.str(), target->width, target->is_signed});
+		if (target->width != 1 || target->is_signed)
+			any_wide = true;
+	}
+	if (!any_wide) {
+		set_bool_attribute(ID(sv_hierrefs_resolved));
+		return false;
+	}
+	loadconfig();
+	auto new_ast = ast->clone();
+	auto loc = ast->location;
+	for (auto &t : targets) {
+		auto wire = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE,
+				AstNode::mkconst_int(loc, t.width - 1, true), AstNode::mkconst_int(loc, 0, true)));
+		wire->str = t.name;
+		wire->is_signed = t.is_signed;
+		wire->set_attribute(ID::hierconn, AstNode::mkconst_int(loc, 1, false));
+		wire->set_attribute(ID(sv_hierref), AstNode::mkconst_int(loc, 1, false));
+		new_ast->children.push_back(std::move(wire));
+		log("Hierarchical reference %s.%s resolved to %d%s bits; rederiving the module.\n",
+				log_id(name), log_id(t.name), t.width, t.is_signed ? " signed" : "");
+	}
+	bool intf_done = get_bool_attribute(ID::interfaces_replaced_in_module);
+	RTLIL::Module *new_module = process_and_replace_module(design, this, new_ast.get(), NULL);
+	new_module->set_bool_attribute(ID(sv_hierrefs_resolved));
+	if (intf_done)
+		new_module->set_bool_attribute(ID::interfaces_replaced_in_module);
+	return true;
+}
+
 // When an interface instance is found in a module, the whole RTLIL for the module will be rederived again
 // from AST. The interface members are copied into the AST module with the prefix of the interface.
 void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Module*> &local_interfaces)

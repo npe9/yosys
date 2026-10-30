@@ -2088,6 +2088,7 @@ public:
 	virtual size_t count_id(RTLIL::IdString id);
 	virtual void expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Module *> &local_interfaces);
 	virtual bool reprocess_if_necessary(RTLIL::Design *design);
+	virtual bool resolve_hierrefs(RTLIL::Design *design);
 
 	virtual void sort();
 	virtual void check();

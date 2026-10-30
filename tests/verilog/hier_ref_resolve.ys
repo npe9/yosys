@@ -1,0 +1,107 @@
+# Multi-bit downward hierarchical references (OpenTitan
+# `u_otbn_controller.state_q == OtbnStateStall`): the frontend makes a
+# one-bit implicit wire, and its reads are sized and constant comparisons
+# folded at that width, so flatten cannot widen it.  Once the instances are
+# derived, hierarchy rederives the module with each reference declared at
+# its target's width (signedness included), and flatten joins it.
+read_verilog -sv -formal <<EOF
+module leaf (input logic clk, output logic [2:0] st);
+  logic [2:0] st_q = 3'd0;
+  always_ff @(posedge clk) if (st_q != 3'd3) st_q <= st_q + 3'd1;
+  assign st = st_q;
+endmodule
+module top (input logic clk, input logic [2:0] x);
+  leaf u (.clk(clk), .st());
+  // needs all three bits: folded at width 1, `u.st != 3'd4` was constant 1
+  a_never4: assert property (@(posedge clk) u.st != 3'd4);
+  a_hits3:  assert property (@(posedge clk) u.st != 3'd3);
+  // a narrower constant is zero-extended, as in SV
+  a_one:    assert property (@(posedge clk) u.st != 1'b1);
+  a_x:      assert property (@(posedge clk) u.st !== x);
+endmodule
+EOF
+logger -expect log "Hierarchical reference top.u.st resolved to 3 bits" 1
+hierarchy -top top
+logger -check-expected
+sva2check
+proc
+flatten
+select -assert-none A:sv_degraded
+select -assert-none a:hierconn a:sv_hierref %u
+opt_clean
+async2sync
+logger -expect log "a_never4: proved" 1
+logger -expect log "a_hits3: disproved \(depth 3\)" 1
+logger -expect log "a_one: disproved \(depth 1\)" 1
+logger -expect log "a_x: disproved \(depth 0\)" 1
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# other reads and paths: a plain assignment, a comparison with a narrower
+# non-constant, two levels, a generate scope, a signed target (a signed
+# comparison), and a write into an instance's undriven wire
+read_verilog -sv -formal <<EOF
+module leaf (input logic clk, output logic [2:0] st);
+  logic signed [3:0] sv;
+  logic [3:0] inp, outp;
+  assign st = 3'd5;
+  assign sv = -4'sd1;
+  assign outp = inp;
+endmodule
+module mid (input logic clk);
+  leaf u_leaf (.clk(clk), .st());
+endmodule
+module top (input logic clk, input logic [1:0] n, output logic [2:0] y);
+  leaf u (.clk(clk), .st());
+  mid u_mid (.clk(clk));
+  for (genvar i = 0; i < 1; i++) begin : g
+    leaf u_l (.clk(clk), .st());
+  end
+  assign y = u.st;
+  assign u.inp = 4'd9;
+  a_y:    assert property (@(posedge clk) y == 3'd5);
+  a_n:    assert property (@(posedge clk) u.st != n);
+  a_two:  assert property (@(posedge clk) u_mid.u_leaf.st == 3'd5);
+  a_gen:  assert property (@(posedge clk) g[0].u_l.st == 3'd5);
+  a_sgn:  assert property (@(posedge clk) u.sv < 0);
+  a_wr:   assert property (@(posedge clk) u.outp == 4'd9);
+endmodule
+EOF
+hierarchy -top top
+sva2check
+proc
+flatten
+select -assert-none A:sv_degraded
+opt_clean
+async2sync
+logger -expect log "a_y: proved" 1
+logger -expect log "a_n: proved" 1
+logger -expect log "a_two: proved" 1
+logger -expect log "a_gen: proved" 1
+logger -expect log "a_sgn: proved" 1
+logger -expect log "a_wr: proved" 1
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# no wire of that name, and a memory: each stays a degraded free wire
+read_verilog -sv -formal <<EOF
+module leaf (input logic clk, output logic [3:0] st);
+  logic [3:0] mem [0:1];
+  assign st = 4'd0;
+endmodule
+module top (input logic clk);
+  leaf u (.clk(clk), .st());
+  a_nope: assert property (@(posedge clk) !u.nope);
+  a_mem:  assert property (@(posedge clk) u.mem[0] == 4'd0);
+endmodule
+EOF
+hierarchy -top top
+sva2check
+proc
+flatten
+select -assert-count 2 w:u.nope w:u.mem %u
+select -assert-any A:sv_degraded
+logger -expect error "refusing a design that carries sv_degraded" 1
+ic3 -init-zero

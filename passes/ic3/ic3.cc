@@ -2501,6 +2501,14 @@ struct Ic3Pass : Pass
 		log("        run on a design whose modules carry sv_degraded / sv_permissive\n");
 		log("        (printed first either way; refused by default: register v3 B5)\n");
 		log("\n");
+		log("    -probe-reset\n");
+		log("        add a cover target $probe_reset$<port> (\"out of reset\") for each\n");
+		log("        1-bit top input named like a reset (rst / reset; active low when\n");
+		log("        the name ends in n, _n, _ni, _nb, _b or _l). An assumption set\n");
+		log("        that holds the design in reset makes every verdict vacuous;\n");
+		log("        it shows up as such a cover not reached. The cells are removed\n");
+		log("        again afterwards.\n");
+		log("\n");
 		log("    -init-zero\n");
 		log("        registers without a 0/1 \\init value (no attribute, or x bits)\n");
 		log("        start at 0; explicit \\init values are kept (as after\n");
@@ -2664,6 +2672,7 @@ struct Ic3Pass : Pass
 		bool check_cells = false;
 		bool init_zero = false;
 		bool allow_degraded = false;
+		bool probe_reset = false;
 		bool preopt = false;
 		bool certify = false;
 		bool verbose = false;
@@ -2704,6 +2713,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-allow-degraded") {
 				allow_degraded = true;
+				continue;
+			}
+			if (args[argidx] == "-probe-reset") {
+				probe_reset = true;
 				continue;
 			}
 			if (args[argidx] == "-init-zero") {
@@ -2803,6 +2816,59 @@ struct Ic3Pass : Pass
 				log_error("ic3: no top module found, use -top to specify one.\n");
 		}
 		(void) check_cells;
+
+		// -probe-reset: vacuity probes (fe63 found OpenTitan's
+		// TriggerAfterAlertInit assumes holding csrng in reset, every
+		// verdict undecided). Removed on every exit path.
+		struct ProbeGuard {
+			RTLIL::Module *m;
+			std::vector<RTLIL::Cell*> cells;
+			pool<RTLIL::Wire*> wires;
+			~ProbeGuard() {
+				for (auto c : cells)
+					m->remove(c);
+				if (!wires.empty())
+					m->remove(wires);
+			}
+		} probe_guard{module, {}, {}};
+		// only next to a real target: a probe alone would turn "no
+		// properties found" (an assume-only top) into a run
+		bool has_target = false;
+		for (auto cell : module->cells())
+			if (cell->type.in(ID($assert), ID($cover), ID($live)) ||
+					(cell->type == ID($check) && cell->getParam(ID(FLAVOR)).decode_string() != "assume"))
+				has_target = true;
+		if (probe_reset && has_target) {
+			std::vector<RTLIL::Wire*> resets;
+			for (auto w : module->wires()) {
+				if (!w->port_input || w->width != 1)
+					continue;
+				std::string n = w->name.unescape();
+				for (auto &ch : n)
+					ch = tolower(ch);
+				if (n.find("rst") == std::string::npos && n.find("reset") == std::string::npos)
+					continue;
+				resets.push_back(w);
+			}
+			std::sort(resets.begin(), resets.end(), [](RTLIL::Wire *a, RTLIL::Wire *b) { return a->name.str() < b->name.str(); });
+			for (auto w : resets) {
+				std::string n = w->name.unescape();
+				std::string ln = n;
+				for (auto &ch : ln)
+					ch = tolower(ch);
+				auto ends = [&](const char *suf) { size_t k = strlen(suf); return ln.size() >= k && ln.compare(ln.size() - k, k, suf) == 0; };
+				bool low = ends("n") || ends("_nb") || ends("_b") || ends("_l") || ends("_ni");
+				RTLIL::SigSpec out_of_reset = w;
+				if (!low) {
+					RTLIL::Wire *nw = module->addWire(NEW_ID);
+					probe_guard.wires.insert(nw);
+					probe_guard.cells.push_back(module->addNot(NEW_ID, w, nw));
+					out_of_reset = nw;
+				}
+				probe_guard.cells.push_back(module->addCover(RTLIL::IdString("$probe_reset$" + n), out_of_reset, RTLIL::State::S1));
+				log("ic3: -probe-reset: cover on %s%s\n", low ? "" : "!", n.c_str());
+			}
+		}
 
 		// E1: -preopt simplifies a CLONE of the module before encoding (the
 		// caller's design is left as it is).  Only don't-care-preserving

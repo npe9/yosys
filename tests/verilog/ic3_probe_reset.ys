@@ -1,0 +1,26 @@
+# ic3 -probe-reset: one cover per 1-bit reset-like top input ("out of
+# reset"). An assumption set that holds the design in reset (fe63: the
+# OpenTitan TriggerAfterAlertInit assumes over a stuck err_o) makes every
+# verdict vacuous; the probe shows it as unreachable. The probe cells are
+# removed afterwards.
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic rst_ni, input logic rst_i, input logic [1:0] d, output logic [1:0] q);
+  always_ff @(posedge clk or negedge rst_ni) if (!rst_ni) q <= 2'd0; else q <= d;
+  // stuck: the active-high reset is held
+  a_hold: assume property (@(posedge clk) rst_i);
+  a_q: assert property (@(posedge clk) q != 2'd3);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+logger -expect log "-probe-reset: cover on rst_ni" 1
+logger -expect log "-probe-reset: cover on !rst_i" 1
+logger -expect log "probe_reset\$rst_ni: cover reached \(depth 0\)" 1
+logger -expect log "probe_reset\$rst_i: cover unreachable" 1
+logger -expect log "a_q: disproved" 1
+ic3 -init-zero -probe-reset
+logger -check-expected
+select -assert-none t:$cover
+select -assert-none w:$auto$ic3.cc* c:$auto$ic3.cc*

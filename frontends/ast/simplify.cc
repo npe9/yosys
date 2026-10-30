@@ -11053,6 +11053,21 @@ void AstNode::expand_genblock(const std::string &prefix)
 						}
 					}
 				}
+				// A member select on a module-level parameter (`DEF.lower_cause`
+				// after `import pkg::*;`, read in a named block): the scan
+				// above stops short of the module scope, and an imported
+				// struct parameter's `P.member` entries are registered on first
+				// use by simplify (register v3 D13), after this renaming. It is
+				// not a net of this scope.
+				if (!is_resolved) {
+					size_t head_end = identifier_str.find('.');
+					if (head_end != std::string::npos) {
+						auto it = current_scope.find(identifier_str.substr(0, head_end));
+						if (it != current_scope.end() && it->second &&
+								(it->second->type == AST_PARAMETER || it->second->type == AST_LOCALPARAM))
+							is_resolved = true;
+					}
+				}
 				if (!prefix_is_function_inline(prefix) && (current_scope.count(identifier_str) == 0) && is_resolved == false) {
 					bool is_type = current_scope.count(identifier_str) && current_scope[identifier_str] &&
 							current_scope[identifier_str]->type == AST_TYPEDEF;
@@ -11082,25 +11097,35 @@ void AstNode::expand_genblock(const std::string &prefix)
 							degrade(child->location.to_loc(), "Identifier `%s' is implicitly declared under `default_nettype none; a 1-bit wire is implied.\n", identifier_str.c_str());
 						}
 						std::string wire_name = prefix_id(prefix, identifier_str);
-						// IEEE 1800-2017 23.8: a dotted name whose first
-						// component is an instance of an enclosing scope (not
-						// of this one) is a hierarchical reference resolved
-						// upward, not a net of this scope; name it in the
-						// scope holding the instance (`u_core.sig` in a
-						// generate loop is the module's `u_core.sig`, which
-						// flatten joins to the instance's wire)
-						size_t head_end = identifier_str.find('.');
-						if (head_end != std::string::npos) {
-							std::string head = identifier_str.substr(0, head_end);
+						// IEEE 1800-2017 23.8: a dotted name whose leading
+						// components name an instance of an enclosing scope
+						// (not of this one) is a hierarchical reference
+						// resolved upward, not a net of this scope; name it
+						// in the scope holding the instance (`u_core.sig` in
+						// a generate loop is the module's `u_core.sig`, which
+						// flatten joins to the instance's wire). The instance
+						// may sit in a sibling generate block
+						// (`gen_fast.u_i.idle` from `gen_sva_fast`: the
+						// module's cell `gen_fast.u_i`), so every proper
+						// prefix of the path is tried, not only the head.
+						if (identifier_str.find('.') != std::string::npos) {
 							auto is_cell = [](const std::string &name) {
 								auto it = current_scope.find(name);
 								return it != current_scope.end() && it->second && it->second->type == AST_CELL;
 							};
-							if (!is_cell(prefix_id(prefix, head))) {
+							auto names_cell = [&](const std::string &scope) {
+								for (size_t d = identifier_str.find('.'); d != std::string::npos; d = identifier_str.find('.', d + 1)) {
+									std::string path = identifier_str.substr(0, d);
+									if (is_cell(scope.empty() ? path : prefix_id(scope, path)))
+										return true;
+								}
+								return false;
+							};
+							if (!names_cell(prefix)) {
 								for (size_t ppos = prefix.size() - 1; ppos != std::string::npos; ) {
 									size_t dot = ppos ? prefix.rfind('.', ppos - 1) : std::string::npos;
 									std::string outer = dot == std::string::npos ? std::string() : prefix.substr(0, dot + 1);
-									if (is_cell(outer.empty() ? head : prefix_id(outer, head))) {
+									if (names_cell(outer)) {
 										wire_name = outer.empty() ? identifier_str : prefix_id(outer, identifier_str);
 										break;
 									}

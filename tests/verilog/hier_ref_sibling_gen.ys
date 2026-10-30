@@ -1,0 +1,51 @@
+# IEEE 1800-2017 23.8 from a generate scope into a sibling generate block:
+# `gen_fast.u_i.idle` inside gen_sva_fast is the module's instance
+# gen_fast.u_i (ibex_ex_block's sva_multdiv_fsm_idle), not a net of
+# gen_sva_fast. Also a member of an imported struct parameter read in a
+# named procedural block (ibex_if_stage's ExcCauseIrqNm.lower_cause)
+read_verilog -sv -formal <<EOT
+package pk;
+	typedef struct packed { logic irq; logic [4:0] lower_cause; } cause_t;
+	parameter cause_t DEF = '{irq: 1'b1, lower_cause: 5'd29};
+endpackage
+module leaf(input logic clk, output logic [2:0] idle);
+	assign idle = 3'b101;
+endmodule
+module top import pk::*; #(parameter int M = 1) (input logic clk, input logic sel, output logic [4:0] v);
+	if (M == 0) begin : gen_slow
+		leaf u_i(.clk(clk), .idle());
+	end else begin : gen_fast
+		leaf u_i(.clk(clk), .idle());
+	end
+	logic [2:0] s;
+	if (M == 0) begin : gen_sva_slow
+		assign s = gen_slow.u_i.idle;
+	end else begin : gen_sva_fast
+		assign s = gen_fast.u_i.idle;
+	end
+	always_comb begin : mux
+		v = 5'd0;
+		if (sel) v = DEF.lower_cause;
+	end
+	for (genvar i = 0; i < 2; i++) begin : g
+		logic [4:0] w;
+		always_comb begin : pick
+			w = DEF.lower_cause + i;
+		end
+	end
+	always_comb begin
+		a0: assert (s == 3'b101);
+		a1: assert (!sel || v == 5'd29);
+		a2: assert (g[1].w == 5'd30);
+	end
+endmodule
+EOT
+hierarchy -top top
+select -assert-count 1 top/gen_fast.u_i.idle
+select -assert-none top/gen_sva_fast.gen_fast.u_i.idle
+select -assert-none top/mux.DEF.lower_cause top/g[0].pick.DEF.lower_cause
+proc
+flatten
+select -assert-none A:sv_degraded
+async2sync
+ic3 -check-cells -init-zero

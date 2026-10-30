@@ -79,7 +79,12 @@ static void inherit_degradation(RTLIL::Module *module, RTLIL::Module *tpl)
 		for (size_t pos = 0; pos <= add.size(); ) {
 			size_t next = add.find("; ", pos);
 			std::string entry = add.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
-			if (!entry.empty() && !have.count(entry)) {
+			// an upward-reference port's pending mark is per template:
+			// connect_upward_refs has connected this instance's port (or
+			// recorded its own reason) before it is inlined
+			bool pending_up = entry.rfind("Upward reference `", 0) == 0 &&
+					entry.find("in the instantiating module) is connected only by flatten.") != std::string::npos;
+			if (!entry.empty() && !pending_up && !have.count(entry)) {
 				cur += (cur.empty() ? "" : "; ") + entry;
 				have.insert(entry);
 			}
@@ -87,7 +92,8 @@ static void inherit_degradation(RTLIL::Module *module, RTLIL::Module *tpl)
 				break;
 			pos = next + 2;
 		}
-		module->attributes[attr] = RTLIL::Const(cur);
+		if (!cur.empty())
+			module->attributes[attr] = RTLIL::Const(cur);
 	}
 	if (tpl->get_bool_attribute(IdString("\\sv_permissive")))
 		module->set_bool_attribute(IdString("\\sv_permissive"));

@@ -9,6 +9,16 @@ async2sync
 ic3 -check-cells -init-zero
 design -reset
 
+# without flatten the upward ports are unconnected inputs: the rederived
+# checker carries a mark (flatten connects them and drops it, above)
+read_verilog -sv -formal hier_ref_bind_up.sv
+hierarchy -top top
+proc
+select -assert-mod-count 1 A:sv_degraded
+select -assert-none A:sv_degraded top %i
+select -assert-mod-count 1 A:sv_degraded=*connected?only?by?flatten*
+design -reset
+
 # the checker read alone (the target not in the design): stays degraded
 read_verilog -sv -formal hier_ref_bind_up.sv
 hierarchy -top chk_m

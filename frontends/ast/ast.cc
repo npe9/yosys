@@ -2143,6 +2143,19 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	bool intf_done = get_bool_attribute(ID::interfaces_replaced_in_module);
 	RTLIL::Module *new_module = process_and_replace_module(design, this, new_ast.get(), NULL);
 	new_module->set_bool_attribute(ID(sv_hierrefs_resolved));
+	// an upward-reference port is connected by flatten only
+	// (connect_upward_refs): until then it is a free input, so the module
+	// carries a mark, which flatten does not pass on to the parent
+	{
+		IdString attr = IdString("\\sv_degraded");
+		std::string cur = new_module->attributes.count(attr) ? new_module->attributes.at(attr).decode_string() : std::string();
+		for (auto &t : targets)
+			if (!t.up_rest.empty())
+				cur += (cur.empty() ? "" : "; ") + stringf("Upward reference `%s' (`%s' in the instantiating module) is connected only by flatten.",
+						t.name.c_str(), t.up_rest.c_str());
+		if (!cur.empty())
+			new_module->attributes[attr] = RTLIL::Const(cur);
+	}
 	if (intf_done)
 		new_module->set_bool_attribute(ID::interfaces_replaced_in_module);
 	return true;

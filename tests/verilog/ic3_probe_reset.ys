@@ -15,6 +15,7 @@ hierarchy -top top
 sva2check
 proc
 async2sync
+select -set before w:* t:* %u
 logger -expect log "-probe-reset: cover on rst_ni" 1
 logger -expect log "-probe-reset: cover on !rst_i" 1
 logger -expect log "probe_reset\$rst_ni: cover reached \(depth 0\)" 1
@@ -23,4 +24,5 @@ logger -expect log "a_q: disproved" 1
 ic3 -init-zero -probe-reset
 logger -check-expected
 select -assert-none t:$cover
-select -assert-none w:$auto$ic3.cc* c:$auto$ic3.cc*
+select -assert-none w:* t:* %u @before %d
+select -assert-none @before w:* t:* %u %d

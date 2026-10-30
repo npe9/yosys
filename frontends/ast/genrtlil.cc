@@ -2973,6 +2973,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			cell->setParam("\\OP", RTLIL::Const(str));
 			if (get_bool_attribute(ID(sv_default_disable)))
 				cell->set_bool_attribute(ID(sv_default_disable));
+			if (get_bool_attribute(ID(sv_default_clock)))
+				cell->set_bool_attribute(ID(sv_default_clock));
 			if (is_decl) {
 				cell->setParam("\\NAME", RTLIL::Const(decl_name));
 				// nothing reads a declaration's Y: without keep, an

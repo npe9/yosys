@@ -1088,6 +1088,12 @@ struct SvaCompiler {
 				bare = sp;
 			}
 		}
+		// the scope's default clock retrofitted onto the declaration body
+		// is not the declaration's own: the instance takes the assertion's
+		// clock (LRM 16.16), so it is transparent here.  (The parser never
+		// puts a default disable inside a property declaration.)
+		if (clock && clock->get_bool_attribute(ID(sv_default_clock)))
+			clock = nullptr;
 		if (clock) {
 			std::string clop = sva_op(clock);
 			SigSpec clksig = clock->getPort(ID(A));
@@ -6659,6 +6665,12 @@ struct Sva2CheckPass : public Pass {
 				// disable -- spurious counterexamples on asserts, and an
 				// over-strong assume gave FALSE PROOFS)
 				std::vector<Cell *> walked_dis;
+				// the same for an explicit clock: the declaration's spec
+				// carries the scope's default clock, which must not replace
+				// the assertion's own (`assert property (@(posedge clk2)
+				// name_p)` under `default clocking @(posedge clk)` was
+				// sampled on clk: a FALSE PROOF under -clk2fflogic)
+				Cell *walked_clk = nullptr;
 				for (int guard = 0; guard < 64 && !hoist_clock; guard++) {
 					clock = nullptr, disable = nullptr, body = nullptr;
 					body_sig = SigSpec(), body_const = SigSpec();
@@ -6706,6 +6718,8 @@ struct Sva2CheckPass : public Pass {
 						break;
 					if (disable && sva_op(disable) == "disable_iff")
 						walked_dis.push_back(disable);
+					if (clock && sva_op(clock) != "no_clock" && !clock->get_bool_attribute(ID(sv_default_clock)))
+						walked_clk = clock;
 					chain.emplace_back(it->second, std::vector<Wire *>(), std::vector<SigSpec>());
 					auto dp = comp.ports_of(it->second);
 					Cell *next = dp.empty() ? nullptr : comp.child_cell(it->second->getPort(dp[0]));
@@ -6722,6 +6736,10 @@ struct Sva2CheckPass : public Pass {
 					clock = hoist_clock;
 					body = spec;
 				}
+				// the declaration's own explicit clock governs its body
+				// (16.16.1); a default or missing one takes the walked clock
+				if (walked_clk && (!clock || sva_op(clock) == "no_clock" || clock->get_bool_attribute(ID(sv_default_clock))))
+					clock = walked_clk;
 				// The disables met along the walk and the final one: an
 				// explicit disable iff overrides a scope default (LRM 16.15:
 				// cv32e40p's `default disable iff !rst_ni` with a declaration

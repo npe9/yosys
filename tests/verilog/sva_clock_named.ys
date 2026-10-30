@@ -1,0 +1,53 @@
+# An assertion's own clock over a property declaration without one, under
+# default clocking (LRM 16.16): the declaration's body carried the scope's
+# default clock, and the spec walk (bare name) took it, as did the instance
+# unwrap (with arguments: a "different sampling clock" error).  `s` toggles
+# on every clk edge, so `s |-> ##1 !s` holds sampled on clk and fails on
+# clk2; the bare-name form was PROVED under -clk2fflogic.
+read_verilog -sv -formal <<EOF
+module top (input logic clk, input logic clk2);
+  logic s = 1'b0;
+  always_ff @(posedge clk) s <= !s;
+  default clocking cb @(posedge clk); endclocking
+  property p_s; s |-> ##1 !s; endproperty
+  property p_a(v); v |-> ##1 !v; endproperty
+  property p_e; @(posedge clk) s |-> ##1 !s; endproperty
+  a_named:  assert property (@(posedge clk2) p_s);
+  a_args:   assert property (@(posedge clk2) p_a(s));
+  a_inline: assert property (@(posedge clk2) s |-> ##1 !s);
+  // the declaration's own clock governs its body
+  a_inner:  assert property (@(posedge clk2) p_e);
+  // no clock of its own: the default
+  a_dflt:   assert property (p_s);
+  a_dargs:  assert property (p_a(s));
+endmodule
+EOF
+hierarchy -top top
+sva2check -clk2fflogic
+proc
+clk2fflogic
+opt_clean
+logger -expect log "a_named: disproved \(depth 4\)" 1
+logger -expect log "a_args: disproved \(depth 4\)" 1
+logger -expect log "a_inline: disproved \(depth 4\)" 1
+logger -expect log "a_inner: proved" 1
+logger -expect log "a_dflt: proved" 1
+logger -expect log "a_dargs: proved" 1
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# an instance whose declaration has its own, different clock is still a
+# multiclock instance, refused
+read_verilog -sv -formal <<EOF
+module top (input logic clk, input logic clk2);
+  logic s = 1'b0;
+  always_ff @(posedge clk) s <= !s;
+  default clocking cb @(posedge clk); endclocking
+  property p_ea(v); @(posedge clk) v |-> ##1 !v; endproperty
+  a_multi: assert property (@(posedge clk2) p_ea(s));
+endmodule
+EOF
+hierarchy -top top
+logger -expect error "instance declaration uses a different sampling clock" 1
+sva2check -clk2fflogic

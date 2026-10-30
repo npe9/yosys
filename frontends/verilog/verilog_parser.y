@@ -7970,12 +7970,20 @@ clocking_decl:
 	} |
 	TOK_DEFAULT TOK_CLOCKING TOK_ID sva_at_clock TOK_SEMICOL clocking_items TOK_ENDCLOCKING opt_label {
 		extra->sva_default_clock = $4->clone();
+		// marks a default (LRM 16.16: an assertion's own clock governs an
+		// unclocked declaration body; the retrofitted default must not)
+		if (extra->sva_default_clock->type == AST_SVA)
+			extra->sva_default_clock->set_attribute(ID(sv_default_clock), AstNode::mkconst_int(@$, 1, false));
 		if (!extra->sva_default_frames.empty())
 			extra->sva_default_frames.back().own_clk = true;
 		checkLabelsMatch(@7, "Clocking block label", $3.get(), $8.get());
 	} |
 	TOK_DEFAULT TOK_CLOCKING sva_at_clock TOK_SEMICOL clocking_items TOK_ENDCLOCKING opt_label {
 		extra->sva_default_clock = $3->clone();
+		// marks a default (LRM 16.16: an assertion's own clock governs an
+		// unclocked declaration body; the retrofitted default must not)
+		if (extra->sva_default_clock->type == AST_SVA)
+			extra->sva_default_clock->set_attribute(ID(sv_default_clock), AstNode::mkconst_int(@$, 1, false));
 		if (!extra->sva_default_frames.empty())
 			extra->sva_default_frames.back().own_clk = true;
 	};

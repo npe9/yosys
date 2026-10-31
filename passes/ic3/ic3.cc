@@ -60,6 +60,13 @@ static std::chrono::steady_clock::time_point ic3_deadline;
 static bool ic3_work_on = false;
 static int64_t ic3_work_left = 0;
 static bool ic3_work_hit = false;
+// -max-clauses <M>: a size cap on one encoding (millions of CNF clauses),
+// checked as each cell is imported, so a design too large for the
+// bit-level engine is refused early instead of exhausting the machine's
+// memory (fv_montmultiplier: a 312M-clause pre-pass unrolling, 22.7 GB).
+// A refused encoding reads undecided, like an exhausted budget.
+static int64_t ic3_max_clauses = 0;
+static bool ic3_size_hit = false;
 static uint64_t ic3_trace_props = 0, ic3_trace_confl = 0;
 static void ic3_check_deadline()
 {
@@ -70,6 +77,8 @@ static void ic3_check_deadline()
 }
 static std::string ic3_budget_str(double timeout_s, double budget_m)
 {
+	if (ic3_size_hit)
+		return stringf("%gM-clause encoding", ic3_max_clauses / 1e6);
 	if (ic3_work_hit)
 		return stringf("%gM-propagation", budget_m);
 	return stringf("%gs", timeout_s);
@@ -501,6 +510,10 @@ struct Ic3Solver
 				if (!satgen.importCell(cell, t))
 					log_error("ic3: unsupported cell %s.%s (type %s) -- run `proc; async2sync; flatten; opt_clean` first.\n",
 							log_id(module), log_id(cell), log_id(cell->type));
+				if (ic3_max_clauses > 0 && ez.numCnfClauses() > ic3_max_clauses) {
+					ic3_size_hit = true;
+					throw Ic3Timeout();
+				}
 			}
 
 		// assume-flavor checks constrain every timeframe; see
@@ -2645,6 +2658,11 @@ struct Ic3Pass : Pass
 		log("        -bmc pre-pass a group of targets gets 1/6 of it (as -timeout's\n");
 		log("        group gets at most 5s)\n");
 		log("\n");
+		log("    -max-clauses <millions>\n");
+		log("        refuse an encoding (the -bmc pre-pass unrolling, or one\n");
+		log("        query's) once it exceeds this many million CNF clauses: its\n");
+		log("        targets read undecided instead of the run exhausting memory\n");
+		log("\n");
 		log("    -bmc <depth>\n");
 		log("        bounded-model-checking pre-pass: every assert and cover on one\n");
 		log("        shared unrolling, asked at t = 1..depth before k-induction and\n");
@@ -2798,6 +2816,7 @@ struct Ic3Pass : Pass
 		int max_frames = 1000;
 		double timeout_s = 0;
 		double budget_m = 0;
+		ic3_max_clauses = 0;  // a global (encode() reads it): reset per run
 		// arm the per-query budgets (0: none)
 		auto arm = [&]() {
 			ic3_deadline_on = timeout_s > 0;
@@ -2807,6 +2826,7 @@ struct Ic3Pass : Pass
 			ic3_work_on = budget_m > 0;
 			ic3_work_left = (int64_t)(budget_m * 1e6);
 			ic3_work_hit = false;
+			ic3_size_hit = false;
 			ic3_trace_props = ic3_trace_confl = 0;
 		};
 		// IC3_WORK_TRACE (env): log each query's work, for calibrating -budget
@@ -2875,6 +2895,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-budget") {
 				budget_m = atof(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-max-clauses") {
+				ic3_max_clauses = (int64_t)(atof(args[++argidx].c_str()) * 1e6);
 				continue;
 			}
 			if (args[argidx] == "-cex") {
@@ -3278,7 +3302,21 @@ struct Ic3Pass : Pass
 			bs.assume_cells = assumes;
 			bs.extra_seeds = targets;
 			bs.gate_constraints = true;
-			bs.encode(targets[0], bmc_max + 1);
+			ic3_size_hit = false;
+			bool refused = false;
+			try {
+				bs.encode(targets[0], bmc_max + 1);
+			} catch (Ic3Timeout &) {
+				if (!ic3_size_hit)
+					throw;
+				refused = true;
+			}
+			if (refused) {
+				log("ic3: bmc pre-pass refused: the %d-step unrolling exceeds -max-clauses %g "
+						"(%d clauses, %d variables when stopped, %.1fs)\n",
+						bmc_max + 1, ic3_max_clauses / 1e6,
+						bs.ez.numCnfClauses(), bs.ez.numCnfVariables(), elapsed());
+			} else {
 			log("ic3: bmc pre-pass: %d assert(s) and %d cover(s) on one %d-step unrolling "
 					"(%d clauses, %d variables, encoded in %.1fs)\n",
 					first_cover, ntargets - first_cover, bmc_max + 1,
@@ -3390,6 +3428,7 @@ struct Ic3Pass : Pass
 			}
 			log("ic3: bmc pre-pass: %d of %d target(s) hit within depth %d (%.1fs)\n",
 					GetSize(bmc_hit), ntargets, t - 2, elapsed());
+			}
 			}
 		}
 

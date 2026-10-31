@@ -1,0 +1,25 @@
+# ic3 -max-clauses: an encoding past the size cap is refused as cells are
+# imported, and its targets read undecided (2026-10-31; fv_montmultiplier's
+# 312M-clause pre-pass unrolling peaked at 22.7 GB).  Under a 1000-clause
+# cap the pre-pass and the query are refused; without it the assert is
+# disproved at depth 3.
+read_verilog -sv -formal <<EOT
+module tcnt(input clk);
+  reg [7:0] n = 0;
+  always @(posedge clk) n <= n + 8'd1;
+  a_small: assert property (@(posedge clk) n < 8'd3);
+endmodule
+EOT
+prep -top tcnt
+sva2check
+async2sync
+opt_clean
+design -save d
+logger -expect log "bmc pre-pass refused: the 5-step unrolling exceeds -max-clauses 0.001" 1
+logger -expect log "a_small: query budget of 0.001M-clause encoding exhausted" 1
+logger -expect log "a_small: undecided" 1
+ic3 -check-cells -init-zero -bmc 4 -max-clauses 0.001
+logger -check-expected
+design -load d
+logger -expect log "a_small: disproved" 1
+ic3 -check-cells -init-zero -bmc 4

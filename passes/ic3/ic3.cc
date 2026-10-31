@@ -170,9 +170,47 @@ struct Ic3MiniSat : public ezSAT
 	Minisat::Solver *minisat_solver;
 	std::vector<int> minisat_vars;
 	size_t clauses_since_simplify;
+	// a clause added by flush() made the solver UNSAT at level 0: every
+	// later solve is UNSAT (MiniSat's addClause said so once)
+	bool unsat_at_root = false;
 
 	Ic3MiniSat() : minisat_solver(nullptr), clauses_since_simplify(0) { }
 	~Ic3MiniSat() override { delete minisat_solver; }
+
+	// Move the CNF ezSAT has generated so far into MiniSat.  solver() does
+	// this before each solve; encode() also calls it every million clauses,
+	// so a large unrolling is not held twice (ezSAT's vector of clause
+	// vectors, then MiniSat's copy) at its peak.
+	void flush()
+	{
+		if (minisat_solver == nullptr)
+			minisat_solver = new Minisat::Solver;
+		std::vector<std::vector<int>> cnf;
+		consumeCnf(cnf);
+		if (getenv("IC3_CNF_DUMP")) {
+			fprintf(stderr, "ic3-cnf: dump: vars=%d newclauses=%zu\n", numCnfVariables(), cnf.size());
+			for (auto &cl : cnf) {
+				fprintf(stderr, "ic3-cnf:  +");
+				for (auto l : cl) fprintf(stderr, " %d", l);
+				fprintf(stderr, "\n");
+			}
+		}
+		while ((int)minisat_vars.size() < numCnfVariables())
+			minisat_vars.push_back(minisat_solver->newVar());
+		for (auto &clause : cnf) {
+			if (unsat_at_root)
+				break;
+			Minisat::vec<Minisat::Lit> ps;
+			for (auto idx : clause)
+				if (idx > 0)
+					ps.push(Minisat::mkLit(minisat_vars.at(idx-1)));
+				else
+					ps.push(Minisat::mkLit(minisat_vars.at(-idx-1), true));
+			if (!minisat_solver->addClause(ps))
+				unsat_at_root = true;
+		}
+		clauses_since_simplify += cnf.size();
+	}
 
 	bool solver(const std::vector<int> &modelExpressions, std::vector<bool> &modelValues,
 			const std::vector<int> &assumptions) override
@@ -184,21 +222,9 @@ struct Ic3MiniSat : public ezSAT
 		for (auto id : modelExpressions)
 			modelIdx.push_back(bind(id));
 
-		if (minisat_solver == nullptr)
-			minisat_solver = new Minisat::Solver;
-
-		std::vector<std::vector<int>> cnf;
-		consumeCnf(cnf);
-
-		if (getenv("IC3_CNF_DUMP")) {
-			fprintf(stderr, "ic3-cnf: dump: vars=%d newclauses=%zu assum=%zu model=%zu\n",
-					numCnfVariables(), cnf.size(), assumptions.size(), modelExpressions.size());
-			for (auto &cl : cnf) {
-				fprintf(stderr, "ic3-cnf:  +");
-				for (auto l : cl) fprintf(stderr, " %d", l);
-				fprintf(stderr, "\n");
-			}
-		}
+		flush();
+		if (unsat_at_root)
+			return false;
 		if (getenv("IC3_MS_DUMP")) {
 			static int ms_dump_ctr = 0;
 			ms_dump_ctr++;
@@ -222,25 +248,10 @@ struct Ic3MiniSat : public ezSAT
 			}
 		}
 
-		while ((int)minisat_vars.size() < numCnfVariables())
-			minisat_vars.push_back(minisat_solver->newVar());
-
-		for (auto &clause : cnf) {
-			Minisat::vec<Minisat::Lit> ps;
-			for (auto idx : clause)
-				if (idx > 0)
-					ps.push(Minisat::mkLit(minisat_vars.at(idx-1)));
-				else
-					ps.push(Minisat::mkLit(minisat_vars.at(-idx-1), true));
-			if (!minisat_solver->addClause(ps))
-				return false;
-		}
-
 		// IC3 interleaves clause addition and solving hundreds of thousands
 		// of times; MiniSat's simplify() walks the whole clause DB, so it
 		// must not run per batch. The solver self-cleans via reduceDB in
 		// solve(); simplify() only kicks in on large batches.
-		clauses_since_simplify += cnf.size();
 		if (clauses_since_simplify >= 10000) {
 			clauses_since_simplify = 0;
 			if (!minisat_solver->simplify())
@@ -671,6 +682,7 @@ struct Ic3Solver
 		// two-timeframe unraveling: comb logic at each timestep, FF
 		// transition constraints tie Q@t to D@(t-1); Q@1 stays a free
 		// variable modulo the init constraints below
+		int flushed_at = ez.numCnfClauses();
 		for (int t = 1; t <= ntf; t++)
 			for (auto cell : coi_cells) {
 				if (cell->type == ID($mem_v2))
@@ -684,6 +696,10 @@ struct Ic3Solver
 				if (ic3_max_clauses > 0 && ez.numCnfClauses() > ic3_max_clauses) {
 					ic3_size_hit = true;
 					throw Ic3Timeout();
+				}
+				if (ez.numCnfClauses() - flushed_at >= 1000000) {
+					ez.flush();
+					flushed_at = ez.numCnfClauses();
 				}
 			}
 

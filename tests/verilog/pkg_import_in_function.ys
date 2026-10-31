@@ -1,0 +1,36 @@
+# A name a package imports (`import pa::*`) and uses inside one of its own
+# functions -- in the return type, an argument or a local -- refers to the
+# source package's item (2026-10-31; OpenTitan otp_ctrl_part_pkg's
+# `function part_access_t [NumPart-1:0] named_part_access_pre(...)`, NumPart
+# from otp_ctrl_reg_pkg).  The function's identifiers were all qualified
+# with the function's own package (`pb::N`), which named nothing once the
+# import's clones were dropped: "Range bound uses implicitly declared
+# identifier `\pb::N' from a missing package".
+read_verilog -sv <<EOF
+package pa;
+  parameter int N = 3;
+  function automatic logic [N-1:0] inv(input logic [N-1:0] x);
+    return ~x;
+  endfunction
+endpackage
+package pb;
+  import pa::*;
+  localparam int M = 5;
+  function automatic logic [N-1:0] f(input logic [N-1:0] x);
+    logic [N-1:0] y;
+    y = inv(x) ^ N[N-1:0];
+    return y;
+  endfunction
+  function automatic int g();
+    return M + N;
+  endfunction
+endpackage
+module top(input [2:0] x, output [2:0] o, output [7:0] p);
+  assign o = pb::f(x);
+  assign p = pb::g();
+endmodule
+EOF
+hierarchy -top top
+proc
+select -assert-none A:sv_degraded
+sat -verify -set x 3'b010 -prove o 3'b110 -prove p 8'd8

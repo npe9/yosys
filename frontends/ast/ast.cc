@@ -1498,7 +1498,12 @@ AST_INTERNAL::process_and_replace_module(RTLIL::Design *design,
 // renames identifiers in tasks and functions within a package
 static void rename_in_package_stmts(AstNode *pkg)
 {
-	std::unordered_set<std::string> idents;
+	// name -> the package that owns it: this one for its own items, the
+	// source package for an imported clone's (`import pa::*` then `N` in a
+	// function's types: it is pa::N, and pb::N named nothing once the
+	// clones were dropped -- OpenTitan otp_ctrl_part_pkg's
+	// `part_access_t [NumPart-1:0]`, NumPart from otp_ctrl_reg_pkg)
+	std::unordered_map<std::string, std::string> idents;
 	// the items of the package's enums too (`case (t) SecdedHsiao:` in
 	// cva6 prim_secded_pkg::get_synd_width): they sit under an AST_ENUM,
 	// and left bare a call from outside the package read them as implicit
@@ -1511,15 +1516,22 @@ static void rename_in_package_stmts(AstNode *pkg)
 			if (!c || c->type == AST_FUNCTION || c->type == AST_TASK)
 				continue;
 			if (c->type == AST_ENUM_ITEM)
-				idents.insert(c->str);
+				idents.emplace(c->str, pkg->str);
 			collect_enum_items(c.get());
 		}
 	};
 	for (auto& item : pkg->children) {
-		idents.insert(item->str);
-		if (item->type != AST_FUNCTION && item->type != AST_TASK && !item->attributes.count(IdString("\\pkg_scope_clone")))
+		if (item->attributes.count(IdString("\\pkg_scope_clone")))
+			continue;
+		idents[item->str] = pkg->str;
+		if (item->type != AST_FUNCTION && item->type != AST_TASK)
 			collect_enum_items(item.get());
 	}
+	// imported clones after the package's own items: a local declaration
+	// keeps its name (26.3)
+	for (auto& item : pkg->children)
+		if (item->attributes.count(IdString("\\pkg_scope_clone")) && item->attributes.count(IdString("\\pkg_import_from")))
+			idents.emplace(item->str, item->attributes.at(IdString("\\pkg_import_from"))->str);
 	std::function<void(std::unique_ptr<AstNode>&)> rename =
 		[&rename, &idents, pkg](std::unique_ptr<AstNode>& node) {
 			for (auto& child : node->children) {
@@ -1527,8 +1539,9 @@ static void rename_in_package_stmts(AstNode *pkg)
 				// name of a typedef cloned in from an imported package)
 				// is not this package's to prefix again (register v3 D13:
 				// `build_config_pkg::config_pkg::cva6_cfg_t`)
-				if (!child->str.empty() && idents.count(child->str) && child->str.find("::") == std::string::npos)
-					child->str = pkg->str + "::" + child->str.substr(1);
+				auto it = child->str.empty() || child->str.find("::") != std::string::npos ? idents.end() : idents.find(child->str);
+				if (it != idents.end())
+					child->str = it->second + "::" + child->str.substr(1);
 				rename(child);
 			}
 	};
@@ -1735,6 +1748,8 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 							continue;
 						auto cloned_node = o->clone();
 						cloned_node->attributes[scope_clone] = AstNode::mkconst_int(cloned_node->location, 1, false);
+						// the package it came from, for rename_in_package_stmts
+						cloned_node->attributes[IdString("\\pkg_import_from")] = AstNode::mkconst_str(cloned_node->location, n->str);
 						import_clones.push_back(std::move(cloned_node));
 					}
 				}

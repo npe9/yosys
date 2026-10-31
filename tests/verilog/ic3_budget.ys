@@ -1,0 +1,32 @@
+# ic3 -budget: a per-query budget in solver work (millions of propagations,
+# summed over the query's SAT calls) rather than seconds, so a verdict does
+# not depend on machine load (2026-10-30).  The hard UNSAT query (10-bit
+# multiplier associativity, no induction) runs out of 1M propagations; an
+# easy one (a mod-100 counter stays below 200; ~44M propagations over IC3's
+# incremental calls) is proved within 100M.
+read_verilog -sv -formal <<EOT
+module tmulc(input clk, input [9:0] a, input [9:0] b, input [9:0] c);
+  wire [9:0] l = (a*b)*c;
+  wire [9:0] r = a*(b*c);
+  a_assoc: assert property (@(posedge clk) l == r);
+endmodule
+module tcnt(input clk);
+  reg [7:0] n = 0;
+  always @(posedge clk) n <= n == 8'd99 ? 8'd0 : n + 8'd1;
+  a_cnt: assert property (@(posedge clk) n < 8'd200);
+endmodule
+EOT
+prep
+sva2check
+async2sync
+opt_clean
+design -save both
+select tmulc
+logger -expect log "a_assoc: query budget of 1M-propagation exhausted" 1
+logger -expect log "a_assoc: undecided" 1
+ic3 -check-cells -init-zero -kind 0 -budget 1
+logger -check-expected
+design -load both
+hierarchy -top tcnt
+logger -expect log "a_cnt: proved" 1
+ic3 -check-cells -init-zero -kind 0 -budget 100

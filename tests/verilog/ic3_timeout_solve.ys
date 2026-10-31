@@ -1,7 +1,7 @@
 # ic3 -timeout must bound a single SAT call (2026-10-22).  The deadline
 # used to be checked only between solves: this one UNSAT query (10-bit
 # multiplier associativity, no induction) ran 150s+ past `-timeout 5`.
-# Now the solve runs in propagation-budget slices and stops at ~2s.
+# Now a watchdog thread interrupts the solve at the deadline (~2s).
 read_verilog -sv -formal <<EOT
 module tmulc(input clk, input [9:0] a, input [9:0] b, input [9:0] c);
   wire [9:0] l = (a*b)*c;

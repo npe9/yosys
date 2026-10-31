@@ -51,10 +51,28 @@ PRIVATE_NAMESPACE_BEGIN
 struct Ic3Timeout {};
 static bool ic3_deadline_on = false;
 static std::chrono::steady_clock::time_point ic3_deadline;
+// -budget <M>: the same per-query budget counted in solver work (millions of
+// MiniSat propagations, summed over every SAT call of the query) instead of
+// seconds.  A wall-clock budget makes a verdict depend on machine load (a
+// pre-pass hit found in 48 s alone ran out of 30 s under a gate's load); a
+// work budget gives the same verdict on every run.  ic3_work_hit says which
+// budget ran out.
+static bool ic3_work_on = false;
+static int64_t ic3_work_left = 0;
+static bool ic3_work_hit = false;
+static uint64_t ic3_trace_props = 0, ic3_trace_confl = 0;
 static void ic3_check_deadline()
 {
-	if (ic3_deadline_on && std::chrono::steady_clock::now() > ic3_deadline)
+	if (ic3_deadline_on && std::chrono::steady_clock::now() > ic3_deadline) {
+		ic3_work_hit = false;
 		throw Ic3Timeout();
+	}
+}
+static std::string ic3_budget_str(double timeout_s, double budget_m)
+{
+	if (ic3_work_hit)
+		return stringf("%gM-propagation", budget_m);
+	return stringf("%gs", timeout_s);
 }
 
 // One watchdog thread for the whole process: a solve under -timeout arms it
@@ -223,18 +241,41 @@ struct Ic3MiniSat : public ezSAT
 		// search at level 0, and a model of an unrolling with more variables
 		// than that never fit in one slice: easy satisfiable queries on the
 		// 2.4M-variable tlul_assert pre-pass spun until the deadline.
-		if (!ic3_deadline_on) {
-			if (!minisat_solver->solve(assumps))
+		// Under -budget the solve gets the query's remaining propagations
+		// (MiniSat checks the budget at every decision, so this does not
+		// restart the search); both budgets can be armed at once.
+		uint64_t props0 = minisat_solver->propagations, confl0 = minisat_solver->conflicts;
+		if (!ic3_deadline_on && !ic3_work_on) {
+			bool sat = minisat_solver->solve(assumps);
+			ic3_trace_props += minisat_solver->propagations - props0;
+			ic3_trace_confl += minisat_solver->conflicts - confl0;
+			if (!sat)
 				return false;
 		} else {
 			ic3_check_deadline();
-			Ic3Watchdog &watchdog = Ic3Watchdog::get();
-			watchdog.arm(minisat_solver, ic3_deadline);
-			Minisat::lbool r = minisat_solver->solveLimited(assumps);
-			watchdog.disarm();
-			minisat_solver->clearInterrupt();
-			if (r == Minisat::lbool((uint8_t)2))
+			if (ic3_work_on && ic3_work_left <= 0) {
+				ic3_work_hit = true;
 				throw Ic3Timeout();
+			}
+			if (ic3_work_on)
+				minisat_solver->setPropBudget(ic3_work_left);
+			Ic3Watchdog &watchdog = Ic3Watchdog::get();
+			if (ic3_deadline_on)
+				watchdog.arm(minisat_solver, ic3_deadline);
+			Minisat::lbool r = minisat_solver->solveLimited(assumps);
+			if (ic3_deadline_on)
+				watchdog.disarm();
+			minisat_solver->clearInterrupt();
+			minisat_solver->budgetOff();
+			uint64_t used = minisat_solver->propagations - props0;
+			ic3_trace_props += used;
+			ic3_trace_confl += minisat_solver->conflicts - confl0;
+			if (ic3_work_on)
+				ic3_work_left -= (int64_t)used;
+			if (r == Minisat::lbool((uint8_t)2)) {
+				ic3_work_hit = ic3_work_on && ic3_work_left <= 0;
+				throw Ic3Timeout();
+			}
 			if (r == Minisat::lbool((uint8_t)1))
 				return false;
 		}
@@ -2595,6 +2636,15 @@ struct Ic3Pass : Pass
 		log("        wall-clock budget per property / cover query; an exhausted\n");
 		log("        query is reported undecided and the next one starts\n");
 		log("\n");
+		log("    -budget <millions>\n");
+		log("        the same budget counted in SAT solver work: millions of\n");
+		log("        propagations, summed over the query's SAT calls.  Unlike\n");
+		log("        -timeout it does not depend on machine load, so a run\n");
+		log("        reproduces its verdicts; with both, whichever runs out first\n");
+		log("        ends the query (-timeout then serves as a backstop).  In the\n");
+		log("        -bmc pre-pass a group of targets gets 1/6 of it (as -timeout's\n");
+		log("        group gets at most 5s)\n");
+		log("\n");
 		log("    -bmc <depth>\n");
 		log("        bounded-model-checking pre-pass: every assert and cover on one\n");
 		log("        shared unrolling, asked at t = 1..depth before k-induction and\n");
@@ -2747,12 +2797,23 @@ struct Ic3Pass : Pass
 		bool verbose = false;
 		int max_frames = 1000;
 		double timeout_s = 0;
-		// arm the per-query budget (0: none)
+		double budget_m = 0;
+		// arm the per-query budgets (0: none)
 		auto arm = [&]() {
 			ic3_deadline_on = timeout_s > 0;
 			if (ic3_deadline_on)
 				ic3_deadline = std::chrono::steady_clock::now() +
 						std::chrono::milliseconds((long long)(timeout_s * 1000));
+			ic3_work_on = budget_m > 0;
+			ic3_work_left = (int64_t)(budget_m * 1e6);
+			ic3_work_hit = false;
+			ic3_trace_props = ic3_trace_confl = 0;
+		};
+		// IC3_WORK_TRACE (env): log each query's work, for calibrating -budget
+		auto trace = [&](const char *what, RTLIL::IdString name) {
+			if (getenv("IC3_WORK_TRACE"))
+				log("ic3-trace: %s %s props %llu confl %llu\n", what, name.unescape().c_str(),
+						(unsigned long long)ic3_trace_props, (unsigned long long)ic3_trace_confl);
 		};
 		int kind_max = 8;
 		int bmc_max = 0;
@@ -2810,6 +2871,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-timeout") {
 				timeout_s = atof(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-budget") {
+				budget_m = atof(args[++argidx].c_str());
 				continue;
 			}
 			if (args[argidx] == "-cex") {
@@ -3248,7 +3313,10 @@ struct Ic3Pass : Pass
 				// -timeout a group gets a short budget; if it runs out, the
 				// group is split in halves, and only a single target gets the
 				// full budget (exhausted: undecided, as before).
-				double group_budget = timeout_s > 0 ? std::min(timeout_s, 5.0) : 0;
+				// (under -budget the group's work budget is the cap, and the
+				// wall clock only the backstop: a 5s cap would fire first on a
+				// slow machine and make the split depend on load again)
+				double group_budget = timeout_s > 0 && budget_m <= 0 ? std::min(timeout_s, 5.0) : 0;
 				std::function<void(std::vector<int>)> settle = [&](std::vector<int> group) {
 					while (1) {
 						std::vector<int> g;
@@ -3276,15 +3344,19 @@ struct Ic3Pass : Pass
 						if (GetSize(g) > 1 && group_budget > 0)
 							ic3_deadline = std::chrono::steady_clock::now() +
 									std::chrono::milliseconds((long long)(group_budget * 1000));
+						if (GetSize(g) > 1 && budget_m > 0)
+							ic3_work_left = std::max<int64_t>(1, (int64_t)(budget_m * 1e6 / 6));
 						try {
 							sat = bs.solve_model(assumptions, watch, model);
 						} catch (Ic3Timeout &) {
-							ic3_deadline_on = false;
+							ic3_deadline_on = ic3_work_on = false;
 							if (GetSize(g) == 1) {
+								trace("prepass-exhausted", targets[g[0]]->name);
 								open[g[0]] = false;
 								nopen--;
-								log("ic3: %s: bmc pre-pass budget of %gs exhausted at depth %d\n",
-										targets[g[0]]->name.unescape().c_str(), timeout_s, t - 1);
+								log("ic3: %s: bmc pre-pass budget of %s exhausted at depth %d\n",
+										targets[g[0]]->name.unescape().c_str(),
+										ic3_budget_str(timeout_s, budget_m).c_str(), t - 1);
 								return;
 							}
 							int half = GetSize(g) / 2;
@@ -3292,7 +3364,8 @@ struct Ic3Pass : Pass
 							settle(std::vector<int>(g.begin() + half, g.end()));
 							return;
 						}
-						ic3_deadline_on = false;
+						ic3_deadline_on = ic3_work_on = false;
+						trace(sat ? "prepass-sat" : "prepass-unsat", GetSize(g) == 1 ? targets[g[0]]->name : RTLIL::IdString(stringf("\\group%d", GetSize(g))));
 						if (!sat)
 							return;
 						for (int i = 0; i < GetSize(idx); i++)
@@ -3459,9 +3532,10 @@ struct Ic3Pass : Pass
 					result = solver.prove(cell, depth);
 				} catch (Ic3Timeout &) {
 					result = 2;
-					log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+					log("ic3: %s: query budget of %s exhausted\n", name.c_str(), ic3_budget_str(timeout_s, budget_m).c_str());
 				}
-				ic3_deadline_on = false;
+				ic3_deadline_on = ic3_work_on = false;
+				trace("query", cell->name);
 			}
 
 			if (result == 1 && cell->get_bool_attribute(ID(sva_capacity))) {
@@ -3548,9 +3622,10 @@ struct Ic3Pass : Pass
 					result = solver.prove(tmp, depth);
 				} catch (Ic3Timeout &) {
 					result = 2;
-					log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+					log("ic3: %s: query budget of %s exhausted\n", name.c_str(), ic3_budget_str(timeout_s, budget_m).c_str());
 				}
-				ic3_deadline_on = false;
+				ic3_deadline_on = ic3_work_on = false;
+				trace("query", cell->name);
 			}
 			if (result == 1) {
 				log("ic3: %s: cover reached (depth %d)%s\n", name.c_str(), depth, lowering_tag(cell).c_str());
@@ -3612,9 +3687,10 @@ struct Ic3Pass : Pass
 				result = solver.prove_liveness(cell, depth, cex_file);
 			} catch (Ic3Timeout &) {
 				result = 2;
-				log("ic3: %s: query budget of %gs exhausted\n", name.c_str(), timeout_s);
+				log("ic3: %s: query budget of %s exhausted\n", name.c_str(), ic3_budget_str(timeout_s, budget_m).c_str());
 			}
-			ic3_deadline_on = false;
+			ic3_deadline_on = ic3_work_on = false;
+			trace("liveness", cell->name);
 
 			if (result == 0) {
 				std::string tag;

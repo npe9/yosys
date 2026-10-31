@@ -22,6 +22,7 @@
 
 #include <set>
 #include <map>
+#include <unordered_set>
 #include <vector>
 #include <string>
 #include <stdio.h>
@@ -57,7 +58,30 @@ private:
 	std::map<std::string, int> literalsCache;
 	std::vector<std::string> literals;
 
-	std::map<std::pair<OpId, std::vector<int>>, int> expressionsCache;
+	// structural hashing: the set holds expression ids only and hashes and
+	// compares through `expressions` (a lookup takes the candidate (op,
+	// args) directly), so each expression is stored once, not twice (the
+	// former std::map key copied the args vector of every expression)
+	struct ExprKeyHash {
+		using is_transparent = void;
+		const ezSAT *ez;
+		static size_t hash_expr(OpId op, const std::vector<int> &args) {
+			size_t h = 5381 + size_t(op);
+			for (int a : args)
+				h = (h * 33) ^ size_t(uint32_t(a));
+			return h;
+		}
+		size_t operator()(int id) const { auto &e = ez->expressions[-id-1]; return hash_expr(e.first, e.second); }
+		size_t operator()(const std::pair<OpId, std::vector<int>> &e) const { return hash_expr(e.first, e.second); }
+	};
+	struct ExprKeyEq {
+		using is_transparent = void;
+		const ezSAT *ez;
+		bool operator()(int a, int b) const { return a == b; }
+		bool operator()(int id, const std::pair<OpId, std::vector<int>> &e) const { return ez->expressions[-id-1] == e; }
+		bool operator()(const std::pair<OpId, std::vector<int>> &e, int id) const { return ez->expressions[-id-1] == e; }
+	};
+	std::unordered_set<int, ExprKeyHash, ExprKeyEq> expressionsCache;
 	std::vector<std::pair<OpId, std::vector<int>>> expressions;
 
 	bool cnfConsumed;
@@ -85,6 +109,9 @@ public:
 
 	ezSAT();
 	virtual ~ezSAT();
+	// expressionsCache's hash and equality point back at this object
+	ezSAT(const ezSAT &) = delete;
+	ezSAT &operator=(const ezSAT &) = delete;
 
 	unsigned int statehash;
 	void addhash(unsigned int);

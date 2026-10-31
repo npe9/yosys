@@ -40,7 +40,7 @@ static std::string my_int_to_string(int i)
 #endif
 }
 
-ezSAT::ezSAT()
+ezSAT::ezSAT() : expressionsCache(0, ExprKeyHash{this}, ExprKeyEq{this})
 {
 	statehash = 5381;
 
@@ -205,15 +205,16 @@ int ezSAT::expression(OpId op, const std::vector<int> &args)
 		abort();
 	}
 
-	std::pair<OpId, std::vector<int>> myExpr(op, myArgs);
+	std::pair<OpId, std::vector<int>> myExpr(op, std::move(myArgs));
 	int id = 0;
 
-	if (expressionsCache.count(myExpr) > 0) {
-		id = expressionsCache.at(myExpr);
+	auto it = expressionsCache.find(myExpr);
+	if (it != expressionsCache.end()) {
+		id = *it;
 	} else {
 		id = -(int(expressions.size()) + 1);
-		expressionsCache[myExpr] = id;
-		expressions.push_back(myExpr);
+		expressions.push_back(std::move(myExpr));
+		expressionsCache.insert(id);
 	}
 
 	if (xorRemovedOddTrues)
@@ -1356,8 +1357,8 @@ void ezSAT::printInternalState(FILE *f) const
 		fprintf(f, "    %d: `%s'\n", i+1, literals[i].c_str());
 
 	fprintf(f, "expressionsCache:\n");
-	for (auto &it : expressionsCache)
-		fprintf(f, "    `%s' -> %d\n", expression2str(it.first).c_str(), it.second);
+	for (int id : expressionsCache)
+		fprintf(f, "    `%s' -> %d\n", expression2str(expressions[-id-1]).c_str(), id);
 
 	fprintf(f, "expressions:\n");
 	for (int i = 0; i < int(expressions.size()); i++)

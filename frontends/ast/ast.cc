@@ -1646,6 +1646,11 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 	for (const auto& child : current_ast->children)
 		if (child && (child->type == AST_MODULE || child->type == AST_INTERFACE))
 			has_module = true;
+	// the $sv_unit module made here already holds this unit's items; it must
+	// not get them a second time as globals (a duplicate wire, and a
+	// "Cannot add procedural assertion" for a named unit-scope assertion)
+	AstNode *unit_mod = nullptr;
+	size_t unit_globals_from = design->verilog_globals.size();
 	if (!has_module && !current_ast->children.empty()) {
 		auto unit = std::make_unique<AstNode>(current_ast->location, AST_MODULE);
 		unit->str = "\\$sv_unit";
@@ -1668,6 +1673,7 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 		if (!unit->children.empty()) {
 			while (design->has(unit->str))
 				unit->str += "$";
+			unit_mod = unit.get();
 			kept.push_back(std::move(unit));
 		}
 		current_ast->children = std::move(kept);
@@ -1751,8 +1757,9 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 	{
 		if (child->type == AST_MODULE || child->type == AST_INTERFACE)
 		{
-			for (auto& n : design->verilog_globals)
-				child->children.push_back(n->clone());
+			size_t nglobals = child.get() == unit_mod ? unit_globals_from : design->verilog_globals.size();
+			for (size_t i = 0; i < nglobals; i++)
+				child->children.push_back(design->verilog_globals[i]->clone());
 
 			// append nodes from previous packages using package-qualified names
 			for (auto& n : design->verilog_packages) {

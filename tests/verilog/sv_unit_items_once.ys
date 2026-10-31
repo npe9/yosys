@@ -1,0 +1,18 @@
+# A file with no module: its items go into the synthetic $sv_unit module,
+# once.  They used to be appended a second time as compilation-unit globals:
+# a duplicate wire and assign, and a named assertion was refused ("Cannot add
+# procedural assertion `\A' because a cell with the same name was already
+# created").
+read_verilog -sv -formal <<EOT
+logic [3:0] a;
+assign a = 4'd5;
+A: assert property (a == 4'd5);
+EOT
+select -assert-mod-count 1 =*
+select -assert-count 1 w:a
+select -assert-count 1 t:$assert t:$check %u
+sva2check
+proc
+async2sync
+logger -expect log "1 properties: proved=1 disproved=0 undecided=0" 1
+ic3 -check-cells -init-zero

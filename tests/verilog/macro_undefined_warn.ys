@@ -1,0 +1,12 @@
+# An undefined macro is read as an identifier (the fork's leniency; upstream
+# errors) and the frontend says so: here `W names the parameter W.
+logger -expect warning "Undefined macro `W' read as the identifier `W'" 1
+read_verilog -sv <<EOT
+module top #(parameter W = 4) (output [`W-1:0] o, output [7:0] n);
+	assign o = '1;
+	assign n = $bits(o);
+endmodule
+EOT
+hierarchy -top top
+proc
+sat -verify -prove o 4'hf -prove n 8'd4

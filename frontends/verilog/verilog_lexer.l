@@ -432,6 +432,9 @@ ASSOC_DIM "["[ \t\r\n]*([a-zA-Z_$][a-zA-Z0-9_$]*|"\*")([ \t\r\n]|"/*"([^*]|\*+[^
 
 "`"[a-zA-Z_$][a-zA-Z0-9_$]* {
 	// An undefined macro is an identifier so a use or a call can still elaborate.
+	// Say so: the failure it causes otherwise surfaces far away (an implicit
+	// net, or "did not evaluate" in a constant function).
+	log_file_warning(out_loc.to_loc(), "Undefined macro `%s' read as the identifier `%s'.\n", YYText() + 1, YYText() + 1);
 	auto val = std::make_unique<std::string>(std::string("\\") + (YYText() + 1));
 	return parser::make_TOK_ID(std::move(val), out_loc);
 }

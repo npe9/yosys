@@ -5516,6 +5516,10 @@ struct SvaCompiler {
 	//   (c) x[*0:$] / x[+] ##k y, k >= 1     (prim_packer)
 	//   (d) P ##[m:$] Q                      (sha3pad): only P can fail; Q
 	//       can always still match in some extension of the trace
+	//   (e) x[*m:$] / x[+] alone, m >= 1      (OpenTitan otp_ctrl
+	//       `|=> $stable(y) [*1:$]`): a sequence property holds at its first
+	//       match, which comes after m consecutive x, so it is exactly
+	//       x[*m]: an attempt fails iff x is low at one of its first m ticks
 	// b, c, x, y are Boolean.  Anything else returns false (the caller
 	// keeps the "no finite bound" refusal).  Locals, multi-clock islands
 	// and nested throughout gates are refused here.
@@ -5601,6 +5605,34 @@ struct SvaCompiler {
 		};
 		SigSpec one = Const(1, 1);
 		std::string op = sva_op(n);
+
+		// (e) a bare consecutive repetition x[*m:$] (x[+]: m = 1), x Boolean
+		if ((op == "[*]" || op == "[+]") && !kid(n, 0)) {
+			int m = 1, hi = -1;
+			Cell *bc = kid(n, 1);
+			if (op == "[*]") {
+				if (!bc || sva_op(bc) != "bounds")
+					return false;
+				auto bp = ports_of(bc);
+				if (bp.empty() || !const_int(bc->getPort(bp[0]), m) || GetSize(bp) < 2 ||
+						!const_int(bc->getPort(bp[1]), hi) || hi >= 0)
+					return false;
+			} else if (bc)
+				return false;
+			// [*0:$] admits the empty match: not a sequence property (16.12.2)
+			if (m < 1 || m > 1024)
+				return false;
+			SigSpec x = boolv(n, 0), tok = start, f = Const(0, 1);
+			for (int i = 0; i < m; i++) {
+				if (i > 0)
+					tok = delay(tok, 1, "wrep");
+				f = orN({f, andN({tok, mod->Not(NEW_ID, x)})});
+				tok = andN({tok, x});
+			}
+			fail = f;
+			note("trailing unbounded repetition, its first match");
+			return true;
+		}
 
 		// x[*0:$] ##k y as rewrite_empty_delays leaves it:
 		// (x[*1:$] ##k y) or (##(k-1) y) -- the empty run as its own arm;

@@ -1,0 +1,44 @@
+# A trailing unbounded consecutive repetition in property position (OpenTitan
+# otp_ctrl `$rose(v) |=> $stable(en) [*1:$]`, 2026-10-31): a sequence property
+# holds at its first match, which comes after m consecutive x, so x[*m:$] is
+# exactly x[*m] (IEEE 1800-2017 16.12.2).  It was "no finite bound".  Each
+# unbounded check is paired with its bounded twin; verdicts and depths are
+# derived by hand on the counter (a at n == 2; b low from n == 5; b2 low at
+# n == 3).  x[*0:$] admits the empty match and stays refused.
+read_verilog -sv -formal <<EOF
+module t(input clk);
+  reg [3:0] n = 0;
+  always @(posedge clk) n <= n + 4'd1;
+  wire a = n == 4'd2, b = n < 4'd5, b2 = n != 4'd3;
+  p_1:  assert property (@(posedge clk) a |-> b [*1:$]);
+  p_3:  assert property (@(posedge clk) a |-> b [*3:$]);
+  p_4:  assert property (@(posedge clk) a |-> b [*4:$]);
+  p_4b: assert property (@(posedge clk) a |-> b [*4]);
+  p_nx: assert property (@(posedge clk) a |=> b2 [*1:$]);
+  p_nxb: assert property (@(posedge clk) a |=> b2);
+  p_pl: assert property (@(posedge clk) a |=> b2 [+]);
+endmodule
+EOF
+proc
+sva2check
+async2sync
+opt_clean
+logger -expect log "p_1: proved" 1
+logger -expect log "p_3: proved" 1
+logger -expect log "p_4: disproved .depth 5." 1
+logger -expect log "p_4b: disproved .depth 5." 1
+logger -expect log "p_nx: disproved .depth 3." 1
+logger -expect log "p_nxb: disproved .depth 3." 1
+logger -expect log "p_pl: disproved .depth 3." 1
+ic3 -check-cells -init-zero
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal <<EOF
+module t0(input clk, input a, input b);
+  p_0: assert property (@(posedge clk) a |-> b [*0:$]);
+endmodule
+EOF
+proc
+logger -expect error "can match empty" 1
+sva2check

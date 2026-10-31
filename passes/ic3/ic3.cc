@@ -3482,6 +3482,52 @@ struct Ic3Pass : Pass
 					multi_driven[c] = md;
 			}
 		}
+		// Vacuity guard (decided 2026-10-31): when the assume constraints
+		// admit no initial state -- init and every assume unsatisfiable at
+		// the first step -- no trace exists, every assert holds and every
+		// cover is unreachable, and neither says anything about the
+		// design.  The same when they admit an initial state but no second
+		// step (a dead end): every trace stops after one step, so a proof
+		// covers one step only.  Such a proof is reported undecided
+		// ("vacuous"), never proved, and the run says so.  (fe40: a
+		// constant-driven init made the initial state UNSAT and every
+		// property of a module proved.)  One 2-step encoding; the
+		// second step's constraints are gated, so both questions are one
+		// solve each.  Dead ends further out are not looked for.
+		std::string vacuous_why;
+		if (!assumes.empty() && (!props.empty() || !covers.empty() || !live_props.empty())) {
+			RTLIL::Cell *any = !props.empty() ? props[0] : !covers.empty() ? covers[0] : live_props[0];
+			Ic3Solver vs(module, init_zero, max_frames);
+			vs.assume_cells = assumes;
+			vs.mem_bmc = true;
+			vs.gate_constraints = true;
+			arm();
+			try {
+				vs.encode(any, 2);
+				std::vector<int> a;
+				vs.push_assum(a, -vs.init_act);
+				if (!vs.solve_assum(a))
+					vacuous_why = "the assumptions admit no initial state";
+				else {
+					vs.push_cgates(a, 2);
+					if (!vs.solve_assum(a))
+						vacuous_why = "the assumptions admit no second step";
+				}
+			} catch (Ic3Timeout &) {
+				log("ic3: vacuity check skipped: %s\n", ic3_query_why(timeout_s, budget_m).c_str());
+			}
+			ic3_deadline_on = ic3_work_on = false;
+			if (!vacuous_why.empty())
+				log_warning("ic3: %s (the initial state and the %d assume constraint(s) are unsatisfiable "
+						"within two steps): no complete trace exists, so no proof is evidence; proved asserts "
+						"and unreachable covers are reported undecided (vacuous).\n",
+						vacuous_why.c_str(), GetSize(assumes));
+		}
+		bool vacuous = !vacuous_why.empty();
+		int n_vacuous = 0;
+		std::string vacuous_tag_s = " (vacuous: " + vacuous_why + ")";
+		const char *vacuous_tag = vacuous_tag_s.c_str();
+
 		dict<RTLIL::Cell*, int> bmc_hit;
 		if (bmc_max > 0 && (!props.empty() || !covers.empty())) {
 			auto t0 = std::chrono::steady_clock::now();
@@ -3790,6 +3836,10 @@ struct Ic3Pass : Pass
 						"this check; the verdict of the check it belongs to is not exact%s\n",
 						name.c_str(), depth, lowering_tag(cell).c_str());
 				n_undecided++;
+			} else if (result == 0 && vacuous) {
+				log("ic3: %s: undecided%s%s\n", name.c_str(), vacuous_tag, lowering_tag(cell).c_str());
+				n_undecided++;
+				n_vacuous++;
 			} else if (result == 0) {
 				if (cex_done && !ext.cert_status.empty())
 					log("ic3: %s: proved%s [engine %s, %s]\n", name.c_str(), lowering_tag(cell).c_str(),
@@ -3881,6 +3931,10 @@ struct Ic3Pass : Pass
 							ch = '_';
 					solver.export_cex(tmp, stringf("%s%s.yw", cex_prefix.c_str(), safe.c_str()), depth);
 				}
+			} else if (result == 0 && vacuous) {
+				log("ic3: %s: cover undecided%s%s\n", name.c_str(), vacuous_tag, lowering_tag(cell).c_str());
+				n_cover_undecided++;
+				n_vacuous++;
 			} else if (result == 0) {
 				log("ic3: %s: cover unreachable%s%s\n", name.c_str(), lowering_tag(cell).c_str(), cert_tag(cell, solver).c_str());
 				n_unreachable++;
@@ -3936,7 +3990,11 @@ struct Ic3Pass : Pass
 			ic3_deadline_on = ic3_work_on = false;
 			trace("liveness", cell->name);
 
-			if (result == 0) {
+			if (result == 0 && vacuous) {
+				log("ic3: %s: undecided%s%s\n", name.c_str(), vacuous_tag, lowering_tag(cell).c_str());
+				n_undecided++;
+				n_vacuous++;
+			} else if (result == 0) {
 				std::string tag;
 				if (ncert_on) {
 					tag = " [uncertified: no liveness certificate yet]";
@@ -3964,6 +4022,9 @@ struct Ic3Pass : Pass
 
 		log("ic3: %d properties: proved=%d disproved=%d undecided=%d\n",
 				GetSize(props) + GetSize(live_props), n_proved, n_disproved, n_undecided);
+		if (vacuous)
+			log("ic3: vacuity: %d proof(s) and unreachable cover(s) not counted (%s)\n",
+					n_vacuous, vacuous_why.c_str());
 		if (ncert_on)
 			log("ic3: native proofs: %d certified, %d uncertified\n", ncert.n_certified, ncert.n_uncertified);
 		if (engine_ext)

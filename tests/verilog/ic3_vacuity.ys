@@ -1,0 +1,73 @@
+# ic3's vacuity guard (2026-10-31): when the assume constraints admit no
+# initial state (or no second step), no complete trace exists, so every
+# assert "holds" and every cover is "unreachable" without saying anything
+# about the design.  Those are reported undecided (vacuous), with a
+# warning, never proved.
+read_verilog -sv -formal <<EOF
+module tcontra(input clk, input a, input [3:0] x);
+  reg [3:0] n = 0;
+  always @(posedge clk) n <= n + 4'd1;
+  m_a:    assume property (@(posedge clk) a);
+  m_na:   assume property (@(posedge clk) !a);
+  p_any:  assert property (@(posedge clk) x == 4'd5);
+  c_any:  cover property (@(posedge clk) n == 4'd3);
+endmodule
+module tinit(input clk, input [3:0] x);
+  reg [3:0] r = 4'd1;
+  always @(posedge clk) r <= x;
+  // contradicts r's initial value at the first step
+  m_r0:   assume property (@(posedge clk) r == 4'd0);
+  p_r:    assert property (@(posedge clk) r != 4'd7);
+endmodule
+module tok(input clk, input a, input [3:0] x);
+  reg [3:0] n = 0;
+  always @(posedge clk) n <= n == 4'd9 ? 4'd0 : n + 4'd1;
+  m_a:    assume property (@(posedge clk) a);
+  p_lt:   assert property (@(posedge clk) n < 4'd10);
+  c_3:    cover property (@(posedge clk) n == 4'd3);
+endmodule
+module tlate(input clk, input a);
+  reg s = 0;
+  always @(posedge clk) s <= 1'b1;
+  // satisfiable at the first step (s == 0), contradictory from the second
+  m_s:    assume property (@(posedge clk) !s);
+  p_s:    assert property (@(posedge clk) !s);
+endmodule
+EOF
+proc
+sva2check
+async2sync
+opt_clean
+design -save d
+
+hierarchy -top tcontra
+logger -expect warning "the assumptions admit no initial state" 1
+logger -expect log "p_any: undecided .vacuous: the assumptions admit no initial state." 1
+logger -expect log "c_any: cover undecided .vacuous" 1
+logger -expect log "vacuity: 2 proof.s. and unreachable cover.s. not counted" 1
+ic3 -check-cells -init-zero
+logger -check-expected
+
+design -load d
+hierarchy -top tinit
+logger -expect warning "the assumptions admit no initial state" 1
+logger -expect log "p_r: undecided .vacuous" 1
+ic3 -check-cells -init-zero
+logger -check-expected
+
+design -load d
+hierarchy -top tok
+logger -expect log "p_lt: proved" 1
+logger -expect log "c_3: cover reached" 1
+logger -expect log "1 properties: proved=1 disproved=0 undecided=0" 1
+ic3 -check-cells -init-zero
+logger -check-expected
+
+# a dead end: the assumption admits an initial state but no second step,
+# so every trace stops after one step and the proof covers one step only
+design -load d
+hierarchy -top tlate
+logger -expect warning "the assumptions admit no second step" 1
+logger -expect log "p_s: undecided .vacuous: the assumptions admit no second step." 1
+ic3 -check-cells -init-zero
+logger -check-expected

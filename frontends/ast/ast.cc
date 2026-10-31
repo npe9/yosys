@@ -2067,6 +2067,22 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		}
 		if (target)
 			continue;
+		// no wire of that name: an unpacked array the child keeps as one
+		// register per element (mem2reg's `rf[3]`), read here with constant
+		// indices (genrtlil recorded them): resolve each element
+		if (wire->has_attribute(ID(sv_hierref_idx))) {
+			bool any_elem = false;
+			for (auto &idx : split_tokens(wire->get_string_attribute(ID(sv_hierref_idx)), ",")) {
+				std::string ename = stringf("%s[%s]", path.c_str(), idx.c_str());
+				RTLIL::Wire *et = walk_hierref_down(design, this, ename);
+				if (!et || et->get_bool_attribute(ID(sv_hierref)))
+					continue;
+				targets.push_back({"\\" + ename, et->width, et->is_signed, std::string()});
+				any_wide = any_elem = true;
+			}
+			if (any_elem)
+				continue;
+		}
 		// upward: `<parent module name>.<rest>`
 		size_t dot = path.find('.');
 		if (dot == std::string::npos || cell(RTLIL::escape_id(path.substr(0, dot))))

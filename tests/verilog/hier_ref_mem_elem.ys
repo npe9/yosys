@@ -1,0 +1,41 @@
+# A downward hierarchical reference to an element of an unpacked array with
+# a constant (genvar) index (OpenTitan otbn's secure-wipe assertions read
+# `u_otbn_rf_bignum_inner.rf[i]`, 2026-10-31): the child keeps the array as
+# one register per element (mem2reg's `rf[3]`), so there is no wire `rf` to
+# resolve, and the parent read bit i of a one-bit implicit `u_in.rf`:
+# out of bounds, a constant x.  hierarchy now resolves each `u_in.rf[i]` to
+# the element register (genrtlil records the constant indices read) and
+# flatten joins it.
+read_verilog -sv -formal <<EOF
+module inner(input clk, input [1:0] wa, input [7:0] d, input we, input [1:0] ra, output [7:0] q);
+  logic [7:0] rf [4];
+  for (genvar i = 0; i < 4; i++) begin : g
+    always_ff @(posedge clk) if (we && wa == i) rf[i] <= d;
+  end
+  assign q = rf[ra];
+endmodule
+module top(input clk, input [1:0] wa, input [7:0] d, input we, input [1:0] ra, output [7:0] q);
+  inner u_in (.*);
+  for (genvar i = 0; i < 4; i++) begin : gen_a
+    // reachable: a write of 8'hff at the first edge
+    a_ff: assert property (@(posedge clk) u_in.rf[i] != 8'hff);
+    // the reference reads the same register as the child's own read port
+    a_rd: assert property (@(posedge clk) ra != i || q == u_in.rf[i]);
+  end
+endmodule
+EOF
+logger -expect log "Hierarchical reference top.u_in.rf.3. resolved to 8 bits" 1
+hierarchy -top top
+logger -check-expected
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+select -assert-none A:sv_degraded
+select -assert-none a:hierconn a:sv_hierref %u
+logger -expect log "gen_a.2..a_ff: disproved .depth 1." 1
+logger -expect log "gen_a.2..a_rd: proved" 1
+logger -expect log "8 properties: proved=4 disproved=4 undecided=0" 1
+ic3 -check-cells -init-zero
+logger -check-expected

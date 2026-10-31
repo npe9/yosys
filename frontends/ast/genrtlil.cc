@@ -1789,6 +1789,23 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				return RTLIL::SigSpec(RTLIL::S0, 1);
 			}
 
+			// an element of an unpacked array in an instance (`u_rf.rf[3]`, a
+			// genvar index): the target is the child's per-element register
+			// (`rf[3]`, from mem2reg), not a bit of `u_rf.rf`.  Once
+			// resolve_hierrefs has declared the element reference (rederive),
+			// a constant single-index read is that wire.
+			auto hier_elem_index = [&]() -> int {
+				if (str.find('.') == std::string::npos || children.size() != 1 || children[0]->type != AST_RANGE ||
+						!children[0]->range_valid || children[0]->range_left != children[0]->range_right ||
+						children[0]->range_left < 0)
+					return -1;
+				return children[0]->range_left;
+			};
+			if (id2ast->type == AST_AUTOWIRE && hier_elem_index() >= 0)
+				if (RTLIL::Wire *ew = current_module->wire(stringf("%s[%d]", str.c_str(), hier_elem_index())))
+					if (ew->get_bool_attribute(ID(sv_hierref)))
+						return RTLIL::SigSpec(ew);
+
 			if (id2ast->type == AST_AUTOWIRE && current_module->wires_.count(str) == 0) {
 				RTLIL::Wire *wire = current_module->addWire(str);
 				set_src_attr(wire, this);
@@ -1889,6 +1906,17 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			else {
 				input_error("Identifier `%s' doesn't map to any signal!\n", str);
 			}
+
+			// (record each constant index read of a hierarchical reference,
+			// for resolve_hierrefs to try as an element `name[i]`)
+			if (id2ast->type == AST_AUTOWIRE && hier_elem_index() >= 0)
+				if (RTLIL::Wire *hw = current_module->wire(str))
+					if (hw->get_bool_attribute(ID(sv_hierref))) {
+						std::string idx = hw->get_string_attribute(ID(sv_hierref_idx));
+						std::string me = stringf("%d", hier_elem_index());
+						if (("," + idx + ",").find("," + me + ",") == std::string::npos)
+							hw->set_string_attribute(ID(sv_hierref_idx), idx.empty() ? me : idx + "," + me);
+					}
 
 			if (id2ast->type == AST_MEMORY) {
 				int width = 1;

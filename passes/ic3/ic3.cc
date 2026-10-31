@@ -33,6 +33,7 @@
 #include <condition_variable>
 #include <cmath>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -3238,44 +3239,79 @@ struct Ic3Pass : Pass
 					if (open[k])
 						lits[k] = target_lit(k, t);
 				int hits = 0;
-				for (int k = 0; k < ntargets; k++) {
-					if (!open[k])
-						continue;
-					std::vector<int> assumptions;
-					bs.push_assum(assumptions, -bs.init_act);
-					bs.push_cgates(assumptions, t);
-					assumptions.push_back(lits[k]);
-					std::vector<int> watch, idx;
-					for (int j = 0; j < ntargets; j++)
-						if (open[j]) {
-							watch.push_back(lits[j]);
-							idx.push_back(j);
+				// Ask for ANY target of a group at once (as smtbmc asks for the
+				// disjunction of its asserts): UNSAT settles the whole group at
+				// this depth in one call, a model hits at least one (every open
+				// target it also hits is harvested) and the group is asked
+				// again.  entropy_src's 1125 targets, none reachable, took 2250
+				// separate UNSAT calls (546 s) one target at a time.  Under
+				// -timeout a group gets a short budget; if it runs out, the
+				// group is split in halves, and only a single target gets the
+				// full budget (exhausted: undecided, as before).
+				double group_budget = timeout_s > 0 ? std::min(timeout_s, 5.0) : 0;
+				std::function<void(std::vector<int>)> settle = [&](std::vector<int> group) {
+					while (1) {
+						std::vector<int> g;
+						for (int k : group)
+							if (open[k])
+								g.push_back(k);
+						if (g.empty())
+							return;
+						std::vector<int> glits;
+						for (int k : g)
+							glits.push_back(lits[k]);
+						std::vector<int> assumptions;
+						bs.push_assum(assumptions, -bs.init_act);
+						bs.push_cgates(assumptions, t);
+						assumptions.push_back(GetSize(g) == 1 ? glits[0] : bs.ez.vec_reduce_or(glits));
+						std::vector<int> watch, idx;
+						for (int j = 0; j < ntargets; j++)
+							if (open[j]) {
+								watch.push_back(lits[j]);
+								idx.push_back(j);
+							}
+						std::vector<bool> model;
+						bool sat;
+						arm();
+						if (GetSize(g) > 1 && group_budget > 0)
+							ic3_deadline = std::chrono::steady_clock::now() +
+									std::chrono::milliseconds((long long)(group_budget * 1000));
+						try {
+							sat = bs.solve_model(assumptions, watch, model);
+						} catch (Ic3Timeout &) {
+							ic3_deadline_on = false;
+							if (GetSize(g) == 1) {
+								open[g[0]] = false;
+								nopen--;
+								log("ic3: %s: bmc pre-pass budget of %gs exhausted at depth %d\n",
+										targets[g[0]]->name.unescape().c_str(), timeout_s, t - 1);
+								return;
+							}
+							int half = GetSize(g) / 2;
+							settle(std::vector<int>(g.begin(), g.begin() + half));
+							settle(std::vector<int>(g.begin() + half, g.end()));
+							return;
 						}
-					std::vector<bool> model;
-					bool sat;
-					arm();
-					try {
-						sat = bs.solve_model(assumptions, watch, model);
-					} catch (Ic3Timeout &) {
 						ic3_deadline_on = false;
-						open[k] = false;
-						nopen--;
-						log("ic3: %s: bmc pre-pass budget of %gs exhausted at depth %d\n",
-								targets[k]->name.unescape().c_str(), timeout_s, t - 1);
-						continue;
+						if (!sat)
+							return;
+						for (int i = 0; i < GetSize(idx); i++)
+							if (model[i] && open[idx[i]]) {
+								open[idx[i]] = false;
+								nopen--;
+								hits++;
+								bmc_hit[targets[idx[i]]] = t - 1;
+								log("ic3: %s: bmc pre-pass hit at depth %d\n",
+										targets[idx[i]]->name.unescape().c_str(), t - 1);
+							}
 					}
-					ic3_deadline_on = false;
-					if (!sat)
-						continue;
-					for (int i = 0; i < GetSize(idx); i++)
-						if (model[i] && open[idx[i]]) {
-							open[idx[i]] = false;
-							nopen--;
-							hits++;
-							bmc_hit[targets[idx[i]]] = t - 1;
-							log("ic3: %s: bmc pre-pass hit at depth %d\n",
-									targets[idx[i]]->name.unescape().c_str(), t - 1);
-						}
+				};
+				{
+					std::vector<int> all;
+					for (int k = 0; k < ntargets; k++)
+						if (open[k])
+							all.push_back(k);
+					settle(all);
 				}
 				log("ic3: bmc pre-pass: depth %d: %d hit(s), %d open (%.1fs)\n", t - 1, hits, nopen, elapsed());
 			}

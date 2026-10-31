@@ -1,0 +1,228 @@
+# ic3 encodes $mem_v2 word-level in BMC (no memory_map; 2026-10-31): the
+# same designs read through `memory` (bit-blasted words) and `memory_collect`
+# (word-level) give the same verdicts at the same depths: byte enables, two
+# write ports with priority, out-of-range addresses (5 words on a 3-bit
+# address read x, free), a ROM, a disproof that needs writes to two
+# addresses, memory_map's static words (an array of continuous assigns
+# passed to an array port), with and without -init-zero.  IC3 proper
+# refuses a query whose cone holds a memory.
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory
+opt_clean
+logger -expect log "p_nib_in: disproved \(depth 1\)" 1
+logger -expect log "p_nib: disproved \(depth 0\)" 1
+logger -expect log "p_oor: disproved \(depth 0\)" 1
+logger -expect log "p_prio_neg: disproved \(depth 1\)" 1
+logger -expect log "p_prio: undecided" 1
+logger -expect log "p_rom0: undecided" 1
+logger -expect log "p_rom1: disproved \(depth 0\)" 1
+logger -expect log "p_zero_in: disproved \(depth 1\)" 1
+logger -expect log "p_zero: disproved \(depth 0\)" 1
+ic3 -check-cells -init-zero -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory_collect
+opt_clean
+logger -expect log "p_nib_in: disproved \(depth 1\)" 1
+logger -expect log "p_nib: disproved \(depth 0\)" 1
+logger -expect log "p_oor: disproved \(depth 0\)" 1
+logger -expect log "p_prio_neg: disproved \(depth 1\)" 1
+logger -expect log "p_prio: undecided" 1
+logger -expect log "p_rom0: undecided" 1
+logger -expect log "p_rom1: disproved \(depth 0\)" 1
+logger -expect log "p_zero_in: disproved \(depth 1\)" 1
+logger -expect log "p_zero: disproved \(depth 0\)" 1
+ic3 -check-cells -init-zero -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem2
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory
+opt_clean
+logger -expect log "p_two: disproved \(depth 2\)" 1
+ic3 -check-cells -init-zero -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem2
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory_collect
+opt_clean
+logger -expect log "p_two: disproved \(depth 2\)" 1
+ic3 -check-cells -init-zero -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem3
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory
+opt_clean
+logger -expect log "p_st_neg: disproved \(depth 0\)" 1
+logger -expect log "p_st: undecided" 1
+logger -expect log "p_st3: undecided" 1
+ic3 -check-cells -init-zero -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem3
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory_collect
+opt_clean
+logger -expect log "p_st_neg: disproved \(depth 0\)" 1
+logger -expect log "p_st: undecided" 1
+logger -expect log "p_st3: undecided" 1
+ic3 -check-cells -init-zero -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory
+opt_clean
+logger -expect log "p_nib_in: disproved \(depth 0\)" 1
+logger -expect log "p_nib: disproved \(depth 0\)" 1
+logger -expect log "p_oor: disproved \(depth 0\)" 1
+logger -expect log "p_prio_neg: disproved \(depth 1\)" 1
+logger -expect log "p_prio: undecided" 1
+logger -expect log "p_rom0: undecided" 1
+logger -expect log "p_rom1: disproved \(depth 0\)" 1
+logger -expect log "p_zero_in: disproved \(depth 0\)" 1
+logger -expect log "p_zero: disproved \(depth 0\)" 1
+ic3 -check-cells -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory_collect
+opt_clean
+logger -expect log "p_nib_in: disproved \(depth 0\)" 1
+logger -expect log "p_nib: disproved \(depth 0\)" 1
+logger -expect log "p_oor: disproved \(depth 0\)" 1
+logger -expect log "p_prio_neg: disproved \(depth 1\)" 1
+logger -expect log "p_prio: undecided" 1
+logger -expect log "p_rom0: undecided" 1
+logger -expect log "p_rom1: disproved \(depth 0\)" 1
+logger -expect log "p_zero_in: disproved \(depth 0\)" 1
+logger -expect log "p_zero: disproved \(depth 0\)" 1
+ic3 -check-cells -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem2
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory
+opt_clean
+logger -expect log "p_two: disproved \(depth 0\)" 1
+ic3 -check-cells -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem2
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory_collect
+opt_clean
+logger -expect log "p_two: disproved \(depth 0\)" 1
+ic3 -check-cells -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem3
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory
+opt_clean
+logger -expect log "p_st_neg: disproved \(depth 0\)" 1
+logger -expect log "p_st: undecided" 1
+logger -expect log "p_st3: undecided" 1
+ic3 -check-cells -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem3
+proc
+sva2check
+async2sync
+flatten
+opt_clean
+memory_collect
+opt_clean
+logger -expect log "p_st_neg: disproved \(depth 0\)" 1
+logger -expect log "p_st: undecided" 1
+logger -expect log "p_st3: undecided" 1
+ic3 -check-cells -kind 0 -bmc 3 -max 0
+logger -check-expected
+
+design -reset
+read_verilog -sv -formal ic3_mem_word.sv
+hierarchy -top tmem
+proc
+sva2check
+async2sync
+opt_clean
+memory_collect
+opt_clean
+logger -expect log "p_prio: refused: memory mem: IC3 and k-induction need memory_map" 1
+ic3 -check-cells -init-zero

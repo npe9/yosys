@@ -24,6 +24,7 @@
 #include "kernel/satgen.h"
 #include "kernel/ff.h"
 #include "kernel/ffinit.h"
+#include "kernel/mem.h"
 #include "passes/ic3/aiger_cert.h"
 #include "passes/ic3/smt_bitwuzla.h"
 
@@ -67,6 +68,9 @@ static bool ic3_work_hit = false;
 // A refused encoding reads undecided, like an exhausted budget.
 static int64_t ic3_max_clauses = 0;
 static bool ic3_size_hit = false;
+// a query refused because its cone holds a memory its solver cannot
+// encode (see Ic3Solver::mem_bmc); the reason, empty when none
+static std::string ic3_mem_refused;
 static uint64_t ic3_trace_props = 0, ic3_trace_confl = 0;
 static void ic3_check_deadline()
 {
@@ -74,6 +78,14 @@ static void ic3_check_deadline()
 		ic3_work_hit = false;
 		throw Ic3Timeout();
 	}
+}
+static std::string ic3_budget_str(double timeout_s, double budget_m);
+// what ended an undecided query, for its log line
+static std::string ic3_query_why(double timeout_s, double budget_m)
+{
+	if (!ic3_mem_refused.empty())
+		return "refused: " + ic3_mem_refused;
+	return "query budget of " + ic3_budget_str(timeout_s, budget_m) + " exhausted";
 }
 static std::string ic3_budget_str(double timeout_s, double budget_m)
 {
@@ -381,6 +393,12 @@ struct Ic3Solver
 	// for the two-frame IC3 queries (bad sits at the last frame) and for
 	// liveness (infinite traces).
 	bool gate_constraints = false;
+	// $mem_v2 cells in the cone are encoded word-level (below) only by a
+	// solver that unrolls from the initial state (BMC: the -bmc pre-pass,
+	// the per-query BMC pre-pass, the witness unroll).  IC3 and k-induction
+	// treat the frame-1 state as a cube over register bits, which a memory
+	// word is not; they refuse the query instead (undecided).
+	bool mem_bmc = false;
 	std::vector<int> cgate;
 
 	void push_cgates(std::vector<int> &assumptions, int upto)
@@ -420,6 +438,157 @@ struct Ic3Solver
 	{
 		return type.in(ID($assert), ID($assume), ID($cover), ID($check),
 				ID($live), ID($fair), ID($print));
+	}
+
+	// Word-level memories (no memory_map): a $mem_v2 contributes no state
+	// bits.  A read at timeframe t of address A returns the initial
+	// content at A folded with every write of frames 1..t-1 (a write at
+	// frame s is visible from s+1, as SatGen ties Q@t to D@(t-1)), applied
+	// per bit in port order, so a later port with priority wins:
+	//   v = F;  for s < t, for each write port w:
+	//     v[b] = (en_w@s[b] && addr_w@s == A) ? data_w@s[b] : v[b]
+	// and an address outside [offset, offset+size) reads a free value per
+	// read and frame (memory_map builds no word there and reads x, which
+	// SatGen leaves free).  F, the initial
+	// word, is a fresh vector per read; reads at the same address get the
+	// same F (pairwise), and when the initial state is on (-init_act) F is
+	// INIT at A, with undefined bits 0 under -init-zero and free otherwise
+	// (as for \init on registers).  Exact for an unrolling from the
+	// initial state.  Supported: asynchronous read ports and synchronous
+	// write ports (the frontend's form before memory_dff), no wide ports,
+	// write ports ordered by priority, plus memory_map's disabled and static
+	// write ports (below); anything else is refused.
+	// memory_map's two write-port forms that need no storage: a port that
+	// never writes, and a "static" one (asynchronous, constant address,
+	// all-ones enable: an unpacked array assigned element-wise from
+	// always_comb), whose word IS its data in the same frame, regardless of
+	// other writes and INIT (the last such port for an address wins)
+	bool mem_wr_off(const MemWr &wr)
+	{
+		SigSpec en = sigmap(wr.en);
+		return en.is_fully_const() && !en.as_bool();
+	}
+	bool mem_wr_static(const MemWr &wr)
+	{
+		return !wr.clk_enable && !wr.wide_log2 && sigmap(wr.addr).is_fully_const() &&
+				sigmap(wr.en).is_fully_ones() && !mem_wr_off(wr);
+	}
+	void encode_memories(const pool<RTLIL::Cell*> &coi_cells, int ntf)
+	{
+		std::vector<Mem> mems;
+		for (auto &mem : Mem::get_all_memories(module))
+			if (mem.cell && coi_cells.count(mem.cell))
+				mems.push_back(mem);
+		for (auto &mem : mems) {
+			std::string why;
+			if (!mem_bmc)
+				why = "IC3 and k-induction need memory_map";
+			for (auto &rd : mem.rd_ports)
+				if (why.empty() && (rd.clk_enable || rd.wide_log2))
+					why = rd.clk_enable ? "a synchronous read port (run memory_map)" : "a wide read port (run memory_map)";
+			std::vector<int> clocked;
+			for (int i = 0; i < GetSize(mem.wr_ports); i++) {
+				auto &wr = mem.wr_ports[i];
+				if (mem_wr_static(wr) || mem_wr_off(wr))
+					continue;
+				if (why.empty() && (!wr.clk_enable || wr.wide_log2))
+					why = !wr.clk_enable ? "an asynchronous write port (run memory_map)" : "a wide write port (run memory_map)";
+				for (int j : clocked)
+					if (why.empty() && !wr.priority_mask[j])
+						why = "write ports without a priority order (run memory_map)";
+				clocked.push_back(i);
+			}
+			if (!why.empty()) {
+				ic3_mem_refused = stringf("memory %s: %s", log_id(mem.memid), why.c_str());
+				throw Ic3Timeout();
+			}
+		}
+		for (auto &mem : mems) {
+			Const init = mem.inits.empty() ? Const() : mem.get_init_data();
+			std::vector<std::pair<std::vector<int>, std::vector<int>>> firsts;  // (A, F) per read
+			for (int t = 1; t <= ntf; t++)
+				for (auto &rd : mem.rd_ports) {
+					std::vector<int> a = satgen.importSigSpec(rd.addr, t);
+					std::vector<int> f = ez.vec_var(mem.width);
+					std::vector<int> v = f;
+					for (int s = 1; s < t; s++)
+						for (auto &wr : mem.wr_ports) {
+							if (mem_wr_static(wr) || mem_wr_off(wr))
+								continue;
+							std::vector<int> wa = satgen.importSigSpec(wr.addr, s);
+							std::vector<int> wd = satgen.importSigSpec(wr.data, s);
+							std::vector<int> we = satgen.importSigSpec(wr.en, s);
+							std::vector<int> ra = a;
+							while (GetSize(wa) < GetSize(ra)) wa.push_back(ez.CONST_FALSE);
+							while (GetSize(ra) < GetSize(wa)) ra.push_back(ez.CONST_FALSE);
+							int match = ez.vec_eq(wa, ra);
+							for (int b = 0; b < mem.width; b++)
+								v[b] = ez.ITE(ez.AND(we[b], match), wd[b], v[b]);
+						}
+					int abits = GetSize(a);
+					{
+						std::map<int, const MemWr*> stat;
+						for (auto &wr : mem.wr_ports)
+							if (mem_wr_static(wr))
+								stat[sigmap(wr.addr).as_int()] = &wr;
+						for (auto &it : stat) {
+							int at = ez.vec_eq(a, ez.vec_const_unsigned(it.first, abits));
+							std::vector<int> sd = satgen.importSigSpec(it.second->data, t);
+							for (int b = 0; b < mem.width; b++)
+								v[b] = ez.ITE(at, sd[b], v[b]);
+						}
+					}
+					// address in range: offset <= A < offset + size
+					int in_range;
+					if (mem.start_offset == 0 && abits < 31 && mem.size >= (1 << abits))
+						in_range = ez.CONST_TRUE;
+					else {
+						std::vector<int> lo = ez.vec_const_unsigned(mem.start_offset, abits);
+						std::vector<int> hi = ez.vec_const_unsigned(mem.start_offset + mem.size, abits + 1);
+						std::vector<int> a1 = a;
+						a1.push_back(ez.CONST_FALSE);
+						in_range = ez.AND(ez.vec_ge_unsigned(a, lo), ez.vec_lt_unsigned(a1, hi));
+					}
+					std::vector<int> d = satgen.importSigSpec(rd.data, t);
+					std::vector<int> oor;  // out of range: x, a free value (as memory_map's x)
+					if (in_range != ez.CONST_TRUE)
+						oor = ez.vec_var(mem.width);
+					for (int b = 0; b < mem.width; b++)
+						ez.assume(ez.IFF(d[b], oor.empty() ? v[b] : ez.ITE(in_range, v[b], oor[b])));
+					// pairwise: same address, same initial word
+					for (auto &prev : firsts) {
+						std::vector<int> pa = prev.first, qa = a;
+						while (GetSize(pa) < GetSize(qa)) pa.push_back(ez.CONST_FALSE);
+						while (GetSize(qa) < GetSize(pa)) qa.push_back(ez.CONST_FALSE);
+						ez.assume(ez.OR(ez.NOT(ez.vec_eq(pa, qa)), ez.vec_eq(prev.second, f)));
+					}
+					firsts.emplace_back(a, f);
+					// the initial word under the initial state
+					if (init.size() == 0) {
+						if (init_zero)
+							ez.assume(ez.OR(init_act, ez.NOT(ez.vec_reduce_or(f))));
+					} else {
+						for (int k = 0; k < mem.size; k++) {
+							int at = -1;  // literal: A == offset + k, built on first use
+							for (int b = 0; b < mem.width; b++) {
+								RTLIL::State st = init[k * mem.width + b];
+								if (st != RTLIL::State::S0 && st != RTLIL::State::S1) {
+									if (!init_zero)
+										continue;
+									st = RTLIL::State::S0;
+								}
+								if (at < 0)
+									at = ez.vec_eq(a, ez.vec_const_unsigned(mem.start_offset + k, abits));
+								ez.assume(ez.OR(init_act, ez.NOT(at), st == RTLIL::State::S1 ? f[b] : ez.NOT(f[b])));
+							}
+						}
+					}
+					if (ic3_max_clauses > 0 && ez.numCnfClauses() > ic3_max_clauses) {
+						ic3_size_hit = true;
+						throw Ic3Timeout();
+					}
+				}
+		}
 	}
 
 	// encode the design unrolled to ntf timeframes: comb logic at each
@@ -504,6 +673,8 @@ struct Ic3Solver
 		// variable modulo the init constraints below
 		for (int t = 1; t <= ntf; t++)
 			for (auto cell : coi_cells) {
+				if (cell->type == ID($mem_v2))
+					continue;
 				if (cell->type == ID($mem) || cell->type == ID($pow))
 					log_error("ic3: %s cell %s.%s is not supported -- run `memory_dff; memory_collect; opt_clean` first.\n",
 							log_id(cell->type), log_id(module), log_id(cell));
@@ -515,6 +686,8 @@ struct Ic3Solver
 					throw Ic3Timeout();
 				}
 			}
+
+		encode_memories(coi_cells, ntf);
 
 		// assume-flavor checks constrain every timeframe; see
 		// gate_constraints for frames after the step a query asks about
@@ -1013,6 +1186,7 @@ struct Ic3Solver
 		Ic3Solver bs(module, init_zero, max_frames);
 		bs.assume_cells = assume_cells;
 		bs.gate_constraints = true;
+		bs.mem_bmc = true;
 		bs.encode(prop, bmc_max + 1);
 		for (int t = 1; t <= bmc_max; t++) {
 			std::vector<int> assumptions;
@@ -1217,6 +1391,7 @@ struct Ic3Solver
 		// that same timeframe.
 		Ic3Solver bs(module, init_zero, max_frames);
 		bs.assume_cells = assume_cells;
+		bs.mem_bmc = true;
 		bs.encode(prop, depth + 1);
 
 		// model vector: per-timeframe data-input bits, t = 1..depth+1,
@@ -2827,6 +3002,7 @@ struct Ic3Pass : Pass
 			ic3_work_left = (int64_t)(budget_m * 1e6);
 			ic3_work_hit = false;
 			ic3_size_hit = false;
+			ic3_mem_refused.clear();
 			ic3_trace_props = ic3_trace_confl = 0;
 		};
 		// IC3_WORK_TRACE (env): log each query's work, for calibrating -budget
@@ -3302,16 +3478,21 @@ struct Ic3Pass : Pass
 			bs.assume_cells = assumes;
 			bs.extra_seeds = targets;
 			bs.gate_constraints = true;
+			bs.mem_bmc = true;
 			ic3_size_hit = false;
+			ic3_mem_refused.clear();
 			bool refused = false;
 			try {
 				bs.encode(targets[0], bmc_max + 1);
 			} catch (Ic3Timeout &) {
-				if (!ic3_size_hit)
+				if (!ic3_size_hit && ic3_mem_refused.empty())
 					throw;
 				refused = true;
 			}
-			if (refused) {
+			if (refused && !ic3_mem_refused.empty()) {
+				log("ic3: bmc pre-pass refused: %s\n", ic3_mem_refused.c_str());
+				ic3_mem_refused.clear();
+			} else if (refused) {
 				log("ic3: bmc pre-pass refused: the %d-step unrolling exceeds -max-clauses %g "
 						"(%d clauses, %d variables when stopped, %.1fs)\n",
 						bmc_max + 1, ic3_max_clauses / 1e6,
@@ -3571,7 +3752,7 @@ struct Ic3Pass : Pass
 					result = solver.prove(cell, depth);
 				} catch (Ic3Timeout &) {
 					result = 2;
-					log("ic3: %s: query budget of %s exhausted\n", name.c_str(), ic3_budget_str(timeout_s, budget_m).c_str());
+					log("ic3: %s: %s\n", name.c_str(), ic3_query_why(timeout_s, budget_m).c_str());
 				}
 				ic3_deadline_on = ic3_work_on = false;
 				trace("query", cell->name);
@@ -3661,7 +3842,7 @@ struct Ic3Pass : Pass
 					result = solver.prove(tmp, depth);
 				} catch (Ic3Timeout &) {
 					result = 2;
-					log("ic3: %s: query budget of %s exhausted\n", name.c_str(), ic3_budget_str(timeout_s, budget_m).c_str());
+					log("ic3: %s: %s\n", name.c_str(), ic3_query_why(timeout_s, budget_m).c_str());
 				}
 				ic3_deadline_on = ic3_work_on = false;
 				trace("query", cell->name);
@@ -3726,7 +3907,7 @@ struct Ic3Pass : Pass
 				result = solver.prove_liveness(cell, depth, cex_file);
 			} catch (Ic3Timeout &) {
 				result = 2;
-				log("ic3: %s: query budget of %s exhausted\n", name.c_str(), ic3_budget_str(timeout_s, budget_m).c_str());
+				log("ic3: %s: %s\n", name.c_str(), ic3_query_why(timeout_s, budget_m).c_str());
 			}
 			ic3_deadline_on = ic3_work_on = false;
 			trace("liveness", cell->name);

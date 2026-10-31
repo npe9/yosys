@@ -29,6 +29,16 @@ logger -expect log "p_pa: disproved \(depth 1\)" 1
 logger -expect log "p_s: disproved \(depth 1\)" 1
 logger -expect log "p_hi: proved" 1
 logger -expect log "ic3: 10 init bit\(s\) on constant-driven wires disagree" 1
+# the encoder's own guard, on the module as it is (the default -preopt
+# gives the x inits 0 first, so fewer bits disagree there: below)
+ic3 -check-cells -init-zero -nopreopt
+logger -check-expected
+
+design -load prepped
+logger -expect log "p_w: disproved \(depth 1\)" 1
+logger -expect log "p_pa: disproved \(depth 1\)" 1
+logger -expect log "p_s: disproved \(depth 1\)" 1
+logger -expect log "p_hi: proved" 1
 ic3 -check-cells -init-zero
 logger -check-expected
 

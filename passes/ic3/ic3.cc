@@ -2915,11 +2915,13 @@ struct Ic3Pass : Pass
 		log("        circuit or an invariant circuit against an AIGER model and log\n");
 		log("        \"certificate check: ok\" or \"... rejected, <check> check failed\"\n");
 		log("\n");
-		log("    -preopt\n");
-		log("        simplify a copy of the module before encoding: opt_expr -keepdc,\n");
-		log("        opt_merge, opt_clean (no x refinement, no FF rewriting; formal cells\n");
-		log("        are kept, so a property that folds to a constant is still reported).\n");
-		log("        With -init-zero, uninitialized registers get init 0 first.\n");
+		log("    -nopreopt\n");
+		log("        encode the module as it is.  By default ic3 simplifies a copy of\n");
+		log("        it first: opt_expr -keepdc, opt_merge, opt_clean (no x refinement,\n");
+		log("        no FF rewriting; formal cells are kept, so a property that folds to\n");
+		log("        a constant is still reported); with -init-zero, uninitialized\n");
+		log("        registers get init 0 first.  (-preopt, the former opt-in, is\n");
+		log("        accepted and changes nothing.)\n");
 		log("\n");
 		log("    -certify\n");
 		log("        check every native safety proof (asserts, unreachable covers)\n");
@@ -3001,7 +3003,9 @@ struct Ic3Pass : Pass
 		bool init_zero = false;
 		bool allow_degraded = false;
 		bool probe_reset = false;
-		bool preopt = false;
+		// on by default (decided 2026-10-31): duplicate monitors merge
+		// before encoding (q_same: 223 s -> 0.01 s)
+		bool preopt = true;
 		bool certify = false;
 		bool verbose = false;
 		int max_frames = 1000;
@@ -3051,6 +3055,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-preopt") {
 				preopt = true;
+				continue;
+			}
+			if (args[argidx] == "-nopreopt") {
+				preopt = false;
 				continue;
 			}
 			if (args[argidx] == "-allow-degraded") {

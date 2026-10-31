@@ -1624,7 +1624,8 @@ static const RTLIL::Module* lookup_module(const std::string &name)
 // parameter override (`leaf #('{A:5, B:9})`, the AXI4 FVIP testbench's
 // `amba_axi4_protocol_checker #('{ID_WIDTH:4, ...})`) has no type in the
 // instantiating module: its type is the overridden parameter's.
-static std::unique_ptr<AstNode> override_struct_type(const std::string &modname, const std::string &paraname, int pos)
+static std::unique_ptr<AstNode> override_struct_type(const std::string &modname, const std::string &paraname, int pos,
+		bool *module_missing = nullptr)
 {
 	// the elaborated module's stored ORIGINAL AST first (the copy in
 	// current_ast may already be simplified: its parameter type folded away)
@@ -1641,8 +1642,11 @@ static std::unique_ptr<AstNode> override_struct_type(const std::string &modname,
 		for (auto &c : current_ast->children)
 			if (c && (c->type == AST_MODULE || c->type == AST_INTERFACE) && c->str == modname)
 				mast = c.get();
-	if (!mast)
+	if (!mast) {
+		if (module_missing)
+			*module_missing = true;
 		return nullptr;
+	}
 	AstNode *param = nullptr;
 	int k = 0;
 	for (auto &c : mast->children)
@@ -4914,7 +4918,16 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				}
 				if (child->children.empty() || child->children[0]->type != AST_ASSIGN_PATTERN)
 					continue;
-				auto stype = override_struct_type(ctype, child->str, my_pos);
+				bool module_missing = false;
+				auto stype = override_struct_type(ctype, child->str, my_pos, &module_missing);
+				// the child is not read yet: its parameter's type is unknown.
+				// Say so in hierarchy's words (read the module before, or with,
+				// its parent; the conformance ladder's closure reads it then)
+				if (!stype && module_missing)
+					input_error("Module `%s' referenced in module `%s' is not part of the design (the assignment "
+							"pattern given for its parameter %s takes its type from the module).\n",
+							log_id(ctype), log_id(current_ast_mod ? current_ast_mod->str : std::string("\\?")),
+							child->str.empty() ? stringf("#%d", my_pos + 1).c_str() : log_id(child->str));
 				if (!stype)
 					input_error("Assignment pattern as the value of parameter %s of `%s' needs the parameter's struct type, "
 							"which could not be resolved.\n",

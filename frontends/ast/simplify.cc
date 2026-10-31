@@ -4375,6 +4375,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 	// create name resolution entries for all objects with names
 	if (type == AST_PACKAGE) {
+		std::set<std::string> pkg_imported_names;
 		//add names to package scope
 		for (size_t i = 0; i < children.size(); i++) {
 			auto& node = children[i];
@@ -4385,17 +4386,31 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				current_scope[node->str] = node.get();
 			}
 			if (node->type == AST_ENUM) {
+				// an enum cloned in from this package's own `import other::*`
+				// (AstNode::process, pkg_scope_clone): its items are imported
+				// names, and a local declaration shadows them (IEEE 1800-2017
+				// 26.3) -- otp_ctrl_top_specific_pkg imports otp_ctrl_pkg::*
+				// and declares its own otp_err_e { NoError, ... } as
+				// otp_ctrl_macro_pkg's err_e does
+				bool imported = node->attributes.count(ID(pkg_scope_clone)) > 0;
 				current_scope[node->str] = node.get();
 				for (auto& enode : node->children) {
 					log_assert(enode->type==AST_ENUM_ITEM);
 					enode->attributes[ID::enum_reg_owner] = AstNode::mkconst_str(enode->location, node->str);
-					if (current_scope.count(enode->str) == 0)
+					if (current_scope.count(enode->str) == 0) {
 						current_scope[enode->str] = enode.get();
-					else if (current_scope[enode->str]->type == AST_ENUM_ITEM &&
+						if (imported)
+							pkg_imported_names.insert(enode->str);
+					} else if (current_scope[enode->str]->type == AST_ENUM_ITEM &&
 							current_scope[enode->str]->attributes.count(ID::enum_reg_owner) &&
 							current_scope[enode->str]->attributes[ID::enum_reg_owner]->str == node->str)
 						; // same enum, already registered
-					else
+					else if (imported)
+						; // a local declaration (or an earlier import) wins
+					else if (pkg_imported_names.count(enode->str)) {
+						current_scope[enode->str] = enode.get();
+						pkg_imported_names.erase(enode->str);
+					} else
 						input_error("enum item %s already exists in package\n", enode->str);
 				}
 			}

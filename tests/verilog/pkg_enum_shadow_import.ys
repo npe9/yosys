@@ -1,0 +1,25 @@
+# A package's own enum item shadows one its wildcard import brings in
+# (IEEE 1800-2017 26.3; OpenTitan otp_ctrl_top_specific_pkg imports
+# otp_ctrl_pkg::* and declares otp_err_e { NoError, ... } next to
+# otp_ctrl_macro_pkg's err_e, 2026-10-31).  This was "enum item \NoError
+# already exists in package".  pb's NoError (2) is pb's bare NoError; pa's
+# (0) stays reachable as pa::NoError.
+read_verilog -sv <<EOF
+package pa;
+  typedef enum logic [2:0] { NoError = 3'h0, MacroError = 3'h1 } err_e;
+endpackage
+package pb;
+  import pa::*;
+  typedef enum logic [2:0] { NoError = 3'h2, AccessError = 3'h5 } otp_err_e;
+  localparam logic [2:0] PbNo = NoError;
+endpackage
+module top(output [2:0] a, output [2:0] b, output [2:0] c, output [2:0] d);
+  assign a = pb::NoError;
+  assign b = pb::PbNo;
+  assign c = pa::NoError;
+  assign d = pa::MacroError;
+endmodule
+EOF
+hierarchy -top top
+proc
+sat -verify -prove a 3'd2 -prove b 3'd2 -prove c 3'd0 -prove d 3'd1

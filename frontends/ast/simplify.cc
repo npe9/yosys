@@ -9571,6 +9571,45 @@ skip_memory_write:;
 					newNode = mkconst_int(location, result, true);
 					goto apply_newNode;
 				}
+				// not "Unresolved function `$clog2'": the function is known,
+				// its argument did not fold.  Name what did not (an
+				// identifier from a missing package -- OpenTitan flash_phy_pkg
+				// `$clog2(WidthMultiple)` with flash_ctrl_top_specific_pkg
+				// absent -- or a hierarchical reference)
+				std::string why = "a non-constant expression";
+				int hops = 0;
+				std::function<bool(AstNode*)> find_free = [&](AstNode *n) -> bool {
+					if (!n || hops > 16)
+						return false;
+					if (n->type == AST_IDENTIFIER) {
+						AstNode *d = n->id2ast;
+						if (!d || d->type == AST_AUTOWIRE) {
+							why = stringf("`%s', which does not resolve (a missing package or an unresolved hierarchical name)",
+									RTLIL::unescape_id(n->str).c_str());
+							return true;
+						}
+						if ((d->type == AST_PARAMETER || d->type == AST_LOCALPARAM) && !d->children.empty() &&
+								d->children[0]->type != AST_CONSTANT) {
+							// a parameter whose own value did not fold: follow it
+							hops++;
+							if (find_free(d->children[0].get()))
+								return true;
+						}
+						if (d->type == AST_WIRE || d->type == AST_MEMORY) {
+							why = stringf("`%s', a signal", RTLIL::unescape_id(n->str).c_str());
+							return true;
+						}
+					}
+					for (auto &c : n->children)
+						if (find_free(c.get()))
+							return true;
+					return false;
+				};
+				find_free(buf.get());
+				degrade(location.to_loc(), "System function $clog2 needs a constant argument; its argument reads %s. The call becomes constant 0.\n",
+						why.c_str());
+				newNode = mkconst_int(location, 0, false);
+				goto apply_newNode;
 			}
 
 			if (str == "\\$dimensions" || str == "\\$unpacked_dimensions" ||

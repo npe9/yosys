@@ -1,0 +1,22 @@
+# $clog2 of an argument that does not fold names the reason (2026-10-31):
+# it used to read "Unresolved function `$clog2'", which sent the reader after
+# the function; the argument was the problem (OpenTitan flash_phy_pkg
+# `$clog2(WidthMultiple)` with flash_ctrl_top_specific_pkg absent; caliptra
+# `$clog2(sha256.BLOCK_NO)`).  A parameter whose value did not fold is
+# followed to its cause.  Still a degradation; a constant argument folds.
+logger -expect warning "System function .clog2 needs a constant argument; its argument reads .missing_pkg::W', which does not resolve" 1
+logger -expect warning "System function .clog2 needs a constant argument; its argument reads .x', a signal" 1
+read_verilog -sv -permissive <<EOF
+package p;
+  parameter int unsigned W = missing_pkg::W;
+  parameter int unsigned L = $clog2(W);
+endpackage
+module top(input [3:0] x, output [7:0] o, output [7:0] q);
+  assign o = $clog2(16);
+  assign q = $clog2(x);
+endmodule
+EOF
+logger -check-expected
+hierarchy -top top
+proc
+sat -verify -prove o 8'd4

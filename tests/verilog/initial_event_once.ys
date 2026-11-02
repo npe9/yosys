@@ -1,0 +1,49 @@
+# `initial @(posedge s) stmt' (IEEE 1800 9.4.2) waits for the first edge of
+# s and runs stmt once (OpenTitan rstmgr_attrs_sva_if checks two immediate
+# asserts at the first reset release this way).  It is modeled as an always
+# block on the edge, guarded by a hidden register that the first run sets.
+read_verilog -sv -formal <<EOF
+module tonce(input clk);
+  reg [3:0] q = 0;
+  always @(posedge clk) q <= q + 4'd1;
+  // q is 0 at the first edge only: holds once, fails every later edge
+  initial @(posedge clk) begin
+    a_once: assert (q == 4'd0);
+  end
+  always @(posedge clk) begin
+    a_every: assert (q == 4'd0);
+  end
+endmodule
+module tfirst(input clk);
+  reg [3:0] q = 0;
+  always @(posedge clk) q <= q + 4'd1;
+  initial @(posedge clk) a_first: assert (q == 4'd1);
+endmodule
+EOF
+proc
+async2sync
+opt_clean
+design -save d
+
+hierarchy -top tonce
+logger -expect log "a_once: proved" 1
+logger -expect log "a_every: disproved" 1
+ic3 -check-cells -init-zero
+logger -check-expected
+
+design -load d
+hierarchy -top tfirst
+logger -expect log "a_first: disproved" 1
+ic3 -check-cells -init-zero
+logger -check-expected
+
+# a level event control after `initial' is not modeled (a degradation, as
+# for the statement-level `@(...)'); a bare `@(posedge s);' still parses
+design -reset
+logger -expect error "procedural event control .@\(\.\.\.\)' is dropped" 1
+read_verilog -sv <<EOF
+module tlevel(input a, output reg y);
+  initial @(a) y = 1'b0;
+endmodule
+EOF
+logger -check-expected

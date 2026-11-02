@@ -1040,7 +1040,10 @@
 // +9 (2026-10-21, sva_live_op after nexttime / not): the operand of a
 // prefixed always / eventually extends as far right as possible (shift),
 // the same reading `always a until b` already had
-%expect 140
+// +1 (2026-11-02, fe99): after `initial', `@' is shifted into the one-shot
+// `initial @(edge) stmt' rule instead of reducing toward a statement-level
+// event control (which the rule covers, with its degradations)
+%expect 141
 
 %precedence FAKE_THEN
 %precedence TOK_ELSE
@@ -4364,6 +4367,61 @@ always_stmt:
 		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_INITIAL));
 		append_attr(node, std::move($1));
 		(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_BLOCK));
+	} behavioral_stmt {
+		extra->ast_stack.pop_back();
+		extra->ast_stack.pop_back();
+	} |
+	attr TOK_INITIAL TOK_AT TOK_LPAREN {
+		// IEEE 1800 9.4.2: `initial @(posedge s) stmt' waits for the first
+		// edge and runs stmt once.  Modeled exactly: an always block on the
+		// edge whose body is guarded by a hidden register, 0 at time 0 and
+		// set by the first run.  (The `@' is shifted here, ahead of the
+		// statement-level event control: one more resolved conflict.)
+		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_ALWAYS));
+		append_attr(node, std::move($1));
+	} always_events TOK_RPAREN {
+		AstNode *node = extra->ast_stack.back();
+		AstNode *mod = extra->ast_stack[extra->ast_stack.size() - 2];
+		bool edges = true;
+		for (auto &c : node->children)
+			if (c->type != AST_POSEDGE && c->type != AST_NEGEDGE)
+				edges = false;
+		if (!edges) {
+			// any change of a level: the wait is not modeled, as for the
+			// statement-level `@(...)'
+			parse_degrade(extra, @3, "procedural event control `@(...)' is dropped: the statements after it run without waiting");
+			node->type = AST_INITIAL;
+			node->children.clear();
+			(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_BLOCK));
+		} else {
+			std::string fired = stringf("$initial_fired$%d", autoidx++);
+			auto wire = std::make_unique<AstNode>(@$, AST_WIRE);
+			wire->str = fired;
+			wire->is_reg = true;
+			wire->is_logic = true;
+			mod->children.push_back(std::move(wire));
+			auto id = [&]() { auto i = std::make_unique<AstNode>(@$, AST_IDENTIFIER); i->str = fired; return i; };
+			mod->children.push_back(std::make_unique<AstNode>(@$, AST_INITIAL, std::make_unique<AstNode>(@$, AST_BLOCK,
+				std::make_unique<AstNode>(@$, AST_ASSIGN_EQ, id(), AstNode::mkconst_int(@$, 0, false, 1)))));
+			auto body = std::make_unique<AstNode>(@$, AST_BLOCK);
+			AstNode *bodyp = body.get();
+			body->children.push_back(std::make_unique<AstNode>(@$, AST_ASSIGN_LE, id(), AstNode::mkconst_int(@$, 1, false, 1)));
+			auto cs = std::make_unique<AstNode>(@$, AST_CASE, std::make_unique<AstNode>(@$, AST_REDUCE_BOOL, std::make_unique<AstNode>(@$, AST_LOGIC_NOT, id())));
+			cs->children.push_back(std::make_unique<AstNode>(@$, AST_COND, AstNode::mkconst_int(@$, 1, false, 1), std::move(body)));
+			node->children.push_back(std::make_unique<AstNode>(@$, AST_BLOCK, std::move(cs)));
+			extra->ast_stack.push_back(bodyp);
+		}
+	} behavioral_stmt {
+		extra->ast_stack.pop_back();
+		extra->ast_stack.pop_back();
+	} |
+	attr TOK_INITIAL TOK_AT rvalue {
+		// `initial @ev stmt' (a named event; simulation-only)
+		parse_degrade(extra, @3, "procedural event wait `@ev' is dropped: its statement runs without waiting");
+		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_INITIAL));
+		append_attr(node, std::move($1));
+		(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_BLOCK));
+		(void)$4;
 	} behavioral_stmt {
 		extra->ast_stack.pop_back();
 		extra->ast_stack.pop_back();

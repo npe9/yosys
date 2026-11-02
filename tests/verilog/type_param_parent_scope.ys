@@ -1,71 +1,72 @@
-# A type parameter whose actual is a module-local typedef of a PARAMETRIC
-# parent (OpenTitan `PRIM_FLOP_SPARSE_FSM(u_state_regs, ..., state_e, Idle)`
-# inside csrng_cmd_stage).  The actual reaches derive as `\stage::state_e`
-# (abstract parent) or `$paramod\stage\P=...::state_e` (derived parent);
-# neither was found, and the bare-name fallback took a package's
-# `state_e` (decoy_pkg's 9-bit one here), resizing the ports and making
-# is_undefined_state true for every value.
-logger -werror "Resizing cell port"
-read_verilog -sv <<EOT
-package decoy_pkg;
-  typedef enum logic [8:0] {X0 = 9'd0, X1 = 9'd3} state_e;
+# A type parameter override is the type the INSTANTIATING scope sees
+# (IEEE 1800-2017 6.20.3), carried into the child with what it names
+# (2026-11-02, cva6 as a context parent).  Before:
+#  - a name the parent sees only through `import pkg::*` (cva6's
+#    `localparam type sbe_t = struct packed { cf_t cf; ... }`) was looked up
+#    in the child: "Unknown identifier `\cf_t' used as type name";
+#  - a member of a struct parameter in a range (`logic [C.u.w-1:0]`) did not
+#    bring `C`, and a parameter whose value calls a function local to the
+#    parent (`U = setc()`) could not be evaluated in the child;
+#  - brought declarations were inserted in reverse, so a typedef brought
+#    after a parameter another typedef had already brought landed ahead of
+#    it ("Range bound uses implicitly declared identifier `\C.u.d'");
+#  - `#(parameter type a = logic, type b = a)` and `type b = a [3:0]` were
+#    syntax errors (hpdcache_mem_resp_demux).
+read_verilog -sv -defer <<EOF
+package p;
+  localparam int W = 5;
+  typedef enum logic [1:0] {A, B, C} cf_t;
 endpackage
-module sp #(parameter int Width = 1, parameter type StateEnumT = logic [Width-1:0])
-           (input StateEnumT state_i, output StateEnumT state_o, output logic err_o);
-  assign state_o = StateEnumT'(state_i);
-  function automatic logic is_undefined_state(StateEnumT sig);
-    logic is_defined = 1'b0;
-    for (int i = 0, StateEnumT t = t.first(); i < t.num(); i += 1, t = t.next())
-      is_defined |= (sig === t);
-    return ~is_defined;
+package q;
+  typedef struct packed { int unsigned w; int unsigned d; } u_t;
+  typedef struct packed { u_t u; int unsigned n; } c_t;
+  function automatic c_t build(input u_t x);
+    c_t r; r.u = x; r.n = x.w * 2; return r;
   endfunction
-  assign err_o = is_undefined_state(state_o);
-endmodule
-module stage #(parameter int P = 1) (input logic [7:0] d, output logic [7:0] q, output logic e);
-  localparam int StateWidth = 8;
-  typedef enum logic [StateWidth-1:0] {Idle = 8'b11110101, Flush = 8'b01011011} state_e;
-  state_e state_q;
-  sp #(.StateEnumT(state_e), .Width($bits(state_e))) u_state_regs (.state_i(state_e'(d)), .state_o(state_q), .err_o(e));
-  assign q = state_q;
-endmodule
-module top (input logic [7:0] d, output logic [7:0] q, output logic e, output logic [7:0] q1, output logic e1);
-  stage #(.P(2)) u (.d, .q, .e);
-  stage u1 (.d, .q(q1), .e(e1));
-endmodule
-EOT
-hierarchy -top top
-proc
-flatten
-select -assert-count 1 w:u.u_state_regs.state_o
-sat -set d 8'b11110101 -prove e 0 -prove e1 0 -verify
-sat -set d 8'b01011011 -prove e 0 -prove e1 0 -verify
-sat -set d 8'h03 -prove e 1 -prove e1 1 -verify
-sat -set d 8'h00 -prove e 1 -prove e1 1 -verify
-sat -prove q d -prove q1 d -verify
-design -reset
-
-# The parent typedefs a struct type actual brings along read a member of
-# the parent's struct parameter (pulp axi_xbar_intf `typedef logic
-# [Cfg.AxiDataWidth/8-1:0] strb_t`). They must be inserted after the
-# child's own value parameters, or `Cfg.W` is an undeclared identifier.
-read_verilog -sv <<EOT
-package cfg_pkg;
-  typedef struct packed { int unsigned W; int unsigned N; } cfg_t;
 endpackage
-module child #(parameter cfg_pkg::cfg_t Cfg = '0, parameter type w_t = logic) (input w_t i, output w_t o);
-  assign o = i;
+module c #(parameter type I = logic, parameter type T = logic, parameter type R = logic)
+          (output logic [7:0] wi, output logic [7:0] wt, output logic [7:0] wr);
+  assign wi = $bits(I);
+  assign wt = $bits(T);
+  assign wr = $bits(R);
 endmodule
-module parent #(parameter cfg_pkg::cfg_t Cfg = '{W: 16, N: 2}) (input logic [15:0] d, input logic [1:0] s, output logic [15:0] q, output logic [1:0] r);
-  typedef logic [Cfg.W-1:0] data_t;
-  typedef logic [Cfg.W/8-1:0] strb_t;
-  typedef struct packed { data_t data; strb_t strb; } w_t;
-  w_t a, b;
-  assign a = '{data: d, strb: s};
-  child #(.Cfg(Cfg), .w_t(w_t)) u (.i(a), .o(b));
-  assign q = b.data; assign r = b.strb;
+module m_import import p::*; #(
+  localparam type s_t = struct packed { logic v; cf_t cf; logic [W-1:0] a; }
+) (output logic [7:0] w);
+  c #(.T(s_t)) u (.wt(w));
 endmodule
-EOT
-hierarchy -top parent
-proc
+module m_cfg #(parameter int K = 3) (output logic [7:0] a, output logic [7:0] b, output logic [7:0] i);
+  function automatic q::u_t setc();
+    q::u_t u; u.w = K + 3; u.d = K; return u;
+  endfunction
+  localparam q::u_t U = setc();
+  localparam q::c_t C = q::build(U);
+  typedef logic [C.u.d-1:0] id_t;
+  typedef logic [C.u.w-1:0] data_t;
+  typedef struct packed { data_t x; logic y; } t2;
+  typedef struct packed { id_t i; data_t x; } r_t;
+  c #(.I(id_t), .T(t2), .R(r_t)) u (.wi(i), .wt(a), .wr(b));
+endmodule
+module d #(
+  parameter type id_t = logic,
+  parameter type b_t = id_t,
+  localparam int D = (1 << $bits(id_t)),
+  localparam type rt_t = id_t [D-1:0]
+) (output logic [7:0] w, output logic [7:0] wb);
+  assign w = $bits(rt_t);
+  assign wb = $bits(b_t);
+endmodule
+module top(output logic [7:0] w0, output logic [7:0] a3, output logic [7:0] b3, output logic [7:0] i3,
+           output logic [7:0] a5, output logic [7:0] b5, output logic [7:0] i5,
+           output logic [7:0] wd, output logic [7:0] wdb);
+  m_import mi (.w(w0));
+  m_cfg #(.K(3)) k3 (.a(a3), .b(b3), .i(i3));
+  m_cfg #(.K(5)) k5 (.a(a5), .b(b5), .i(i5));
+  d #(.id_t(logic [2:0])) ud (.w(wd), .wb(wdb));
+endmodule
+EOF
+hierarchy -top top
 flatten
-sat -prove q d -prove r s -verify
+# s_t: 1 + 2 + W(5) = 8; K=3: data 6, id 3 -> t2 7, r_t 9; K=5: data 8, id 5 -> t2 9, r_t 13
+# d: rt_t = logic [2:0] [7:0] = 24 bits (8'd24), b_t = id_t = 3
+sat -verify -prove w0 8 -prove a3 7 -prove b3 9 -prove i3 3 -prove a5 9 -prove b5 13 -prove i5 5 -prove wd 24 -prove wdb 3

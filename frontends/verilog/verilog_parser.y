@@ -1270,53 +1270,21 @@ single_module_para:
 		extra->astbuf1->children.push_back(AstNode::mkconst_int(@2, 0, true));
 		append_attr(extra->astbuf1.get(), std::move($1));
 	} param_type single_param_decl |
-	attr TOK_PARAMETER TOK_TYPE TOK_ID TOK_EQ typedef_base_type range_or_multirange {
-		auto base = std::move($6);
-		if ($7) {
-			auto range = checkRange(base.get(), std::move($7));
-			if (range)
-				base->children.push_back(std::move(range));
-		}
-		extra->addTypeParamNode($4.get(), std::move(base));
-	} |
-	attr TOK_PARAMETER TOK_TYPE TOK_ID TOK_EQ TOK_SCOPED_ID {
-		auto base = std::make_unique<AstNode>(@6, AST_WIRE);
-		base->is_logic = true;
-		extra->addWiretypeNode($6.get(), base.get());
-		extra->addTypeParamNode($4.get(), std::move(base));
-	} |
-	attr TOK_PARAMETER TOK_TYPE TOK_ID TOK_EQ enum_struct_type {
+	// the type forms the body's `parameter type' takes (param_type_rhs),
+	// among them a type name the lexer delivers as a plain identifier
+	// after `=' (`#(type a = logic, type b = a)', fe98) and a type name
+	// with packed dimensions (`localparam type rt_t = id_t [D-1:0]',
+	// hpdcache_mem_resp_demux)
+	attr TOK_PARAMETER TOK_TYPE TOK_ID TOK_EQ param_type_rhs {
 		extra->addTypeParamNode($4.get(), std::move($6));
 	} |
-	attr TOK_PARAMETER TOK_TYPE TOK_ID TOK_EQ TOK_TYPE TOK_LPAREN type_operand TOK_RPAREN {
-		// `parameter type T = type(...)' (IEEE 1800-2009 6.23): the type
-		// operator yields a type, registered as an opaque alias
-		auto base = std::make_unique<AstNode>(@$, AST_WIRE);
-		base->is_logic = true;
-		extra->addTypeParamNode($4.get(), std::move(base));
-	} |
-	attr TOK_LOCALPARAM TOK_TYPE TOK_ID TOK_EQ enum_struct_type {
-		extra->addTypedefNode($4.get(), std::move($6));
-	} |
-	attr TOK_TYPE TOK_ID TOK_EQ typedef_base_type range_or_multirange {
+	attr TOK_TYPE TOK_ID TOK_EQ param_type_rhs {
 		// `#(type T = data_type)' without the parameter keyword
 		// (IEEE A.1.3 parameter_port_declaration)
-		auto base = std::move($5);
-		if ($6) {
-			auto range = checkRange(base.get(), std::move($6));
-			if (range)
-				base->children.push_back(std::move(range));
-		}
-		extra->addTypeParamNode($3.get(), std::move(base));
+		extra->addTypeParamNode($3.get(), std::move($5));
 	} |
-	attr TOK_LOCALPARAM TOK_TYPE TOK_ID TOK_EQ typedef_base_type range_or_multirange {
-		auto base = std::move($6);
-		if ($7) {
-			auto range = checkRange(base.get(), std::move($7));
-			if (range)
-				base->children.push_back(std::move(range));
-		}
-		extra->addTypedefNode($4.get(), std::move(base));
+	attr TOK_LOCALPARAM TOK_TYPE TOK_ID TOK_EQ param_type_rhs {
+		extra->addTypedefNode($4.get(), std::move($6));
 	} |
 	attr TOK_USER_TYPE TOK_ID TOK_EQ expr {
 		auto node = std::make_unique<AstNode>(@$, AST_PARAMETER);
@@ -3241,17 +3209,27 @@ param_type_rhs:
 	enum_struct_type {
 		$$ = std::move($1);
 	} |
-	TOK_SCOPED_ID {
+	TOK_SCOPED_ID range_or_multirange {
 		$$ = std::make_unique<AstNode>(@$, AST_WIRE);
 		$$->is_logic = true;
 		extra->addWiretypeNode($1.get(), $$.get());
+		if ($2) {
+			auto range = checkRange($$.get(), std::move($2));
+			if (range)
+				$$->children.push_back(std::move(range));
+		}
 	} |
-	TOK_ID {
+	TOK_ID range_or_multirange {
 		// type name without typedef-usage lookahead (e.g. after `='), so
 		// the lexer delivered a plain identifier
 		$$ = std::make_unique<AstNode>(@$, AST_WIRE);
 		$$->is_logic = true;
 		extra->addWiretypeNode($1.get(), $$.get());
+		if ($2) {
+			auto range = checkRange($$.get(), std::move($2));
+			if (range)
+				$$->children.push_back(std::move(range));
+		}
 	} |
 	TOK_TYPE TOK_LPAREN type_operand TOK_RPAREN {
 		// `type(...)' (IEEE 1800-2009 6.23): opaque alias

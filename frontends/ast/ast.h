@@ -408,6 +408,11 @@ namespace AST
 		// globals -- a -formal module derived after a plain read folded
 		// every assertion to constant true (a false proof)
 		bool formal = false, svmode = false;
+		// parameter / localparam values as simplify folded them (fe98): a
+		// type parameter override that reads `Cfg.u.w` brings `Cfg` into
+		// the child by value, as its definition may call a function local
+		// to this module (`HPDcacheUserCfg = hpdcacheSetConfig()`, cva6)
+		std::map<std::string, std::unique_ptr<AstNode>> folded_params;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, bool mayfail) override;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, const dict<RTLIL::IdString, RTLIL::Module*> &interfaces, const dict<RTLIL::IdString, RTLIL::IdString> &modports, bool mayfail) override;
 		std::string derive_common(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, std::unique_ptr<AstNode>* new_ast_out, bool quiet = false);

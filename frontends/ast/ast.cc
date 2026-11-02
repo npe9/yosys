@@ -1434,6 +1434,11 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 
 	if (ast->type == AST_INTERFACE)
 		module->set_bool_attribute(ID::is_interface);
+	if (!defer)
+		for (const auto &node : ast->children)
+			if ((node->type == AST_PARAMETER || node->type == AST_LOCALPARAM) && !node->children.empty() &&
+					node->children[0]->type == AST_CONSTANT)
+				module->folded_params[node->str] = node->children[0]->clone();
 	module->ast = std::move(ast_before_simplify);
 	module->nolatches = flag_nolatches;
 	module->nomeminit = flag_nomeminit;
@@ -2550,6 +2555,36 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 			// their own names, unless the child or the globals already have
 			// them (register v3 D0 follow-up)
 			if (scope_module) {
+				// a name the parent sees only through a package import
+				// (`module cva6 import ariane_pkg::*; #(localparam type
+				// sbe_t = struct packed { cf_t cf; ... })`, fe98): name it
+				// by its package, which resolves in any scope (IEEE 6.20.3:
+				// the override type is the one the instantiating scope sees)
+				auto qualify_import = [&](AstNode *c, const std::string &name, bool is_type) {
+					for (auto &imp : scope_module->ast->children) {
+						if (!imp || imp->type != AST_IMPORT)
+							continue;
+						bool listed = imp->children.empty();
+						for (auto &it : imp->children)
+							if (it && it->str == name)
+								listed = true;
+						if (!listed)
+							continue;
+						for (auto &pkg : design->verilog_packages) {
+							if (!pkg || pkg->str != imp->str)
+								continue;
+							for (auto &o : pkg->children)
+								if (o && o->str == name && (is_type ? o->type == AST_TYPEDEF :
+										(o->type == AST_PARAMETER || o->type == AST_LOCALPARAM))) {
+									if (!quiet)
+										log("Type parameter %s: %s names %s through an import\n", child->str.c_str(), name.c_str(), pkg->str.c_str());
+									c->str = pkg->str + "::" + c->str.substr(1);
+									return true;
+								}
+						}
+					}
+					return false;
+				};
 				std::function<void(AstNode*)> bring = [&](AstNode *n) {
 					for (auto &c : n->children) {
 						if (!c)
@@ -2558,26 +2593,36 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 							// a range bound naming a parameter of the parent
 							// (`logic [AddrWidth-1:0]`): bring it as a localparam
 							// (the parent AST is the derived one, so overrides
-							// are already substituted)
+							// are already substituted); a member of a struct
+							// parameter (`logic [Cfg.u.w-1:0]`) brings `Cfg`
+							std::string base = c->str.substr(0, c->str.find('.'));
 							bool have = false;
 							for (auto &k : new_ast->children)
-								if ((k->type == AST_PARAMETER || k->type == AST_LOCALPARAM) && k->str == c->str)
+								if ((k->type == AST_PARAMETER || k->type == AST_LOCALPARAM) && k->str == base)
 									have = true;
 							for (auto &k : enum_clones)
-								if ((k->type == AST_PARAMETER || k->type == AST_LOCALPARAM) && k->str == c->str)
+								if ((k->type == AST_PARAMETER || k->type == AST_LOCALPARAM) && k->str == base)
 									have = true;
+							bool found = have;
 							if (!have)
 								for (auto &k : scope_module->ast->children)
-									if ((k->type == AST_PARAMETER || k->type == AST_LOCALPARAM) && k->str == c->str) {
+									if ((k->type == AST_PARAMETER || k->type == AST_LOCALPARAM) && k->str == base) {
 										auto cl = k->clone();
 										cl->type = AST_LOCALPARAM;
-										AstNode *clp = cl.get();
-										enum_clones.push_back(std::move(cl));
+										// its folded value, when the parent has one
+										auto fv = scope_module->folded_params.find(base);
+										if (fv != scope_module->folded_params.end() && !cl->children.empty())
+											cl->children[0] = fv->second->clone();
 										if (!quiet)
-											log("Type parameter %s: also brings parameter %s from %s\n", child->str.c_str(), c->str.c_str(), log_id(scope_module->name));
-										bring(clp);
+											log("Type parameter %s: also brings parameter %s from %s\n", child->str.c_str(), base.c_str(), log_id(scope_module->name));
+										// what it reads first (fe98: declaration order)
+										bring(cl.get());
+										enum_clones.push_back(std::move(cl));
+										found = true;
 										break;
 									}
+							if (!found)
+								qualify_import(c.get(), base, false);
 						}
 						if (c->type == AST_WIRETYPE && !c->str.empty() && c->str.find("::") == std::string::npos) {
 							bool have = false;
@@ -2590,17 +2635,20 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 							for (auto &g : design->verilog_globals)
 								if (g && g->type == AST_TYPEDEF && g->str == c->str)
 									have = true;
+							bool found = have;
 							if (!have)
 								for (auto &k : scope_module->ast->children)
 									if (k->type == AST_TYPEDEF && k->str == c->str) {
 										auto cl = k->clone();
-										AstNode *clp = cl.get();
-										enum_clones.push_back(std::move(cl));
 										if (!quiet)
 											log("Type parameter %s: also brings %s from %s\n", child->str.c_str(), c->str.c_str(), log_id(scope_module->name));
-										bring(clp);
+										bring(cl.get());
+										enum_clones.push_back(std::move(cl));
+										found = true;
 										break;
 									}
+							if (!found)
+								qualify_import(c.get(), c->str, true);
 						}
 						bring(c.get());
 					}
@@ -2653,8 +2701,14 @@ std::string AstModule::derive_common(RTLIL::Design *design, const dict<RTLIL::Id
 		at++;
 	if (at == new_ast->children.size())
 		at = 0;
+	// in order, each after what it reads (fe98: inserting every one at
+	// `at` reversed them, so a typedef brought after the parameter it
+	// shared with an earlier one landed ahead of it: `C.u.w' unresolved);
+	// enum definitions first, as before
+	std::stable_partition(enum_clones.begin(), enum_clones.end(),
+			[](const std::unique_ptr<AstNode> &e) { return e->type == AST_ENUM; });
 	for (auto& e : enum_clones)
-		new_ast->children.insert(new_ast->children.begin() + at, std::move(e));
+		new_ast->children.insert(new_ast->children.begin() + at++, std::move(e));
 
 	para_counter = 0;
 	for (auto& child : new_ast->children) {
@@ -2727,6 +2781,8 @@ RTLIL::Module *AstModule::clone() const
 	new_mod->autowire = autowire;
 	new_mod->formal = formal;
 	new_mod->svmode = svmode;
+	for (auto &it : folded_params)
+		new_mod->folded_params[it.first] = it.second->clone();
 
 	return new_mod;
 }

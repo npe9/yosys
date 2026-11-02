@@ -6996,6 +6996,10 @@ basic_expr:
 		if (!mode->sv)
 			err_at_loc(@2, "Static cast is only supported in SystemVerilog mode.");
 		$$ = std::move($4);
+		// keep the type (`pkg::T'{...}` parses as an expression): simplify
+		// orders named members and `default:` by it
+		if ($1->type == AST_IDENTIFIER && $1->children.empty())
+			$$->set_attribute(ID::wiretype, AstNode::mkconst_str(@1, $1->str));
 	} |
 	typedef_base_type OP_CAST TOK_LPAREN expr TOK_RPAREN {
 		if (!mode->sv)
@@ -7007,6 +7011,14 @@ basic_expr:
 		if (!mode->sv)
 			err_at_loc(@2, "Static cast is only supported in SystemVerilog mode.");
 		$$ = std::move($4);
+		// keep the type (`T'{...}`): simplify orders named members and
+		// `default:` by it (it was dropped, so the members were laid out
+		// in source order)
+		for (auto &c : $1->children)
+			if (c && c->type == AST_WIRETYPE) {
+				$$->set_attribute(ID::wiretype, AstNode::mkconst_str(@1, c->str));
+				break;
+			}
 	} |
 	typedef_base_type OP_CAST TOK_LPAREN expr TOK_RPAREN TOK_DOT TOK_ID TOK_LPAREN TOK_RPAREN {
 		if (!mode->sv)
@@ -7596,6 +7608,14 @@ sva_bexpr:
 sva_primary:
 	rvalue { $$ = std::move($1); } |
 	integral_number { $$ = sva_num(@1, *$1, extra->case_type_stack); } |
+	// an assignment pattern operand (OpenTitan pinmux_assert_fpv
+	// `mio_attr_o[i] == '{schmitt_en: 1'b1, default: '0}`): typed from the
+	// other `==` operand in simplify, as in a plain expression
+	OP_CAST TOK_LCURL assignment_pattern_list optional_comma TOK_RCURL {
+		if (!mode->sv)
+			err_at_loc(@1, "Assignment patterns are only supported in SystemVerilog mode.");
+		$$ = std::move($3);
+	} |
 	TOK_REALVAL {
 		$$ = std::make_unique<AstNode>(@$, AST_REALVALUE);
 		$$->realvalue = strtod($1->c_str(), nullptr);

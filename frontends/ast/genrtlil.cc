@@ -2121,6 +2121,48 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 		}
 
 	case AST_ASSIGN_PATTERN: {
+			// a pattern with member names, type keys or `default:` that
+			// reached here has no type: laid out positionally it is wrong
+			// (the members' order and widths come from the type), so it is
+			// a degradation, not a silent value
+			// `'{default: '0}` (or '1, 'x, 'z) alone fills every bit with that
+			// value, whatever the type
+			// (a zero value -- '0 or any sized 0 -- fills zeros whatever the
+			// type: `.data_i('{default: 1'b0})`)
+			if (GetSize(children) == 1 && children[0] && children[0]->attributes.count(ID(sv_member)) &&
+					children[0]->attributes.at(ID(sv_member))->str == "default" && children[0]->type == AST_CONSTANT) {
+				auto &db = children[0]->bits;
+				if (children[0]->is_unsized && GetSize(db) == 1)
+					return RTLIL::SigSpec(db[0], std::max(1, width_hint));
+				bool zero = true;
+				for (auto b : db)
+					if (b != RTLIL::State::S0)
+						zero = false;
+				if (zero)
+					return RTLIL::SigSpec(RTLIL::State::S0, std::max(1, width_hint));
+			}
+			// `default:` or a type key needs the type (which members it
+			// fills, at which widths): without one the value is wrong, so it
+			// is a degradation.  Member names alone are right when the
+			// source order is the type's (the usual style): kept, with a
+			// warning, since the order cannot be checked here.
+			bool needs_type = false, has_names = false;
+			for (auto &ch : children)
+				if (ch && ch->attributes.count(ID(sv_typekey)))
+					needs_type = true;
+				else if (ch && ch->attributes.count(ID(sv_member))) {
+					if (ch->attributes.at(ID(sv_member))->str == "default")
+						needs_type = true;
+					else
+						has_names = true;
+				}
+			if (needs_type)
+				degrade(location.to_loc(), "Assignment pattern with a default or type key has no type from its "
+						"context (an assignment target, a parameter, or the other operand of ==/!=); its members are "
+						"laid out in source order.\n");
+			else if (has_names)
+				log_file_warning(location.to_loc(), "Assignment pattern with member names has no type from its context; "
+						"its members are laid out in source order, which is right only if that is the type's order.\n");
 			// IEEE 1800: the first element of a positional pattern is the leftmost
 			// (most significant) member. SigSpec::append adds bits toward the MSB,
 			// so the source order is emitted from last to first.

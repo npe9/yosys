@@ -5119,6 +5119,21 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			if (!str.empty() && str[0] == '\\') {
 				// instance so add a wire for the packed structure
 				auto wnode = make_packed_struct(this, str, attributes);
+				// an anonymous struct variable keeps its type (a typedef'd
+				// one has it from the declaration): a named assignment
+				// pattern for it is ordered by it, not laid out in source
+				// order (`s <= '{valid: 1'b1, data: d}` was {1'b1, d})
+				// (as a hidden typedef: an attribute must stay constant)
+				if (!wnode->attributes.count(ID::wiretype)) {
+					std::string tname = "\\$anon_struct$" + str.substr(1);
+					auto t = clone();
+					t->str.clear();
+					auto td = std::make_unique<AstNode>(location, AST_TYPEDEF, std::move(t));
+					td->str = tname;
+					current_scope[tname] = td.get();
+					wnode->set_attribute(ID::wiretype, mkconst_str(location, tname));
+					current_ast_mod->children.push_back(std::move(td));
+				}
 				log_assert(current_ast_mod);
 				current_ast_mod->children.push_back(std::move(wnode));
 			}
@@ -8612,25 +8627,87 @@ skip_memory_read:;
 	}
 
 	// IEEE 1800-2009 10.9: named pattern members follow the type, not source order.
-	if ((type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE || type == AST_ASSIGN) &&
-			children.size() >= 2 && children[1] && children[1]->type == AST_ASSIGN_PATTERN) {
-		AstNode *pat = children[1].get();
+	// An equality operand takes its type from the other operand (OpenTitan
+	// pinmux_assert_fpv `mio_attr_o[i] == '{schmitt_en: 1'b1, default: '0}`).
+	{
+	bool pat_eq = (type == AST_EQ || type == AST_NE || type == AST_EQX || type == AST_NEX) && children.size() == 2 &&
+			children[0] && children[1] && (children[0]->type == AST_ASSIGN_PATTERN) != (children[1]->type == AST_ASSIGN_PATTERN);
+	if (pat_eq && children[0]->type == AST_ASSIGN_PATTERN && children[1]->type == AST_IDENTIFIER && !children[1]->id2ast)
+		while (children[1]->simplify(true, stage, -1, false)) { }
+	if (pat_eq && children[1]->type == AST_ASSIGN_PATTERN && children[0]->type == AST_IDENTIFIER && !children[0]->id2ast)
+		while (children[0]->simplify(true, stage, -1, false)) { }
+	// a typed pattern `T'{...}` carries T (the parser keeps it as wiretype):
+	// it is ordered by its own type wherever it stands (a concatenation
+	// element, an operand, an argument)
+	// a ?: on the right of an assignment (ibex `exc_cause_o = c ? K :
+	// '{irq_ext: ..., ...}`, hmac's chained ?: of '{data: ..., mask: '1}):
+	// each pattern branch takes the target's type, as its own wiretype
+	if ((type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE || type == AST_ASSIGN) && children.size() >= 2 &&
+			children[0] && children[1] && children[1]->type == AST_TERNARY && children[0]->type == AST_IDENTIFIER) {
+		AstNode *lid = children[0].get();
+		AstNode *ldecl = lid->id2ast ? lid->id2ast : current_scope.count(lid->str) ? current_scope.at(lid->str) : nullptr;
+		// the whole target, or one element of a packed array of structs
+		// (`assign attr_padring_o[k] = en ? '{schmitt_en: 1'b1, default: '0} : ...`,
+		// OpenTitan pinmux_strap_sampling: a single index selects a struct)
+		bool elem = false;
+		if (lid->children.size() == 1 && lid->children[0] && lid->children[0]->type == AST_RANGE && ldecl) {
+			AstNode *r = lid->children[0].get();
+			if (r->children.size() == 1)
+				elem = true;
+			else if (r->children.size() == 2 && r->children[0]->type == AST_CONSTANT && r->children[1]->type == AST_CONSTANT) {
+				// the index already rewritten to the element's bit range
+				AstNode *est = resolve_wiretype_struct(ldecl);
+				int span = (int)std::abs((long long)r->children[0]->integer - (long long)r->children[1]->integer) + 1;
+				elem = est && est->range_valid && span == std::abs(est->range_left - est->range_right) + 1;
+			}
+		}
+		AstNode *wt = lid->attributes.count(ID::wiretype) ? lid->attributes.at(ID::wiretype).get()
+				: ldecl && (lid->children.empty() || elem) && ldecl->attributes.count(ID::wiretype) ? ldecl->attributes.at(ID::wiretype).get() : nullptr;
+		if (wt && wt->type == AST_CONSTANT) {
+			std::function<void(AstNode*)> mark = [&](AstNode *n) {
+				if (!n)
+					return;
+				if (n->type == AST_TERNARY && n->children.size() == 3) {
+					mark(n->children[1].get());
+					mark(n->children[2].get());
+				} else if (n->type == AST_ASSIGN_PATTERN && !n->attributes.count(ID::wiretype))
+					n->set_attribute(ID::wiretype, wt->clone());
+			};
+			mark(children[1].get());
+		}
+	}
+	bool own_typed = type == AST_ASSIGN_PATTERN && attributes.count(ID::wiretype) && resolve_wiretype_struct(this);
+	if (((type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE || type == AST_ASSIGN) &&
+			children.size() >= 2 && children[1] && children[1]->type == AST_ASSIGN_PATTERN) || pat_eq || own_typed) {
+		int pi = own_typed ? -1 : children[1]->type == AST_ASSIGN_PATTERN ? 1 : 0;
+		AstNode *pat = own_typed ? this : children[pi].get();
 		bool named = false;
 		for (auto &ch : pat->children)
 			if (ch && (ch->attributes.count(ID(sv_member)) || ch->attributes.count(ID(sv_typekey))))
 				named = true;
-		AstNode *lhs_id = children[0].get();
+		// the type's source: the pattern itself, or the target / other operand
+		AstNode *lhs_id = own_typed ? this : children[1 - pi].get();
 		// a whole unpacked array of structs (`v = '{default: D}`) takes
 		// an array pattern; the struct members order only its elements
 		bool whole_array = lhs_id && lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
 				lhs_id->children.empty() &&
 				(lhs_id->id2ast->type == AST_MEMORY || lhs_id->id2ast->unpacked_dimensions > 0);
-		if (named && !whole_array && lhs_id && lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
-				(lhs_id->attributes.count(ID::wiretype) || lhs_id->id2ast->attributes.count(ID::wiretype))) {
+		// an anonymous struct variable (`struct packed {...} s;`) is its own
+		// AST_STRUCT node: s's id2ast is the type (out-of-order members of
+		// `s <= '{valid: 1'b1, data: d}` were laid out in source order)
+		// (a procedural target may not be resolved yet: its declaration
+		// from the scope)
+		AstNode *lhs_decl = lhs_id && lhs_id->type == AST_IDENTIFIER ? (lhs_id->id2ast ? lhs_id->id2ast :
+				current_scope.count(lhs_id->str) ? current_scope.at(lhs_id->str) : nullptr) : nullptr;
+		bool anon_struct = lhs_decl && lhs_id->children.empty() &&
+				(lhs_decl->type == AST_STRUCT || lhs_decl->type == AST_UNION);
+		if (named && !whole_array && lhs_id && (own_typed || anon_struct || (lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
+				(lhs_id->attributes.count(ID::wiretype) || lhs_id->id2ast->attributes.count(ID::wiretype))))) {
 			// a member target (`assign hw2reg.tpm_cap = '{...}`, OpenTitan
 			// reg-top connections) is a slice of the struct wire by now; the
 			// member rewrite leaves the member's type on the identifier
-			AstNode *st = lhs_id->attributes.count(ID::wiretype) ? resolve_wiretype_struct(lhs_id)
+			AstNode *st = anon_struct && !lhs_id->attributes.count(ID::wiretype) ? lhs_decl
+					: own_typed || lhs_id->attributes.count(ID::wiretype) ? resolve_wiretype_struct(lhs_id)
 					: resolve_wiretype_struct(lhs_id->id2ast);
 			auto bare = [](std::string s) {
 				if (!s.empty() && s[0] == '\\')
@@ -8677,18 +8754,21 @@ skip_memory_read:;
 						std::string iname = bare(item->str);
 						AstNode *src = by_name.count(iname) ? by_name.at(iname) : fallback;
 						std::unique_ptr<AstNode> val;
+						int member_width = 1;
+						bool width_known = item->range_valid;
+						if (item->range_valid)
+							member_width = std::abs(item->range_left - item->range_right) + 1;
+						else
+							for (auto &ch : item->children)
+								if (ch && ch->type == AST_RANGE && ch->range_valid) {
+									member_width *= std::abs(ch->range_left - ch->range_right) + 1;
+									width_known = true;
+								}
 						if (!src) {
 							// IEEE 1800-2009 10.9: members without an assignment
 							// get the default value of their type.
 							degrade(item->location.to_loc(), "Named assignment pattern at %s leaves member `%s' unassigned; using default value.\n",
 									pattern->location.to_string().c_str(), item->str.c_str());
-							int member_width = 1;
-							if (item->range_valid)
-								member_width = std::abs(item->range_left - item->range_right) + 1;
-							else
-								for (auto &ch : item->children)
-									if (ch && ch->type == AST_RANGE && ch->range_valid)
-										member_width *= std::abs(ch->range_left - ch->range_right) + 1;
 							val = AstNode::mkconst_bits(item->location, RTLIL::Const(0, member_width).to_bits(), false);
 						} else {
 							val = src->clone();
@@ -8705,6 +8785,14 @@ skip_memory_read:;
 						}
 						if (nested && val->type == AST_ASSIGN_PATTERN)
 							order_pat(val.get(), nested);
+						else if (val->type != AST_ASSIGN_PATTERN && width_known)
+							// the member's own width: the pattern is laid out
+							// as a concatenation, where an unsized `default: '0`
+							// (or '1) was one bit and shifted every member
+							// after it (`'{a: 1'b1, default: '0}` -> 4'h2,
+							// not 4'h8)
+							val = std::make_unique<AstNode>(val->location, AST_CAST_SIZE,
+									mkconst_int(val->location, member_width, true), std::move(val));
 						ordered.push_back(std::move(val));
 					}
 					pattern->children.swap(ordered);
@@ -8713,6 +8801,8 @@ skip_memory_read:;
 				did_something = true;
 			}
 		}
+	}
+
 	}
 
 	// IEEE 1800-2009 10.9.1: '{index: value} follows the declared index, not source order.

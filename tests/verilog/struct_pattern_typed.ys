@@ -1,0 +1,105 @@
+# Named and `default:` struct assignment patterns follow the struct type in
+# every context (2026-10-31).  Before: an unsized `default: '0` was one bit
+# wide in the concatenation the pattern became, so `'{a: 1'b1, default: '0}`
+# for { a; b[2:0] } was 4'h2, not 4'h8 (continuous, declaration, procedural,
+# and as an == operand); a typed `T'{...}` lost T, and an anonymous struct
+# variable had no type, so their members were laid out in source order
+# (`s <= '{valid: 1'b1, data: d}` was {1'b1, d}).  A pattern with member
+# names that still has no type is a degradation, not a silent value.
+read_verilog -sv <<EOF
+typedef struct packed { logic a; logic [2:0] b; } st_t;
+typedef struct packed { logic ready; logic [3:0] data; } resp_t;
+module t(input st_t s, input [7:0] d, input clk,
+         output st_t w1, output st_t w2, output st_t w4, output logic e1, output logic e2,
+         output logic [9:0] cat, output st_t f1, output logic [8:0] anon);
+  assign w1 = '{a: 1'b1, default: '0};
+  st_t dd = '{a: 1'b1, default: '0};
+  assign w2 = dd;
+  always_comb w4 = '{a: 1'b1, default: '0};
+  assign e1 = (s == '{a: 1'b1, default: '0});
+  assign e2 = (s != '{b: 3'd5, a: 1'b0});
+  assign cat = {resp_t'{data: 4'd4, ready: 1'b1}, resp_t'{data: 4'd3, ready: 1'b0}};
+  assign f1 = '{default: '1};
+  struct packed { logic [7:0] data; logic valid; } sv;
+  always_comb sv = '{valid: 1'b1, data: d};
+  assign anon = sv;
+endmodule
+EOF
+hierarchy -top t
+proc
+sat -verify -prove w1 4'h8 -prove w2 4'h8 -prove w4 4'h8 -prove cat 10'b1010000011 -prove f1 4'hf
+sat -verify -set s 4'h8 -prove e1 1'b1 -set-at 1 s 4'h8
+sat -verify -set s 4'h5 -prove e1 1'b0 -prove e2 1'b0
+sat -verify -set d 8'h5a -prove anon 9'b010110101
+
+design -reset
+read_verilog -sv <<EOF
+typedef struct packed { logic a; logic [2:0] b; } st_t;
+module tt(input c, input c2, output st_t t1, output st_t t2, output st_t z);
+  // a ?: on the right of an assignment: each pattern branch takes the
+  // target's type (out of order, and with an unsized member value)
+  assign t1 = c ? '{b: 3'd5, a: 1'b0} : '{a: 1'b1, default: '0};
+  always_comb t2 = c ? 4'hf : c2 ? '{b: '1, a: 1'b0} : '{a: 1'b1, b: 3'd1};
+  // a zero `default:` fills zeros with or without a type
+  assign z = '{default: 1'b0};
+endmodule
+EOF
+hierarchy -top tt
+proc
+sat -verify -set c 1 -prove t1 4'h5 -prove z 4'h0
+sat -verify -set c 0 -prove t1 4'h8
+sat -verify -set c 0 -set c2 1 -prove t2 4'h7
+sat -verify -set c 0 -set c2 0 -prove t2 4'h9
+
+design -reset
+read_verilog -sv <<EOF
+package pw;
+  typedef struct packed { logic pull_en; logic [2:0] drv; logic schmitt_en; } pad_attr_t;
+endpackage
+// one element of a packed array of structs as the target (OpenTitan pinmux):
+// a genvar-indexed ?: branch, and a loop-indexed procedural assignment
+module te(input clk, input en, input pw::pad_attr_t [1:0] core, output pw::pad_attr_t [1:0] o,
+          output pw::pad_attr_t [1:0] q);
+  for (genvar k = 0; k < 2; k++) begin : g
+    assign o[k] = en ? '{schmitt_en: 1'b1, default: '0} : core[k];
+  end
+  always_ff @(posedge clk)
+    for (int kk = 0; kk < 2; kk++)
+      q[kk] <= '{pull_en: 1'b1, default: '0};
+endmodule
+EOF
+hierarchy -top te
+proc
+flatten
+opt
+sat -verify -set en 1 -prove o 10'b0000100001
+sat -verify -prove q 10'b1000010000
+
+design -reset
+read_verilog -sv -formal <<EOF
+typedef struct packed { logic a; logic [2:0] b; } st_t;
+module tp(input clk);
+  reg [1:0] n = 0;
+  always @(posedge clk) n <= n + 2'd1;
+  st_t v;
+  assign v = n == 2'd2 ? 4'b1000 : 4'b0000;
+  p_ok:  assert property (@(posedge clk) n == 2'd2 |-> v == '{a: 1'b1, default: '0});
+  p_bad: assert property (@(posedge clk) n == 2'd2 |-> v != '{a: 1'b1, default: '0});
+endmodule
+EOF
+proc
+sva2check
+async2sync
+opt_clean
+logger -expect log "p_ok: proved" 1
+logger -expect log "p_bad: disproved .depth 2." 1
+ic3 -check-cells -init-zero
+logger -check-expected
+
+design -reset
+logger -expect error "Assignment pattern with a default or type key has no type from its context" 1
+read_verilog -sv <<EOF
+module tu(input [3:0] s, output e);
+  assign e = (s == '{a: 1'b1, default: '0});
+endmodule
+EOF

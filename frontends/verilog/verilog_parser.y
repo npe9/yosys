@@ -3654,6 +3654,22 @@ member_type_token:
 			// recover state
 			extra->astbuf2.reset(extra->ast_stack.back());
 			extra->ast_stack.pop_back();
+		} range_or_multirange {
+			// `struct packed {...} [15:0] BLOCK;' (PeakRDL register-block
+			// hwif structs): packed dimensions on an anonymous struct
+			// member.  The struct becomes a hidden typedef in the enclosing
+			// scope and the member `T [15:0] BLOCK', the typedef'd form
+			// that sizes and selects packed arrays of structs.
+			if ($6) {
+				std::string tname = stringf("\\__sv_anon_member_%zx_%d",
+						std::hash<std::string>{}(@$.begin.filename ? *@$.begin.filename : std::string()), ++extra->anon_struct_count);
+				extra->addTypedefNode(&tname, std::move(extra->astbuf1));
+				extra->astbuf1 = std::make_unique<AstNode>(@$, AST_STRUCT_ITEM);
+				extra->addWiretypeNode(&tname, extra->astbuf1.get());
+				auto range = checkRange(extra->astbuf1.get(), std::move($6));
+				if (range)
+					extra->astbuf1->children.push_back(std::move(range));
+			}
 		}
 	;
 

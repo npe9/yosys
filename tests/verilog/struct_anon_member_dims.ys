@@ -1,0 +1,74 @@
+# Packed dimensions on an anonymous struct member (PeakRDL register-block
+# hwif structs, caliptra sha256_reg.sv `struct packed {...} [16-1:0]
+# SHA256_BLOCK;`) were "syntax error, unexpected '['".  The member is the
+# typedef'd form `T [16-1:0] SHA256_BLOCK` with T a hidden typedef.
+read_verilog -sv <<EOT
+package p;
+  typedef struct packed {
+    struct packed {
+      struct packed { logic [3:0] next; logic ld; } B;
+    } [3:0] ARR;
+    struct packed { logic [1:0] v; } [1:0][2:0] M;
+    logic z;
+  } s_t;
+endpackage
+module m (input logic [1:0] i, output logic [3:0] o, output logic [1:0] w,
+          output logic [7:0] wd);
+  p::s_t s;
+  always_comb begin
+    s = '0;
+    s.z = 1'b1;
+    s.ARR[2].B.next = 4'd5;
+    s.ARR[1].B.ld = 1'b1;
+    s.M[1][2].v = 2'd3;
+  end
+  assign o = s.ARR[i].B.next;
+  assign w = s.M[1][2].v;
+  assign wd = $bits(s);
+endmodule
+EOT
+hierarchy -top m
+proc
+opt
+sat -verify -prove o 4'd5 -set i 2
+sat -verify -prove o 4'd0 -set i 1
+sat -verify -prove w 2'd3
+# 4 x (4+1) + 2 x 3 x 2 + 1
+sat -verify -prove wd 8'd33
+design -reset
+
+# file-scope typedefs in two reads of the same file name: the hidden
+# names do not collide
+read_verilog -sv <<EOT
+typedef struct packed { struct packed { logic a; } [1:0] X; } t1_t;
+module m1 (output logic [1:0] o); t1_t s; assign s = 2'b10; assign o = s.X[1].a ? 2'd1 : 2'd2; endmodule
+EOT
+read_verilog -sv <<EOT
+typedef struct packed { struct packed { logic [2:0] b; } [3:0] Y; } t2_t;
+module m2 (output logic [3:0] o); t2_t s; assign s = '0; assign o = $bits(s); endmodule
+EOT
+hierarchy -top m1
+proc
+sat -verify -prove o 2'd1
+design -reset
+read_verilog -sv <<EOT
+typedef struct packed { struct packed { logic [2:0] b; } [3:0] Y; } t2_t;
+module m2 (output logic [3:0] o); t2_t s; assign s = '0; assign o = $bits(s); endmodule
+EOT
+hierarchy -top m2
+proc
+sat -verify -prove o 4'd12
+design -reset
+
+# the same with the first module derived only after the second read
+read_verilog -sv <<EOT
+typedef struct packed { struct packed { logic a; } [1:0] X; } t1_t;
+module m1 #(parameter P = 1) (output logic [3:0] o); t1_t s; assign s = '0; assign o = $bits(s); endmodule
+EOT
+read_verilog -sv <<EOT
+typedef struct packed { struct packed { logic [2:0] b; } [3:0] Y; } t2_t;
+module m2 (output logic [3:0] o); t2_t s; assign s = '0; assign o = $bits(s); endmodule
+EOT
+hierarchy -top m1 -chparam P 2
+proc
+sat -verify -prove o 4'd2

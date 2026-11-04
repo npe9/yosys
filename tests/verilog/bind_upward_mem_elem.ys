@@ -1,0 +1,67 @@
+# A bound checker's constant-index read of an unpacked array of its target
+# (caliptra fv_sha256 `sha256.block_reg[3]`), the array kept as one
+# register per element (mem2reg): an input port per element, connected to
+# the element.  It was a select of an implicit one-bit wire: undef.
+read_verilog -sv -formal -defer <<EOT
+module dut (input logic clk, input logic [15:0] d);
+  reg [3:0] mem [3:0];
+  always_comb
+    for (int i = 0; i < 4; i++)
+      mem[i] = d[4*i +: 4];
+endmodule
+module chk (input logic clk, input logic [1:0] k);
+  logic [3:0] x;
+  always_comb
+    case (k)
+      0: x = dut.mem[0];
+      1: x = dut.mem[1];
+      2: x = dut.mem[2];
+      default: x = dut.mem[3];
+    endcase
+  always @(posedge clk) begin
+    p_eq: assert (x == dut.d[4*k +: 4]);
+    p_bad: assert (dut.mem[3] == 4'd0);
+  end
+endmodule
+bind dut chk u_chk(.clk, .k(d[1:0]));
+EOT
+hierarchy -check -top dut
+proc
+flatten
+async2sync
+opt_clean
+logger -expect log "ic3: u_chk.p_eq: proved" 1
+logger -expect log "ic3: u_chk.p_bad: disproved" 1
+ic3 -check-cells -init-zero -allow-degraded -bmc 4
+logger -check-expected
+design -reset
+
+# upward to the target, then down to an instance's array
+read_verilog -sv -formal -defer <<EOT
+module sub (input logic [7:0] d);
+  reg [3:0] mem [1:0];
+  always_comb begin
+    mem[0] = d[3:0];
+    mem[1] = d[7:4];
+  end
+endmodule
+module dut (input logic clk, input logic [7:0] d);
+  sub u(.d);
+endmodule
+module chk (input logic clk);
+  always @(posedge clk) begin
+    p_dn: assert (dut.u.mem[1] == dut.d[7:4]);
+    p_dn_bad: assert (dut.u.mem[0] == 4'd0);
+  end
+endmodule
+bind dut chk u_chk(.clk);
+EOT
+hierarchy -check -top dut
+proc
+flatten
+async2sync
+opt_clean
+logger -expect log "ic3: u_chk.p_dn: proved" 1
+logger -expect log "ic3: u_chk.p_dn_bad: disproved" 1
+ic3 -check-cells -init-zero -allow-degraded -bmc 4
+logger -check-expected

@@ -2314,36 +2314,55 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		// not be the one used; come back in the next round
 		if (pending_parent_derivation(design, parents, used_modules))
 			return false;
-		int width = -1;
-		bool is_signed = false, ok = true;
-		for (auto &pc : parents) {
-			RTLIL::Module *parent = pc.first;
-			if (source_module_name(parent->name) != head) {
-				ok = false;
-				break;
+		// the same wire below every parent: 1 (width, signedness set), 0
+		// (no), -1 (an instance on the path still to be derived)
+		auto resolve_up = [&](const std::string &r, int &width, bool &is_signed) -> int {
+			width = -1, is_signed = false;
+			for (auto &pc : parents) {
+				RTLIL::Module *parent = pc.first;
+				if (source_module_name(parent->name) != head)
+					return 0;
+				bool pending = false;
+				RTLIL::Wire *t = r.find('.') == std::string::npos ? parent->wire(RTLIL::escape_id(r)) :
+						walk_hierref_down(design, parent, r, &pending);
+				if (pending)
+					return -1;
+				if (!t || t->get_bool_attribute(ID(sv_hierref)) || (width >= 0 && (t->width != width || t->is_signed != is_signed)))
+					return 0;
+				// a downward reference wire already in the parent must agree
+				if (r.find('.') != std::string::npos)
+					if (RTLIL::Wire *pw = parent->wire(RTLIL::escape_id(r)))
+						if (pw->width != t->width)
+							return 0;
+				width = t->width, is_signed = t->is_signed;
 			}
-			bool pending = false;
-			RTLIL::Wire *t = rest.find('.') == std::string::npos ? parent->wire(RTLIL::escape_id(rest)) :
-					walk_hierref_down(design, parent, rest, &pending);
-			if (pending)
-				return false;
-			if (!t || t->get_bool_attribute(ID(sv_hierref)) || (width >= 0 && (t->width != width || t->is_signed != is_signed))) {
-				ok = false;
-				break;
-			}
-			// a downward reference wire already in the parent must agree
-			if (rest.find('.') != std::string::npos)
-				if (RTLIL::Wire *pw = parent->wire(RTLIL::escape_id(rest)))
-					if (pw->width != t->width) {
-						ok = false;
-						break;
-					}
-			width = t->width, is_signed = t->is_signed;
-		}
-		if (!ok || width < 1)
+			return width >= 1 ? 1 : 0;
+		};
+		int width;
+		bool is_signed;
+		int res = resolve_up(rest, width, is_signed);
+		if (res < 0)
+			return false;
+		if (res > 0) {
+			targets.push_back({wire->name.str(), width, is_signed, rest});
+			any_up = true;
 			continue;
-		targets.push_back({wire->name.str(), width, is_signed, rest});
-		any_up = true;
+		}
+		// an element of the target's unpacked array, kept as one register
+		// per element (`sha256.block_reg[3]`, mem2reg), read with constant
+		// indices: an input port per element, which genrtlil maps the
+		// reads to
+		if (wire->has_attribute(ID(sv_hierref_idx)))
+			for (auto &idx : split_tokens(wire->get_string_attribute(ID(sv_hierref_idx)), ",")) {
+				std::string er = stringf("%s[%s]", rest.c_str(), idx.c_str());
+				res = resolve_up(er, width, is_signed);
+				if (res < 0)
+					return false;
+				if (res == 0)
+					continue;
+				targets.push_back({stringf("\\%s[%s]", path.c_str(), idx.c_str()), width, is_signed, er});
+				any_up = true;
+			}
 	}
 	if (!any_wide && !any_up) {
 		set_bool_attribute(ID(sv_hierrefs_resolved));

@@ -1793,7 +1793,8 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			// genvar index): the target is the child's per-element register
 			// (`rf[3]`, from mem2reg), not a bit of `u_rf.rf`.  Once
 			// resolve_hierrefs has declared the element reference (rederive),
-			// a constant single-index read is that wire.
+			// a constant single-index read is that wire (an upward one,
+			// `dut.mem[2]` in a bound checker, is an input port).
 			auto hier_elem_index = [&]() -> int {
 				if (str.find('.') == std::string::npos || children.size() != 1 || children[0]->type != AST_RANGE ||
 						!children[0]->range_valid || children[0]->range_left != children[0]->range_right ||
@@ -1803,7 +1804,7 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			};
 			if (id2ast->type == AST_AUTOWIRE && hier_elem_index() >= 0)
 				if (RTLIL::Wire *ew = current_module->wire(stringf("%s[%d]", str.c_str(), hier_elem_index())))
-					if (ew->get_bool_attribute(ID(sv_hierref)))
+					if (ew->get_bool_attribute(ID(sv_hierref)) || ew->has_attribute(ID(sv_upward_ref)))
 						return RTLIL::SigSpec(ew);
 
 			if (id2ast->type == AST_AUTOWIRE && current_module->wires_.count(str) == 0) {

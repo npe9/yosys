@@ -1,0 +1,85 @@
+# A checker bound into its target reads members of the target's
+# struct-typed variables by upward name (caliptra fv_sha256
+# `sha256.hwif_in.SHA256_STATUS.READY.next`,
+# `sha256.hwif_in.SHA256_DIGEST[digest_position].DIGEST.hwclr`).  The
+# member select was an implicitly declared free wire (false disproofs on
+# a degraded design, or "Hierarchical prefix did not resolve" for the
+# indexed form).  The checker now gets a port of the variable's type,
+# connected by the bound instance.
+read_verilog -sv -formal <<EOT
+package pk;
+  typedef struct packed { logic hwclr; logic [1:0] nx; } e_t;
+  typedef struct packed { e_t [3:0] arr; logic a; } s_t;
+endpackage
+module dut import pk::*; (input logic clk, input logic [1:0] k);
+  s_t s;
+  always_comb begin s = '0; s.a = 1'b1; s.arr[2].hwclr = 1'b1; s.arr[k].nx = k; end
+endmodule
+module chk_m (input logic clk);
+  logic [1:0] p;
+  p_a: assert property (@(posedge clk) dut.s.a);
+  p_i: assert property (@(posedge clk) dut.s.arr[p].hwclr == (p == 2'd2));
+  p_f: assert property (@(posedge clk) dut.s.arr[p].hwclr == 1'b0);
+endmodule
+bind dut chk_m u_chk ();
+module top (input logic clk, input logic [1:0] k);
+  dut u (.clk, .k);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+sva2check
+async2sync
+select -assert-none A:sv_degraded
+logger -expect log "ic3: 3 properties: proved=2 disproved=1 undecided=0" 1
+logger -expect log "ic3: u.u_chk.p_f: disproved" 1
+ic3
+design -reset
+logger -check-expected
+
+# the target read first, the checker and its bind in a later read
+read_verilog -sv -formal <<EOT
+package pk;
+  typedef struct packed { logic [3:0] v; logic a; } s_t;
+endpackage
+module dut import pk::*; (input logic clk);
+  s_t s;
+  assign s = '{v: 4'd9, a: 1'b0};
+endmodule
+EOT
+read_verilog -sv -formal <<EOT
+module chk_m (input logic clk);
+  p_v: assert property (@(posedge clk) dut.s.v == 4'd9 && !dut.s.a);
+endmodule
+bind dut chk_m u_chk (.clk(clk));
+module top (input logic clk);
+  dut u (.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+sva2check
+async2sync
+select -assert-none A:sv_degraded
+logger -expect log "ic3: 1 properties: proved=1 disproved=0 undecided=0" 1
+ic3
+design -reset
+logger -check-expected
+
+# a type the target declares itself is not visible to the checker: the
+# member select stays an implicit (degraded) name
+read_verilog -sv -formal <<EOT
+module dut (input logic clk);
+  typedef struct packed { logic a; } l_t;
+  l_t s;
+  assign s.a = 1'b1;
+endmodule
+module chk_m (input logic clk);
+  p_a: assert property (@(posedge clk) dut.s.a);
+endmodule
+bind dut chk_m u_chk (.clk(clk));
+EOT
+hierarchy -top dut
+select -assert-mod-count 1 A:sv_degraded

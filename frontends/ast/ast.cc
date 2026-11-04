@@ -1568,6 +1568,110 @@ static std::string bind_target_of(const AstNode *n)
 	return (it == n->attributes.end() || !it->second) ? std::string() : it->second->str;
 }
 
+// fe104: an upward name into a struct-typed variable of the target
+// (caliptra fv_sha256 `sha256.hwif_in.SHA256_STATUS.READY.next`,
+// `sha256.hwif_in.SHA256_DIGEST[digest_position].DIGEST.hwclr`) is a member
+// select, which the hierarchy-time upward resolution (instance paths down
+// to a wire) cannot follow: it stayed an implicitly declared free wire.
+// The checker gets an input port `\<tgt>.<var>' of the variable's type
+// (package-qualified through the target's imports) connected by the bound
+// instance to the variable, so every member path, with any index, is an
+// ordinary member select of that port.
+static std::string bind_qualified_type(RTLIL::Design *design, AstNode *ast, const AstNode *tast, const std::string &tname)
+{
+	if (tname.find("::") != std::string::npos)
+		return tname;
+	std::string bare = tname.substr(1);
+	auto pkg_has = [&](const AstNode *pkg) {
+		for (auto &c : pkg->children)
+			if (c && c->type == AST_TYPEDEF && (c->str == pkg->str + "::" + bare || c->str == "\\" + bare))
+				return true;
+		return false;
+	};
+	for (auto &imp : tast->children) {
+		if (!imp || imp->type != AST_IMPORT)
+			continue;
+		for (auto &c : ast->children)
+			if (c && c->type == AST_PACKAGE && c->str == imp->str && pkg_has(c.get()))
+				return imp->str + "::" + bare;
+		for (auto &c : design->verilog_packages)
+			if (c && c->type == AST_PACKAGE && c->str == imp->str && pkg_has(c.get()))
+				return imp->str + "::" + bare;
+	}
+	return std::string();
+}
+
+static void bind_upward_struct_refs(RTLIL::Design *design, AstNode *ast, AstNode *chk, AstNode *cell, const AstNode *tast, const std::string &tgt)
+{
+	std::string prefix = tgt + ".";
+	std::set<std::string> vars;
+	std::function<void(const AstNode *)> walk = [&](const AstNode *n) {
+		if ((n->type == AST_IDENTIFIER || n->type == AST_PREFIX) && n->str.compare(0, prefix.size(), prefix) == 0) {
+			std::string rest = n->str.substr(prefix.size());
+			size_t end = rest.find_first_of(".[");
+			// a member select: something follows the variable name
+			if (end != std::string::npos && rest[end] == '.')
+				vars.insert(rest.substr(0, end));
+			else if (n->type == AST_PREFIX && end == std::string::npos)
+				vars.insert(rest);
+		}
+		for (auto &c : n->children)
+			if (c)
+				walk(c.get());
+	};
+	walk(chk);
+	int max_port_id = 0;
+	for (auto &c : chk->children)
+		if (c && c->type == AST_WIRE && c->port_id > max_port_id)
+			max_port_id = c->port_id;
+	for (auto &v : vars) {
+		std::string pname = prefix + v;
+		const AstNode *decl = nullptr;
+		bool other = false;
+		for (auto &c : tast->children) {
+			if (!c || c->str != "\\" + v)
+				continue;
+			if (c->type == AST_WIRE)
+				decl = c.get();
+			else
+				other = true;
+		}
+		// a plain struct variable: no unpacked dimensions, a named type
+		if (!decl || other || decl->type != AST_WIRE || decl->children.size() != 1 ||
+				decl->children[0]->type != AST_WIRETYPE)
+			continue;
+		std::string tname = bind_qualified_type(design, ast, tast, decl->children[0]->str);
+		if (tname.empty())
+			continue;
+		bool have = false;
+		for (auto &c : chk->children)
+			if (c && c->type == AST_WIRE && c->str == pname)
+				have = true;
+		if (!have) {
+			auto w = std::make_unique<AstNode>(chk->location, AST_WIRE, decl->children[0]->clone());
+			w->children[0]->str = tname;
+			w->str = pname;
+			w->is_input = true;
+			w->is_logic = true;
+			w->is_custom_type = true;
+			w->is_signed = decl->is_signed;
+			w->port_id = ++max_port_id;
+			chk->children.push_back(std::move(w));
+		}
+		// `u_chk()' is one empty positional argument: drop it so the named
+		// connection is not mixed with a positional one
+		cell->children.erase(std::remove_if(cell->children.begin(), cell->children.end(), [](const std::unique_ptr<AstNode> &c) {
+			return c && c->type == AST_ARGUMENT && c->str.empty() && c->children.empty();
+		}), cell->children.end());
+		auto arg = std::make_unique<AstNode>(cell->location, AST_ARGUMENT, std::make_unique<AstNode>(cell->location, AST_IDENTIFIER));
+		arg->str = pname;
+		arg->children[0]->str = "\\" + v;
+		cell->children.push_back(std::move(arg));
+		log("Bound instance of `%s' in `%s': `%s' is the target's variable `%s' (%s), connected as a port.\n",
+				log_id(chk->str), log_id(tgt), log_id(pname), v.c_str(), log_id(tname));
+	}
+}
+
 // fe103: IEEE 1800-2017 23.8 upward names in a bound checker can name the
 // target's parameters (caliptra `logic [ecc_arith_unit.REG_SIZE-1:0]`,
 // `$clog2(sha256.BLOCK_NO)`), which a constant expression needs at
@@ -1576,7 +1680,7 @@ static std::string bind_target_of(const AstNode *n)
 // gets a parameter of that exact name with no default (so it waits for a
 // derivation) and the bound instance overrides it with `X', evaluated in
 // the target, so a derived target passes its own value.
-static void bind_upward_params(AstNode *ast, AstNode *cell, const AstNode *tast, const std::string &tgt)
+static void bind_upward_params(RTLIL::Design *design, AstNode *ast, AstNode *cell, const AstNode *tast, const std::string &tgt)
 {
 	std::string ctype;
 	for (auto &c : cell->children)
@@ -1605,6 +1709,7 @@ static void bind_upward_params(AstNode *ast, AstNode *cell, const AstNode *tast,
 				walk(c.get());
 	};
 	walk(chk);
+	bind_upward_struct_refs(design, ast, chk, cell, tast, tgt);
 	for (auto &x : names) {
 		std::string pname = prefix + x;
 		bool have = false;
@@ -1657,7 +1762,7 @@ static void apply_binds(RTLIL::Design *design, AstNode *ast)
 				tast = tam->ast.get();
 		}
 		if (tast)
-			bind_upward_params(ast, b.get(), tast, tgt);
+			bind_upward_params(design, ast, b.get(), tast, tgt);
 		if (mod) {
 			b->attributes.erase(ID(sv_bind_target));
 			mod->children.push_back(std::move(b));

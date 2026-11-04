@@ -216,20 +216,35 @@ void proc_arst(RTLIL::Module *mod, RTLIL::Process *proc, SigMap &assign_map)
 	// the rest.  Split the root `switch (A || B)` into `switch A` (the async
 	// reset, recognized below) whose other case is `switch B { R; else }`.
 	// Simulation semantics: at the clock edge with rst_n high, clr selects R.
+	// fe101: the condition may be an OR tree of any depth (pwrmgr
+	// sec_cm_checker `!rst_ni || !io_clk_en || clk_esc_edge`): its leaves
+	// are collected, the async one is split off, the others ORed again.
 	if (edge_syncs.size() > 1 && proc->root_case.switches.size() == 1) {
 		RTLIL::SwitchRule *sw = proc->root_case.switches[0];
-		Cell *orc = nullptr;
+		std::vector<RTLIL::SigSpec> leaves;
 		if (sw->signal.size() == 1 && GetSize(sw->cases) == 2 &&
 				sw->cases[0]->compare == std::vector<RTLIL::SigSpec>{RTLIL::SigSpec(RTLIL::State::S1)} &&
-				sw->cases[1]->compare.empty())
-			for (auto cell : mod->cells())
-				if (cell->type.in(ID($logic_or), ID($or)) && GetSize(cell->getPort(ID::Y)) == 1 &&
-						cell->getPort(ID::Y) == sw->signal)
-					orc = cell;
-		if (orc) {
-			RTLIL::SigSpec ports[2] = {orc->getPort(ID::A), orc->getPort(ID::B)};
-			for (int k = 0; k < 2; k++) {
-				RTLIL::SigSpec a = ports[k], b = ports[1-k];
+				sw->cases[1]->compare.empty()) {
+			// a leaf is one term of the disjunction (its truth value is
+			// the term's reduce_bool); $or is followed only bit by bit
+			std::function<void(RTLIL::SigSpec, bool)> collect = [&](RTLIL::SigSpec sig, bool root) {
+				if (sig.size() == 1)
+					for (auto cell : mod->cells())
+						if ((cell->type == ID($logic_or) || (cell->type == ID($or) &&
+								 GetSize(cell->getPort(ID::A)) == 1 && GetSize(cell->getPort(ID::B)) == 1)) &&
+								GetSize(cell->getPort(ID::Y)) == 1 && cell->getPort(ID::Y) == sig) {
+							collect(cell->getPort(ID::A), false);
+							collect(cell->getPort(ID::B), false);
+							return;
+						}
+				if (!root)
+					leaves.push_back(sig);
+			};
+			collect(sw->signal, true);
+		}
+		if (GetSize(leaves) >= 2) {
+			for (int k = 0; k < GetSize(leaves); k++) {
+				RTLIL::SigSpec a = leaves[k];
 				if (a.size() != 1)
 					continue;
 				bool matched = false;
@@ -241,9 +256,15 @@ void proc_arst(RTLIL::Module *mod, RTLIL::Process *proc, SigMap &assign_map)
 				}
 				if (!matched)
 					continue;
+				RTLIL::SigSpec bbit;
+				for (int j = 0; j < GetSize(leaves); j++) {
+					if (j == k)
+						continue;
+					RTLIL::SigSpec t = leaves[j].size() == 1 ? leaves[j] : RTLIL::SigSpec(mod->ReduceBool(NEW_ID, leaves[j]));
+					bbit = bbit.empty() ? t : RTLIL::SigSpec(mod->LogicOr(NEW_ID, bbit, t));
+				}
 				log("Splitting async reset term %s from synchronous term %s in `%s.%s'.\n",
-						log_signal(a), log_signal(b), mod->name, proc->name);
-				RTLIL::SigSpec bbit = b.size() == 1 ? b : RTLIL::SigSpec(mod->ReduceBool(NEW_ID, b));
+						log_signal(a), log_signal(bbit), mod->name, proc->name);
 				RTLIL::CaseRule *reset_case = sw->cases[0], *else_case = sw->cases[1];
 				RTLIL::SwitchRule *inner = new RTLIL::SwitchRule;
 				inner->signal = bbit;

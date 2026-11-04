@@ -20,11 +20,26 @@ module gate2 (input logic clk, rst_n, clr, d, e, output logic q);
     if (clr || !rst_n) q <= 1'b0;
     else if (e) q <= d;
 endmodule
+// fe101: three terms, the reset in the middle of the OR tree (OpenTitan
+// pwrmgr_sec_cm_checker_assert `!rst_ni || !io_clk_en || clk_esc_edge`),
+// one of them a multi-bit term
+module gold3 (input logic clk, rst_n, clr, d, e, input logic [1:0] k, output logic q);
+  always @(posedge clk or negedge rst_n)
+    if (!rst_n) q <= 1'b0;
+    else if (clr || k != 2'b00) q <= 1'b0;
+    else if (e) q <= d;
+endmodule
+module gate3 (input logic clk, rst_n, clr, d, e, input logic [1:0] k, output logic q);
+  always @(posedge clk or negedge rst_n)
+    if (clr || !rst_n || k) q <= 1'b0;
+    else if (e) q <= d;
+endmodule
 EOT
 proc
 opt_clean
 select -assert-count 1 gate/t:$adff
 select -assert-count 1 gate2/t:$adff
+select -assert-count 1 gate3/t:$adff
 async2sync
 design -save all
 equiv_make gold gate eq
@@ -38,9 +53,15 @@ hierarchy -top eq2
 equiv_simple -seq 2
 equiv_induct
 equiv_status -assert
+design -load all
+equiv_make gold3 gate3 eq3
+hierarchy -top eq3
+equiv_simple -seq 2
+equiv_induct
+equiv_status -assert
 design -reset
 
-# an OR with a term that is not the reset edge's level stays an error
+# an OR with no term that is the reset edge's level stays an error
 logger -expect error "Multiple edge sensitive events" 1
 read_verilog -sv <<EOT
 module bad (input logic clk, rst_n, clr, d, output logic q);
@@ -50,3 +71,20 @@ module bad (input logic clk, rst_n, clr, d, output logic q);
 endmodule
 EOT
 proc
+design -reset
+
+# the OR-tree walk meets cells without a Y port (a submodule instance):
+# it skips them instead of aborting
+read_verilog -sv <<EOT
+module sub (input logic a, output logic o);
+  assign o = a;
+endmodule
+module inst (input logic clk, rst_n, clr, k, d, output logic q, o);
+  sub u (.a(d), .o(o));
+  always @(posedge clk or negedge rst_n)
+    if (clr || !rst_n || k) q <= 1'b0;
+    else q <= d;
+endmodule
+EOT
+proc
+select -assert-count 1 inst/t:$adff

@@ -1,0 +1,69 @@
+# A checker bound into its target names the target's parameters by the
+# target's module name (IEEE 1800-2017 23.8; caliptra fv coverpoints
+# `logic [ecc_arith_unit.REG_SIZE-1:0]`, fv_sha256 `$clog2(sha256.BLOCK_NO)`).
+# A range bound needs the value at elaboration: it was "Range bound uses
+# implicitly declared identifier from a missing package".  The bound
+# instance now passes the target's value (a derived target its own).
+read_verilog -sv -formal <<EOT
+module dut #(parameter int W = 4) (input logic clk, input logic [W-1:0] d, output logic [W-1:0] q);
+  localparam int L = W * 2;
+  always_ff @(posedge clk) q <= d;
+endmodule
+module chk_m (input logic clk);
+  logic [dut.L-1:0] x;
+  assign x = '1;
+  p_w: assert property (@(posedge clk) $bits(x) == 16);
+  p_c: assert property (@(posedge clk) $clog2(dut.L) == 4);
+  p_def: assert property (@(posedge clk) dut.W == 4);
+endmodule
+bind dut chk_m u_chk (.clk(clk));
+module top (input logic clk, input logic [7:0] d, output logic [7:0] q);
+  dut #(.W(8)) u (.clk, .d, .q);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+sva2check
+async2sync
+logger -expect log "ic3: 3 properties: proved=2 disproved=1 undecided=0" 1
+logger -expect log "ic3: u.u_chk.p_def: disproved" 1
+ic3
+design -reset
+logger -check-expected
+
+# the target read first, the checker and its bind in a later read (the
+# order a corpus read of the checker file uses)
+read_verilog -sv -formal <<EOT
+module dut #(parameter int W = 4) (input logic clk);
+  localparam int L = W * 2;
+endmodule
+module top (input logic clk);
+  dut #(.W(3)) u (.clk);
+endmodule
+EOT
+read_verilog -sv -formal <<EOT
+module chk_m (input logic clk);
+  logic [dut.L-1:0] x;
+  assign x = '0;
+  p_w: assert property (@(posedge clk) $bits(x) == 6);
+endmodule
+bind dut chk_m u_chk (.clk(clk));
+EOT
+hierarchy -top top
+proc
+flatten
+sva2check
+async2sync
+logger -expect log "ic3: 1 properties: proved=1 disproved=0 undecided=0" 1
+ic3
+design -reset
+logger -check-expected
+
+# the checker read alone (no target): the name stays unresolved
+logger -expect error "Range bound uses implicitly declared identifier" 1
+read_verilog -sv -formal <<EOT
+module chk_m (input logic clk);
+  logic [dut.L-1:0] x;
+endmodule
+EOT

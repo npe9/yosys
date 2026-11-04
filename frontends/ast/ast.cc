@@ -1568,6 +1568,63 @@ static std::string bind_target_of(const AstNode *n)
 	return (it == n->attributes.end() || !it->second) ? std::string() : it->second->str;
 }
 
+// fe103: IEEE 1800-2017 23.8 upward names in a bound checker can name the
+// target's parameters (caliptra `logic [ecc_arith_unit.REG_SIZE-1:0]`,
+// `$clog2(sha256.BLOCK_NO)`), which a constant expression needs at
+// elaboration.  For each `\<target>.<X>' in the checker (a module of this
+// read) where X is a parameter or localparam of the target, the checker
+// gets a parameter of that exact name with no default (so it waits for a
+// derivation) and the bound instance overrides it with `X', evaluated in
+// the target, so a derived target passes its own value.
+static void bind_upward_params(AstNode *ast, AstNode *cell, const AstNode *tast, const std::string &tgt)
+{
+	std::string ctype;
+	for (auto &c : cell->children)
+		if (c && c->type == AST_CELLTYPE)
+			ctype = c->str;
+	AstNode *chk = nullptr;
+	for (auto &m : ast->children)
+		if (m && (m->type == AST_MODULE || m->type == AST_INTERFACE) && m->str == ctype)
+			chk = m.get();
+	if (!chk)
+		return;
+	pool<std::string> tparams;
+	for (auto &c : tast->children)
+		if (c && (c->type == AST_PARAMETER || c->type == AST_LOCALPARAM))
+			tparams.insert(c->str);
+	std::string prefix = tgt + ".";
+	std::set<std::string> names;
+	std::function<void(const AstNode *)> walk = [&](const AstNode *n) {
+		if (n->type == AST_IDENTIFIER && n->str.compare(0, prefix.size(), prefix) == 0) {
+			std::string rest = n->str.substr(prefix.size());
+			if (!rest.empty() && rest.find_first_of(".[") == std::string::npos && tparams.count("\\" + rest))
+				names.insert(rest);
+		}
+		for (auto &c : n->children)
+			if (c)
+				walk(c.get());
+	};
+	walk(chk);
+	for (auto &x : names) {
+		std::string pname = prefix + x;
+		bool have = false;
+		for (auto &c : chk->children)
+			if (c && c->type == AST_PARAMETER && c->str == pname)
+				have = true;
+		if (!have) {
+			auto p = std::make_unique<AstNode>(chk->location, AST_PARAMETER);
+			p->str = pname;
+			chk->children.push_back(std::move(p));
+		}
+		auto ps = std::make_unique<AstNode>(cell->location, AST_PARASET, std::make_unique<AstNode>(cell->location, AST_IDENTIFIER));
+		ps->str = pname;
+		ps->children[0]->str = "\\" + x;
+		cell->children.insert(cell->children.begin() + 1, std::move(ps));
+		log("Bound instance of `%s' in `%s': `%s' is the target's parameter `%s'.\n",
+				log_id(ctype), log_id(tgt), log_id(pname), x.c_str());
+	}
+}
+
 static void apply_binds(RTLIL::Design *design, AstNode *ast)
 {
 	std::vector<std::unique_ptr<AstNode>> binds;
@@ -1591,6 +1648,16 @@ static void apply_binds(RTLIL::Design *design, AstNode *ast)
 		for (auto &child : ast->children)
 			if (child && (child->type == AST_MODULE || child->type == AST_INTERFACE) && child->str == tgt)
 				mod = child.get();
+		const AstNode *tast = mod;
+		if (!tast) {
+			auto *tam = dynamic_cast<AST::AstModule *>(design->module(tgt));
+			if (!tam)
+				tam = dynamic_cast<AST::AstModule *>(design->module("$abstract" + tgt));
+			if (tam && tam->ast)
+				tast = tam->ast.get();
+		}
+		if (tast)
+			bind_upward_params(ast, b.get(), tast, tgt);
 		if (mod) {
 			b->attributes.erase(ID(sv_bind_target));
 			mod->children.push_back(std::move(b));

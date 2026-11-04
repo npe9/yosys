@@ -9719,6 +9719,75 @@ skip_memory_write:;
 				}
 			}
 
+			// fe102: $urandom, $random and $urandom_range (IEEE 1800 18.13,
+			// 20.15): an evaluation returns a value of the generator's
+			// sequence for some seed, i.e. any 32-bit value.  The model is
+			// a hidden wire driven by $anyconst when the call is in an
+			// initial block (evaluated once) and by $anyseq elsewhere.
+			// $urandom_range(a, b) lies in [min(a,b), max(a,b)] (b defaults
+			// to 0; reversed bounds swap): the wire if it lies there, else
+			// the low bound, which is every value of the range and only
+			// those.  $urandom's seed argument only selects the sequence;
+			// $random(seed) also writes the seed variable, which is not
+			// modelled, so that form stays unresolved.
+			if (type == AST_FCALL && (str == "\\$urandom" || str == "\\$urandom_range" ||
+					(str == "\\$random" && children.empty()))) {
+				int nargs = GetSize(children);
+				if (str == "\\$urandom_range" ? (nargs < 1 || nargs > 2) : nargs > 1)
+					input_error("System function %s got %d arguments.\n", RTLIL::unescape_id(str), nargs);
+				bool once = current_always && current_always->type == AST_INITIAL;
+				std::string wname = stringf("%s$%d", str.c_str() + 1, autoidx++);
+				auto wire = std::make_unique<AstNode>(location, AST_WIRE, make_range(location, 31, 0));
+				wire->str = wname;
+				wire->is_logic = true;
+				AstNode *wire_p = wire.get();
+				while (wire_p->simplify(true, 1, -1, false)) { }
+				current_scope[wname] = wire_p;
+				current_ast_mod->children.push_back(std::move(wire));
+				auto ref = [&]() {
+					auto id = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+					id->str = wname;
+					id->id2ast = wire_p;
+					id->was_checked = true;
+					return id;
+				};
+				auto src = std::make_unique<AstNode>(location, AST_FCALL, mkconst_int(location, 32, false));
+				src->str = once ? "\\$anyconst" : "\\$anyseq";
+				current_ast_mod->children.push_back(std::make_unique<AstNode>(location, AST_ASSIGN, ref(), std::move(src)));
+				if (str == "\\$urandom_range") {
+					auto bound = [&](int i) {
+						if (i >= nargs)
+							return mkconst_int(location, 0, false, 32);
+						return std::make_unique<AstNode>(location, AST_TO_UNSIGNED,
+								std::make_unique<AstNode>(location, AST_CAST_SIZE, mkconst_int(location, 32, true), children[i]->clone()));
+					};
+					auto lo = [&]() { return std::make_unique<AstNode>(location, AST_TERNARY,
+							std::make_unique<AstNode>(location, AST_LT, bound(0), bound(1)), bound(0), bound(1)); };
+					auto hi = [&]() { return std::make_unique<AstNode>(location, AST_TERNARY,
+							std::make_unique<AstNode>(location, AST_LT, bound(0), bound(1)), bound(1), bound(0)); };
+					newNode = std::make_unique<AstNode>(location, AST_TERNARY,
+							std::make_unique<AstNode>(location, AST_LOGIC_AND,
+								std::make_unique<AstNode>(location, AST_LE, lo(), ref()),
+								std::make_unique<AstNode>(location, AST_LE, ref(), hi())),
+							ref(), lo());
+				} else if (str == "\\$random")
+					newNode = std::make_unique<AstNode>(location, AST_TO_SIGNED, ref());
+				else
+					newNode = ref();
+				goto apply_newNode;
+			}
+
+			// fe102: $value$plusargs / $test$plusargs (IEEE 1800 21.6): the
+			// model is a run with no plusargs, which is the configuration
+			// the design's own fallback describes: the call returns 0 and
+			// leaves the output argument unwritten.
+			if (type == AST_FCALL && (str == "\\$value$plusargs" || str == "\\$test$plusargs")) {
+				if (GetSize(children) != (str == "\\$value$plusargs" ? 2 : 1))
+					input_error("System function %s got %d arguments.\n", RTLIL::unescape_id(str), GetSize(children));
+				newNode = mkconst_int(location, 0, true);
+				goto apply_newNode;
+			}
+
 			// $anyconst and $anyseq are mapped in AstNode::genRTLIL()
 			if (str == "\\$anyconst" || str == "\\$anyseq" || str == "\\$allconst" || str == "\\$allseq") {
 				recursion_counter--;

@@ -1,0 +1,54 @@
+# $urandom_range / $urandom / $value$plusargs / $test$plusargs (OpenTitan
+# ast rng.sv, rglts_pdm_3p3v.sv DV hooks) were "Unresolved function; the
+# call becomes constant 0".  A random call in an initial block is a free
+# value fixed for the run ($anyconst), elsewhere free per evaluation
+# ($anyseq); $urandom_range is confined to its range (bounds swap when
+# reversed); the plusargs functions model a run with no plusargs.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [31:0] v, w, u, p;
+  logic [1:0] x;
+  logic [3:0] t;
+  logic [7:0] j;
+  initial v = $urandom_range(500, 5);   // reversed bounds
+  initial w = $urandom_range(7);        // [0, 7]
+  initial u = $urandom();
+  initial begin
+    if (!$value$plusargs("x=%d", x)) x = 2'd1;
+  end
+  initial t = $test$plusargs("t") ? 4'd1 : 4'd2;
+  initial p = 0;
+  always @(posedge clk) p <= v;
+  initial j = 0;
+  always @(posedge clk) j <= 8'($urandom_range(1, 3));
+  p_range: assert property (@(posedge clk) v >= 5 && v <= 500);
+  p_stable: assert property (@(posedge clk) p == 0 || p == v);
+  p_w: assert property (@(posedge clk) w <= 7);
+  p_x: assert property (@(posedge clk) x == 1);
+  p_t: assert property (@(posedge clk) t == 2);
+  p_j: assert property (@(posedge clk) j == 0 || (j >= 1 && j <= 3));
+  // free: each of these has a counterexample
+  p_v7: assert property (@(posedge clk) v != 7);
+  p_v5: assert property (@(posedge clk) v != 5);
+  p_v500: assert property (@(posedge clk) v != 500);
+  p_w7: assert property (@(posedge clk) w != 7);
+  p_u: assert property (@(posedge clk) u != 32'hdeadbeef);
+  p_j3: assert property (@(posedge clk) j != 3);
+endmodule
+EOT
+prep -top top
+sva2check
+async2sync
+logger -expect log "ic3: 12 properties: proved=6 disproved=6 undecided=0" 1
+ic3
+design -reset
+logger -check-expected
+
+# $random(seed) writes the seed: not modelled, stays unresolved
+logger -expect error "Unresolved function `\\\$random'" 1
+read_verilog -sv <<EOT
+module bad (output logic [31:0] o);
+  integer s;
+  initial o = $random(s);
+endmodule
+EOT

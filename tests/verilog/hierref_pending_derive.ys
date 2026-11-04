@@ -1,0 +1,94 @@
+# A hierarchical path through a parametrized instance not yet derived when
+# the referencing module's references are resolved (caliptra
+# fv_key_stable_top `hmac_ctrl.hmac_inst.core.key`, hmac_inst a `#(..)`
+# instance): it waits for the derivation.  It was dropped for good once
+# another reference of the module resolved: an implicit free wire.
+read_verilog -sv -formal -defer <<EOT
+module leaf #(parameter W = 2) (input logic clk, input logic [W-1:0] key, output logic [W-1:0] q);
+  always_ff @(posedge clk) q <= key;
+endmodule
+module mid #(parameter W = 2) (input logic clk, input logic [W-1:0] d, output logic [W-1:0] q);
+  leaf #(.W(W)) core(.clk, .key(d), .q);
+endmodule
+module dut (input logic clk, input logic [3:0] d, output logic [3:0] q);
+  mid #(.W(4)) inst(.clk, .d, .q);
+endmodule
+module chk (input logic clk);
+  logic [3:0] kk;
+  assign kk = dut.inst.core.key;
+  always @(posedge clk) begin
+    p_eq: assert (kk == dut.d);
+    p_bad: assert (kk == 4'd0);
+  end
+endmodule
+bind dut chk u_chk(.clk);
+EOT
+hierarchy -check -top dut
+proc
+flatten
+async2sync
+opt_clean
+logger -expect log "ic3: u_chk.p_eq: proved" 1
+logger -expect log "ic3: u_chk.p_bad: disproved" 1
+ic3 -check-cells -init-zero -allow-degraded -bmc 4
+logger -check-expected
+design -reset
+
+# the same without -defer (the cell names the underived base module first)
+read_verilog -sv -formal <<EOT
+module leaf #(parameter W = 2) (input logic clk, input logic [W-1:0] key, output logic [W-1:0] q);
+  always_ff @(posedge clk) q <= key;
+endmodule
+module mid #(parameter W = 2) (input logic clk, input logic [W-1:0] d, output logic [W-1:0] q);
+  leaf #(.W(W)) core(.clk, .key(d), .q);
+endmodule
+module dut (input logic clk, input logic [3:0] d, output logic [3:0] q);
+  mid #(.W(4)) inst(.clk, .d, .q);
+endmodule
+module chk (input logic clk);
+  logic [3:0] kk;
+  assign kk = dut.inst.core.key;
+  always @(posedge clk) begin
+    p_eq: assert (kk == dut.d);
+    p_bad: assert (kk == 4'd0);
+  end
+endmodule
+bind dut chk u_chk(.clk);
+EOT
+hierarchy -check -top dut
+proc
+flatten
+async2sync
+opt_clean
+logger -expect log "ic3: u_chk.p_eq: proved" 1
+logger -expect log "ic3: u_chk.p_bad: disproved" 1
+ic3 -check-cells -init-zero -allow-degraded -bmc 4
+logger -check-expected
+design -reset
+
+# a downward path through such an instance, next to one that resolves at
+# once
+read_verilog -sv -formal -defer <<EOT
+module leaf #(parameter W = 2) (input logic clk, input logic [W-1:0] key, output logic [W-1:0] q);
+  always_ff @(posedge clk) q <= key;
+endmodule
+module mid #(parameter W = 2) (input logic clk, input logic [W-1:0] d, output logic [W-1:0] q);
+  leaf #(.W(W)) core(.clk, .key(d), .q);
+endmodule
+module top (input logic clk, input logic [3:0] d, output logic [3:0] q);
+  mid #(.W(4)) inst(.clk, .d, .q);
+  always @(posedge clk) begin
+    p_dn: assert (inst.core.key == d);
+    p_q: assert (inst.q == q);
+  end
+endmodule
+EOT
+hierarchy -check -top top
+proc
+flatten
+async2sync
+opt_clean
+logger -expect log "ic3: p_dn: proved" 1
+logger -expect log "ic3: p_q: proved" 1
+ic3 -check-cells -init-zero -allow-degraded -bmc 4
+logger -check-expected

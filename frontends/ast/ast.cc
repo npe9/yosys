@@ -2132,8 +2132,11 @@ static std::string source_module_name(RTLIL::IdString id)
 }
 
 // the wire a downward path (`u_a.g[0].u_b.sig`) names below `mod`, through
-// instance names (generate scopes included) to a non-blackbox module's wire
-static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod, std::string rest)
+// instance names (generate scopes included) to a non-blackbox module's wire;
+// *pending is set when the path stops at an instance whose parameters are
+// not derived yet (`mid #(.W(4)) inst`: no `$paramod` module this round, or
+// only the underived base), so the answer may change in a later round
+static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod, std::string rest, bool *pending = nullptr)
 {
 	for (int depth = 0; depth < 64 && mod; depth++) {
 		// the longest instance-name prefix of the remaining path
@@ -2145,6 +2148,12 @@ static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod,
 		if (!cell)
 			return nullptr;
 		RTLIL::Module *sub = design->module(cell->type);
+		if (pending && cell->type.str().rfind("$paramod", 0) != 0 &&
+				((!sub && design->module("$abstract" + cell->type.str())) ||
+				(sub && !sub->get_blackbox_attribute() && !cell->parameters.empty()))) {
+			*pending = true;
+			return nullptr;
+		}
 		rest = rest.substr(cut + 1);
 		if (!sub || sub->get_blackbox_attribute())
 			return nullptr;
@@ -2249,7 +2258,13 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		if (!wire->get_bool_attribute(ID(sv_hierref)) || wire->port_id)
 			continue;
 		std::string path = wire->name.str().substr(1);
-		RTLIL::Wire *target = walk_hierref_down(design, this, path);
+		bool pending = false;
+		RTLIL::Wire *target = walk_hierref_down(design, this, path, &pending);
+		// an instance on the path is still to be derived: come back in the
+		// next round (rederiving now would mark the module resolved and
+		// drop this reference for good)
+		if (pending)
+			return false;
 		// a target that is itself an unresolved reference in the child
 		if (target && !target->get_bool_attribute(ID(sv_hierref))) {
 			targets.push_back({wire->name.str(), target->width, target->is_signed, std::string()});
@@ -2307,8 +2322,11 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				ok = false;
 				break;
 			}
+			bool pending = false;
 			RTLIL::Wire *t = rest.find('.') == std::string::npos ? parent->wire(RTLIL::escape_id(rest)) :
-					walk_hierref_down(design, parent, rest);
+					walk_hierref_down(design, parent, rest, &pending);
+			if (pending)
+				return false;
 			if (!t || t->get_bool_attribute(ID(sv_hierref)) || (width >= 0 && (t->width != width || t->is_signed != is_signed))) {
 				ok = false;
 				break;

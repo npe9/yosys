@@ -2061,6 +2061,63 @@ static bool contains_loop_exit(const AstNode *node)
 // IEEE 1800-2017 12.8 with a data-dependent condition: `break` sets the
 // break flag, `continue` the continue flag, and every statement after a
 // possible exit runs only while neither is set.
+// A procedural for-loop condition that does not fold, of the shape
+// `c OP x' / `x OP c' (c the folded loop variable, x an expression of at
+// most 16 bits): 1 if it holds for every value x can take, 0 if for none,
+// -1 if it depends on x; -2 for any other shape.  A synthesis tool unrolls
+// `for (k = 0; k <= n; k++)' to n's largest value with the body guarded,
+// which is exact because the loop ends at the first false condition.
+static int loop_cond_range_truth(AstNode *cond)
+{
+	AstNodeType op = cond->type;
+	if (op == AST_CONSTANT)
+		return cond->asBool() ? 1 : 0;
+	if (op == AST_REDUCE_BOOL && cond->children.size() == 1)
+		return loop_cond_range_truth(cond->children[0].get());
+	if (op == AST_LOGIC_NOT && cond->children.size() == 1) {
+		int t = loop_cond_range_truth(cond->children[0].get());
+		return t < 0 ? t : 1 - t;
+	}
+	if ((op == AST_LOGIC_AND || op == AST_LOGIC_OR) && cond->children.size() == 2) {
+		int a = loop_cond_range_truth(cond->children[0].get());
+		int b = loop_cond_range_truth(cond->children[1].get());
+		int dom = op == AST_LOGIC_AND ? 0 : 1;	// the value that decides alone
+		if (a == dom || b == dom)
+			return dom;
+		if (a == -2 || b == -2)
+			return -2;
+		return (a == 1 - dom && b == 1 - dom) ? 1 - dom : -1;
+	}
+	if (op != AST_LT && op != AST_LE && op != AST_GT && op != AST_GE)
+		return -2;
+	if (cond->children.size() != 2)
+		return -2;
+	AstNode *c = cond->children[0].get(), *x = cond->children[1].get();
+	if (c->type != AST_CONSTANT) {
+		std::swap(c, x);
+		// x OP c is c OP' x
+		op = op == AST_LT ? AST_GT : op == AST_LE ? AST_GE : op == AST_GT ? AST_LT : AST_LE;
+	}
+	if (c->type != AST_CONSTANT || x->type == AST_CONSTANT || c->bits.size() > 32)
+		return -2;
+	int xw = -1;
+	bool xs = false;
+	x->detectSignWidth(xw, xs);
+	if (xw <= 0 || xw > 16)
+		return -2;
+	bool sgn = xs && c->is_signed;
+	RTLIL::Const cc = c->bitsAsConst();
+	int64_t cv = sgn ? (int64_t)cc.as_int(true) : (int64_t)(uint32_t)cc.as_int(false);
+	int64_t lo = sgn ? -(int64_t(1) << (xw - 1)) : 0;
+	int64_t hi = sgn ? (int64_t(1) << (xw - 1)) - 1 : (int64_t(1) << xw) - 1;
+	switch (op) {
+	case AST_LT: return cv < lo ? 1 : cv >= hi ? 0 : -1;
+	case AST_LE: return cv <= lo ? 1 : cv > hi ? 0 : -1;
+	case AST_GT: return cv > hi ? 1 : cv <= lo ? 0 : -1;
+	default:     return cv >= hi ? 1 : cv < lo ? 0 : -1;
+	}
+}
+
 static bool guard_loop_exits(std::vector<std::unique_ptr<AstNode>> &stmts, const std::string &brk,
 		const std::string &cont, AstSrcLocType loc)
 {
@@ -7779,6 +7836,41 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		bool saw_iter_return = false;
 		std::string exit_brk, exit_cont;
 
+		auto ensure_exit_flags = [&]() {
+			if (!exit_brk.empty())
+				return;
+			// flags of this loop: per-call locals, never state
+			std::stringstream fs;
+			fs << "$loop_exit$" << RTLIL::encode_filename(*location.begin.filename) << ":" << location.begin.line << "$" << (autoidx++);
+			exit_brk = fs.str() + ".break";
+			exit_cont = fs.str() + ".continue";
+			for (auto &name : {exit_brk, exit_cont}) {
+				auto wire = std::make_unique<AstNode>(location, AST_WIRE, make_range(location, 0, 0));
+				wire->str = name;
+				wire->is_reg = true;
+				wire->is_logic = true;
+				wire->set_attribute(ID::nosync, AstNode::mkconst_int(location, 1, false));
+				current_scope[name] = wire.get();
+				while (wire->simplify(true, 1, -1, false)) { }
+				current_ast_mod->children.push_back(std::move(wire));
+			}
+			auto id = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+			id->str = exit_brk;
+			current_block->children.insert(current_block->children.begin() + return_from,
+					std::make_unique<AstNode>(location, AST_ASSIGN_EQ, std::move(id), mkconst_int(location, 0, false, 1)));
+			current_block_idx++;
+		};
+		auto exit_id = [&]() {
+			auto id = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+			id->str = exit_brk;
+			return id;
+		};
+		// fe100: a condition that depends on signals (loop_cond_range_truth
+		// -1) is checked in the iteration: `if (!cond) break', the loop's
+		// break flag; dyn_started once one has been
+		bool dyn_started = false;
+		std::unique_ptr<AstNode> dyn_cond;
+
 		int unroll_iters = 0;
 		while (1)
 		{
@@ -7808,12 +7900,21 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				while (buf->simplify(true, stage, expr_width_hint, expr_sign_hint)) { }
 			}
 
+			dyn_cond.reset();
 			if (buf->type != AST_CONSTANT) {
-				degrade(location.to_loc(), "Loop condition is not constant; the loop is skipped.\n");
-				break;
-			}
-
-			if (buf->integer == 0) {
+				int truth = type == AST_FOR ? loop_cond_range_truth(buf.get()) : -2;
+				if (truth == -2) {
+					if (dyn_started)
+						input_error("Loop condition no longer has a bounded form after an iteration that depended on signals.\n");
+					degrade(location.to_loc(), "Loop condition is not constant; the loop is skipped.\n");
+					break;
+				}
+				// false for every value of its operands: the loop ends here
+				if (truth == 0)
+					break;
+				if (truth == -1)
+					dyn_cond = std::move(buf);
+			} else if (buf->integer == 0) {
 				break;
 			}
 
@@ -7850,33 +7951,37 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				if (contains_function_return(buf.get()))
 					saw_iter_return = true;
 				if (loop_exit == 0 && contains_loop_exit(buf.get())) {
-					if (exit_brk.empty()) {
-						// flags of this loop: per-call locals, never state
-						std::stringstream fs;
-						fs << "$loop_exit$" << RTLIL::encode_filename(*location.begin.filename) << ":" << location.begin.line << "$" << (autoidx++);
-						exit_brk = fs.str() + ".break";
-						exit_cont = fs.str() + ".continue";
-						for (auto &name : {exit_brk, exit_cont}) {
-							auto wire = std::make_unique<AstNode>(location, AST_WIRE, make_range(location, 0, 0));
-							wire->str = name;
-							wire->is_reg = true;
-							wire->is_logic = true;
-							wire->set_attribute(ID::nosync, AstNode::mkconst_int(location, 1, false));
-							current_scope[name] = wire.get();
-							while (wire->simplify(true, 1, -1, false)) { }
-							current_ast_mod->children.push_back(std::move(wire));
-						}
-						auto id = std::make_unique<AstNode>(location, AST_IDENTIFIER);
-						id->str = exit_brk;
-						current_block->children.insert(current_block->children.begin() + return_from,
-								std::make_unique<AstNode>(location, AST_ASSIGN_EQ, std::move(id), mkconst_int(location, 0, false, 1)));
-						current_block_idx++;
-					}
+					ensure_exit_flags();
 					auto id = std::make_unique<AstNode>(location, AST_IDENTIFIER);
 					id->str = exit_cont;
 					buf->children.insert(buf->children.begin(),
 							std::make_unique<AstNode>(location, AST_ASSIGN_EQ, std::move(id), mkconst_int(location, 0, false, 1)));
 					guard_loop_exits(buf->children, exit_brk, exit_cont, location);
+				}
+				if (dyn_cond || dyn_started) {
+					// the loop variable takes this value only if the loop is
+					// still running (the first check: unconditionally, so the
+					// variable is assigned on every path), then the check
+					ensure_exit_flags();
+					auto set_var = std::make_unique<AstNode>(location, AST_ASSIGN_EQ, next_ast->children[0]->clone(), varbuf->children[0]->clone());
+					if (!dyn_started)
+						current_block->children.insert(current_block->children.begin() + current_block_idx++, std::move(set_var));
+					auto body = std::make_unique<AstNode>(location, AST_BLOCK);
+					for (auto &st : buf->children)
+						body->children.push_back(std::move(st));
+					buf->children.clear();
+					if (set_var)
+						buf->children.push_back(std::move(set_var));
+					auto stop = std::make_unique<AstNode>(location, AST_BLOCK,
+							std::make_unique<AstNode>(location, AST_ASSIGN_EQ, exit_id(), mkconst_int(location, 1, false, 1)));
+					if (dyn_cond)
+						buf->children.push_back(std::make_unique<AstNode>(location, AST_CASE,
+								std::make_unique<AstNode>(location, AST_REDUCE_BOOL, std::make_unique<AstNode>(location, AST_LOGIC_NOT, std::move(dyn_cond))),
+								std::make_unique<AstNode>(location, AST_COND, mkconst_int(location, 1, false, 1), std::move(stop))));
+					buf->children.push_back(std::make_unique<AstNode>(location, AST_CASE,
+							std::make_unique<AstNode>(location, AST_REDUCE_BOOL, std::make_unique<AstNode>(location, AST_LOGIC_NOT, exit_id())),
+							std::make_unique<AstNode>(location, AST_COND, mkconst_int(location, 1, false, 1), std::move(body))));
+					dyn_started = true;
 				}
 				if (!exit_brk.empty()) {
 					// after a possible break, every later iteration is conditional
@@ -7925,6 +8030,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		if (type == AST_FOR) {
 			auto buf = next_ast->clone();
 			buf->children[1] = varbuf->children[0]->clone();
+			if (dyn_started) {
+				// assigned at the first signal-dependent check already: the
+				// end value only if no check stopped the loop
+				auto blk = std::make_unique<AstNode>(location, AST_BLOCK, std::move(buf));
+				buf = std::make_unique<AstNode>(location, AST_CASE,
+						std::make_unique<AstNode>(location, AST_REDUCE_BOOL, std::make_unique<AstNode>(location, AST_LOGIC_NOT, exit_id())),
+						std::make_unique<AstNode>(location, AST_COND, mkconst_int(location, 1, false, 1), std::move(blk)));
+			}
 			current_block->children.insert(current_block->children.begin() + current_block_idx++, std::move(buf));
 		}
 		// A return inside an iteration must also hide every later statement in

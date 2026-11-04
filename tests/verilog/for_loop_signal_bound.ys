@@ -1,0 +1,67 @@
+# A procedural for-loop whose condition depends on a signal of at most 16
+# bits (OpenTitan rram_ctrl_otp `for (k = 0; k <= otp_size_q; k++)') is
+# unrolled to the largest value the signal can take, each iteration after
+# the first signal-dependent check guarded by the loop's break flag: exact,
+# since the loop ends at its first false condition.  Each loop below is
+# proved equal to a closed form, the loop variable's final value included.
+read_verilog -sv <<EOF
+module t(input [2:0] n, input [7:0] d, input signed [2:0] m, input [1:0] b,
+         output logic [7:0] y, output logic [3:0] kk, output logic [7:0] z,
+         output logic [7:0] w, output logic [3:0] kb, output logic [7:0] u, output ok);
+  logic [3:0] k;
+  always_comb begin
+    y = '0;
+    for (int unsigned j = 0; j <= n; j++) y[j] = d[j];
+  end
+  // the loop variable's final value: the first that fails
+  always_comb begin
+    for (k = 0; k < n; k++) ;
+    kk = k;
+  end
+  // signed, counting down
+  always_comb begin
+    z = '0;
+    for (int i = 3; i >= m; i--) z[i + 4] = 1'b1;
+  end
+  // a break inside a signal-bounded loop
+  always_comb begin
+    w = '0;
+    for (kb = 0; kb < n; kb++) begin
+      if (kb == {2'b0, b}) break;
+      w[kb] = 1'b1;
+    end
+  end
+  // a conjunction with a constant bound
+  always_comb begin
+    u = '0;
+    for (int j = 0; j < 6 && j <= n; j++) u[j] = 1'b1;
+  end
+  wire [7:0] y_ref;
+  genvar g;
+  for (g = 0; g < 8; g++) assign y_ref[g] = (g <= n) ? d[g] : 1'b0;
+  wire [7:0] z_ref;
+  for (g = 0; g < 8; g++) assign z_ref[g] = (g - 4 >= m);
+  wire [3:0] stop = (n < {1'b0, b}) ? n : {1'b0, b};
+  wire [7:0] w_ref;
+  for (g = 0; g < 8; g++) assign w_ref[g] = g < stop;
+  wire [7:0] u_ref;
+  for (g = 0; g < 8; g++) assign u_ref[g] = g < 6 && g <= n;
+  assign ok = (u == u_ref) && (y == y_ref) && (kk == {1'b0, n}) && (z == z_ref) && (w == w_ref) && (kb == stop);
+endmodule
+EOF
+proc
+opt_clean
+sat -verify -prove ok 1 -show-ports t
+
+# a wider bound keeps the degradation
+design -reset
+logger -expect error "Loop condition is not constant; the loop is skipped" 1
+read_verilog -sv <<EOF
+module tw(input [31:0] n32, output logic [7:0] y);
+  always_comb begin
+    y = '0;
+    for (int k = 0; k < n32; k++) y[k[2:0]] = 1'b1;
+  end
+endmodule
+EOF
+logger -check-expected

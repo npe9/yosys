@@ -693,6 +693,71 @@
 		return n;
 	}
 
+	// A long `s0 ##d1 s1 ##d2 s2 ...' is parsed left-deep, one tree level per
+	// step; the recursive AST passes cannot take a few hundred levels
+	// (caliptra fv_ecc_pm_sequencer: one property of 1040 steps hit the
+	// simplifier's depth guard, or the stack).  Concatenation is associative
+	// (IEEE 1800-2017 16.9.2), so past a length the chain is rebuilt as a
+	// balanced tree of the same operands and delays in the same order.  A
+	// chain with a multiclock element is kept: its clock flows left to right.
+	static bool sva_has_clocked(const AstNode *n)
+	{
+		std::vector<const AstNode *> todo{n};
+		while (!todo.empty()) {
+			const AstNode *x = todo.back();
+			todo.pop_back();
+			if (!x)
+				continue;
+			if (x->type == AST_SVA && x->str == "clocked")
+				return true;
+			for (auto &c : x->children)
+				todo.push_back(c.get());
+		}
+		return false;
+	}
+
+	static std::unique_ptr<AstNode> sva_balance_build(std::vector<std::unique_ptr<AstNode>> &ops,
+			std::vector<std::unique_ptr<AstNode>> &delays, size_t lo, size_t hi, const Location &loc)
+	{
+		if (lo == hi)
+			return std::move(ops[lo]);
+		size_t mid = (lo + hi) / 2;
+		auto n = mk_sva(loc, "##");
+		n->children.push_back(sva_balance_build(ops, delays, lo, mid, loc));
+		n->children.push_back(std::move(delays[mid]));
+		n->children.push_back(sva_balance_build(ops, delays, mid + 1, hi, loc));
+		return n;
+	}
+
+	static std::unique_ptr<AstNode> sva_balance_concat(std::unique_ptr<AstNode> n)
+	{
+		const size_t min_steps = 128;
+		auto is_cat = [](const AstNode *x) { return x && x->type == AST_SVA && x->str == "##" && x->children.size() == 3; };
+		size_t steps = 0;
+		for (const AstNode *x = n.get(); is_cat(x); x = x->children[0].get())
+			steps++;
+		if (steps < min_steps)
+			return n;
+		for (const AstNode *x = n.get(); is_cat(x); x = x->children[0].get())
+			if (sva_has_clocked(x->children[1].get()) || sva_has_clocked(x->children[2].get()) ||
+					(!is_cat(x->children[0].get()) && sva_has_clocked(x->children[0].get())))
+				return n;
+		Location loc = n->location;
+		// unwind the left spine: delays[i] joins ops[i] and ops[i+1]
+		std::vector<std::unique_ptr<AstNode>> ops, delays;
+		std::unique_ptr<AstNode> cur = std::move(n);
+		while (is_cat(cur.get())) {
+			ops.push_back(std::move(cur->children[2]));
+			delays.push_back(std::move(cur->children[1]));
+			auto lhs = std::move(cur->children[0]);
+			cur = std::move(lhs);
+		}
+		ops.push_back(std::move(cur));
+		std::reverse(ops.begin(), ops.end());
+		std::reverse(delays.begin(), delays.end());
+		return sva_balance_build(ops, delays, 0, ops.size() - 1, loc);
+	}
+
 	static std::unique_ptr<AstNode> sva_num(const parser::location_type &loc, const std::string &text, const std::vector<char> &case_stack)
 	{
 		ConstParser p{loc};
@@ -7487,8 +7552,8 @@ sva_within:
 	sva_within TOK_WITHIN sva_throughout { $$ = sva_bin(@$, "within", std::move($1), std::move($3)); };
 
 sva_throughout:
-	sva_concat { $$ = std::move($1); } |
-	sva_concat TOK_THROUGHOUT sva_throughout { $$ = sva_bin(@$, "throughout", std::move($1), std::move($3)); };
+	sva_concat { $$ = sva_balance_concat(std::move($1)); } |
+	sva_concat TOK_THROUGHOUT sva_throughout { $$ = sva_bin(@$, "throughout", sva_balance_concat(std::move($1)), std::move($3)); };
 
 sva_concat:
 	sva_repeat { $$ = std::move($1); } |

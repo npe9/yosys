@@ -1,0 +1,133 @@
+# A function or task with a `return` inside a `for`, called with non-constant
+# arguments or reading module signals (caliptra_top_sva
+# check_kv_slot_debug_value: `for (...) if (kv[entry] ...) return 0;` over
+# hierarchical KV entries, called with a genvar).  It was forced through
+# constant evaluation ("Constant function ... did not evaluate"), then lost
+# its scope prefix in the loop body, latched the loop variable on return
+# paths, and dropped the statements after a loop inside an `if` arm.  It is
+# inlined now; each gate output matches a gold form with a `done` flag.
+read_verilog -sv <<EOT
+module gold (input logic [15:0] p, input logic [2:0] s, input logic [1:0] c, input logic [7:0] d [4],
+             output logic [3:0] o1, o2, o3, o4, o5, o6, o7, o8, output logic o9);
+  function automatic logic [3:0] g(logic [2:0] e);
+    logic done; logic [3:0] r; done = 0; r = 0;
+    for (int i = 0; i < 4; i++) if (!done && p[e+i]) begin r = i; done = 1; end
+    if (!done) r = 4'hf;
+    return r;
+  endfunction
+  always_comb begin
+    logic done; logic [3:0] a;
+    o1 = g(s);
+    o2 = c[0] && g(s) != 4'hf ? g(s) : 4'h9;
+    o3 = c[0] ? (g(s) == 4'hf ? 4'hd : g(s)) : 4'h9;
+    case (c) 2'd0: o4 = g(s); 2'd1: o4 = 4'h5; default: o4 = 4'h6; endcase
+    done = 0; a = 0; o5 = 0;
+    for (int i = 0; i < 4; i++) begin a = a + p[8+i]; if (!done && p[s+i]) begin o5 = a; done = 1; end end
+    if (!done) o5 = 4'hf - a;
+    o6 = g(s);
+    o7 = g(s);
+    o8 = g(s + 3'd2);
+    o9 = d[0] == 8'h11 && d[1] == 8'h11;
+  end
+endmodule
+module gate (input logic [15:0] p, input logic [2:0] s, input logic [1:0] c, input logic [7:0] d [4],
+             output logic [3:0] o1, o2, o3, o4, o5, o6, o7, o8, output logic o9);
+  function automatic logic [3:0] f1(logic [2:0] e);
+    for (int i = 0; i < 4; i++) if (p[e+i]) return i;
+    return 4'hf;
+  endfunction
+  // the loop in an `if` arm, the fall-through after the `if`
+  function automatic logic [3:0] f2(logic [2:0] e);
+    if (c[0]) for (int i = 0; i < 4; i++) if (p[e+i]) return i;
+    return 4'h9;
+  endfunction
+  // the arm returns after its loop too
+  function automatic logic [3:0] f3(logic [2:0] e);
+    if (c[0]) begin
+      for (int i = 0; i < 4; i++) if (p[e+i]) return i;
+      return 4'hd;
+    end
+    return 4'h9;
+  endfunction
+  function automatic logic [3:0] f4(logic [2:0] e);
+    case (c)
+      2'd0: for (int i = 0; i < 4; i++) if (p[e+i]) return i;
+      2'd1: return 4'h5;
+      default: return 4'h6;
+    endcase
+    return 4'hf;
+  endfunction
+  // a value carried across iterations
+  function automatic logic [3:0] f5(logic [2:0] e);
+    logic [3:0] a; a = 0;
+    for (int i = 0; i < 4; i++) begin a = a + p[8+i]; if (p[e+i]) return a; end
+    return 4'hf - a;
+  endfunction
+  task automatic t6(input logic [2:0] e, output logic [3:0] r);
+    r = 4'hf;
+    for (int i = 0; i < 4; i++) if (p[e+i]) begin r = i; return; end
+  endtask
+  // the loop variable declared outside the loop
+  function automatic logic [3:0] f7(logic [2:0] e);
+    int i;
+    for (i = 0; i < 4; i++) if (p[e+i]) return i;
+    return 4'hf;
+  endfunction
+  // a constant argument, module signals in the loop (the caliptra shape)
+  function automatic logic chk(int entry);
+    for (int k = 0; k < 2; k++) if (d[entry + k] != 8'h11) return 1'b0;
+    return 1'b1;
+  endfunction
+  always_comb begin
+    o1 = f1(s); o2 = f2(s); o3 = f3(s); o4 = f4(s); o5 = f5(s);
+    t6(s, o6);
+    o7 = f7(s); o8 = f1(s + 3'd2);
+    o9 = chk(0);
+  end
+endmodule
+EOT
+proc
+equiv_make gold gate eq
+hierarchy -top eq
+equiv_simple
+equiv_status -assert
+design -reset
+
+# shapes the per-iteration folding does not cover stay errors
+logger -expect error "Function `f' has a return inside a nested loop \(not supported\)" 1
+read_verilog -sv <<EOT
+module nested (input logic [15:0] p, input logic [2:0] s, output logic [3:0] o);
+  function automatic logic [3:0] f(logic [2:0] e);
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) if (p[e+i*2+j]) return i*2+j;
+    return 4'hf;
+  endfunction
+  always_comb o = f(s);
+endmodule
+EOT
+logger -check-expected
+design -reset
+
+logger -expect error "Function `f' has a return in a loop with break or continue \(not supported\)" 1
+read_verilog -sv <<EOT
+module brk (input logic [15:0] p, input logic [2:0] s, output logic [3:0] o);
+  function automatic logic [3:0] f(logic [2:0] e);
+    for (int i = 0; i < 4; i++) begin if (p[i]) continue; if (p[e+i]) return i; end
+    return 4'hf;
+  endfunction
+  always_comb o = f(s);
+endmodule
+EOT
+logger -check-expected
+design -reset
+
+logger -expect error "Function `f' has returns in two loops \(not supported\)" 1
+read_verilog -sv <<EOT
+module two (input logic [15:0] p, input logic [2:0] s, output logic [3:0] o);
+  function automatic logic [3:0] f(logic [2:0] e);
+    for (int i = 0; i < 4; i++) if (p[e+i]) return i;
+    for (int j = 0; j < 3; j++) if (p[8+j]) return 4+j;
+    return 4'hf;
+  endfunction
+  always_comb o = f(s);
+endmodule
+EOT

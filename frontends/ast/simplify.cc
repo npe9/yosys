@@ -2360,6 +2360,41 @@ static bool contains_function_return(const AstNode *node)
 	return false;
 }
 
+// A return inside a loop is folded per unrolled iteration (absorb_loop_tail).
+// The shapes that fold wrongly are refused: a return-loop inside another loop
+// (the outer iterations ran on), break / continue in a return-loop, and two
+// return-loops in one subroutine.
+static bool contains_loop_exit_tcall(const AstNode *node)
+{
+	if (!node)
+		return false;
+	if (node->type == AST_TCALL && (node->str == "\\break" || node->str == "\\continue"))
+		return true;
+	for (auto &child : node->children)
+		if (contains_loop_exit_tcall(child.get()))
+			return true;
+	return false;
+}
+
+static const char *unsupported_loop_return(const AstNode *node, int depth, int &ret_loops)
+{
+	if (!node)
+		return nullptr;
+	bool loop = node->type == AST_FOR || node->type == AST_WHILE || node->type == AST_REPEAT;
+	if (loop && contains_function_return(node)) {
+		if (depth > 0)
+			return "a return inside a nested loop";
+		if (contains_loop_exit_tcall(node))
+			return "a return in a loop with break or continue";
+		if (++ret_loops > 1)
+			return "returns in two loops";
+	}
+	for (auto &child : node->children)
+		if (const char *why = unsupported_loop_return(child.get(), depth + (loop ? 1 : 0), ret_loops))
+			return why;
+	return nullptr;
+}
+
 static void strip_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
 {
 	for (size_t i = 0; i < stmts.size();) {
@@ -2578,11 +2613,22 @@ static bool absorb_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
 			// A loop inside this block does not see the statements after the block.
 			// Bring those statements in, then fold them onto the paths that fall through.
 			if (contains_function_return(stmt) && i + 1 < stmts.size()) {
+				// the block's own statements still need its scope prefix (a
+				// loop body inside resolves the function's arguments through
+				// it: `for (...) if (d[entry] ...) return 0;` read `entry` as
+				// `$for_loop$N[0].entry`); the moved statements have theirs
+				if (!stmt->str.empty() && !stmt->get_bool_attribute(ID(sv_noexpand)))
+					stmt->expand_genblock(stmt->str + ".");
 				stmt->set_attribute(ID(sv_noexpand), AstNode::mkconst_int(stmt->location, 1, false));
 				for (size_t r = i + 1; r < stmts.size(); r++)
 					stmt->children.push_back(std::move(stmts[r]));
 				stmts.erase(stmts.begin() + i + 1, stmts.end());
-				absorb_function_return(stmt->children);
+				// every path returns when the block with them does: the
+				// caller must not add its own fall-through (a `for (int i
+				// ...)` is such a block; `if (c) begin for (...) return i;
+				// return 1; end return 2;` gave 2 for c)
+				if (absorb_function_return(stmt->children))
+					return true;
 			}
 			continue;
 		}
@@ -2592,6 +2638,7 @@ static bool absorb_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
 			bool all_return = true;
 			bool has_default = false;
 			bool terminal = false;
+			bool nested_return = false;
 			std::vector<std::vector<std::unique_ptr<AstNode>>*> open_arms;
 			std::vector<std::vector<std::unique_ptr<AstNode>>*> returned_arms;
 			for (size_t c = 1; c < stmt->children.size(); c++) {
@@ -2641,6 +2688,14 @@ static bool absorb_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
 				}
 				all_return = false;
 				open_arms.push_back(body);
+				// an arm that falls through but still has a return inside (a
+				// nested case: `if (a) begin if (b) return 1; end return 2;`
+				// gave 2 for a && b; or a loop, folded only once it is
+				// unrolled in this arm by absorb_loop_tail, which does not
+				// see the statements after the case) takes them too
+				for (auto &ch : *body)
+					if (ch && contains_function_return(ch.get()))
+						nested_return = true;
 			}
 			// No default means an unselected case falls through.
 			if (!has_default)
@@ -2649,7 +2704,7 @@ static bool absorb_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
 				stmts.erase(stmts.begin() + i + 1, stmts.end());
 				return true;
 			}
-			if (any_return && i + 1 < stmts.size()) {
+			if ((any_return || nested_return) && i + 1 < stmts.size()) {
 				std::vector<std::unique_ptr<AstNode>> rest;
 				for (size_t r = i + 1; r < stmts.size(); r++)
 					rest.push_back(std::move(stmts[r]));
@@ -7847,6 +7902,13 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 		for (auto &init : extra_inits)
 			current_block->children.insert(current_block->children.begin() + current_block_idx++, std::move(init));
+		// a function return in the body skips the end-value assignment
+		// after the loop on its paths: assign the start value first, so
+		// the loop variable is written on every path (no latch in an
+		// always_comb; its value after the return is never read)
+		if (type == AST_FOR && contains_function_return(body_ast))
+			current_block->children.insert(current_block->children.begin() + current_block_idx++,
+					std::make_unique<AstNode>(location, AST_ASSIGN_EQ, init_ast->children[0]->clone(), varbuf->children[0]->clone()));
 		size_t return_from = current_block_idx;
 		bool saw_iter_return = false;
 		std::string exit_brk, exit_cont;
@@ -10349,6 +10411,7 @@ skip_memory_write:;
 		std::string prefix = sstr.str();
 
 		auto* decl = current_scope[str];
+		std::string call_name = str;
 		if (unevaluated_tern_branch && decl->is_recursive_function())
 			goto replace_fcall_later;
 		auto decl_clone = decl->clone();
@@ -10424,6 +10487,21 @@ skip_memory_write:;
 		if (decl->type == AST_FUNCTION && !decl->attributes.count(ID::via_celltype))
 		{
 			bool require_const_eval = decl->has_const_only_constructs();
+			// a `for` is const-only here so that a loop function with
+			// constant arguments folds; when it does not (the body reads
+			// module signals: caliptra_top_sva check_kv_slot_debug_value,
+			// a `for` with an early `return` over hierarchical KV entries),
+			// the call is inlined like any other.  while / repeat are
+			// const-only proper (upstream).
+			std::function<bool(AstNode*)> has_while_repeat = [&](AstNode *n) {
+				if (n->type == AST_WHILE || n->type == AST_REPEAT)
+					return true;
+				for (auto &c : n->children)
+					if (c && has_while_repeat(c.get()))
+						return true;
+				return false;
+			};
+			bool loop_inline_ok = require_const_eval && !in_param && !has_while_repeat(decl);
 			bool all_args_const = true;
 			for (auto& child : children) {
 				while (child->simplify(true, 1, -1, false)) { }
@@ -10439,14 +10517,27 @@ skip_memory_write:;
 				func_workspace->set_in_param_flag(true);
 				func_workspace->str = prefix_id(prefix, "$result");
 				// func_workspace->dumpAst(stdout, "func_workspace ");
-				newNode = func_workspace->eval_const_function(this, in_param || require_const_eval);
+				newNode = func_workspace->eval_const_function(this, in_param || (require_const_eval && !loop_inline_ok));
 			}
-			if (!newNode && (in_param || (require_const_eval && all_args_const))) {
+			if (!newNode && (in_param || (require_const_eval && !loop_inline_ok && all_args_const))) {
 				degrade(location.to_loc(), "Constant function `%s' did not evaluate; using constant 0.\n", str.c_str());
 				newNode = AstNode::mkconst_int(location, 0, false);
 			}
 			if (newNode)
 				goto apply_newNode;
+		}
+
+		{
+			int ret_loops = 0;
+			if (const char *why = unsupported_loop_return(decl, 0, ret_loops)) {
+				degrade(location.to_loc(), "%s `%s' has %s (not supported); the call is replaced by %s.\n",
+						decl->type == AST_TASK ? "Task" : "Function", call_name.c_str() + (call_name[0] == '\\'), why, type == AST_FCALL ? "constant 0" : "nothing");
+				if (type == AST_FCALL)
+					newNode = AstNode::mkconst_int(location, 0, false);
+				else
+					newNode = std::make_unique<AstNode>(location, AST_BLOCK);
+				goto apply_newNode;
+			}
 		}
 
 		if (probe_eval_depth > 0) {

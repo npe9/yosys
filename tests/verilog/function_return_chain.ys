@@ -45,3 +45,33 @@ equiv_make gold gate eq
 hierarchy -top eq
 equiv_simple
 equiv_status -assert
+design -reset
+
+# fe111: a return nested in an arm that falls through (no loop): the case
+# did not take the statements after it, so they ran on the return path
+# too (`if (a) begin if (b) return 1; end return 2;` gave 2 for a && b)
+read_verilog -sv <<EOT
+module gold (input logic a, b, input logic [1:0] c, output logic [3:0] o1, o2, o3, o4);
+  always_comb begin
+    o1 = a && b ? 1 : 2;
+    o2 = a && b ? 1 : 2;
+    o3 = c == 2'd0 && b ? 1 : 2;
+    o4 = a && b ? 1 : (a ? 3 : 2);
+  end
+endmodule
+module gate (input logic a, b, input logic [1:0] c, output logic [3:0] o1, o2, o3, o4);
+  function automatic logic [3:0] f1(logic x); if (x) begin if (b) return 1; end return 2; endfunction
+  function automatic logic [3:0] f2(logic x); if (x) if (b) return 1; return 2; endfunction
+  function automatic logic [3:0] f3(logic [1:0] x); case (x) 2'd0: if (b) return 1; endcase return 2; endfunction
+  function automatic logic [3:0] f4(logic x);
+    logic [3:0] r; r = 2; if (x) begin r = 3; if (b) return 1; end return r;
+  endfunction
+  always_comb begin o1 = f1(a); o2 = f2(a); o3 = f3(c); o4 = f4(a); end
+endmodule
+EOT
+proc
+opt_clean
+equiv_make gold gate eq
+hierarchy -top eq
+equiv_simple
+equiv_status -assert

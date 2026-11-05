@@ -1,0 +1,21 @@
+# An attribute instance at the start of an always statement, ahead of its
+# event control (IEEE 1800-2017 A.6.4: statement ::= [ label : ]
+# { attribute_instance } statement_item): OpenTitan ast vio_pgd
+# `always (* xprop_off *) @( * ) begin ... end'.  It was a syntax error
+# (stock: "unexpected '@'").  The attribute is kept on the process.
+read_verilog -sv <<EOT
+module t (input logic clk, a, b, output logic q, r, c);
+  always (* keep *) @(posedge clk) q <= a;
+  always_ff (* my_attr = 3 *) @(posedge clk) r <= b;
+  always (* xprop_off *) @( * ) begin
+    c = a & b;
+  end
+endmodule
+EOT
+select -assert-count 1 t/p:* a:keep %i
+select -assert-count 1 t/p:* a:my_attr=3 %i
+select -assert-count 1 t/p:* a:xprop_off %i
+proc
+opt_clean
+select -assert-count 2 t/t:$dff
+select -assert-count 1 t/t:$and

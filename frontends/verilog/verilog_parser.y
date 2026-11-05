@@ -1108,7 +1108,7 @@
 // +1 (2026-11-02, fe99): after `initial', `@' is shifted into the one-shot
 // `initial @(edge) stmt' rule instead of reducing toward a statement-level
 // event control (which the rule covers, with its degradations)
-%expect 141
+%expect 142
 
 %precedence FAKE_THEN
 %precedence TOK_ELSE
@@ -4414,15 +4414,21 @@ always_or_always_ff:
 	};
 
 always_stmt:
-	attr always_or_always_ff {
+	// IEEE 1800-2017 9.2.2 / A.6.4: `always (* xprop_off *) @(*) ...' -- the
+	// attribute instance starts the statement, ahead of its event control
+	// (OpenTitan ast vio_pgd and other behavioral models).  It is kept on
+	// the process.  (Shifting it here is one more resolved conflict: with no
+	// event control, `always (* a *) stmt' could also give it to stmt.)
+	attr always_or_always_ff attr {
 		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_ALWAYS));
 		append_attr(node, std::move($1));
+		append_attr(node, std::move($3));
 		if ($2)
 			node->attributes[ID::always_ff] = AstNode::mkconst_int(@2, 1, false);
 	} always_cond {
 		(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_BLOCK));
 	} behavioral_stmt {
-		SET_AST_NODE_LOC(extra->ast_stack.back(), @6, @6);
+		SET_AST_NODE_LOC(extra->ast_stack.back(), @7, @7);
 		extra->ast_stack.pop_back();
 
 		SET_AST_NODE_LOC(extra->ast_stack.back(), @2, @$);

@@ -2591,6 +2591,7 @@ static bool absorb_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
 			bool any_return = false;
 			bool all_return = true;
 			bool has_default = false;
+			bool terminal = false;
 			std::vector<std::vector<std::unique_ptr<AstNode>>*> open_arms;
 			std::vector<std::vector<std::unique_ptr<AstNode>>*> returned_arms;
 			for (size_t c = 1; c < stmt->children.size(); c++) {
@@ -2653,15 +2654,27 @@ static bool absorb_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
 				for (size_t r = i + 1; r < stmts.size(); r++)
 					rest.push_back(std::move(stmts[r]));
 				stmts.erase(stmts.begin() + i + 1, stmts.end());
+				// every path returns now when each open arm (with the moved
+				// statements) and the default do: the caller must see this
+				// case as a return, or it keeps its own fall-through after it
+				// (`if (a) begin if (b) return 1; return 2; end return 3;`
+				// gave 3 for a && b)
+				terminal = true;
 				for (auto *body : open_arms) {
 					for (auto &extra : rest)
 						body->push_back(extra->clone());
-					absorb_function_return(*body);
+					if (!absorb_function_return(*body))
+						terminal = false;
 				}
 				if (!has_default) {
 					auto blk = std::make_unique<AstNode>(stmt->location, AST_BLOCK);
 					for (auto &extra : rest)
 						blk->children.push_back(extra->clone());
+					// fold the returns of the moved statements too, like an
+					// open arm's: `if (a) return 1; if (b) return 2; return 3;`
+					// lost the second return (b's arm fell through to 3)
+					if (!absorb_function_return(blk->children))
+						terminal = false;
 					auto cond = std::make_unique<AstNode>(stmt->location, AST_COND);
 					cond->children.push_back(std::make_unique<AstNode>(stmt->location, AST_DEFAULT));
 					cond->children.push_back(std::move(blk));
@@ -2683,6 +2696,8 @@ static bool absorb_function_return(std::vector<std::unique_ptr<AstNode>> &stmts)
 					body->push_back(std::move(stop));
 				}
 			}
+			if (terminal)
+				return true;
 		}
 	}
 	return false;

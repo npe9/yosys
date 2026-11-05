@@ -1,0 +1,72 @@
+# ANSI ports with unpacked dimensions and no packed range (OpenTitan i3c
+# `output grp_addr_de_o[MaxGroups]', veer el2_pmp `output logic
+# pmp_chan_err [PMP_CHANNELS]').  The unpacked range sat where the packed
+# one goes: `e [N]' became the one bit e[N:N] (e[1], e[2] out of bounds,
+# the parent's elements undriven) and `e [0:N-1]' an ascending vector
+# with e[0] in the MSB, bit-reversed against the parent's flattened array.
+# A following `, f' port also copied the unpacked dimensions
+# (`input logic [1:0] y [3], z' made z six bits wide; IEEE 1800-2017
+# 23.2.2.3: the dimensions belong to the one port).  (Stock rejects
+# unpacked ANSI port dimensions.)
+read_verilog -sv <<EOT
+module sub #(parameter N = 3) (
+  input logic x [N],
+  input logic [1:0] y [N], z,
+  input bit s [N], t,
+  output logic e [N],
+  output logic a [0:N-1],
+  output wire d [N-1:0],
+  output b [3],
+  output logic [1:0] w [N],
+  output logic zw, tw
+);
+  for (genvar c = 0; c < N; c++) begin : g
+    assign e[c] = x[c] ^ (c == 1);
+    assign a[c] = x[c] & s[c];
+    assign d[c] = ~x[c];
+    assign b[c] = y[c][0];
+    assign w[c] = y[c] ^ {2{t}};
+  end
+  assign zw = $bits(z) == 2 && z == y[0];
+  assign tw = $bits(t) == 1;
+endmodule
+
+module top (input logic x0, x1, x2, s0, s1, s2, t, input logic [1:0] y0, y1, y2,
+    output logic [2:0] oe, oa, od, ob, output logic [5:0] ow, output logic zw, tw);
+  logic x [3], s [3], e [3], a [0:2], d [3], b [3];
+  logic [1:0] y [3], w [3];
+  assign x[0] = x0; assign x[1] = x1; assign x[2] = x2;
+  assign s[0] = s0; assign s[1] = s1; assign s[2] = s2;
+  assign y[0] = y0; assign y[1] = y1; assign y[2] = y2;
+  sub #(.N(3)) u (.x(x), .y(y), .z(y0), .s(s), .t(t), .e(e), .a(a), .d(d), .b(b), .w(w), .zw(zw), .tw(tw));
+  assign oe = {e[2], e[1], e[0]};
+  assign oa = {a[2], a[1], a[0]};
+  assign od = {d[2], d[1], d[0]};
+  assign ob = {b[2], b[1], b[0]};
+  assign ow = {w[2], w[1], w[0]};
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+memory
+opt_clean
+rename top gate
+design -stash gate
+
+read_verilog -sv <<EOT
+module gold (input logic x0, x1, x2, s0, s1, s2, t, input logic [1:0] y0, y1, y2,
+    output logic [2:0] oe, oa, od, ob, output logic [5:0] ow, output logic zw, tw);
+  assign oe = {x2, ~x1, x0};
+  assign oa = {x2 & s2, x1 & s1, x0 & s0};
+  assign od = ~{x2, x1, x0};
+  assign ob = {y2[0], y1[0], y0[0]};
+  assign ow = {y2, y1, y0} ^ {6{t}};
+  assign zw = 1;
+  assign tw = 1;
+endmodule
+EOT
+proc
+design -copy-from gate -as gate gate
+miter -equiv -flatten -make_outputs -ignore_gold_x gold gate miter
+sat -verify -prove trigger 0 -set-def-inputs -show-inputs -show-outputs miter

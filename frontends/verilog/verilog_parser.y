@@ -68,6 +68,11 @@
 		typedef std::map<std::string, AST::AstNode*> UserTypeMap;
 		struct ParseState {
 			int port_counter;
+			// the last ANSI port declared with unpacked dimensions, and how
+			// many trailing range children are its unpacked part (a later
+			// `, name' port copies the declaration without them)
+			const AstNode *unpacked_port = nullptr;
+			int unpacked_port_ranges = 0;
 			dict<std::string, int> port_stubs;
 			std::unique_ptr<dict<IdString, std::unique_ptr<AstNode>>> attr_list;
 			dict<IdString, std::unique_ptr<AstNode>> default_attr_list;
@@ -1255,6 +1260,7 @@ module:
 		extra->current_ast_mod = mod;
 		extra->port_stubs.clear();
 		extra->port_counter = 0;
+		extra->unpacked_port = nullptr;
 		// default / global clocking are per module (IEEE 14.12, 14.14): a
 		// default clocking of an earlier module used to clock this module's
 		// unclocked assertions (an undriven implicit clock net)
@@ -1292,6 +1298,7 @@ program:
 		extra->current_ast_mod = mod;
 		extra->port_stubs.clear();
 		extra->port_counter = 0;
+		extra->unpacked_port = nullptr;
 		// default / global clocking are per module (IEEE 14.12, 14.14): a
 		// default clocking of an earlier module used to clock this module's
 		// unclocked assertions (an undriven implicit clock net)
@@ -1431,6 +1438,14 @@ module_arg:
 	TOK_ID {
 		if (extra->ast_stack.back()->children.size() > 0 && extra->ast_stack.back()->children.back()->type == AST_WIRE) {
 			auto node = extra->ast_stack.back()->children.back()->clone();
+			// IEEE 1800-2017 23.2.2.3: unpacked dimensions belong to the
+			// one port; `input logic [1:0] e [3], f' makes f two bits wide
+			if (extra->ast_stack.back()->children.back().get() == extra->unpacked_port) {
+				for (int k = 0; k < extra->unpacked_port_ranges; k++)
+					node->children.pop_back();
+				node->attributes.erase(ID(sv_port_unpacked));
+				node->fixup_hierarchy_flags();
+			}
 			node->str = *$1;
 			node->port_id = ++extra->port_counter;
 			SET_AST_NODE_LOC(node.get(), @1, @1);
@@ -1513,8 +1528,10 @@ module_arg:
 			node->children.push_back(std::move(ty));
 		}
 		auto range = checkRange(node.get(), std::move($3));
+		bool packed_range = range != nullptr;
 		if (range != nullptr)
 			node->children.push_back(std::move(range));
+		extra->unpacked_port = nullptr;
 		if ($5 != nullptr) {
 			// Unpacked array ports stay wires with an unpacked range child;
 			// the shared array-access machinery flattens them. Rewriting the
@@ -1523,10 +1540,21 @@ module_arg:
 			// one goes; mark the port so type resolution reads it as an
 			// unpacked declaration (`st_t p [2]` is 2 elements, not packed
 			// [2:2]; `st_t [1:0] p [2]` keeps its packed dimension).
+			// With no type name and no packed range, the unpacked range
+			// would likewise be read as the packed one (`output logic e [N]'
+			// became the one bit e[N:N], `e [0:N-1]' an ascending vector with
+			// e[0] in the MSB); give the port its implicit one-bit packed
+			// range first.
+			extra->unpacked_port_ranges = 1;
 			if (!iface_type.empty() && node->type != AST_INTERFACEPORT)
 				node->set_attribute(ID(sv_port_unpacked), AstNode::mkconst_int(@5, 1, false));
+			else if (!packed_range && node->type != AST_INTERFACEPORT) {
+				node->children.push_back(makeRange(@5, 0, 0, false));
+				extra->unpacked_port_ranges = 2;
+			}
 			node->children.push_back(std::move($5));
 			node->fixup_hierarchy_flags();
+			extra->unpacked_port = node.get();
 		}
 		if (node->type != AST_INTERFACEPORT && !node->is_input && !node->is_output) {
 			// A later ANSI port inherits the previous direction.
@@ -1918,6 +1946,7 @@ interface:
 		extra->current_ast_mod = intf;
 		extra->port_stubs.clear();
 		extra->port_counter = 0;
+		extra->unpacked_port = nullptr;
 		// default / global clocking are per module (IEEE 14.12, 14.14): a
 		// default clocking of an earlier module used to clock this module's
 		// unclocked assertions (an undriven implicit clock net)

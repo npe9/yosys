@@ -1,0 +1,40 @@
+# A packed-struct-typed ANSI port kept its direction but not its port
+# position when the type resolved: it was numbered after every other port,
+# so a positional instance `sub u (p, q, r)' of
+# `sub (input st_t e, input logic [2:0] g, output o)' connected p to g and q
+# to the output (stock too: yosys-main af9f71e51).  Struct, union, packed
+# struct array, enum and typedef'd vector ports, connected positionally,
+# against a gold computed on plain vectors.
+read_verilog -sv <<EOT
+typedef struct packed { logic [2:0] a; } st_t;
+typedef union packed { logic [2:0] v; struct packed { logic h; logic [1:0] l; } s; } un_t;
+typedef enum logic [1:0] { A, B, C } en_t;
+typedef logic [2:0] vec_t;
+module sub (input st_t e, input logic [2:0] g, input un_t u, input st_t [1:0] w,
+    input en_t n, input vec_t v, output logic [2:0] o, output st_t so);
+  assign o = e.a & ~g ^ u.v;
+  assign so.a = w[1].a ^ w[0].a ^ {n == C, n} ^ v;
+endmodule
+module top (input logic [2:0] p, q, x, input logic [5:0] y, input logic [1:0] m,
+    input logic [2:0] z, output logic [2:0] r, s);
+  sub i (p, q, x, y, m, z, r, s);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt_clean
+rename top gate
+design -stash gate
+
+read_verilog -sv <<EOT
+module gold (input logic [2:0] p, q, x, input logic [5:0] y, input logic [1:0] m,
+    input logic [2:0] z, output logic [2:0] r, s);
+  assign r = p & ~q ^ x;
+  assign s = y[5:3] ^ y[2:0] ^ {m == 2'd2, m} ^ z;
+endmodule
+EOT
+proc
+design -copy-from gate -as gate gate
+miter -equiv -flatten -make_outputs gold gate miter
+sat -verify -prove trigger 0 -set-def-inputs -show-inputs -show-outputs miter

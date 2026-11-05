@@ -6232,6 +6232,11 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				// add original input/output attribute to resolved wire
 				newNode->is_input = this->is_input;
 				newNode->is_output = this->is_output;
+				// and its port position: without it the port was numbered
+				// after every other port, and a positional instance
+				// `sub u (p, q, r)' of `sub (input st_t e, input g, output o)'
+				// connected p to g (stock too)
+				newNode->port_id = port_id;
 				current_scope[str] = this;
 				goto apply_newNode;
 			}

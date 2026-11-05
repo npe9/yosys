@@ -1,0 +1,65 @@
+# `.*' whose same-named signal in the instantiating scope is a 1-D unpacked
+# array (veer el2_veer `logic pmp_chan_err [3]' to el2_pmp's `output logic
+# pmp_chan_err [PMP_CHANNELS]', `.*').  The array is an RTLIL memory, so
+# hierarchy found no wire: "No matching wire for implicit port connection".
+# It now connects like the explicit `.e(e)': element concatenation, lowest
+# index in the LSBs.  The child is declared after the parent (the parent
+# is reprocessed once the child is known), and one instance sits in a
+# generate block with a block-local array.
+read_verilog -sv <<EOT
+module top (input logic x0, x1, x2, k, output logic o0, o1, o2, ok, p0, p1);
+  logic x [3], e [3];
+  assign x[0] = x0; assign x[1] = x1; assign x[2] = x2;
+  sub #(.N(3)) u (.*);
+  assign o0 = e[0]; assign o1 = e[1]; assign o2 = e[2];
+  if (1) begin : g
+    logic x [2], e [2];
+    assign x[0] = k; assign x[1] = ~k;
+    sub #(.N(2)) v (.*);
+    assign p0 = e[0]; assign p1 = e[1];
+  end
+  assign ok = k;
+endmodule
+module sub #(parameter N = 3) (input logic x [N], output logic e [N]);
+  for (genvar c = 0; c < N; c++) begin : gc
+    assign e[c] = x[c] ^ (c == 1);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+memory
+opt_clean
+rename top gate
+design -stash gate
+
+read_verilog -sv <<EOT
+module gold (input logic x0, x1, x2, k, output logic o0, o1, o2, ok, p0, p1);
+  assign o0 = x0; assign o1 = ~x1; assign o2 = x2;
+  assign p0 = k; assign p1 = k;
+  assign ok = k;
+endmodule
+EOT
+proc
+design -copy-from gate -as gate gate
+miter -equiv -flatten -make_outputs gold gate miter
+sat -verify -prove trigger 0 -set-def-inputs -show-inputs -show-outputs miter
+
+# an array whose size does not match the port is still an error
+design -reset
+read_verilog -sv <<EOT
+module top2 (input logic a, output logic b);
+  logic x [3], e [2];
+  assign x[0] = a; assign x[1] = a; assign x[2] = a;
+  sub #(.N(3)) u (.*);
+  assign b = e[0];
+endmodule
+module sub #(parameter N = 3) (input logic x [N], output logic e [N]);
+  for (genvar c = 0; c < N; c++) begin : gc
+    assign e[c] = x[c];
+  end
+endmodule
+EOT
+logger -expect error "No matching wire for implicit port connection `e'" 1
+hierarchy -top top2

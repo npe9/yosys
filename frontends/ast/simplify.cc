@@ -5104,10 +5104,67 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					lookup_suggested = true;
 			}
 		}
+		// `.*' may match an unpacked array of this scope, which is an RTLIL
+		// memory and not a wire hierarchy could connect
+		bool wildcard_conns = get_bool_attribute(ID::wildcard_port_conns);
+		if (wildcard_conns && !lookup_suggested)
+			for (auto &it : current_scope)
+				if (it.second && it.second->type == AST_MEMORY) {
+					lookup_suggested = true;
+					break;
+				}
 
 		const RTLIL::Module *module = nullptr;
 		if (lookup_suggested)
 			module = lookup_cell_module();
+		if (module && wildcard_conns) {
+			// IEEE 1800-2017 23.3.2.4: `.*' connects each remaining port to
+			// the same-named signal.  For a 1-D unpacked array (`logic
+			// pmp_chan_err [3]' to veer el2_pmp's `output logic
+			// pmp_chan_err [PMP_CHANNELS]') make the connection explicit, so
+			// the whole-array rewrite turns it into the element concatenation
+			// as for `.pmp_chan_err(pmp_chan_err)'.  Wires (and arrays whose
+			// size does not match the port) are left to hierarchy, which
+			// looks the name up the same way: generate-scope prefixes of the
+			// instance name first, then the plain name.
+			pool<std::string> named;
+			for (auto& child : children)
+				if (child->type == AST_ARGUMENT && !child->str.empty())
+					named.insert(child->str);
+			for (auto port : module->ports) {
+				if (named.count(port.str()))
+					continue;
+				const RTLIL::Wire *pw = module->wire(port);
+				if (pw == nullptr || pw->port_input == pw->port_output)
+					continue;
+				std::vector<std::string> names;
+				size_t idx = str.size();
+				while (idx > 0 && (idx = str.find_last_of('.', idx - 1)) != std::string::npos)
+					names.push_back(str.substr(0, idx + 1) + port.str().substr(1));
+				names.push_back(port.str());
+				AstNode *mem = nullptr;
+				std::string mem_name;
+				for (auto &n : names)
+					if (current_scope.count(n)) {
+						if (current_scope.at(n)->type == AST_MEMORY) {
+							mem = current_scope.at(n);
+							mem_name = n;
+						}
+						break;
+					}
+				int ew, lo, hi;
+				if (mem == nullptr || !get_1d_unpacked_mem_info(mem, ew, lo, hi) ||
+						(int64_t)ew * (hi - lo + 1) != pw->width)
+					continue;
+				auto id = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+				id->str = mem_name;
+				id->id2ast = mem;
+				auto arg = std::make_unique<AstNode>(location, AST_ARGUMENT, std::move(id));
+				arg->str = port.str();
+				children.push_back(std::move(arg));
+				did_something = true;
+			}
+		}
 		if (module) {
 			size_t port_counter = 0;
 			for (auto& child : children) {

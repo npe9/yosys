@@ -6071,10 +6071,14 @@ struct SvaCompiler {
 		if (len > 64 && minl != len)
 			log_error("sva2check: variable-length sequence in %s (%d to %d ticks) used in property position exceeds the 64-tick window.\n", log_id(n), minl, len);
 		// the cap counts chain registers: long fixed delays go through
-		// the countdown CAM (long_delay), as does the deadline then
+		// the countdown CAM (long_delay), as does the deadline then.  It
+		// bounds size only (a fixed-length sequence is exact at any
+		// length): 4096, past caliptra fv_ecc_pm_sequencer's 1041-tick
+		// microcode walks (inv_modp_p, inv_modq_p)
+		const int seq_ticks_max = 4096;
 		bool long_exp = len - 1 > long_delay_min && minl == len && long_delay_ok(len - 1);
-		if (len > 1024 && !(long_exp && len - long_fixed_sum(n) <= 1024))
-			log_error("sva2check: sequence in %s used in property position is %d ticks long (max 1024).\n", log_id(n), len);
+		if (len > seq_ticks_max && !(long_exp && len - long_fixed_sum(n) <= seq_ticks_max))
+			log_error("sva2check: sequence in %s used in property position is %d ticks long (max %d).\n", log_id(n), len, seq_ticks_max);
 		int deadline = len - 1;
 		// A variable-length sequence: the window [t, t+deadline] of the
 		// attempt started at t also sees the ends of LATER attempts, which

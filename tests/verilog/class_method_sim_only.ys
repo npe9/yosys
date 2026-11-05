@@ -1,0 +1,24 @@
+# fe116: simulation-only statements inside a class (in-class or out-of-block
+# methods) are not degradations -- classes are never elaborated -- so the
+# strict frontend accepts them; the same statement in a module still refuses
+read_verilog -sv <<EOT
+package p;
+  class c;
+    bit done;
+    task w(); wait (done); @(done); endtask
+    extern task x();
+  endclass
+  task c::x(); wait (done == 1); fork begin end join endtask
+endpackage
+module top(input a, output y);
+  assign y = a;
+endmodule
+EOT
+hierarchy -top top
+design -reset
+logger -expect error "is dropped" 1
+read_verilog -sv <<EOT
+module top2(input a, output reg y);
+  initial begin wait (a); y = 1; end
+endmodule
+EOT

@@ -334,6 +334,13 @@
 		static void parse_degrade(ParseState *extra, const frontend_verilog_yy::parser::location_type& loc, const char *what,
 				bool upstream_leniency = false)
 		{
+			// a class body, or an out-of-block class method, is opaque to
+			// elaboration (simplify skips both): nothing in it is modeled, so
+			// a simulation-only statement there drops nothing (UVM's
+			// uvm_sequence_base `wait (...)' refused every file reading uvm_pkg)
+			for (auto *n : extra->ast_stack)
+				if (n->type == AST_CLASS || n->attributes.count(ID(sv_class_method_def)))
+					return;
 			struct Restore {
 				AstNode *mod = AST_INTERNAL::current_ast_mod;
 				RTLIL::Module *rtl = AST_INTERNAL::current_module;

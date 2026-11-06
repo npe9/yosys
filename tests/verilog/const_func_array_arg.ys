@@ -1,0 +1,47 @@
+# fe121: an unpacked-array parameter passed whole to a constant function
+# (OpenTitan flash_ctrl_top_specific_pkg `max_info_pages(InfoTypeSize)`,
+# called before the function is declared) did not evaluate: the argument
+# is not a constant and the evaluator had no array variables.  The
+# parameter is passed as its flat value and the formal reads it
+# element-wise, in either range direction.
+read_verilog -sv <<EOT
+package p;
+  parameter int N = 3;
+  parameter int SZ [N] = '{4, 9, 2};
+  parameter int M = maxof(SZ);
+  function automatic integer maxof(int xs[N]);
+    int m = 0;
+    for (int i = 0; i < N; i++) if (xs[i] > m) m = xs[i];
+    return m;
+  endfunction
+endpackage
+module top(output [7:0] m, output [7:0] y0, output [7:0] y2, output [7:0] z0, output [7:0] z2);
+  localparam int SZ [3] = '{4, 9, 2};
+  function automatic integer pick_dn(int xs[2:0], int k); return xs[k]; endfunction
+  function automatic integer pick_up(int xs[0:2], int k); return xs[k]; endfunction
+  assign m = p::M;
+  assign y0 = pick_dn(SZ, 0);
+  assign y2 = pick_dn(SZ, 2);
+  localparam int B0 = pick_up(SZ, 0);
+  localparam int B2 = pick_up(SZ, 2);
+  assign z0 = B0;
+  assign z2 = B2;
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+select -assert-none A:sv_degraded
+sat -verify -prove m 8'd9 -prove y0 8'd2 -prove y2 8'd4 -prove z0 8'd4 -prove z2 8'd2
+design -reset
+
+# a write to an array variable is not supported: it still refuses
+logger -expect error "Constant function `\\f' did not evaluate" 1
+read_verilog -sv <<EOT
+module top(output [7:0] y);
+  localparam int SZ [3] = '{4, 9, 2};
+  function automatic integer f(int xs[3]); xs[0] = 7; return xs[0]; endfunction
+  localparam int M = f(SZ);
+  assign y = M;
+endmodule
+EOT

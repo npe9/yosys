@@ -292,6 +292,11 @@ namespace AST
 			bool is_signed;
 			AstNode *arg = nullptr;
 			bool explicitly_sized;
+			// an unpacked-array variable (an array argument): mem_count
+			// elements of mem_width bits, element mem_left first, held
+			// flat with the first element in the most significant bits
+			int mem_width = 0, mem_count = 0, mem_left = 0;
+			bool mem_up = true;
 		};
 		bool has_const_only_constructs();
 		bool replace_variables(std::map<std::string, varinfo_t> &variables, AstNode *fcall, bool must_succeed);

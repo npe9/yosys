@@ -3201,6 +3201,67 @@ static void apply_force_override(std::vector<std::unique_ptr<AstNode>> &stmts, d
 	}
 }
 
+// The value of an unpacked-array parameter whose value is an assignment
+// pattern, as ONE flat constant: element 0 in the most significant bits
+// (the layout of an instance override, which the parameter's own
+// elaboration splits back).  Struct elements are materialized with the
+// array's element type.  nullptr when an element does not fold.
+static std::unique_ptr<AstNode> array_param_flat_value(AstNode *src, AstSrcLocType loc)
+{
+	if (src->children.empty() || src->children[0]->type != AST_ASSIGN_PATTERN)
+		return nullptr;
+	AstNode *etype = src->attributes.count(ID::wiretype) ? src->attributes.at(ID::wiretype).get() : nullptr;
+	// an array's wiretype attribute is the element type's NAME
+	if (etype && etype->type != AST_STRUCT && etype->type != AST_UNION) {
+		std::string tn = etype->str;
+		etype = nullptr;
+		AstNode *td = current_scope.count(tn) ? current_scope.at(tn) : nullptr;
+		if (!td && current_ast_mod)
+			for (auto &c : current_ast_mod->children)
+				if (c && c->type == AST_TYPEDEF && c->str == tn)
+					td = c.get();
+		if (td && td->type == AST_TYPEDEF && !td->children.empty())
+			td = td->children[0].get();
+		if (td && (td->type == AST_STRUCT || td->type == AST_UNION))
+			etype = td;
+	}
+	int ew = etype ? etype->range_left - etype->range_right + 1
+			: (src->range_valid ? std::abs(src->range_left - src->range_right) + 1 : -1);
+	std::vector<RTLIL::State> flat;   // LSB first; built back to front
+	std::vector<std::vector<RTLIL::State>> elems;
+	bool ok = ew > 0;
+	std::function<void(AstNode*, int)> walk = [&](AstNode *n, int d) {
+		if (!ok)
+			return;
+		if (d < src->unpacked_dimensions) {
+			if (n->type != AST_ASSIGN_PATTERN) { ok = false; return; }
+			for (auto &c : n->children)
+				walk(c.get(), d + 1);
+			return;
+		}
+		std::unique_ptr<AstNode> leaf = n->clone();
+		if (leaf->type == AST_ASSIGN_PATTERN && etype) {
+			auto tmp = std::make_unique<AstNode>(n->location, AST_LOCALPARAM, std::move(leaf));
+			tmp->str = "\\$override_element";
+			auto st = etype->clone();
+			size_packed_struct(st.get(), 0);
+			tmp->set_attribute(ID::wiretype, std::move(st));
+			while (tmp->simplify(true, 1, -1, false)) { }
+			leaf = tmp->children[0]->clone();
+		} else {
+			while (leaf->simplify(true, 1, -1, false)) { }
+		}
+		if (leaf->type != AST_CONSTANT) { ok = false; return; }
+		elems.push_back(leaf->bitsAsConst(ew, leaf->is_signed).to_bits());
+	};
+	walk(src->children[0].get(), 0);
+	if (!ok || elems.empty())
+		return nullptr;
+	for (int i = GetSize(elems) - 1; i >= 0; i--)
+		flat.insert(flat.end(), elems[i].begin(), elems[i].end());
+	return AstNode::mkconst_bits(loc, flat, false);
+}
+
 bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hint)
 {
 	{
@@ -4987,57 +5048,11 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 							continue;
 						}
 						if (src->children[0]->type == AST_ASSIGN_PATTERN) {
-							AstNode *etype = src->attributes.count(ID::wiretype) ? src->attributes.at(ID::wiretype).get() : nullptr;
-							// an array's wiretype attribute is the element type's NAME
-							if (etype && etype->type != AST_STRUCT && etype->type != AST_UNION) {
-								std::string tn = etype->str;
-								etype = nullptr;
-								AstNode *td = current_scope.count(tn) ? current_scope.at(tn) : nullptr;
-								if (!td && current_ast_mod)
-									for (auto &c : current_ast_mod->children)
-										if (c && c->type == AST_TYPEDEF && c->str == tn)
-											td = c.get();
-								if (td && td->type == AST_TYPEDEF && !td->children.empty())
-									td = td->children[0].get();
-								if (td && (td->type == AST_STRUCT || td->type == AST_UNION))
-									etype = td;
-							}
-							int ew = etype ? etype->range_left - etype->range_right + 1
-									: (src->range_valid ? std::abs(src->range_left - src->range_right) + 1 : -1);
-							std::vector<RTLIL::State> flat;   // LSB first; built back to front
-							std::vector<std::vector<RTLIL::State>> elems;
-							bool ok = ew > 0;
-							std::function<void(AstNode*, int)> walk = [&](AstNode *n, int d) {
-								if (!ok)
-									return;
-								if (d < src->unpacked_dimensions) {
-									if (n->type != AST_ASSIGN_PATTERN) { ok = false; return; }
-									for (auto &c : n->children)
-										walk(c.get(), d + 1);
-									return;
-								}
-								std::unique_ptr<AstNode> leaf = n->clone();
-								if (leaf->type == AST_ASSIGN_PATTERN && etype) {
-									auto tmp = std::make_unique<AstNode>(n->location, AST_LOCALPARAM, std::move(leaf));
-									tmp->str = "\\$override_element";
-									auto st = etype->clone();
-									size_packed_struct(st.get(), 0);
-									tmp->set_attribute(ID::wiretype, std::move(st));
-									while (tmp->simplify(true, 1, -1, false)) { }
-									leaf = tmp->children[0]->clone();
-								} else {
-									while (leaf->simplify(true, 1, -1, false)) { }
-								}
-								if (leaf->type != AST_CONSTANT) { ok = false; return; }
-								elems.push_back(leaf->bitsAsConst(ew, leaf->is_signed).to_bits());
-							};
-							walk(src->children[0].get(), 0);
-							if (!ok || elems.empty())
+							auto flat = array_param_flat_value(src, child->location);
+							if (!flat)
 								input_error("Unpacked-array parameter %s passed to `%s' did not fold to constant elements.\n",
 										log_id(src->str), log_id(ctype));
-							for (int i = GetSize(elems) - 1; i >= 0; i--)
-								flat.insert(flat.end(), elems[i].begin(), elems[i].end());
-							child->children[0] = mkconst_bits(child->location, flat, false);
+							child->children[0] = std::move(flat);
 							did_something = true;
 							continue;
 						}
@@ -10607,8 +10622,25 @@ skip_memory_write:;
 			};
 			bool loop_inline_ok = require_const_eval && !in_param && !has_while_repeat(decl);
 			bool all_args_const = true;
-			for (auto& child : children) {
+			// an unpacked-array parameter passed whole (OpenTitan
+			// flash_ctrl_top_specific_pkg `max_info_pages(InfoTypeSize)`):
+			// evaluated as its flat value, which an array formal reads
+			// element-wise; the call itself keeps the identifier
+			std::unique_ptr<AstNode> eval_call;
+			for (int ai = 0; ai < GetSize(children); ai++) {
+				auto &child = children[ai];
 				while (child->simplify(true, 1, -1, false)) { }
+				if (child->type == AST_IDENTIFIER && child->children.empty()) {
+					AstNode *src = child->id2ast ? child->id2ast :
+							current_scope.count(child->str) ? current_scope.at(child->str) : nullptr;
+					if (src && (src->type == AST_PARAMETER || src->type == AST_LOCALPARAM) && src->unpacked_dimensions == 1)
+						if (auto flat = array_param_flat_value(src, child->location)) {
+							if (!eval_call)
+								eval_call = clone();
+							eval_call->children[ai] = std::move(flat);
+							continue;
+						}
+				}
 				if (child->type != AST_CONSTANT && child->type != AST_REALVALUE) {
 					all_args_const = false;
 					if (getenv("SVA_DEBUG_FCALL"))
@@ -10621,7 +10653,8 @@ skip_memory_write:;
 				func_workspace->set_in_param_flag(true);
 				func_workspace->str = prefix_id(prefix, "$result");
 				// func_workspace->dumpAst(stdout, "func_workspace ");
-				newNode = func_workspace->eval_const_function(this, in_param || (require_const_eval && !loop_inline_ok));
+				newNode = func_workspace->eval_const_function(eval_call ? eval_call.get() : this,
+						in_param || (require_const_eval && !loop_inline_ok));
 			}
 			if (!newNode && (in_param || (require_const_eval && !loop_inline_ok && all_args_const))) {
 				degrade(location.to_loc(), "Constant function `%s' did not evaluate; using constant 0.\n", str.c_str());
@@ -12541,6 +12574,32 @@ bool AstNode::replace_variables(std::map<std::string, AstNode::varinfo_t> &varia
 			return true;
 		}
 	}
+	// an element of an unpacked-array variable (`infos[i]`): its word out
+	// of the flat value, the first element most significant; a whole-array
+	// or part-select read is not supported
+	if (type == AST_IDENTIFIER && variables.count(str) && variables.at(str).mem_width) {
+		const varinfo_t &v = variables.at(str);
+		if (children.size() == 1 && children.at(0)->type == AST_RANGE) {
+			if (!children.at(0)->replace_variables(variables, fcall, must_succeed))
+				return false;
+			while (children.at(0)->simplify(true, 1, -1, false)) { }
+		}
+		if (children.size() != 1 || children.at(0)->type != AST_RANGE || !children.at(0)->range_valid ||
+				children.at(0)->range_left != children.at(0)->range_right) {
+			if (!must_succeed)
+				return false;
+			input_error("Unsupported access to unpacked-array variable %s in constant function\n%s: ...called from here.\n",
+					str.c_str(), fcall->loc_string().c_str());
+		}
+		int idx = children.at(0)->range_left;
+		int pos = v.mem_up ? idx - v.mem_left : v.mem_left - idx;
+		std::vector<RTLIL::State> new_bits;
+		for (int i = 0; i < v.mem_width; i++)
+			new_bits.push_back(pos >= 0 && pos < v.mem_count ? v.val[(v.mem_count - 1 - pos) * v.mem_width + i] : RTLIL::State::Sx);
+		auto newNode = mkconst_bits(location, new_bits, v.is_signed);
+		replace_keep_pattern_keys(this, std::move(newNode));
+		return true;
+	}
 	if (type == AST_IDENTIFIER && variables.count(str)) {
 		int offset = variables.at(str).offset, width = variables.at(str).val.size();
 		// `v[i][j]` on a packed multi-dimensional variable (`logic
@@ -12662,6 +12721,43 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			current_scope[stmt->str] = stmt.get();
 			temporary_nodes.push_back(std::move(stmt));
 
+			block->children.erase(block->children.begin());
+			continue;
+		}
+
+		// an unpacked-array input (`int infos[N]`): one variable holding the
+		// flat argument (see array_param_flat_value); elements are read in
+		// replace_variables.  Local arrays and writes are not supported.
+		if (stmt->type == AST_MEMORY)
+		{
+			while (stmt->simplify(true, 1, -1, false)) { }
+			AstNode *mr = GetSize(stmt->children) == 2 ? stmt->children[1].get() : nullptr;
+			AstNode *wr = GetSize(stmt->children) == 2 ? stmt->children[0].get() : nullptr;
+			bool ok = stmt->is_input && argidx < fcall->children.size() && wr && wr->type == AST_RANGE && wr->range_valid && mr &&
+					mr->type == AST_RANGE && GetSize(mr->children) == 2 &&
+					mr->children[0]->type == AST_CONSTANT && mr->children[1]->type == AST_CONSTANT;
+			AstNode *arg = ok ? fcall->children.at(argidx).get() : nullptr;
+			if (!arg || arg->type != AST_CONSTANT) {
+				if (!must_succeed)
+					goto finished;
+				stmt->input_error("Unsupported unpacked-array variable %s in constant function\n%s: ... called from here.\n",
+						stmt->str.c_str(), fcall->loc_string().c_str());
+			}
+			argidx++;
+			AstNode::varinfo_t &variable = variables[stmt->str];
+			int l = mr->children[0]->asInt(true), r = mr->children[1]->asInt(true);
+			variable.mem_width = std::abs(wr->range_left - wr->range_right) + 1;
+			variable.mem_count = std::abs(l - r) + 1;
+			variable.mem_left = l;
+			variable.mem_up = l <= r;
+			variable.val = arg->bitsAsConst(variable.mem_width * variable.mem_count);
+			variable.offset = 0;
+			variable.range_swapped = false;
+			variable.is_signed = stmt->is_signed;
+			variable.explicitly_sized = true;
+			variable.arg = arg;
+			current_scope[stmt->str] = stmt.get();
+			temporary_nodes.push_back(std::move(stmt));
 			block->children.erase(block->children.begin());
 			continue;
 		}
@@ -12854,6 +12950,12 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 						fcall->loc_string().c_str());
 			}
 
+			if (variables[stmt->children.at(0)->str].mem_width) {
+				if (!must_succeed)
+					goto finished;
+				stmt->input_error("Assignment to unpacked-array variable in constant function is not supported\n%s: ... called from here.\n",
+						fcall->loc_string().c_str());
+			}
 			if (stmt->children.at(0)->children.empty()) {
 				variables[stmt->children.at(0)->str].val = stmt->children.at(1)->bitsAsConst(variables[stmt->children.at(0)->str].val.size());
 			} else {

@@ -1,0 +1,10 @@
+# fe120: in a pass/fail action pair the pass action was discarded unchecked;
+# an assigning pass action is a frontend degradation like a fail action
+logger -expect error "assertion action block that assigns `cnt' is dropped" 1
+read_verilog -sv -formal <<EOT
+module top(input clk, input a, output reg [3:0] cnt);
+  always @(posedge clk) begin
+    ai: assert (a) begin cnt <= cnt + 1; end else $error("x");
+  end
+endmodule
+EOT

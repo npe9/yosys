@@ -1,0 +1,35 @@
+# fe120: an assertion's statement action is never lowered (only the special
+# `else x = expr;' form is).  One that assigns a variable it does not declare
+# itself used to be dropped silently (cnt below stayed undriven); it is a
+# frontend degradation now.  Allowed shapes first, then -permissive tags the
+# module, then strict mode refuses (last: an expected error ends the script).
+read_verilog -sv -formal <<EOT
+module ok(input clk, input a, input b, output reg f);
+  always @(posedge clk) begin
+    ai: assert (a) else f = 1'b1;
+    aj: assert (b) else begin int t; t = 3; $error("t=%0d", t); end
+  end
+endmodule
+EOT
+hierarchy -top ok
+proc
+select -assert-count 2 t:$check
+select -assert-none A:sv_degraded
+select -assert-count 1 t:$dff
+design -reset
+
+read_verilog -sv -formal -permissive <<EOT
+module top(input clk, input a, input b, output reg [3:0] cnt);
+  aq: assert property (@(posedge clk) a |-> b) else begin cnt = cnt + 1; end
+endmodule
+EOT
+hierarchy -top top
+select -assert-mod-count 1 A:sv_degraded
+design -reset
+
+logger -expect error "assertion action block that assigns `cnt' is dropped" 1
+read_verilog -sv -formal <<EOT
+module top(input clk, input a, input b, output reg [3:0] cnt);
+  aq: assert property (@(posedge clk) a |-> b) else begin cnt = cnt + 1; end
+endmodule
+EOT

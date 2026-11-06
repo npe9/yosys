@@ -624,9 +624,12 @@
 	// uvm_report_error(..)', whose inlined package functions reach class code
 	// and were refused.  A reporting-only action (no assignment in it, except
 	// to a variable the action declares itself -- `uvm_report_begin's
-	// `_local_report_object_') is dropped here; one that assigns anything
-	// else keeps today's path.
-	static std::unique_ptr<AstNode> sva_action_reporting_only(std::unique_ptr<AstNode> act)
+	// `_local_report_object_') is dropped here, which changes nothing modeled.
+	// fe120: one that assigns anything else was dropped silently further down
+	// (`else begin cnt = cnt + 1; end' left cnt undriven); it is a
+	// degradation now.  Only the special `else x = expr;' form is lowered.
+	static std::unique_ptr<AstNode> sva_action_reporting_only(ParseState *extra,
+			const frontend_verilog_yy::parser::location_type &loc, std::unique_ptr<AstNode> act)
 	{
 		if (!act)
 			return act;
@@ -639,19 +642,25 @@
 					collect(c.get());
 		};
 		collect(act.get());
-		std::function<bool(const AstNode *)> assigns = [&](const AstNode *n) {
+		std::function<const AstNode *(const AstNode *)> assigns = [&](const AstNode *n) -> const AstNode * {
 			if (n->type == AST_ASSIGN_EQ || n->type == AST_ASSIGN_LE || n->type == AST_ASSIGN) {
 				const AstNode *lhs = n->children.empty() ? nullptr : n->children[0].get();
 				if (!lhs || lhs->type != AST_IDENTIFIER || !lhs->children.empty() || !locals.count(lhs->str))
-					return true;
+					return lhs ? lhs : n;
 			}
 			for (auto &c : n->children)
-				if (c && assigns(c.get()))
-					return true;
-			return false;
+				if (c)
+					if (auto *hit = assigns(c.get()))
+						return hit;
+			return nullptr;
 		};
-		if (assigns(act.get()))
-			return act;
+		if (auto *hit = assigns(act.get())) {
+			std::string name = hit->type == AST_IDENTIFIER ? hit->str : std::string("a variable");
+			if (!name.empty() && name[0] == '\\')
+				name = name.substr(1);
+			std::string what = "assertion action block that assigns `" + name + "' is dropped";
+			parse_degrade(extra, loc, what.c_str());
+		}
 		return nullptr;
 	}
 
@@ -8051,16 +8060,16 @@ sva_action:
 	TOK_ELSE sva_msg { $$ = std::move($2); } |
 	TOK_ELSE behavioral_stmt {
 		// behavioral_stmt (incl. begin/end) registers itself as the last
-		// child of the enclosing context: move it under the assertion.
-		$$ = sva_action_reporting_only(sva_action_detach_last(extra));
+		// child of the enclosing context: detach it from there.
+		$$ = sva_action_reporting_only(extra, @2, sva_action_detach_last(extra));
 	} |
 	behavioral_stmt TOK_ELSE behavioral_stmt {
-		// if-action / else-action pair: keep the else action
-		$$ = sva_action_reporting_only(sva_action_detach_last(extra));
-		(void)sva_action_detach_last(extra);
+		// if-action / else-action pair: both are checked, neither is lowered
+		$$ = sva_action_reporting_only(extra, @3, sva_action_detach_last(extra));
+		(void)sva_action_reporting_only(extra, @1, sva_action_detach_last(extra));
 	} |
 	behavioral_stmt {
-		$$ = sva_action_reporting_only(sva_action_detach_last(extra));
+		$$ = sva_action_reporting_only(extra, @1, sva_action_detach_last(extra));
 	} |
 	sva_msg { $$ = std::move($1); };
 

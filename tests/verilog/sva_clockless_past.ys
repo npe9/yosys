@@ -1,0 +1,34 @@
+# A concurrent assertion with no clock and no default clocking is checked
+# at every formal step; its sample-value functions are lowered on that
+# step (fe123).  They used to be replaced by their data argument with only
+# a log line: `x >= $past(x)' read `x >= x' and was proved (hw-cbmc
+# ebmc/k-induction/past1), $stable / $changed took the whole argument and
+# $rose / $fell bit 0.  The step registers keep no init, so before one
+# step of history the checks are guarded by `st'.
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic inc);
+  logic [3:0] x = 4'd0;
+  logic st = 1'b0;
+  always_ff @(posedge clk) begin
+    st <= 1'b1;
+    if (inc) x <= x + 4'd1;
+  end
+  p_ge:   assert property (!st || x >= $past(x));
+  p_st:   assert property (!st || $past(inc) || $stable(x));
+  p_rose: assert property (!st || !$rose(x[0]) || $past(inc));
+  p_ch:   assert property (!st || !$changed(x) || $past(inc));
+  p_bad:  assert property (!st || $stable(x));
+endmodule
+EOT
+logger -expect-no-warnings
+hierarchy -top top
+sva2check
+proc
+async2sync
+select -assert-none A:sv_degraded
+logger -expect log "ic3: 5 properties: proved=3 disproved=2 undecided=0" 1
+logger -expect log "ic3: p_ge: disproved" 1
+logger -expect log "ic3: p_bad: disproved" 1
+ic3
+design -reset
+logger -check-expected

@@ -8073,13 +8073,25 @@ struct Sva2CheckPass : public Pass {
 				mod->remove(c);
 			mod->remove(leftoverwires);
 
-			// sample-value cells no check claimed (clockless or skipped
-			// contexts): degrade to the data argument as the frontend used
-			// to, so no unknown cell type reaches downstream passes
+			// fe123: sample-value cells no check claimed (a concurrent
+			// assertion with no clock and no default clocking, which is
+			// checked at every formal step; or a skipped context) are
+			// lowered on the global clock: $past(a, n) is a chain of n
+			// formal-step registers.  They used to be replaced by their data
+			// argument with only a log line, so `x >= $past(x)' read
+			// `x >= x' and was proved (hw-cbmc ebmc/k-induction/past1),
+			// $stable / $changed took the whole argument and $rose / $fell
+			// bit 0.  Like the clocked chains (reg(..., "past")) the
+			// registers keep no init: before n steps of history $past is a
+			// free value (EBMC reads the initial value there instead).
 			{
 				std::vector<Cell *> rm;
-				bool warned = false;
 				std::vector<Cell *> scan(mod->cells().begin(), mod->cells().end());
+				auto step_past = [&](SigSpec d) {
+					Wire *w = mod->addWire(NEW_ID, d.size());
+					mod->addFf(NEW_ID, d, w);
+					return SigSpec(w);
+				};
 				for (auto cell : scan) {
 					if (!cell->type.in("\\$past", "\\$rose", "\\$fell", "\\$stable", "\\$changed"))
 						continue;
@@ -8091,16 +8103,33 @@ struct Sva2CheckPass : public Pass {
 						rm.push_back(cell);
 						continue;
 					}
-					if (!warned) {
-						warned = true;
-						log("Warning: sample-value function in a clockless context in %s; degraded to its data argument.\n", log_id(mod));
-					}
 					SigSpec a = cell->getPort(ID(A));
 					SigSpec y = cell->getPort(ID(Y));
-					if (cell->type.in("\\$rose", "\\$fell"))
-						mod->connect(y, SigSpec(a[0]));
-					else
-						mod->connect(y, a);
+					if (cell->type == "\\$past") {
+						int steps = 1;
+						SigSpec b = cell->getPort(ID(B));
+						if (!b.empty()) {
+							if (!b.is_fully_const())
+								log_error("sva2check: non-constant $past step count in %s.\n", log_id(cell));
+							steps = b.as_int();
+						}
+						if (steps < 0 || steps > 64)
+							log_error("sva2check: $past step count %d out of range in %s.\n", steps, log_id(cell));
+						SigSpec p = a;
+						for (int k = 0; k < steps; k++)
+							p = step_past(p);
+						mod->connect(y, p);
+					} else {
+						SigSpec pa = step_past(a);
+						if (cell->type == "\\$rose")
+							mod->connect(y, mod->And(NEW_ID, SigSpec(a[0]), mod->Not(NEW_ID, SigSpec(pa[0]))));
+						else if (cell->type == "\\$fell")
+							mod->connect(y, mod->And(NEW_ID, mod->Not(NEW_ID, SigSpec(a[0])), SigSpec(pa[0])));
+						else if (cell->type == "\\$stable")
+							mod->connect(y, mod->Eq(NEW_ID, a, pa));
+						else
+							mod->connect(y, mod->Ne(NEW_ID, a, pa));
+					}
 					rm.push_back(cell);
 				}
 				for (auto cell : rm)

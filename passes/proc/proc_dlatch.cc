@@ -430,8 +430,14 @@ struct proc_dlatch_db_t
 			}
 			comb_latches.swap(keep);
 		}
+		// fe122: the scratchpad flag proc_dlatch.always_comb_warn takes the
+		// -permissive path for these latches only (warn, build the latch,
+		// mark the module) while the rest of the read stays strict: the
+		// conformance ladder's interim policy for third-party code with a
+		// missing default (ibex_cheriot_ex pmask, cva6_fifo_v3 data_ft_n)
+		bool comb_warn = module->design && module->design->scratchpad_get_bool("proc_dlatch.always_comb_warn");
 		for (auto &l : comb_latches) {
-			if (!module->get_bool_attribute(IdString("\\sv_permissive")))
+			if (!comb_warn && !module->get_bool_attribute(IdString("\\sv_permissive")))
 				log_error("Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",
 						module->name.c_str(), log_signal(l.lhs), module->name.c_str(), l.proc_name.c_str());
 			log_warning("[sv_degraded] Latch inferred for signal `%s.%s' from always_comb process `%s.%s'.\n",

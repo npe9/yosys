@@ -1550,8 +1550,12 @@ static void rename_in_package_stmts(AstNode *pkg)
 				rename(child);
 			}
 	};
+	// fe119: a package variable's initializer (`logic [7:0] v = 8'h5a;') is
+	// a package-level initial block assigning the bare name; the variable is
+	// cloned into each module as `p::v', so the unrenamed block drove a
+	// separate `\\v' and the clone lost its initial value
 	for (auto& item : pkg->children)
-		if (item->type == AST_FUNCTION || item->type == AST_TASK)
+		if (item->type == AST_FUNCTION || item->type == AST_TASK || item->type == AST_INITIAL)
 			rename(item);
 }
 

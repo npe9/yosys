@@ -25,10 +25,9 @@ hierarchy -top top
 proc
 select -assert-count 1 top/a
 design -reset
-# a bare read through `import p::*' resolves no package variable at all (a
-# general gap, any package variable: an implicit net, a strict-mode warning;
-# register item) -- pinned so a fix there shows up here
-logger -expect warning "Identifier `\\q' is implicitly declared" 1
+# a bare read through `import p::*' binds the package variable's clone
+# (fe119) and so refuses like a qualified read (that case: package_var_import.ys)
+logger -expect error "Identifier `\\p::q' is simulation-only package storage" 1
 read_verilog -sv <<EOT
 package p;
   int q[$];
@@ -39,17 +38,3 @@ module top3(output int y);
 endmodule
 EOT
 hierarchy -top top3
-logger -check-expected
-design -reset
-# a qualified read resolves to the placeholder and refuses (an expected
-# error ends the script, so this case is last)
-logger -expect error "Identifier `\\p::q' is simulation-only package storage" 1
-read_verilog -sv <<EOT
-package p;
-  int q[$];
-endpackage
-module top2(output int y);
-  assign y = p::q[0];
-endmodule
-EOT
-hierarchy -top top2

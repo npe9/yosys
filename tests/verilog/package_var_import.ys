@@ -1,0 +1,55 @@
+# fe119: a package variable read through `import p::*' / `import p::v' is
+# the package variable (its module clone p::v, with the package initializer),
+# not a 1-bit implicit net; a local declaration shadows the wildcard import,
+# and the package initializer no longer drives a module's own same-named net
+read_verilog -sv <<EOT
+package p;
+  logic [7:0] v = 8'h5a;
+  logic [7:0] w = 8'h33;
+endpackage
+module top(output [7:0] y, output [7:0] z, output [7:0] n);
+  import p::*;
+  assign y = v;
+  assign z = p::v;
+endmodule
+module named(output [7:0] y);
+  import p::w;
+  assign y = w;
+endmodule
+module shadow(input [7:0] v, output [7:0] y);
+  import p::*;
+  assign y = v;
+endmodule
+EOT
+hierarchy
+proc
+opt
+sat -prove y 8'h5a -prove z 8'h5a top
+sat -prove y 8'h33 named
+design -reset
+read_verilog -sv <<EOT
+package p;
+  logic [7:0] v = 8'h5a;
+endpackage
+module shadow(input [7:0] v, output [7:0] y);
+  import p::*;
+  assign y = v;
+endmodule
+EOT
+hierarchy -top shadow
+proc
+opt
+select -assert-count 1 shadow/y %ci:+[Y,A] shadow/v %i
+design -reset
+# fe117's placeholder: a qualified read of a package queue refuses (an
+# expected error ends the script, so this case is last)
+logger -expect error "Identifier `\\p::q' is simulation-only package storage" 1
+read_verilog -sv <<EOT
+package p;
+  int q[$];
+endpackage
+module top2(output int y);
+  assign y = p::q[0];
+endmodule
+EOT
+hierarchy -top top2

@@ -7428,6 +7428,33 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				}
 			}
 		}
+		// fe119: a package VARIABLE named through `import p::*' / `import
+		// p::x' -- PackageImporter brings parameters, types, functions and
+		// enums into scope but not wires, so the bare name fell through to
+		// an implicit net (a free wire in place of the package variable).
+		// The module carries the variable as its qualified clone `p::x':
+		// bind to that.  A local declaration was found above and wins.
+		if (current_scope.count(str) == 0 && current_ast_mod && !str.empty() && str[0] == '\\' &&
+				str.find("::") == std::string::npos) {
+			for (auto &imp : current_ast_mod->children) {
+				if (!imp || imp->type != AST_IMPORT)
+					continue;
+				bool named = imp->children.empty();
+				for (auto &it : imp->children)
+					if (it && it->str == str)
+						named = true;
+				if (!named)
+					continue;
+				std::string q = imp->str + "::" + str.substr(1);
+				auto qi = current_scope.find(q);
+				if (qi != current_scope.end() && qi->second &&
+						(qi->second->type == AST_WIRE || qi->second->type == AST_MEMORY)) {
+					str = q;
+					did_something = true;
+					break;
+				}
+			}
+		}
 		if (current_scope.count(str) == 0) {
 			bool seq_meth = is_sequence_method_ref(str) || is_sva_decl_ref(str);
 			if (current_ast_mod == nullptr) {

@@ -7444,6 +7444,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		if (id2ast != current_scope[str]) {
 			id2ast = current_scope[str];
 			did_something = true;
+			// fe117: a package queue / class-handle variable is a placeholder
+			// (AstNode::process); reading it would read a free 1-bit wire
+			if (id2ast && id2ast->attributes.count(ID(sv_sim_only_storage)))
+				degrade(location.to_loc(), "Identifier `%s' is simulation-only package storage (a queue or class handle); it is not modeled.\n", str.c_str());
 		}
 	}
 

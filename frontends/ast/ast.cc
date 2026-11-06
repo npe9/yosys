@@ -1876,6 +1876,70 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 	for (const auto& child : current_ast->children)
 	{
 		if (child->type == AST_PACKAGE) {
+			// A package-scope queue variable (`T q[$];`, IEEE 1800-2017 7.10)
+			// is dynamic, simulation-only storage: the `$' bound would be an
+			// undeclared identifier and the strict frontend refused the whole
+			// package (UVM's `uvm_core_state m_uvm_core_state[$];' in
+			// uvm_object_globals.svh, touched only by class code).  A variable
+			// of class type is a handle, simulation-only too (UVM's
+			// `uvm_seed_map uvm_random_seed_table_lookup [0:0];').  Replace the
+			// variable by a 1-bit placeholder tagged sv_sim_only_storage (a
+			// typedef of either kind is dropped, and names a sim-only type):
+			// simplify refuses any read that resolves to the placeholder,
+			// qualified or through an import, so nothing is silently modeled.
+			{
+				std::set<std::string> class_names;
+				for (auto &c : child->children)
+					if (c && c->type == AST_CLASS)
+						class_names.insert(c->str);
+				for (auto &pk : design->verilog_packages)
+					for (auto &c : pk->children)
+						if (c && c->type == AST_CLASS) {
+							class_names.insert(c->str);
+							class_names.insert(pk->str + "::" + c->str.substr(1));
+						}
+				std::function<bool(const AstNode*)> has_dollar = [&](const AstNode *n) {
+					if (n->type == AST_IDENTIFIER && n->str == "\\$")
+						return true;
+					for (auto &c : n->children)
+						if (c && has_dollar(c.get()))
+							return true;
+					return false;
+				};
+				auto &pc = child->children;
+				for (auto it = pc.begin(); it != pc.end(); ) {
+					AstNode *n = it->get();
+					const char *what = nullptr;
+					// a typedef of a class type (`typedef uvm_object_string_pool
+					// #(uvm_barrier) uvm_barrier_pool;') names a class too
+					const AstNode *decl = n;
+					if (n && n->type == AST_TYPEDEF && !n->children.empty() && n->children[0] &&
+							(n->children[0]->type == AST_WIRE || n->children[0]->type == AST_MEMORY))
+						decl = n->children[0].get();
+					if (n && decl && (decl->type == AST_WIRE || decl->type == AST_MEMORY))
+						for (auto &c : decl->children) {
+							if (c && (c->type == AST_RANGE || c->type == AST_MULTIRANGE) && has_dollar(c.get()))
+								what = n->type == AST_TYPEDEF ? "queue typedef" : "queue";
+							if (c && c->type == AST_WIRETYPE && class_names.count(c->str))
+								what = n->type == AST_TYPEDEF ? "class typedef" : "variable of simulation-only type";
+						}
+					if (what && n->type == AST_TYPEDEF)
+						class_names.insert(n->str);
+					if (what) {
+						log("Dropping package `%s' %s `%s' (simulation-only).\n",
+								child->str.c_str() + 1, what, n->str.c_str() + 1);
+						if (n->type == AST_TYPEDEF) {
+							it = pc.erase(it);
+							continue;
+						}
+						auto ph = std::make_unique<AstNode>(n->location, AST_WIRE);
+						ph->str = n->str;
+						ph->set_attribute(ID(sv_sim_only_storage), AstNode::mkconst_int(n->location, 1, false));
+						*it = std::move(ph);
+					}
+					++it;
+				}
+			}
 			// A package body may reference EARLIER packages by qualified
 			// name (`localparam W = prim_util_pkg::vbits(N);` is all over
 			// OpenTitan).  Modules get those names from the clones appended

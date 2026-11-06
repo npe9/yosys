@@ -1,0 +1,55 @@
+# fe117: a package-scope queue variable, class handle, or typedef of either
+# (simulation-only, as in UVM's uvm_object_globals.svh / uvm_misc.svh /
+# uvm_pool.svh) is dropped instead of refusing the package; the
+# package's other members still work, and a module that reads the queue
+# still fails (the name no longer resolves)
+read_verilog -sv <<EOT
+package p;
+  typedef enum {A, B} st_t;
+  st_t q[$];
+  int unsigned qq[$:7];
+  class c #(type T = int); T x; endclass
+  c h;
+  c ha [0:0];
+  typedef c #(bit) cb_t;
+  cb_t hb;
+  typedef int iq_t[$];
+  iq_t qv;
+  localparam int W = 4;
+endpackage
+module top(input [p::W-1:0] a, output [p::W-1:0] y);
+  assign y = a;
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-count 1 top/a
+design -reset
+# a bare read through `import p::*' resolves no package variable at all (a
+# general gap, any package variable: an implicit net, a strict-mode warning;
+# register item) -- pinned so a fix there shows up here
+logger -expect warning "Identifier `\\q' is implicitly declared" 1
+read_verilog -sv <<EOT
+package p;
+  int q[$];
+endpackage
+module top3(output int y);
+  import p::*;
+  assign y = q[0];
+endmodule
+EOT
+hierarchy -top top3
+logger -check-expected
+design -reset
+# a qualified read resolves to the placeholder and refuses (an expected
+# error ends the script, so this case is last)
+logger -expect error "Identifier `\\p::q' is simulation-only package storage" 1
+read_verilog -sv <<EOT
+package p;
+  int q[$];
+endpackage
+module top2(output int y);
+  assign y = p::q[0];
+endmodule
+EOT
+hierarchy -top top2

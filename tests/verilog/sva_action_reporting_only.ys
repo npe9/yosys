@@ -1,0 +1,24 @@
+# fe118: an assertion's statement action is never lowered; a reporting-only
+# one (no assignment, UVM `uvm_error' shape: `if (report_enabled(..))
+# report_error(..)') is no longer elaborated, so the package functions it
+# calls -- which reach class code -- are not inlined and refused
+read_verilog -sv -formal <<EOT
+package rp;
+  class rs; static function rs get(); return null; endfunction endclass
+  function bit report_enabled(int s); rs h; h = rs::get(); return 1; endfunction
+  function void report_error(string id, string msg); rs h; h = rs::get(); endfunction
+endpackage
+module top(input clk, input a, input b);
+  import rp::*;
+  ap: assert property (@(posedge clk) a |-> b)
+    else begin if (report_enabled(1)) report_error("ID", "a without b"); end
+  aq: assert property (@(posedge clk) b |-> a)
+    else report_error("ID", "b without a");
+  // UVM 1.2+ `uvm_report_begin' shape: a block-local handle assigned inside
+  ar: assert property (@(posedge clk) a |-> ##1 b)
+    else begin rs h; h = rs::get(); if (report_enabled(1)) report_error("ID", "x"); end
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-count 3 t:$check

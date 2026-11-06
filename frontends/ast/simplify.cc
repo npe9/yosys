@@ -7353,6 +7353,17 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			}
 		}
 	}
+	// fe118: a system function called without parentheses (IEEE 1800-2017
+	// 13.4: `$urandom' is `$urandom()') parsed as an identifier and became a
+	// 1-bit implicit net (UVM's `uvm_global_random_seed = $urandom;'); read
+	// it as the call, which fe102 models
+	if (type == AST_IDENTIFIER && !in_lvalue && children.empty() && (str == "\\$urandom" || str == "\\$random") &&
+			current_scope.count(str) == 0) {
+		newNode = std::make_unique<AstNode>(location, AST_FCALL);
+		newNode->str = str;
+		goto apply_newNode;
+	}
+
 	// annotate identifiers using scope resolution and create auto-wires as needed
 	if (type == AST_IDENTIFIER) {
 		if (current_scope.count(str) == 0 && id2ast && id2ast->type != AST_AUTOWIRE) {

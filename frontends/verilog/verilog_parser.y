@@ -618,6 +618,43 @@
 		return owned;
 	}
 
+	// fe118: an assertion's statement action (pass / fail block) is never
+	// lowered (genrtlil reads only the condition), but simplify still
+	// elaborated it: UVM's `uvm_error' expands to `if (uvm_report_enabled(..))
+	// uvm_report_error(..)', whose inlined package functions reach class code
+	// and were refused.  A reporting-only action (no assignment in it, except
+	// to a variable the action declares itself -- `uvm_report_begin's
+	// `_local_report_object_') is dropped here; one that assigns anything
+	// else keeps today's path.
+	static std::unique_ptr<AstNode> sva_action_reporting_only(std::unique_ptr<AstNode> act)
+	{
+		if (!act)
+			return act;
+		std::set<std::string> locals;
+		std::function<void(const AstNode *)> collect = [&](const AstNode *n) {
+			if (n->type == AST_WIRE)
+				locals.insert(n->str);
+			for (auto &c : n->children)
+				if (c)
+					collect(c.get());
+		};
+		collect(act.get());
+		std::function<bool(const AstNode *)> assigns = [&](const AstNode *n) {
+			if (n->type == AST_ASSIGN_EQ || n->type == AST_ASSIGN_LE || n->type == AST_ASSIGN) {
+				const AstNode *lhs = n->children.empty() ? nullptr : n->children[0].get();
+				if (!lhs || lhs->type != AST_IDENTIFIER || !lhs->children.empty() || !locals.count(lhs->str))
+					return true;
+			}
+			for (auto &c : n->children)
+				if (c && assigns(c.get()))
+					return true;
+			return false;
+		};
+		if (assigns(act.get()))
+			return act;
+		return nullptr;
+	}
+
 	// IEEE 16.16 / 16.15: a scope's default clocking and default disable
 	// iff apply to every concurrent assertion in the scope without its own,
 	// wherever they are declared.  sva_property_spec tags every property
@@ -8015,15 +8052,15 @@ sva_action:
 	TOK_ELSE behavioral_stmt {
 		// behavioral_stmt (incl. begin/end) registers itself as the last
 		// child of the enclosing context: move it under the assertion.
-		$$ = sva_action_detach_last(extra);
+		$$ = sva_action_reporting_only(sva_action_detach_last(extra));
 	} |
 	behavioral_stmt TOK_ELSE behavioral_stmt {
 		// if-action / else-action pair: keep the else action
-		$$ = sva_action_detach_last(extra);
+		$$ = sva_action_reporting_only(sva_action_detach_last(extra));
 		(void)sva_action_detach_last(extra);
 	} |
 	behavioral_stmt {
-		$$ = sva_action_detach_last(extra);
+		$$ = sva_action_reporting_only(sva_action_detach_last(extra));
 	} |
 	sva_msg { $$ = std::move($1); };
 

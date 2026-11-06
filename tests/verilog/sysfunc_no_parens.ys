@@ -1,0 +1,17 @@
+# fe118: `$urandom' / `$random' without parentheses (IEEE 1800-2017 13.4) is
+# the call, modeled like `$urandom()' (fe102: an $anyconst in an initial
+# value) -- not a 1-bit implicit net
+read_verilog -sv <<EOT
+package p;
+  int unsigned seed = $urandom;
+endpackage
+module top(output reg [31:0] y, output reg [31:0] z);
+  initial y = $urandom;
+  initial z = $random;
+endmodule
+EOT
+hierarchy -top top
+proc
+# (3: the package initializer rides along as a qualified clone, p::seed)
+select -assert-count 3 t:$anyconst
+select -assert-count 0 w:$urandom w:$random

@@ -1,0 +1,27 @@
+# fe127: a real variable is kept as a 32-bit integer and its initializer as a
+# continuous assignment, so `real r = 1.5; ... r = r + 1.0' read r as a
+# constant and a failing property was proved (hw-cbmc real_variable2).
+# Strict reads now refuse it; -permissive warns and marks the module
+# sv_degraded.  Real parameters are unaffected.
+logger -expect warning "Real variable `\\r' is modeled as a 32-bit integer" 1
+read_verilog -sv -formal -permissive <<EOT
+module top(input clk, input c);
+  real r = 1.5;
+  always @(posedge clk)
+    if (c) r = r + 1.0;
+  p0: assert property (@(posedge clk) r < 3.0);
+endmodule
+EOT
+hierarchy -top top
+select -assert-mod-count 1 A:sv_degraded
+logger -check-expected
+design -reset
+
+logger -expect error "Real variable `\\r' is modeled as a 32-bit integer" 1
+read_verilog -sv -formal <<EOT
+module top(input clk, input c);
+  real r = 1.5;
+  always @(posedge clk)
+    if (c) r = r + 1.0;
+endmodule
+EOT

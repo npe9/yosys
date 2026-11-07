@@ -1695,6 +1695,15 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			if (!(range_left + 1 >= range_right))
 				input_error("Signal `%s' with invalid width range %d!\n", str, range_left - range_right + 1);
 
+			// fe127: a real / shortreal / realtime variable is kept as a
+			// 32-bit integer and its initializer as a continuous assignment
+			// (`real r = 1.5; ... r = r + 1.0' read r as the constant 2, and
+			// a REFUTED property was proved; hw-cbmc real_variable2)
+			for (auto &child : children)
+				if (child->type == AST_REALVALUE) {
+					degrade(location.to_loc(), "Real variable `%s' is modeled as a 32-bit integer; real values and arithmetic are not synthesized.\n", str.c_str());
+					break;
+				}
 			RTLIL::IdString id = str;
 			check_unique_id(current_module, id, this, "signal");
 			RTLIL::Wire *wire = current_module->addWire(id, range_left - range_right + 1);

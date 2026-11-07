@@ -8066,6 +8066,12 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		// break flag; dyn_started once one has been
 		bool dyn_started = false;
 		std::unique_ptr<AstNode> dyn_cond;
+		// fe124: a data-dependent break under a constant condition: the
+		// loop variable is assigned in every iteration (the first time
+		// unconditionally), so after a break it keeps that iteration's value;
+		// only the end value was assigned, so `for (i = 0; i < 4; i++) if
+		// (b[i]) break; o = i;' read 4 for every b (hw-cbmc for/break2)
+		bool brk_var_started = false;
 
 		int unroll_iters = 0;
 		while (1)
@@ -8179,6 +8185,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 							std::make_unique<AstNode>(location, AST_COND, mkconst_int(location, 1, false, 1), std::move(body))));
 					dyn_started = true;
 				}
+				if (!exit_brk.empty() && !dyn_started) {
+					auto set_var = std::make_unique<AstNode>(location, AST_ASSIGN_EQ, next_ast->children[0]->clone(), varbuf->children[0]->clone());
+					if (!brk_var_started)
+						current_block->children.insert(current_block->children.begin() + current_block_idx++, std::move(set_var));
+					else
+						buf->children.insert(buf->children.begin(), std::move(set_var));
+					brk_var_started = true;
+				}
 				if (!exit_brk.empty()) {
 					// after a possible break, every later iteration is conditional
 					auto body = std::make_unique<AstNode>(location, AST_BLOCK);
@@ -8226,9 +8240,9 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		if (type == AST_FOR) {
 			auto buf = next_ast->clone();
 			buf->children[1] = varbuf->children[0]->clone();
-			if (dyn_started) {
-				// assigned at the first signal-dependent check already: the
-				// end value only if no check stopped the loop
+			if (dyn_started || brk_var_started) {
+				// assigned at the first signal-dependent check (or possible
+				// break) already: the end value only if the loop was not stopped
 				auto blk = std::make_unique<AstNode>(location, AST_BLOCK, std::move(buf));
 				buf = std::make_unique<AstNode>(location, AST_CASE,
 						std::make_unique<AstNode>(location, AST_REDUCE_BOOL, std::make_unique<AstNode>(location, AST_LOGIC_NOT, exit_id())),

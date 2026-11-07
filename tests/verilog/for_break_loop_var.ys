@@ -1,0 +1,33 @@
+# A data-dependent break under a constant loop condition: after the loop
+# the loop variable holds the value of the iteration that broke (IEEE
+# 1800-2017 12.8).  Only the end value used to be assigned, so `o1' read
+# 4 for every input (hw-cbmc verilog/for/break2).
+read_verilog -sv <<EOT
+module top(input [3:0] bits, output logic [5:0] o1, o2, o3);
+  always_comb begin
+    int i;
+    for (i = 0; i < 4; i++)
+      if (bits[i]) break;
+    o1 = i;
+  end
+  always_comb begin
+    o2 = 6'd4;
+    for (int j = 0; j < 4; j++)
+      if (bits[j]) begin o2 = j; break; end
+  end
+  // a decrementing loop: the exit value is -1, the break keeps the index
+  always_comb begin
+    int k;
+    for (k = 3; k >= 0; k--)
+      if (bits[k]) break;
+    o3 = k;
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-none t:$dlatch
+sat -verify -set bits 4'b0000 -prove o1 6'd4 -prove o2 6'd4 -prove o3 6'b111111
+sat -verify -set bits 4'b0010 -prove o1 6'd1 -prove o2 6'd1 -prove o3 6'd1
+sat -verify -set bits 4'b1000 -prove o1 6'd3 -prove o2 6'd3 -prove o3 6'd3
+sat -verify -set bits 4'b0101 -prove o1 6'd0 -prove o2 6'd0 -prove o3 6'd2

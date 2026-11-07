@@ -1482,6 +1482,16 @@ void AstNode::detectSignWidthWorker(int &width_hint, bool &sign_hint, bool *foun
 			width_hint = max(width_hint, 32);
 			break;
 		}
+		// fe129: integer-valued system functions left unfolded (inside a
+		// concurrent assertion simplify does not fold them) are 32 bits wide,
+		// not the 1-bit width of an unknown call: `$bits($clog2(16) + b)' was
+		// 8 (hw-cbmc integer_operands1).  Unsigned, as genRTLIL returns them;
+		// their values are never negative.
+		if (str == "\\$clog2" || str == "\\$countones" || str == "\\$countbits") {
+			width_hint = max(width_hint, 32);
+			sign_hint = false;
+			break;
+		}
 		if (current_scope.count(str))
 		{
 			// This width detection is needed for function calls which are

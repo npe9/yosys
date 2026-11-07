@@ -1,0 +1,23 @@
+# fe129: inside a concurrent assertion simplify does not fold $clog2,
+# $countones or $countbits, and width detection gave them the 1-bit width
+# of an unknown call: `$bits($clog2(16) + b)' was 8, `$bits($clog2(16))' 1
+# (hw-cbmc integer_operands1).  They are 32 bits.
+read_verilog -sv -formal <<EOT
+module top(input clk, input [7:0] b, input [3:0] x);
+  a0: assert property (@(posedge clk) $bits($clog2(16)) == 32);
+  a1: assert property (@(posedge clk) $bits($clog2(16) + $clog2(8)) == 32);
+  a2: assert property (@(posedge clk) $bits($clog2(16) + b) == 32);
+  a3: assert property (@(posedge clk) $bits($countones(x)) == 32);
+  a4: assert property (@(posedge clk) $clog2(16) + b == b + 32'd4);
+  a5: assert property (@(posedge clk) $countones(x) + 8'd255 > 8'd255 || x == 0);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+logger -expect log "ic3: 6 properties: proved=6 disproved=0 undecided=0" 1
+ic3 -check-cells -kind 2 -bmc 2 -max 50
+logger -check-expected

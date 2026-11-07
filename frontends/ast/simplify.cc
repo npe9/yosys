@@ -10123,7 +10123,12 @@ skip_memory_write:;
 				int expr_dimensions = 0, expr_unpacked_dimensions = 0;
 				AstNode *id_ast = nullptr;
 
-				buf->detectSignWidth(width_hint, sign_hint);
+				// fe124b: the argument's own width, not the context's: this
+				// widened the caller's hint, so `$bits(10'(1)) == 10' read
+				// $bits as the comparison's 32 (hw-cbmc expressions/size_cast1)
+				int arg_width = -1;
+				bool arg_sign = false;
+				buf->detectSignWidth(arg_width, arg_sign);
 
 				if (buf->type == AST_IDENTIFIER) {
 					id_ast = buf->id2ast;
@@ -10214,7 +10219,7 @@ skip_memory_write:;
 					}
 					width = high - low + 1;
 				} else {
-					width = width_hint;
+					width = arg_width;
 					right = low  = 0;
 					left  = high = width - 1;
 					expr_dimensions = 1;

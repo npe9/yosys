@@ -1246,7 +1246,20 @@ void AstNode::detectSignWidthWorker(int &width_hint, bool &sign_hint, bool *foun
 				degrade(location.to_loc(), "Static cast with a non-constant size `%s'; the operand width is used.\n", sz->str.c_str());
 			}
 		}
-		children.at(1)->detectSignWidthWorker(width_hint, sign_hint);
+		// fe124: a static cast's self-determined width is its size (IEEE
+		// 1800-2017 6.24.1), not the max with its operand's: `$bits(10'(1))'
+		// was 32, and each member cast of a packed struct pattern
+		// `'{1, 0, 'b1110011}' counted 32 bits in the concatenation
+		// (hw-cbmc size_cast1, structs5).  The operand gives the
+		// signedness only; a size that does not fold keeps the operand's
+		// width, as before.
+		sub_width_hint = -1;
+		sub_sign_hint = true;
+		children.at(1)->detectSignWidthWorker(sub_width_hint, sub_sign_hint);
+		if (!sub_sign_hint)
+			sign_hint = false;
+		if (children.at(0)->type != AST_CONSTANT || children.at(0)->bitsAsConst().as_int() <= 0)
+			width_hint = max(width_hint, sub_width_hint);
 		if (children.at(0)->type == AST_CONSTANT) {
 			this_width = children.at(0)->bitsAsConst().as_int();
 			// a literal size <= 0 is upstream's error; a parameter that

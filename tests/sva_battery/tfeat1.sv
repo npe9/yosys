@@ -24,7 +24,12 @@ module tfeat1(input logic clk);
 
   // sync_accept_on / sync_reject_on: synchronous abort.
   p_sacc_ok: assert property (@(posedge clk) (ctr==2) |-> sync_accept_on(ctr == 8'd4) nexttime[3] (ctr == 8'd99)); // PROVED (abort at 4 before check at 5)
-  p_srej_b:  assert property (@(posedge clk) (ctr==2) |-> sync_reject_on(ctr == 8'd4) (ctr != 8'd99));             // DIS @4
+  // The abort condition counts only while the operand is evaluated (LRM
+  // 16.12.14; hw-cbmc sva_abort2): a Boolean operand ends at the start
+  // tick, so ctr==4 two ticks later cannot reject it (fe126; this case
+  // expected DIS @4 before, from a lowering that kept one abort flag).
+  p_srej_ok: assert property (@(posedge clk) (ctr==2) |-> sync_reject_on(ctr == 8'd4) (ctr != 8'd99));             // PROVED
+  p_srej_b:  assert property (@(posedge clk) (ctr==2) |-> sync_reject_on(ctr == 8'd4) nexttime[2] (ctr != 8'd99)); // DIS @4
 
   // weak/strong on bounded sequences in consequent position.  weak and
   // strong coincide on the infinite traces model checking explores (LRM

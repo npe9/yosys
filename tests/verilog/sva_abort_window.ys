@@ -1,0 +1,43 @@
+# accept_on / reject_on: the abort condition counts at every tick of the
+# operand's evaluation, its start tick included (LRM 16.12.14).  The old
+# lowering kept one registered `active' flag for all attempts: b at the
+# start tick or at the failing tick was not seen (`reject_on(1) 1' was
+# proved), and a later attempt restarted the flag of an aborted one
+# (hw-cbmc SVA/sva_abort1, sva_abort2).
+read_verilog -sv -formal <<EOT
+module top(input clk, input b, input a);
+  reg [3:0] c = 0;
+  always @(posedge clk) if (c != 15) c <= c + 1;
+  r0: assert property (@(posedge clk) reject_on(b) 1'b1);
+  a0: assert property (@(posedge clk) accept_on(b) a);
+  a1: assert property (@(posedge clk) accept_on(1'b1) a);
+  r1: assert property (@(posedge clk) reject_on(1'b0) 1'b1);
+  r2: assert property (@(posedge clk) reject_on(1'b1) 1'b1);
+  // attempt 0 is aborted by c == 1 at its second tick, attempt 1 at its
+  // first; attempt 2 fails at tick 3
+  a2: assert property (@(posedge clk) accept_on(c == 1) (1'b1 ##1 1'b0));
+  // attempts 0..2 are evaluating when c == 2
+  r3: assert property (@(posedge clk) reject_on(c == 2) (1'b1 ##2 1'b1));
+  // a Boolean operand ends at its start tick: c == 4 rejects only the
+  // attempt started at 4
+  r4: assert property (@(posedge clk) (c == 2) |-> reject_on(c == 4) (c != 9));
+  r5: assert property (@(posedge clk) (c == 2) |-> reject_on(c == 4) nexttime[2] (c != 9));
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+logger -expect log "ic3: r0: disproved \(depth 0\)" 1
+logger -expect log "ic3: a0: disproved \(depth 0\)" 1
+logger -expect log "ic3: a1: proved" 1
+logger -expect log "ic3: r1: proved" 1
+logger -expect log "ic3: r2: disproved \(depth 0\)" 1
+logger -expect log "ic3: a2: disproved \(depth 3\)" 1
+logger -expect log "ic3: r3: disproved \(depth 2\)" 1
+logger -expect log "ic3: r4: proved" 1
+logger -expect log "ic3: r5: disproved \(depth 4\)" 1
+ic3 -check-cells -kind 4 -bmc 8 -max 200
+logger -check-expected

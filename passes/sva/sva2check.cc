@@ -4209,6 +4209,12 @@ struct SvaCompiler {
 		}
 		if (op == "strong" || op == "weak")
 			return fail_off(ch(0));
+		// fe126: accept_on reports at its operand's tick; reject_on also
+		// at the tick b rises, which varies unless the operand's is 0
+		if (op == "accept_on" || op == "sync_accept_on")
+			return fail_off(ch(1));
+		if (op == "reject_on" || op == "sync_reject_on")
+			return fail_off(ch(1)) == 0 ? 0 : -1;
 		if (op == "nexttime" || op == "s_nexttime") {
 			int k = 1, idx = 0;
 			if (GetSize(p) >= 2 && const_int(c->getPort(p[0]), k))
@@ -4904,13 +4910,39 @@ struct SvaCompiler {
 		if (op == "accept_on" || op == "sync_accept_on" || op == "reject_on" || op == "sync_reject_on") {
 			SigSpec b = reduce1(resolve(port(0)));
 			bool reject = op == "reject_on" || op == "sync_reject_on";
-			SigSpec active = feedback([=](SigSpec qq) {
-				return andN({orN({start, qq}), mod->Not(NEW_ID, b)});
-			}, "abort_active", 1);
 			SigSpec fail_p = prop_dispatch(port(1), child(1), start);
+			// fe126: an attempt started at s whose operand reports at s+dp
+			// is aborted by b at any tick of [s, s+dp], its own start tick
+			// included (LRM 16.12.14).  The old form kept one `active'
+			// flag, registered, for all attempts: b at the start tick or at
+			// the failing tick was not seen (`reject_on(1) 1' was proved),
+			// and an abort of one attempt was lost when the next attempt
+			// restarted the flag.
+			int dp = fail_off(child(1));
+			if (dp >= 0) {
+				SigSpec win_b = b, win_start = start;
+				for (int j = 1; j <= dp; j++) {
+					win_b = orN({win_b, delay(b, j, "abort_b")});
+					win_start = orN({win_start, delay(start, j, "abort_st")});
+				}
+				if (!reject)
+					return andN({fail_p, mod->Not(NEW_ID, win_b)});
+				// an attempt whose operand already passed before s+dp
+				// (a vacuous implication) is still rejected by a later b
+				if (dp > 0)
+					approx("reject-on-window", op + " at " + std::string(log_id(n)));
+				return orN({fail_p, andN({b, win_start})});
+			}
+			// varying offset: one flag for the attempts in flight
+			approx("abort-merged-attempts", op + " at " + std::string(log_id(n)));
+			SigSpec pending;
+			feedback([&](SigSpec qq) {
+				pending = orN({start, qq});
+				return andN({pending, mod->Not(NEW_ID, b)});
+			}, "abort_active", 1);
 			if (reject)
-				return orN({andN({active, b}), andN({active, fail_p})});
-			return andN({active, fail_p});
+				return andN({pending, orN({b, fail_p})});
+			return andN({pending, mod->Not(NEW_ID, b), fail_p});
 		}
 		if (op == "eventually" || op == "s_eventually") {
 			// children: bounds, property

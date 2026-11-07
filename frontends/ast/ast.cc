@@ -1465,6 +1465,43 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 	return current_module;
 }
 
+// fe130: an interface member driven inside the interface (`assign',
+// `initial', a declaration initializer) is not connected to what a module
+// reads through an interface port or an interface instance: the reader's
+// first elaboration declared the member implicitly (sv_degraded), and the
+// re-derivation keeps that free wire while the interface's driver lands on a
+// renamed copy (`c.bus.data' vs `c.bus.data_1'; stock yosys 0.51 does the
+// same).  The re-derivation dropped the mark, so ic3 gave verdicts on a free
+// wire (hw-cbmc interface/port2, port6, port7).  Members driven from outside
+// (a module assigning `bus.data') are connected correctly, so the mark is only
+// carried when an interface has logic of its own.
+static bool interface_has_logic(RTLIL::Module *intf)
+{
+	if (!intf)
+		return false;
+	if (!intf->processes.empty() || !intf->connections().empty())
+		return true;
+	for (auto c : intf->cells())
+		if (c->type != ID($scopeinfo) && !c->get_bool_attribute(ID::is_interface))
+			return true;
+	for (auto w : intf->wires())
+		if (w->attributes.count(ID::init))
+			return true;
+	return false;
+}
+
+static void carry_degraded(RTLIL::Module *from, RTLIL::Module *to)
+{
+	IdString attr = IdString("\\sv_degraded");
+	if (!from || !to || from == to || !from->attributes.count(attr))
+		return;
+	std::string add = from->attributes.at(attr).decode_string();
+	std::string cur = to->attributes.count(attr) ? to->attributes.at(attr).decode_string() : std::string();
+	if (add.empty() || cur.find(add) != std::string::npos)
+		return;
+	to->attributes[attr] = RTLIL::Const(cur.empty() ? add : cur + "; " + add);
+}
+
 RTLIL::Module *
 AST_INTERNAL::process_and_replace_module(RTLIL::Design *design,
                                          RTLIL::Module *old_module,
@@ -2549,8 +2586,18 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 
 	// Generate RTLIL from AST for the new module and add to the design,
 	// renaming this module to move it out of the way.
+	bool intf_logic = false;
+	for (auto &intf : local_interfaces)
+		intf_logic |= interface_has_logic(intf.second);
+	for (auto &ch : new_ast->children)
+		if (ch->type == AST_CELL && ch->str.size() > 20 && ch->str.compare(ch->str.size() - 20, 20, "_inst_from_top_dummy") == 0 &&
+				!ch->children.empty() && ch->children[0]->type == AST_CELLTYPE)
+			intf_logic |= interface_has_logic(design->module(ch->children[0]->str));
+	RTLIL::Module *old_module = this;
 	RTLIL::Module* new_module =
 		process_and_replace_module(design, this, new_ast.get(), std::move(ast_before_replacing_interface_ports));
+	if (intf_logic)
+		carry_degraded(old_module, new_module);
 
 	// Set the attribute "interfaces_replaced_in_module" so that it does not happen again.
 	new_module->set_bool_attribute(ID::interfaces_replaced_in_module);
@@ -2580,9 +2627,12 @@ RTLIL::IdString AstModule::derive(RTLIL::Design *design, const dict<RTLIL::IdStr
 
 
 	if (!design->has(new_modname)) {
+		// fe130: the module the re-derivation is cloned from
+		RTLIL::Module *src_mod = nullptr;
 		if (!new_ast) {
 			auto mod = dynamic_cast<AstModule*>(design->module(modname));
 			new_ast = mod->ast->clone();
+			src_mod = mod;
 		}
 		modname = new_modname;
 		new_ast->str = modname;
@@ -2634,6 +2684,12 @@ RTLIL::IdString AstModule::derive(RTLIL::Design *design, const dict<RTLIL::IdStr
 		if (interfaces.size() > 0) {
 			mod->set_bool_attribute(ID::interfaces_replaced_in_module);
 		}
+
+		bool intf_logic = false;
+		for (auto &intf : interfaces)
+			intf_logic |= interface_has_logic(intf.second);
+		if (intf_logic)
+			carry_degraded(src_mod, mod);
 
 	} else {
 		modname = new_modname;

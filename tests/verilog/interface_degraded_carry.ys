@@ -1,0 +1,63 @@
+# fe130: a member driven inside an interface is not connected to a module
+# that reads it through an interface port (the reader keeps an implicitly
+# declared free wire; stock yosys does the same).  The re-derivation for
+# the interface used to drop the reader's sv_degraded mark, so ic3 gave
+# verdicts on the free wire (hw-cbmc interface/port2, port6, port7).
+read_verilog -sv -formal -permissive <<EOT
+interface simple_bus;
+  logic [7:0] data;
+  assign data = 8'hAB;
+endinterface
+module consumer(input clk, simple_bus bus);
+  p1: assert property (@(posedge clk) bus.data == 8'hAB);
+endmodule
+module main(input clk);
+  simple_bus my_bus();
+  consumer c(.clk(clk), .bus(my_bus));
+endmodule
+EOT
+hierarchy -top main
+select -assert-mod-count 1 A:sv_degraded
+design -reset
+
+# a member driven from outside the interface is connected: no mark
+read_verilog -sv -formal -permissive <<EOT
+interface simple_bus;
+  logic [7:0] data;
+endinterface
+module prod(simple_bus bus);
+  assign bus.data = 8'hAB;
+endmodule
+module consumer(simple_bus bus, output [7:0] o);
+  assign o = bus.data;
+endmodule
+module main(output [7:0] o);
+  simple_bus my_bus();
+  prod p(.bus(my_bus));
+  consumer c(.bus(my_bus), .o(o));
+endmodule
+EOT
+hierarchy -top main
+select -assert-mod-count 0 A:sv_degraded
+proc
+flatten
+sat -verify -prove o 8'hAB
+design -reset
+
+# an interface instance read by hierarchical reference in the instantiating
+# module (port7): the instantiating module keeps its mark
+read_verilog -sv -formal -permissive <<EOT
+module sub(input logic data_if);
+  initial p0: assert(data_if == 1);
+endmodule
+interface data_if;
+  logic value;
+  initial value = 1;
+endinterface
+module main;
+  data_if shared();
+  sub s(.data_if(shared.value));
+endmodule
+EOT
+hierarchy -top main
+select -assert-mod-count 1 A:sv_degraded

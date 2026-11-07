@@ -25,6 +25,8 @@
 #include "kernel/ff.h"
 #include "kernel/ffinit.h"
 #include "kernel/mem.h"
+#include "kernel/celltypes.h"
+#include "kernel/utils.h"
 #include "passes/ic3/aiger_cert.h"
 #include "passes/ic3/smt_bitwuzla.h"
 
@@ -3329,6 +3331,120 @@ struct Ic3Pass : Pass
 				log_error("ic3: refusing a design that carries sv_degraded/sv_permissive modules "
 						"(%d): verdicts on a degraded design are not evidence; pass -allow-degraded "
 						"to run anyway.\n", n_deg);
+		}
+
+		// fe125: a zero-delay combinational loop (`assign u = ~u') has no
+		// defined value.  Encoded as is, its cells are equalities the
+		// solver must satisfy: `u = ~u' admits no state at all, so every
+		// property in its cone was vacuously proved (hw-cbmc
+		// nets/intra_vector_slices1 proved both u == 0 and u == 3).  Each
+		// loop is cut at one cell: its outputs become free (an
+		// over-approximation, so a proof stays sound; a counterexample may
+		// rest on the free value).  The design is then degraded: refused
+		// unless -allow-degraded, and reported like the frontend's
+		// degradations either way.
+		{
+			CellTypes ct;
+			ct.setup_internals();
+			ct.setup_stdcells();
+			auto comb = [&](RTLIL::Cell *c) {
+				return ct.cell_known(c->type) && !RTLIL::builtin_ff_cell_types().count(c->type) &&
+						!c->is_mem_cell() && !c->type.in(ID($check), ID($assert), ID($assume), ID($cover),
+						ID($live), ID($fair), ID($print), ID($scopeinfo), ID($anyconst), ID($anyseq),
+						ID($allconst), ID($allseq), ID($anyinit), ID($initstate));
+			};
+			// bit-level dependencies, so a word-level cell whose bits do not
+			// feed back (`assign u[1:0] = ~u[3:2]') is no loop: bitwise
+			// cells map bit i to bit i, add/sub bits <= i to bit i, every
+			// other cell all inputs to all outputs (conservative)
+			auto bitwise = [](RTLIL::IdString t) {
+				return t.in(ID($not), ID($pos), ID($buf), ID($and), ID($or), ID($xor), ID($xnor), ID($mux), ID($bwmux), ID($pmux));
+			};
+			int n_cut = 0;
+			bool loops_left = false;
+			std::vector<std::string> cut_names;
+			for (int round = 0; round < 256; round++) {
+				SigMap sigmap(module);
+				TopoSort<RTLIL::SigBit> topo;
+				dict<RTLIL::SigBit, std::pair<RTLIL::Cell*, std::pair<RTLIL::IdString, int>>> out_of;
+				for (auto c : module->cells()) {
+					if (!comb(c))
+						continue;
+					std::vector<std::pair<RTLIL::IdString, RTLIL::SigSpec>> ins, outs;
+					for (auto &conn : c->connections()) {
+						if (c->output(conn.first))
+							outs.push_back({conn.first, sigmap(conn.second)});
+						else if (c->input(conn.first))
+							ins.push_back({conn.first, sigmap(conn.second)});
+					}
+					bool bw = bitwise(c->type), carry = c->type.in(ID($add), ID($sub), ID($neg));
+					for (auto &o : outs)
+						for (int k = 0; k < GetSize(o.second); k++) {
+							RTLIL::SigBit ob = o.second[k];
+							if (!ob.wire)
+								continue;
+							out_of[ob] = {c, {o.first, k}};
+							topo.node(ob);
+							for (auto &in : ins) {
+								// a select / shared control input reaches every bit
+								bool sel = in.first.in(ID::S, ID::EN);
+								int w = GetSize(in.second);
+								int lo = 0, hi = w - 1;
+								if (bw && !sel && GetSize(in.second) == GetSize(o.second))
+									lo = hi = k;
+								else if (carry && GetSize(in.second) >= k + 1)
+									hi = k;
+								else if (bw && !sel && c->type == ID($pmux) && in.first == ID::B && GetSize(o.second) > 0) {
+									// B holds one word per case: bit k of each
+									for (int q = k; q < w; q += GetSize(o.second))
+										if (in.second[q].wire)
+											topo.edge(in.second[q], ob);
+									continue;
+								}
+								for (int q = lo; q <= hi && q < w; q++)
+									if (in.second[q].wire)
+										topo.edge(in.second[q], ob);
+							}
+						}
+				}
+				topo.analyze_loops = true;
+				topo.sort();
+				// a loop runs through at least one cell output bit: cut it there
+				RTLIL::SigBit cut_bit;
+				bool found = false;
+				for (auto &loop : topo.loops) {
+					for (auto &b : loop)
+						if (out_of.count(b)) {
+							cut_bit = b;
+							found = true;
+							break;
+						}
+					if (found)
+						break;
+				}
+				loops_left = found;
+				if (!found)
+					break;
+				auto &where = out_of.at(cut_bit);
+				RTLIL::Cell *cut = where.first;
+				RTLIL::SigSpec port = cut->getPort(where.second.first);
+				port[where.second.second] = module->addWire(NEW_ID);
+				cut->setPort(where.second.first, port);
+				cut_names.push_back(log_signal(cut_bit) + std::string(" (") + cut->name.unescape() +
+						(cut->has_attribute(ID::src) ? " @" + cut->get_src_attribute() : "") + ")");
+				n_cut++;
+			}
+			if (loops_left)
+				log_error("ic3: more than %d combinational-loop bits; not cut, not checked.\n", n_cut);
+			if (n_cut) {
+				std::string why = "combinational loop cut at " + std::to_string(n_cut) + " bit(s), now free:";
+				for (auto &n : cut_names)
+					why += " " + n + ";";
+				log("ic3: design carries sv_degraded: %s: %s\n", log_id(module), why.c_str());
+				if (!allow_degraded)
+					log_error("ic3: refusing a design with a zero-delay combinational loop (%d cut): it has "
+							"no defined value; pass -allow-degraded to check it with the loop cut.\n", n_cut);
+			}
 		}
 
 		std::vector<RTLIL::Cell*> props;

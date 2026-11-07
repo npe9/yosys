@@ -1,0 +1,45 @@
+# A zero-delay combinational loop has no defined value.  Encoded as is,
+# `u = ~u' admitted no state, so both of two contradictory properties were
+# proved (hw-cbmc nets/intra_vector_slices1).  ic3 now refuses such a
+# design unless -allow-degraded, and with it cuts each loop at one bit
+# (free), so neither contradictory property is proved.  A word-level cell
+# whose bits do not feed back (`w[1:0] = ~w[3:2]') is no loop.
+# The 1-bit loop t is already undriven (so free) when ic3 sees it:
+# proc's opt_expr folds `t[0] = ~t[1], t[1] = t[0]' to a self-connection,
+# as stock yosys does.  Only the two u bits reach the ic3 cut.
+read_verilog -sv -formal <<EOT
+module top(input clk);
+  wire [3:0] u;
+  assign u[1:0] = 2'd1;
+  assign u[3:2] = ~u[3:2];
+  p5: assert property (@(posedge clk) u[3:2] == 2'd0);
+  q:  assert property (@(posedge clk) u[3:2] == 2'd3);
+  wire [1:0] t;
+  assign t[0] = ~t[1];
+  assign t[1] = t[0];
+  p6: assert property (@(posedge clk) t == 2'd0);
+  q6: assert property (@(posedge clk) t != 2'd0);
+  wire [3:0] w;
+  assign w[3:2] = 2'b10;
+  assign w[1:0] = ~w[3:2];
+  pw: assert property (@(posedge clk) w == 4'b1001);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+design -save loop
+logger -expect log "combinational loop cut at 2 bit" 1
+logger -expect log "ic3: pw: proved" 1
+logger -expect log "ic3: p5: disproved" 1
+logger -expect log "ic3: q: disproved" 1
+logger -expect log "ic3: p6: disproved" 1
+logger -expect log "ic3: q6: disproved" 1
+ic3 -check-cells -allow-degraded
+logger -check-expected
+design -load loop
+logger -expect error "zero-delay combinational loop" 1
+ic3 -check-cells

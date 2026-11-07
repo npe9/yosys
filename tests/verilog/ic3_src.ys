@@ -1,0 +1,21 @@
+# fe133: `ic3 -src' prints each check's src attribute before its verdict
+# (`ic3: <name>: src <file:line...>'), so a verdict export can locate the
+# property in the source (run_elab --verdict-rows, ladder_to_ucis).
+# Without -src the output is unchanged (the gate's verdict TSVs show it).
+read_verilog -sv -formal <<EOT
+module top(input clk, input a);
+  reg [1:0] c = 0;
+  always @(posedge clk) c <= c + 1;
+  pa: assert property (@(posedge clk) c != 2'd3);
+  pc: cover property (@(posedge clk) c == 2'd2);
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+opt_clean
+logger -expect log "ic3: pa: src <inlined>:4\." 1
+logger -expect log "ic3: pc: src <inlined>:5\." 1
+ic3 -src -kind 2 -bmc 4
+logger -check-expected

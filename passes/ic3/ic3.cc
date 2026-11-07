@@ -2971,6 +2971,10 @@ struct Ic3Pass : Pass
 		log("    -v\n");
 		log("        print per-property solve statistics\n");
 		log("\n");
+		log("    -src\n");
+		log("        before each assert / cover verdict, print `ic3: <name>: src <src>'\n");
+		log("        with the check cell's src attribute (for verdict exports)\n");
+		log("\n");
 	}
 
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
@@ -3010,6 +3014,7 @@ struct Ic3Pass : Pass
 		bool preopt = true;
 		bool certify = false;
 		bool verbose = false;
+		bool print_src = false;
 		int max_frames = 1000;
 		double timeout_s = 0;
 		double budget_m = 0;
@@ -3145,6 +3150,10 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-v") {
 				verbose = true;
+				continue;
+			}
+			if (args[argidx] == "-src") {
+				print_src = true;
 				continue;
 			}
 			break;
@@ -3887,6 +3896,8 @@ struct Ic3Pass : Pass
 			std::string src;
 			if (cell->attributes.count(ID::src))
 				src = cell->attributes.at(ID::src).decode_string();
+			if (print_src)
+				log("ic3: %s: src %s\n", name.c_str(), src.c_str());
 			if (multi_driven.count(cell)) {
 				log("ic3: %s: multiply-driven net %s in the cone of influence: not checked (an encoding "
 						"would assume the drivers agree)\n", name.c_str(), multi_driven.at(cell).c_str());
@@ -3991,6 +4002,8 @@ struct Ic3Pass : Pass
 		int n_reached = 0, n_unreachable = 0, n_cover_undecided = 0;
 		for (auto cell : covers) {
 			std::string name = cell->name.unescape();
+			if (print_src)
+				log("ic3: %s: src %s\n", name.c_str(), cell->get_string_attribute(ID::src).c_str());
 			if (multi_driven.count(cell)) {
 				log("ic3: %s: multiply-driven net %s in the cone of influence: not checked\n", name.c_str(),
 						multi_driven.at(cell).c_str());
@@ -4070,6 +4083,8 @@ struct Ic3Pass : Pass
 			std::string src;
 			if (cell->attributes.count(ID::src))
 				src = cell->attributes.at(ID::src).decode_string();
+			if (print_src)
+				log("ic3: %s: src %s\n", name.c_str(), src.c_str());
 			if (multi_driven.count(cell)) {
 				log("ic3: %s: multiply-driven net %s in the cone of influence: not checked\n", name.c_str(),
 						multi_driven.at(cell).c_str());

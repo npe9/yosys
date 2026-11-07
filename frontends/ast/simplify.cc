@@ -9500,7 +9500,23 @@ skip_memory_read:;
 			// Validate array compatibility
 			if (is_direct_assign) {
 				direct_rhs_mem = rhs->id2ast;
-				if (!arrays_have_compatible_dims(lhs_mem, direct_rhs_mem)) {
+				// fe131: equal unpacked dimensions with a different element
+				// width (`byte C[10:1]; int B[0:9]; C = B;') are assigned
+				// element by element, left to right, each element converted
+				// to the target's element type (1800-2017 7.6, as EBMC
+				// reads it); left unexpanded the whole-array copy took bits
+				// by flattened position and C read garbage (hw-cbmc
+				// assignment_to_unpacked_array5)
+				bool same_unpacked = lhs_mem->unpacked_dimensions == direct_rhs_mem->unpacked_dimensions;
+				for (int i = 0; same_unpacked && i < lhs_mem->unpacked_dimensions; i++)
+					same_unpacked = lhs_mem->dimensions[i].range_width == direct_rhs_mem->dimensions[i].range_width;
+				// a mismatch keeps the old warning, not a degrade: a
+				// struct-typed port's size-form range (`dev_t q[2]') is
+				// still [2:2] in `dimensions' here although the port is
+				// elaborated right, so the metadata cannot be trusted to
+				// refuse on (OpenTitan i3c_target `assign targ_dev_o =
+				// targ_dev')
+				if (!same_unpacked) {
 					log_file_warning(location.to_loc(), "Array dimension mismatch in assignment; leaving it unexpanded.\n");
 					goto skip_array_expand;
 				}

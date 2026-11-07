@@ -1,0 +1,46 @@
+# Static-cast width and positional assignment patterns (fe124; found by
+# the hw-cbmc differential):
+#  - a cast's self-determined width is its size (IEEE 1800-2017 6.24.1):
+#    `$bits(10'(1))' read 32, the operand's width
+#  - a cast of an unsized based literal truncates: `8'('hffff)' folded
+#    to 65535
+#  - `$bits' of an expression is its own width, not the context's
+#  - a positional pattern to a packed struct sizes each item to its
+#    member, and to a packed array to its element, leftmost first (10.9):
+#    `'{1, 0, 'b1110011}' lost the top members, `'{1, 2, 3, 4}' on
+#    `bit [0:3][7:0]' kept only the last item, `'{1, 1, 1}' on
+#    `bit [2:0]' read 3'b001
+read_verilog -sv <<EOT
+module top(input [15:0] v, output [31:0] b1, b2, b3, output c1, c2, c3,
+           output [8:0] s1, s2, output [31:0] a1, a2, output [2:0] a3, output [11:0] a4);
+  typedef bit [7:0] eight_bits;
+  parameter P = 20;
+  assign b1 = $bits(10'(1));
+  assign b2 = $bits(P'(1));
+  assign b3 = $bits(eight_bits'(v));
+  assign c1 = (8'('hffff) == 'hff);
+  assign c2 = (eight_bits'('hffff) == 'hff);
+  assign c3 = (8'(v) == 'hff);
+  struct packed { bit f1, f2; bit [6:0] f3; } s = '{ 1, 0, 'b1110011 };
+  struct packed { bit f1, f2; bit [6:0] f3; } t;
+  assign t = '{ 1, 0, 'b1110011 };
+  assign s1 = s;
+  assign s2 = t;
+  bit [0:3][7:0] x = '{ 1, 2, 3, 4 };
+  bit [3:0][7:0] y;
+  always_comb y = '{ 1, 2, 3, 4 };
+  bit [2:0] z = '{ 1, 0, 1 };
+  bit [2:0][3:0] w;
+  assign w = '{ 1, 2, 3 };
+  assign a1 = x;
+  assign a2 = y;
+  assign a3 = z;
+  assign a4 = w;
+endmodule
+EOT
+hierarchy -top top
+proc
+opt
+sat -verify -set v 16'hffff -prove b1 32'd10 -prove b2 32'd20 -prove b3 32'd8 -prove c1 1 -prove c2 1 -prove c3 1
+sat -verify -prove s1 9'h173 -prove s2 9'h173
+sat -verify -prove a1 32'h01020304 -prove a2 32'h01020304 -prove a3 3'b101 -prove a4 12'h123

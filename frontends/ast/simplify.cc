@@ -9024,7 +9024,49 @@ skip_memory_read:;
 				current_scope.count(lhs_id->str) ? current_scope.at(lhs_id->str) : nullptr) : nullptr;
 		bool anon_struct = lhs_decl && lhs_id->children.empty() &&
 				(lhs_decl->type == AST_STRUCT || lhs_decl->type == AST_UNION);
-		if (named && !whole_array && lhs_id && (own_typed || anon_struct || (lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
+		// fe124: a positional pattern to a whole packed struct (one packed
+		// dimension: not an array of structs, whose pattern lists elements)
+		// takes its members in declaration order, so each element is sized
+		// to its member below; laid out untyped, unsized items kept 32 bits
+		// and `s = '{1, 0, 'b1110011}' lost its top members (hw-cbmc
+		// structs5)
+		bool positional_any = !named && !pat->children.empty() && lhs_id && (own_typed || (lhs_decl && lhs_id->children.empty()));
+		for (auto &ch : pat->children)
+			if (!ch || ch->attributes.count(ID(sv_index)))
+				positional_any = false;
+		// laid out once: order_pat drops the member keys, so the ordered
+		// pattern would read as positional again on every pass
+		if (pat->attributes.count(ID(sv_pattern_ordered)))
+			positional_any = false;
+		bool positional = positional_any && (own_typed || GetSize(lhs_decl->dimensions) <= 1);
+		// fe124: a positional pattern to a whole packed array (no struct
+		// type): one item per element of the outermost packed dimension,
+		// leftmost first (IEEE 1800-2017 10.9), each sized to the element.
+		// Laid out untyped, `bit [0:3][7:0] a = '{1, 2, 3, 4}' kept only
+		// the last 32-bit item (32'h4) and `bit [2:0] b = '{1, 1, 1}' read
+		// 3'b001 (hw-cbmc arrays/array_conversion3, assignment_pattern_
+		// symbolic_variable)
+		if (positional_any && !own_typed && pi == 1 && lhs_decl && lhs_decl->type == AST_WIRE &&
+				lhs_decl->unpacked_dimensions == 0 && !lhs_decl->attributes.count(ID::wiretype) &&
+				!lhs_id->attributes.count(ID::wiretype) && !lhs_decl->dimensions.empty() &&
+				lhs_decl->dimensions[0].range_width == GetSize(pat->children)) {
+			int total = 1;
+			for (auto &d : lhs_decl->dimensions)
+				total *= d.range_width;
+			int ew = total / GetSize(pat->children);
+			bool ok = ew >= 1;
+			for (auto &ch : pat->children)
+				if (ch->type == AST_ASSIGN_PATTERN)
+					ok = false;
+			if (ok) {
+				for (auto &ch : pat->children)
+					ch = std::make_unique<AstNode>(ch->location, AST_CAST_SIZE, mkconst_int(ch->location, ew, true), std::move(ch));
+				pat->set_attribute(ID(sv_pattern_ordered), mkconst_int(pat->location, 1, false));
+				positional = false;
+				did_something = true;
+			}
+		}
+		if ((named || positional) && !whole_array && lhs_id && (own_typed || anon_struct || (lhs_id->type == AST_IDENTIFIER && lhs_id->id2ast &&
 				(lhs_id->attributes.count(ID::wiretype) || lhs_id->id2ast->attributes.count(ID::wiretype))))) {
 			// a member target (`assign hw2reg.tpm_cap = '{...}`, OpenTitan
 			// reg-top connections) is a slice of the struct wire by now; the
@@ -9051,6 +9093,22 @@ skip_memory_read:;
 			};
 			if (st && (st->type == AST_STRUCT || st->type == AST_UNION)) {
 				std::function<void(AstNode *, AstNode *)> order_pat = [&](AstNode *pattern, AstNode *stype) {
+					// a positional (struct) pattern: name its elements by
+					// member order; any other count is left as it is
+					bool keyed = false;
+					for (auto &ch : pattern->children)
+						if (ch && (ch->attributes.count(ID(sv_member)) || ch->attributes.count(ID(sv_typekey)) || ch->attributes.count(ID(sv_index))))
+							keyed = true;
+					if (!keyed) {
+						std::vector<AstNode *> mitems;
+						for (auto &item : stype->children)
+							if (item && (item->type == AST_STRUCT_ITEM || item->type == AST_STRUCT || item->type == AST_UNION))
+								mitems.push_back(item.get());
+						if (stype->type != AST_STRUCT || GetSize(mitems) != GetSize(pattern->children))
+							return;
+						for (int k = 0; k < GetSize(mitems); k++)
+							pattern->children[k]->set_attribute(ID(sv_member), AstNode::mkconst_str(pattern->location, mitems[k]->str));
+					}
 					dict<std::string, AstNode*> by_name;
 					AstNode *fallback = nullptr;
 					for (auto &ch : pattern->children) {
@@ -9121,6 +9179,8 @@ skip_memory_read:;
 					pattern->children.swap(ordered);
 				};
 				order_pat(pat, st);
+				if (positional)
+					pat->set_attribute(ID(sv_pattern_ordered), mkconst_int(pat->location, 1, false));
 				did_something = true;
 			}
 		}
@@ -11305,9 +11365,15 @@ replace_fcall_later:;
 			if (children.at(0)->type == AST_CONSTANT && children.at(1)->type == AST_CONSTANT) {
 				int width = children[0]->bitsAsConst().as_int();
 				RTLIL::Const val;
-				if (children[1]->is_unsized)
+				if (children[1]->is_unsized) {
 					val = children[1]->bitsAsUnsizedConst(width);
-				else
+					// fe124c: bitsAsUnsizedConst only extends; an unsized
+					// based literal wider than the cast is truncated like
+					// any operand (`8'('hffff)' folded to 65535; hw-cbmc
+					// expressions/static_cast1)
+					if (GetSize(val) > width)
+						val = val.extract(0, width);
+				} else
 					val = children[1]->bitsAsConst(width);
 				newNode = mkconst_bits(location, val.to_bits(), children[1]->is_signed);
 			}

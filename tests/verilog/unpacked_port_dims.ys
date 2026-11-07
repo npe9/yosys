@@ -7,7 +7,8 @@
 # A following `, f' port also copied the unpacked dimensions
 # (`input logic [1:0] y [3], z' made z six bits wide; IEEE 1800-2017
 # 23.2.2.3: the dimensions belong to the one port).  (Stock rejects
-# unpacked ANSI port dimensions.)
+# unpacked ANSI port dimensions.)  fe132: elements connect left to
+# right, so the [N-1:0] port d reverses onto the parent's d [3].
 read_verilog -sv <<EOT
 module sub #(parameter N = 3) (
   input logic x [N],
@@ -59,7 +60,7 @@ module gold (input logic x0, x1, x2, s0, s1, s2, t, input logic [1:0] y0, y1, y2
     output logic [2:0] oe, oa, od, ob, output logic [5:0] ow, output logic zw, tw);
   assign oe = {x2, ~x1, x0};
   assign oa = {x2 & s2, x1 & s1, x0 & s0};
-  assign od = ~{x2, x1, x0};
+  assign od = ~{x0, x1, x2};   // fe132: [N-1:0] port maps left to right onto [3] (7.6)
   assign ob = {y2[0], y1[0], y0[0]};
   assign ow = {y2, y1, y0} ^ {6{t}};
   assign zw = 1;

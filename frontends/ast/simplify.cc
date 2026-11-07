@@ -341,7 +341,28 @@ static AstNode *find_missing_autowire(AstNode *node, int depth = 0)
 // select becomes a part-select on the wide wire (word width w).
 static AstNode *resolve_wiretype_struct(AstNode *decl_node);
 
-static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, int w, AstNode *port_node)
+// fe132: elements of a flattened unpacked port are laid out left to right
+// from the LSBs (the leftmost element, `p[0]' of `[0:2]' or `p[3]' of
+// `[3:1]', at bits [w-1:0]), the same layout the whole-array rewrites below
+// give the connected array, so a connection matches elements left to right
+// whatever the two ranges (1800-2017 7.6, 23.3.3).  The offset used to be
+// idx * w, which reversed a descending range and put an offset range
+// (`[3:1]') out of bounds.
+static std::unique_ptr<AstNode> unpacked_pos(Location loc, AstNode *ix, int ulo, int uhi, bool udesc)
+{
+	if (ix->type == AST_CONSTANT) {
+		int k = ix->asInt(true);
+		return AstNode::mkconst_int(loc, udesc ? uhi - k : k - ulo, true);
+	}
+	if (udesc)
+		return std::make_unique<AstNode>(loc, AST_SUB, AstNode::mkconst_int(loc, uhi, true), ix->clone());
+	if (ulo)
+		return std::make_unique<AstNode>(loc, AST_SUB, ix->clone(), AstNode::mkconst_int(loc, ulo, true));
+	return ix->clone();
+}
+
+static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, int w, AstNode *port_node,
+		int ulo = 0, int uhi = 0, bool udesc = false)
 {
 	if (!node)
 		return;
@@ -393,7 +414,8 @@ static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, i
 		auto loc = idx->location;
 		std::unique_ptr<AstNode> off;
 		if (idx->range_valid) {
-			off = AstNode::mkconst_int(loc, idx->range_left * w, true);
+			int k = idx->range_left;
+			off = AstNode::mkconst_int(loc, (udesc ? uhi - k : k - ulo) * w, true);
 		} else {
 			// Unwrap the index expression from its single-child range node and
 			// fold constant indices now: downstream width detection recurses
@@ -401,11 +423,11 @@ static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, i
 			// non-const bounds shaped like one) trips it up.
 			AstNode *ix = idx->children.size() == 1 ? idx->children[0].get() : nullptr;
 			if (ix && ix->type == AST_CONSTANT)
-				off = AstNode::mkconst_int(loc, ix->integer * w, true);
+				off = AstNode::mkconst_int(loc, (udesc ? uhi - (int)ix->integer : (int)ix->integer - ulo) * w, true);
 			if (!off) {
 				if (!ix)
 					ix = idx;
-				off = std::make_unique<AstNode>(loc, AST_MUL, ix->clone(), AstNode::mkconst_int(loc, w, true));
+				off = std::make_unique<AstNode>(loc, AST_MUL, unpacked_pos(loc, ix, ulo, uhi, udesc), AstNode::mkconst_int(loc, w, true));
 			}
 		}
 		node->children.erase(node->children.begin());
@@ -441,9 +463,9 @@ static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, i
 		node->basic_prep = false;
 	}
 	for (auto &child : node->children)
-		rewrite_unpacked_port_refs(child.get(), name, w, port_node);
+		rewrite_unpacked_port_refs(child.get(), name, w, port_node, ulo, uhi, udesc);
 	for (auto &attr : node->attributes)
-		rewrite_unpacked_port_refs(attr.second.get(), name, w, port_node);
+		rewrite_unpacked_port_refs(attr.second.get(), name, w, port_node, ulo, uhi, udesc);
 }
 
 // Information about a plain 1-D unpacked memory (packed range + exactly one
@@ -562,7 +584,7 @@ static bool is_sva_decl_ref(const std::string &str)
 	return false;
 }
 
-static bool get_1d_unpacked_mem_info(AstNode *mem, int &elem_width, int &lo, int &hi, bool *struct_array = nullptr){
+static bool get_1d_unpacked_mem_info(AstNode *mem, int &elem_width, int &lo, int &hi, bool *struct_array = nullptr, bool *descending = nullptr){
 	log_assert(mem->type == AST_MEMORY);
 	if (mem->children.size() != 2)
 		return false;
@@ -583,6 +605,8 @@ static bool get_1d_unpacked_mem_info(AstNode *mem, int &elem_width, int &lo, int
 	elem_width = std::abs(prange->range_left - prange->range_right) + 1;
 	lo = std::min(urange->range_left, urange->range_right);
 	hi = std::max(urange->range_left, urange->range_right);
+	if (descending)
+		*descending = !urange->range_swapped;   // fe132: declared [hi:lo]
 	if ((int64_t)(hi - lo + 1) * elem_width > whole_array_rewrite_max_bits)
 		return false;
 	return true;
@@ -634,6 +658,10 @@ static bool get_2d_unpacked_mem_info(AstNode *mem, int &elem_width, int &lo0, in
 // always exist; stock yosys rejected whole-array accesses to memories
 // ("Invalid array access"). References inside system function/task calls and
 // nested in an assignment lvalue concatenation are left alone.
+// fe132: the declared direction of the memory the last is_whole_array_assign /
+// is_slice_array_assign matched (descending: leftmost element is hi)
+static bool whole_array_desc = false;
+
 static bool is_whole_array_assign(AstNode *node, AstNode *&mem, int &elem_width, int &lo, int &hi)
 {
 	if (!(node->type == AST_ASSIGN || node->type == AST_ASSIGN_EQ || node->type == AST_ASSIGN_LE))
@@ -645,7 +673,7 @@ static bool is_whole_array_assign(AstNode *node, AstNode *&mem, int &elem_width,
 	if (!lhs->id2ast || lhs->id2ast->type != AST_MEMORY)
 		return false;
 	bool struct_array = false;
-	if (!get_1d_unpacked_mem_info(lhs->id2ast, elem_width, lo, hi, &struct_array) || struct_array)
+	if (!get_1d_unpacked_mem_info(lhs->id2ast, elem_width, lo, hi, &struct_array, &whole_array_desc) || struct_array)
 		return false;
 	mem = lhs->id2ast;
 	return true;
@@ -669,7 +697,7 @@ static bool is_slice_array_assign(AstNode *node, AstNode *&mem, int &elem_width,
 	if (!range->range_valid || range->range_left == range->range_right)
 		return false;
 	int dim_lo, dim_hi;
-	if (!get_1d_unpacked_mem_info(lhs->id2ast, elem_width, dim_lo, dim_hi))
+	if (!get_1d_unpacked_mem_info(lhs->id2ast, elem_width, dim_lo, dim_hi, nullptr, &whole_array_desc))
 		return false;
 	lo = std::min(range->range_left, range->range_right);
 	hi = std::max(range->range_left, range->range_right);
@@ -720,8 +748,10 @@ static std::vector<std::unique_ptr<AstNode>> expand_whole_array_assign(AstNode *
 	for (int i = hi; i >= lo; i--) {
 		auto assign = std::make_unique<AstNode>(loc, node->type);
 		assign->children.push_back(make_mem_elem_ref(loc, mem, i));
+		// fe132: left to right from the LSBs
+		int pos = whole_array_desc ? hi - i : i - lo;
 		auto rhs = std::make_unique<AstNode>(loc, AST_IDENTIFIER,
-				make_range(loc, (i - lo + 1) * elem_width - 1, (i - lo) * elem_width));
+				make_range(loc, (pos + 1) * elem_width - 1, pos * elem_width));
 		rhs->str = tmpname;
 		rhs->id2ast = tmp_wire_p;
 		assign->children.push_back(std::move(rhs));
@@ -753,6 +783,7 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 		// node's children list
 		AstNode *mem = nullptr;
 		int elem_width = 0, lo = 0, hi = -1;
+		bool mem_desc = false;
 		if (is_whole_array_assign(child, mem, elem_width, lo, hi)) {
 			auto expanded = expand_whole_array_assign(child, mem, elem_width, lo, hi, procedural);
 			mem->set_attribute(ID::mem2reg, AstNode::mkconst_int(node->location, 1, false));
@@ -792,7 +823,7 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 				child->id2ast->type == AST_MEMORY && !opaque_call &&
 				child->children.size() == 1 && child->children[0] && child->children[0]->type == AST_RANGE &&
 				child->children[0]->range_valid && child->children[0]->range_left != child->children[0]->range_right &&
-				get_1d_unpacked_mem_info(child->id2ast, elem_width, lo, hi)) {
+				get_1d_unpacked_mem_info(child->id2ast, elem_width, lo, hi, nullptr, &mem_desc)) {
 			AstNode *sel_range = child->children[0].get();
 			int sel_lo = std::min(sel_range->range_left, sel_range->range_right);
 			int sel_hi = std::max(sel_range->range_left, sel_range->range_right);
@@ -804,8 +835,8 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 				child->id2ast = nullptr;
 				child->is_signed = false;
 				child->children.clear();
-				for (int j = sel_lo; j <= sel_hi; j++)
-					child->children.push_back(make_mem_elem_ref(loc, smem, j));
+				for (int p = 0; p <= sel_hi - sel_lo; p++)
+					child->children.push_back(make_mem_elem_ref(loc, smem, mem_desc ? sel_hi - p : sel_lo + p));
 				smem->set_attribute(ID::mem2reg, AstNode::mkconst_int(loc, 1, false));
 				// element references are terminal; no recursion needed
 				continue;
@@ -840,7 +871,10 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 						child->is_signed = false;
 						child->children.clear();
 						child->attributes.erase(ID(sv_subarray_row));
-						for (int j = lo1; j <= hi1; j++) {
+						// fe132: left to right from the LSBs
+						bool desc1 = !mem2->dimensions[1].range_swapped;
+						for (int p = 0; p <= hi1 - lo1; p++) {
+							int j = desc1 ? hi1 - p : lo1 + p;
 							auto mr = std::make_unique<AstNode>(loc, AST_MULTIRANGE,
 									std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, k, true)),
 									std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, j, true)));
@@ -863,15 +897,15 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 		// children: first child = low bits)
 		if (child->type == AST_IDENTIFIER && !in_lvalue && !(node_is_assign && i == 0) && child->children.empty() && child->id2ast &&
 				child->id2ast->type == AST_MEMORY && !opaque_call &&
-				get_1d_unpacked_mem_info(child->id2ast, elem_width, lo, hi)) {
+				get_1d_unpacked_mem_info(child->id2ast, elem_width, lo, hi, nullptr, &mem_desc)) {
 			AstNode *mem = child->id2ast;
 			auto loc = child->location;
 			child->type = AST_CONCAT;
 			child->str.clear();
 			child->id2ast = nullptr;
 			child->is_signed = false;
-			for (int j = lo; j <= hi; j++)
-				child->children.push_back(make_mem_elem_ref(loc, mem, j));
+			for (int p = 0; p <= hi - lo; p++)
+				child->children.push_back(make_mem_elem_ref(loc, mem, mem_desc ? hi - p : lo + p));
 			mem->set_attribute(ID::mem2reg, AstNode::mkconst_int(loc, 1, false));
 			// element references are terminal; no recursion needed
 			continue;
@@ -894,10 +928,12 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 			child->str.clear();
 			child->id2ast = nullptr;
 			child->is_signed = false;
+			// fe132: leftmost element in the LSBs, as for a memory above
+			bool pdesc = !dim.range_swapped;
 			for (int j = 0; j < dim.range_width; j++) {
 				auto elem = ref->clone();
 				elem->children.push_back(std::make_unique<AstNode>(loc, AST_RANGE,
-						AstNode::mkconst_int(loc, dim.range_right + j, true)));
+						AstNode::mkconst_int(loc, pdesc ? dim.range_right + dim.range_width - 1 - j : dim.range_right + j, true)));
 				elem->integer = 1;
 				elem->basic_prep = false;
 				child->children.push_back(std::move(elem));
@@ -4106,7 +4142,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			// Probe non-constant sizes on a clone: simplifying an unresolved
 			// size expression (e.g. a struct-member of a parameter) mutates it
 			// in place and breaks the legacy memory-dim path downstream.
-			if (unpacked->type == AST_RANGE && unpacked->children.size() == 1) {
+			// fe132: the size form `[N]' is [0:N-1] (1800-2017 7.4.2),
+			// ascending, though it is rebuilt here as [N-1:0]
+			bool size_form = unpacked->type == AST_RANGE && unpacked->children.size() == 1;
+			if (size_form) {
 				int n = -1;
 				if (unpacked->children[0]->type == AST_CONSTANT) {
 					n = unpacked->children[0]->asInt(true);
@@ -4127,6 +4166,9 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				continue;
 			int w = std::abs(packed->range_left - packed->range_right) + 1;
 			int n = std::abs(unpacked->range_left - unpacked->range_right) + 1;
+			int ulo = std::min(unpacked->range_left, unpacked->range_right);
+			int uhi = std::max(unpacked->range_left, unpacked->range_right);
+			bool udesc = !size_form && !unpacked->range_swapped;
 			// a one-element array port (`logic [7:0] p [1]`, OpenTitan's
 			// `[NumShares]` with NumShares = 1) is flattened too: left as a
 			// wire with its unpacked range, `p[0]` read bit 0 (silently)
@@ -4143,7 +4185,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			port->unpacked_dimensions = 0;
 			if (port->type == AST_MEMORY)
 				port->type = AST_WIRE;
-			rewrite_unpacked_port_refs(this, port->str, w, port);
+			rewrite_unpacked_port_refs(this, port->str, w, port, ulo, uhi, udesc);
 		}
 		// a port that stays a memory (zero-size or non-constant dimension,
 		// e.g. a default configuration with zero requesters) is left a wire

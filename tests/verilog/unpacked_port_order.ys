@@ -1,0 +1,46 @@
+# fe132: an unpacked array connected to a port maps elements left to
+# right (1800-2017 7.6 / 23.3.3), whatever the two index ranges are.  The
+# port side used index*width and the actual lowest-index-in-LSB, so a
+# [2:0] port on a [0:2] actual came out reversed and a [3:1] port wrote
+# off the end (hw-cbmc unpacked_array_output_port1, A3).
+read_verilog -sv <<EOT
+module child(output int o [2:0]);
+  assign o[2] = 100; assign o[1] = 200; assign o[0] = 300;
+endmodule
+module child2(output int o [3:1]);
+  assign o[3] = 100; assign o[2] = 200; assign o[1] = 300;
+endmodule
+module child3(input int i [0:2], output int s);
+  assign s = i[0];
+endmodule
+module child4(output int o [0:2]);
+  assign o[0] = 100; assign o[1] = 200; assign o[2] = 300;
+endmodule
+module top;
+  int a [0:2];
+  int b [0:2];
+  int x [3:1];
+  int p [3:1];
+  int q [1:3];
+  int s0;
+  child c1(.o(a));
+  child2 c2(.o(b));
+  child4 c4(.o(x));
+  assign p[3] = 7; assign p[2] = 8; assign p[1] = 9;
+  assign q = p;
+  child3 c3(.i(p), .s(s0));
+  always @* begin
+    assert (a[0] == 100 && a[1] == 200 && a[2] == 300);
+    assert (b[0] == 100 && b[1] == 200 && b[2] == 300);
+    assert (x[3] == 100 && x[2] == 200 && x[1] == 300);
+    assert (q[1] == 7 && q[3] == 9);
+    assert (s0 == 7);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+chformal -lower
+sat -verify -prove-asserts -show-all

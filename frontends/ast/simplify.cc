@@ -1311,10 +1311,31 @@ static std::unique_ptr<AstNode> normalize_index(AstNode *expr, AstNode *decl_nod
 	return new_expr;
 }
 
+// fe128: the bound of a packed slice that lands on the element's low bits.
+// A slice is kept as written ([l:r]); `+:' / `-:' are parsed into the
+// numeric form [base+w-1:base] / [base:base-w+1] whatever the dimension's
+// direction.  On a descending dimension the low bits are at the numerically
+// smaller bound, on an ascending one (`logic [0:3][7:0]') at the larger, so
+// `b[0 +: 2]' is elements 0..1 = the upper half (1800-2017 7.4.6, 11.5.1).
+// Constant bounds are ordered numerically; non-constant bounds only come
+// from an indexed select, which is already [hi:lo].
+static bool packed_slice_flipped(AstNode *rnode, AstNode *decl_node, int dimension)
+{
+	if (GetSize(rnode->children) != 2 || dimension < decl_node->unpacked_dimensions)
+		return false;
+	if (!decl_node->dimensions[dimension].range_swapped)
+		return false;
+	AstNode *l = rnode->children[0].get(), *r = rnode->children[1].get();
+	if (l->type == AST_CONSTANT && r->type == AST_CONSTANT && l->asInt(true) < r->asInt(true))
+		return false;   // written ascending ([1:2]): the right bound is low
+	return true;
+}
+
 static std::unique_ptr<AstNode> index_offset(std::unique_ptr<AstNode> offset, AstNode *rnode, AstNode *decl_node, int dimension, int &stride)
 {
 	stride /= decl_node->dimensions[dimension].range_width;
-	auto right = normalize_index(rnode->children.back().get(), decl_node, dimension);
+	bool flip = packed_slice_flipped(rnode, decl_node, dimension);
+	auto right = normalize_index((flip ? rnode->children.front() : rnode->children.back()).get(), decl_node, dimension);
 	auto add_offset = stride > 1 ? multiply_by_const(std::move(right), stride) : std::move(right);
 	return offset ? std::make_unique<AstNode>(rnode->location, AST_ADD, std::move(offset), std::move(add_offset)) : std::move(add_offset);
 }
@@ -1333,8 +1354,9 @@ static std::unique_ptr<AstNode> index_msb_offset(std::unique_ptr<AstNode> lsb_of
 	else {
 		// rnode->children.size() == 2
 		// Slice, e.g. s.a[i:j]
-		auto left = normalize_index(rnode->children[0].get(), decl_node, dimension);
-		auto right = normalize_index(rnode->children[1].get(), decl_node, dimension);
+		bool flip = packed_slice_flipped(rnode, decl_node, dimension);
+		auto left = normalize_index(rnode->children[flip ? 1 : 0].get(), decl_node, dimension);
+		auto right = normalize_index(rnode->children[flip ? 0 : 1].get(), decl_node, dimension);
 		add_offset = std::make_unique<AstNode>(loc, AST_SUB, std::move(left), std::move(right));
 		if (stride > 1) {
 			// offset = (msb - lsb + 1)*stride - 1

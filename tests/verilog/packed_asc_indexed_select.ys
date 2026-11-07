@@ -1,0 +1,44 @@
+# fe128: indexed part-selects of an ascending packed array select elements
+# (1800-2017 7.4.6, 11.5.1): on `logic [0:3][7:0] b', `b[0 +: 2]' is
+# elements 0..1, the upper half.  The parser keeps `+:' / `-:' as the
+# numeric range [base+w-1:base] and the multi-dimensional offset took its
+# right bound as the low end, which is wrong on an ascending dimension
+# (hw-cbmc indexed_part_select_packed_array1 p3 p4 p7; stock 0.51 too).
+read_verilog -sv <<EOT
+module top(input [31:0] v, input [15:0] x, input [1:0] i);
+  localparam P = 1;
+  logic [0:3][7:0] b; assign b = v;
+  logic [3:0][7:0] a; assign a = v;
+  logic [4:7][7:0] c; assign c = v;
+  logic [0:3][7:0] e, f, g;
+  always_comb begin e = 0; e[2 -: 2] = x; end
+  always_comb begin f = 0; f[i +: 2] = x; end
+  always_comb begin g = 0; g[P +: 2] = x; end
+  wire [31:0] sh = v << (8*i);
+  wire [31:0] fx = {x, 16'd0} >> (8*i);
+  always @* begin
+    assert (b[0 +: 2] == v[31:16]);
+    assert (b[3 -: 2] == v[15:0]);
+    assert (b[1 +: 1] == v[23:16]);
+    assert (b[P +: 2] == v[23:8]);
+    assert (b[P:P+1] == v[23:8]);
+    assert (b[1:2] == v[23:8]);
+    assert (b[1] == v[23:16]);
+    assert (c[5 +: 2] == v[23:8]);
+    assert (c[7 -: 3] == v[23:0]);
+    assert (e == {8'd0, x, 8'd0});
+    assert (g == {8'd0, x, 8'd0});
+    assert (a[0 +: 2] == v[15:0]);
+    assert (a[3 -: 2] == v[31:16]);
+    assert (a[2:1] == v[23:8]);
+    if (i <= 2) begin
+      assert (b[i +: 2] == sh[31:16]);
+      assert (b[i+1 -: 2] == sh[31:16]);
+      assert (f == fx);
+    end
+  end
+endmodule
+EOT
+proc
+chformal -lower
+sat -verify -prove-asserts -set-def-inputs

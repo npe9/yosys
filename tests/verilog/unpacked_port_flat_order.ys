@@ -1,0 +1,18 @@
+# fe134: a flattened unpacked-array port keeps the leftmost element in the
+# MSBs, the layout of the packed `[0:n-1][w-1:0]' and of slang (yosys-slang),
+# so a netlist written by the fork connects element-for-element to one from
+# another tool.  Element semantics are unchanged (left to right, 7.6 / 23.3.3).
+read_verilog -sv <<EOT
+module t(input logic [3:0] a [2], input logic [3:0] d [3:1], output logic [3:0] z0, z1, dz3, dz1);
+  assign z0 = a[0];
+  assign z1 = a[1];
+  assign dz3 = d[3];
+  assign dz1 = d[1];
+endmodule
+EOT
+hierarchy -top t
+proc
+opt_clean
+# a [2] = [0:1]: a[0] in a[7:4]; d [3:1]: d[3] (leftmost) in d[11:8]
+sat -verify -set a 8'h12 -prove z0 4'h1 -prove z1 4'h2
+sat -verify -set d 12'h345 -prove dz3 4'h3 -prove dz1 4'h5

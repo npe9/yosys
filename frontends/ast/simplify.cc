@@ -749,7 +749,7 @@ static std::vector<std::unique_ptr<AstNode>> expand_whole_array_assign(AstNode *
 		auto assign = std::make_unique<AstNode>(loc, node->type);
 		assign->children.push_back(make_mem_elem_ref(loc, mem, i));
 		// fe132: left to right from the LSBs
-		int pos = whole_array_desc ? hi - i : i - lo;
+		int pos = whole_array_desc ? i - lo : hi - i;   // fe134: rightmost in the LSBs
 		auto rhs = std::make_unique<AstNode>(loc, AST_IDENTIFIER,
 				make_range(loc, (pos + 1) * elem_width - 1, pos * elem_width));
 		rhs->str = tmpname;
@@ -836,7 +836,7 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 				child->is_signed = false;
 				child->children.clear();
 				for (int p = 0; p <= sel_hi - sel_lo; p++)
-					child->children.push_back(make_mem_elem_ref(loc, smem, mem_desc ? sel_hi - p : sel_lo + p));
+					child->children.push_back(make_mem_elem_ref(loc, smem, mem_desc ? sel_lo + p : sel_hi - p));
 				smem->set_attribute(ID::mem2reg, AstNode::mkconst_int(loc, 1, false));
 				// element references are terminal; no recursion needed
 				continue;
@@ -874,7 +874,7 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 						// fe132: left to right from the LSBs
 						bool desc1 = !mem2->dimensions[1].range_swapped;
 						for (int p = 0; p <= hi1 - lo1; p++) {
-							int j = desc1 ? hi1 - p : lo1 + p;
+							int j = desc1 ? lo1 + p : hi1 - p;
 							auto mr = std::make_unique<AstNode>(loc, AST_MULTIRANGE,
 									std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, k, true)),
 									std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, j, true)));
@@ -905,7 +905,7 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 			child->id2ast = nullptr;
 			child->is_signed = false;
 			for (int p = 0; p <= hi - lo; p++)
-				child->children.push_back(make_mem_elem_ref(loc, mem, mem_desc ? hi - p : lo + p));
+				child->children.push_back(make_mem_elem_ref(loc, mem, mem_desc ? lo + p : hi - p));
 			mem->set_attribute(ID::mem2reg, AstNode::mkconst_int(loc, 1, false));
 			// element references are terminal; no recursion needed
 			continue;
@@ -933,7 +933,7 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 			for (int j = 0; j < dim.range_width; j++) {
 				auto elem = ref->clone();
 				elem->children.push_back(std::make_unique<AstNode>(loc, AST_RANGE,
-						AstNode::mkconst_int(loc, pdesc ? dim.range_right + dim.range_width - 1 - j : dim.range_right + j, true)));
+						AstNode::mkconst_int(loc, pdesc ? dim.range_right + j : dim.range_right + dim.range_width - 1 - j, true)));
 				elem->integer = 1;
 				elem->basic_prep = false;
 				child->children.push_back(std::move(elem));
@@ -4168,7 +4168,11 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			int n = std::abs(unpacked->range_left - unpacked->range_right) + 1;
 			int ulo = std::min(unpacked->range_left, unpacked->range_right);
 			int uhi = std::max(unpacked->range_left, unpacked->range_right);
-			bool udesc = !size_form && !unpacked->range_swapped;
+			// fe134: the rightmost element in the LSBs (leftmost in the
+			// MSBs, as the packed `[0:n-1][w-1:0]' and slang lay it out):
+			// position-from-LSB is k-lo on a descending range, hi-k on an
+			// ascending one, which is the udesc=true formula for ascending
+			bool udesc = size_form || unpacked->range_swapped;
 			// a one-element array port (`logic [7:0] p [1]`, OpenTitan's
 			// `[NumShares]` with NumShares = 1) is flattened too: left as a
 			// wire with its unpacked range, `p[0]` read bit 0 (silently)

@@ -6122,17 +6122,19 @@ rvalue:
 		SET_AST_NODE_LOC($$.get(), @1, @1);
 	} |
 	hierarchical_id non_opt_multirange TOK_DOT TOK_ID range {
-		std::string member = *$4;
-		if (!member.empty() && member[0] == '\\')
-			member.erase(0, 1);
-		std::string base = *$1;
-		if (!base.empty() && base[0] == '\\')
-			base.erase(0, 1);
-		$$ = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
-		$$->str = "\\" + base + "." + member;
-		SET_AST_NODE_LOC($$.get(), @1, @4);
+		// fe137: keep the selects.  W[i][j].m is a member select on an
+		// element of a multi-dimensional array; the indices used to be
+		// dropped here (`\\W.m', an implicit wire).  The prefix keeps them
+		// as a MULTIRANGE; a flattened multi-dimensional port linearizes
+		// them, and any other use falls back to the old identifier in
+		// simplify (still flagged sv_degraded, as before).
+		auto member = std::make_unique<AstNode>(@4, AST_IDENTIFIER);
+		member->str = *$4;
 		if ($5)
-			$$->children.push_back(std::move($5));
+			member->children.push_back(std::move($5));
+		$$ = std::make_unique<AstNode>(@$, AST_PREFIX, std::move($2), std::move(member));
+		$$->str = *$1;
+		SET_AST_NODE_LOC($$.get(), @1, @4);
 	} |
 	hierarchical_id non_opt_multirange TOK_DOT TOK_ID TOK_LPAREN TOK_RPAREN {
 		if (!mode->sv)

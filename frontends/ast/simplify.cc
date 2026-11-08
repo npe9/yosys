@@ -371,10 +371,87 @@ static std::unique_ptr<AstNode> unpacked_pos(Location loc, AstNode *ix, int ulo,
 // m[i][j] read out of range (x) with only a warning.
 struct UnpackedDim { int lo, hi; bool asc; };
 
+// fe136/fe137: the row-major linear index of K unpacked indices (one
+// single-index RANGE each in sel[0..K-1]); an index outside its own
+// dimension gives N, out of range of the flat array (7.4.6)
+static std::unique_ptr<AstNode> multidim_linear_index(Location loc, const std::vector<std::unique_ptr<AstNode>> &sel,
+		const std::vector<UnpackedDim> &dims)
+{
+	// L = sum r_d * stride_d, r_d the left-to-right position in dim d
+	std::unique_ptr<AstNode> lin, inr;
+	bool all_const = true, const_oob = false;
+	int lin_c = 0, stride = 1;
+	std::vector<int> strides(dims.size());
+	for (int d = (int)dims.size() - 1; d >= 0; d--) {
+		strides[d] = stride;
+		stride *= dims[d].hi - dims[d].lo + 1;
+	}
+	for (size_t d = 0; d < dims.size(); d++) {
+		AstNode *ix = sel[d]->children[0].get();
+		std::unique_ptr<AstNode> r;
+		if (ix->type == AST_CONSTANT) {
+			int k = ix->asInt(true);
+			if (k < dims[d].lo || k > dims[d].hi)
+				const_oob = true;
+			lin_c += (dims[d].asc ? k - dims[d].lo : dims[d].hi - k) * strides[d];
+			continue;
+		}
+		all_const = false;
+		// an index outside its own dimension must not alias another
+		// element through the linear index (7.4.6: a read returns
+		// the default value, a write is ignored)
+		auto c = std::make_unique<AstNode>(loc, AST_LOGIC_AND,
+				std::make_unique<AstNode>(loc, AST_GE, ix->clone(), AstNode::mkconst_int(loc, dims[d].lo, true)),
+				std::make_unique<AstNode>(loc, AST_LE, ix->clone(), AstNode::mkconst_int(loc, dims[d].hi, true)));
+		inr = inr ? std::make_unique<AstNode>(loc, AST_LOGIC_AND, std::move(inr), std::move(c)) : std::move(c);
+		if (dims[d].asc)
+			r = dims[d].lo ? std::make_unique<AstNode>(loc, AST_SUB, ix->clone(), AstNode::mkconst_int(loc, dims[d].lo, true))
+				       : ix->clone();
+		else
+			r = std::make_unique<AstNode>(loc, AST_SUB, AstNode::mkconst_int(loc, dims[d].hi, true), ix->clone());
+		if (strides[d] != 1)
+			r = std::make_unique<AstNode>(loc, AST_MUL, std::move(r), AstNode::mkconst_int(loc, strides[d], true));
+		lin = lin ? std::make_unique<AstNode>(loc, AST_ADD, std::move(lin), std::move(r)) : std::move(r);
+	}
+	int n_elems = stride;
+	if (const_oob)
+		lin = AstNode::mkconst_int(loc, n_elems, true);    // out of range of the flat array
+	else if (all_const)
+		lin = AstNode::mkconst_int(loc, lin_c, true);
+	else {
+		if (lin_c)
+			lin = std::make_unique<AstNode>(loc, AST_ADD, std::move(lin), AstNode::mkconst_int(loc, lin_c, true));
+		lin = std::make_unique<AstNode>(loc, AST_TERNARY, std::move(inr), std::move(lin),
+				AstNode::mkconst_int(loc, n_elems, true));
+	}
+	return lin;
+}
+
 static void linearize_multidim_port_refs(AstNode *node, const std::string &name, const std::vector<UnpackedDim> &dims)
 {
 	if (!node)
 		return;
+	// fe137: W[i][j].member (the parser keeps the indices as a MULTIRANGE):
+	// the linear index takes the place of the single index of W[i].member,
+	// which the one-dimensional rewrite turns into the member's bits
+	// fewer indices than dimensions (`W[i].member' on [2][2]) selects a
+	// sub-array, which has no members: illegal (slang rejects it too), and
+	// it used to read some element's bits silently
+	if (node->type == AST_PREFIX && node->str == name && node->children.size() == 2 &&
+			node->children[0]->type != AST_MULTIRANGE)
+		node->input_error("A member select on the multi-dimensional unpacked port `%s' must index every "
+				"unpacked dimension.\n", name.c_str() + 1);
+	if (node->type == AST_PREFIX && node->str == name && node->children.size() == 2 &&
+			node->children[0]->type == AST_MULTIRANGE) {
+		auto &sel = node->children[0]->children;
+		bool ok = sel.size() == dims.size();
+		for (size_t d = 0; ok && d < dims.size(); d++)
+			ok = sel[d]->type == AST_RANGE && sel[d]->children.size() == 1;
+		if (!ok)
+			node->input_error("A member select on the multi-dimensional unpacked port `%s' must index every "
+					"unpacked dimension.\n", name.c_str() + 1);
+		node->children[0] = multidim_linear_index(node->location, sel, dims);
+	}
 	if (node->type == AST_IDENTIFIER && node->str == name && !node->children.empty()) {
 		// the selects as a flat list: one MULTIRANGE child or several RANGEs
 		std::vector<std::unique_ptr<AstNode>> sel;
@@ -393,53 +470,7 @@ static void linearize_multidim_port_refs(AstNode *node, const std::string &name,
 			node->input_error("Slice or part-select of an unpacked dimension of the multi-dimensional "
 					"unpacked port `%s' is not supported; index every unpacked dimension.\n", name.c_str() + 1);
 		auto loc = node->location;
-		// L = sum r_d * stride_d, r_d the left-to-right position in dim d
-		std::unique_ptr<AstNode> lin, inr;
-		bool all_const = true, const_oob = false;
-		int lin_c = 0, stride = 1;
-		std::vector<int> strides(dims.size());
-		for (int d = (int)dims.size() - 1; d >= 0; d--) {
-			strides[d] = stride;
-			stride *= dims[d].hi - dims[d].lo + 1;
-		}
-		for (size_t d = 0; d < dims.size(); d++) {
-			AstNode *ix = sel[d]->children[0].get();
-			std::unique_ptr<AstNode> r;
-			if (ix->type == AST_CONSTANT) {
-				int k = ix->asInt(true);
-				if (k < dims[d].lo || k > dims[d].hi)
-					const_oob = true;
-				lin_c += (dims[d].asc ? k - dims[d].lo : dims[d].hi - k) * strides[d];
-				continue;
-			}
-			all_const = false;
-			// an index outside its own dimension must not alias another
-			// element through the linear index (7.4.6: a read returns
-			// the default value, a write is ignored)
-			auto c = std::make_unique<AstNode>(loc, AST_LOGIC_AND,
-					std::make_unique<AstNode>(loc, AST_GE, ix->clone(), AstNode::mkconst_int(loc, dims[d].lo, true)),
-					std::make_unique<AstNode>(loc, AST_LE, ix->clone(), AstNode::mkconst_int(loc, dims[d].hi, true)));
-			inr = inr ? std::make_unique<AstNode>(loc, AST_LOGIC_AND, std::move(inr), std::move(c)) : std::move(c);
-			if (dims[d].asc)
-				r = dims[d].lo ? std::make_unique<AstNode>(loc, AST_SUB, ix->clone(), AstNode::mkconst_int(loc, dims[d].lo, true))
-					       : ix->clone();
-			else
-				r = std::make_unique<AstNode>(loc, AST_SUB, AstNode::mkconst_int(loc, dims[d].hi, true), ix->clone());
-			if (strides[d] != 1)
-				r = std::make_unique<AstNode>(loc, AST_MUL, std::move(r), AstNode::mkconst_int(loc, strides[d], true));
-			lin = lin ? std::make_unique<AstNode>(loc, AST_ADD, std::move(lin), std::move(r)) : std::move(r);
-		}
-		int n_elems = stride;
-		if (const_oob)
-			lin = AstNode::mkconst_int(loc, n_elems, true);    // out of range of the flat array
-		else if (all_const)
-			lin = AstNode::mkconst_int(loc, lin_c, true);
-		else {
-			if (lin_c)
-				lin = std::make_unique<AstNode>(loc, AST_ADD, std::move(lin), AstNode::mkconst_int(loc, lin_c, true));
-			lin = std::make_unique<AstNode>(loc, AST_TERNARY, std::move(inr), std::move(lin),
-					AstNode::mkconst_int(loc, n_elems, true));
-		}
+		auto lin = multidim_linear_index(loc, sel, dims);
 		node->children.push_back(std::make_unique<AstNode>(loc, AST_RANGE, std::move(lin)));
 		for (size_t d = dims.size(); d < sel.size(); d++)
 			node->children.push_back(std::move(sel[d]));
@@ -3469,6 +3500,30 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	}
 	recursion_counter++;
 
+
+	// fe137: a member select after several indices (`W[i][j].m', kept by the
+	// parser as a MULTIRANGE prefix) that no flattened multi-dimensional port
+	// linearized: the identifier the parser used to build, `\\W.m' (an
+	// implicit wire, flagged sv_degraded downstream), so nothing else changes
+	if (type == AST_PREFIX && GetSize(children) == 2 && children[0] && children[0]->type == AST_MULTIRANGE &&
+			children[1] && children[1]->type == AST_IDENTIFIER &&
+			// an array of a packed struct (a memory or a packed
+			// multi-dimensional wire) is resolved by the element member
+			// select below
+			!(current_scope.count(str) && (current_scope.at(str)->type == AST_MEMORY ||
+			  (current_scope.at(str)->type == AST_WIRE && GetSize(current_scope.at(str)->dimensions) > 1)))) {
+		std::string base = str, member = children[1]->str;
+		if (!base.empty() && base[0] == '\\')
+			base.erase(0, 1);
+		if (!member.empty() && member[0] == '\\')
+			member.erase(0, 1);
+		auto mchildren = std::move(children[1]->children);
+		children.clear();
+		for (auto &c : mchildren)
+			children.push_back(std::move(c));
+		type = AST_IDENTIFIER;
+		str = "\\" + base + "." + member;
+	}
 
 	// Class declarations are simulation-only: keep the parsed AST (for
 	// completeness) but never elaborate the body.
@@ -6762,7 +6817,22 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				// one MULTIRANGE child, split downstream into unpacked
 				// index + packed member range (memory read/write paths)
 				auto mr = std::make_unique<AstNode>(location, AST_MULTIRANGE);
-				mr->children.push_back(std::make_unique<AstNode>(location, AST_RANGE, children[0]->clone()));
+				if (children[0]->type == AST_MULTIRANGE) {
+					// fe137: W[i][j].member on a multi-dimensional
+					// array of the struct: one index per array
+					// dimension (the struct's own range is the last)
+					int nidx = GetSize(children[0]->children);
+					if (decl->attributes.count(ID(sv_elem_type)) || nidx != GetSize(decl->dimensions) - 1)
+						input_error("Member select `%s' on an element of `%s' needs one index for each of its %d "
+								"array dimensions (%d given).\n", mname.c_str(), str.c_str() + 1,
+								GetSize(decl->dimensions) - 1, nidx);
+					for (auto &ix : children[0]->children) {
+						if (ix->type != AST_RANGE || GetSize(ix->children) != 1)
+							input_error("Unsupported index on `%s' before member `%s'.\n", str.c_str() + 1, mname.c_str());
+						mr->children.push_back(ix->clone());
+					}
+				} else
+					mr->children.push_back(std::make_unique<AstNode>(location, AST_RANGE, children[0]->clone()));
 				if (msel) {
 					// a select on the member (`.key[j]`, `.data[hi:lo]`,
 					// `.key[j][c +: w]`): the member is indexed like a
@@ -12867,6 +12937,69 @@ static void replace_keep_pattern_keys(AstNode *node, std::unique_ptr<AstNode> ne
 // helper function for AstNode::eval_const_function()
 bool AstNode::replace_variables(std::map<std::string, AstNode::varinfo_t> &variables, AstNode *fcall, bool must_succeed)
 {
+	// fe137: a member of an element of a packed array-of-struct variable
+	// (`w[i].b', `v[i][j].b' with `s_t [1:0][1:0] v'): the element's bits
+	// (one index per array dimension, each direction-aware) plus the
+	// member's offset in the element.  The parser used to drop the indices
+	// of `v[i][j].b', and the dotted-member read below then took the
+	// member of element 0 (silently); `w[i].b' did not evaluate.
+	if (type == AST_PREFIX && GetSize(children) == 2 && children[1]->type == AST_IDENTIFIER && variables.count(str) &&
+			!variables.at(str).mem_width && current_scope.count(str)) {
+		AstNode *decl = current_scope.at(str);
+		std::string mname = children[1]->str;
+		if (!mname.empty() && mname[0] == '\\')
+			mname = mname.substr(1);
+		std::string mkey = str + "." + mname;
+		AstNode *item = current_scope.count(mkey) ? current_scope.at(mkey) : nullptr;
+		std::vector<AstNode *> idx;
+		if (children[0]->type == AST_MULTIRANGE) {
+			for (auto &r : children[0]->children)
+				idx.push_back(r->type == AST_RANGE && GetSize(r->children) == 1 ? r->children[0].get() : nullptr);
+		} else
+			idx.push_back(children[0].get());
+		int ndims = GetSize(decl->dimensions);
+		if (!item || !item->range_valid || decl->type != AST_WIRE || decl->unpacked_dimensions != 0 ||
+				GetSize(idx) != ndims - 1 || !children[1]->children.empty()) {
+			if (!must_succeed)
+				return false;
+			input_error("Unsupported member select on an element of `%s' in constant function\n%s: ...called from here.\n",
+					str.c_str() + 1, fcall->loc_string().c_str());
+		}
+		// element width: the innermost (struct) dimension
+		int elem_w = decl->dimensions.back().range_width, stride = elem_w, elem_lsb = 0;
+		bool oob = false;
+		for (int d = ndims - 2; d >= 0; d--) {
+			AstNode *ix = idx[d];
+			if (!ix || !ix->replace_variables(variables, fcall, must_succeed))
+				return false;
+			while (ix->simplify(true, 1, -1, false)) { }
+			// the index node may have been replaced in place; re-read it
+			if (children[0]->type == AST_MULTIRANGE)
+				ix = children[0]->children[d]->children[0].get();
+			else
+				ix = children[0].get();
+			if (ix->type != AST_CONSTANT) {
+				if (!must_succeed)
+					return false;
+				input_error("Non-constant index\n%s: ... called from here.\n", fcall->loc_string().c_str());
+			}
+			const auto &dm = decl->dimensions[d];
+			int k = ix->asInt(true);
+			int pos = dm.range_swapped ? dm.range_right + dm.range_width - 1 - k : k - dm.range_right;
+			if (pos < 0 || pos >= dm.range_width)
+				oob = true;
+			elem_lsb += pos * stride;
+			stride *= dm.range_width;
+		}
+		const varinfo_t &v = variables.at(str);
+		int offset = elem_lsb + item->range_right - v.offset, width = item->range_left - item->range_right + 1;
+		std::vector<RTLIL::State> new_bits;
+		for (int i = 0; i < width; i++)
+			new_bits.push_back(!oob && offset + i >= 0 && offset + i < GetSize(v.val) ? v.val[offset + i] : RTLIL::State::Sx);
+		auto newNode = mkconst_bits(location, new_bits, item->is_signed);
+		replace_keep_pattern_keys(this, std::move(newNode));
+		return true;
+	}
 	// a member of a struct-typed variable (`cfg.XLEN`, `u.a.b`): the member
 	// was registered in the function's scope when the variable's type was
 	// resolved; read its bits out of the base variable (register v3 D13:

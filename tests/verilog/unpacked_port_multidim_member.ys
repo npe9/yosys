@@ -1,0 +1,79 @@
+# fe137: a member select after several indices (W[i][j].m) used to lose the
+# indices in the parser, which built the identifier `\W.m' (an implicit
+# wire, flagged sv_degraded).  The parser keeps them; on a flattened
+# multi-dimensional port they take the row-major linear index (fe136), with
+# member sub-selects and member writes, and an index outside its own
+# dimension reads x and drops the write (7.4.6).  A local array of the
+# struct (memory or packed multi-dimensional) takes the element member
+# select, also in constant functions.  Values agree with slang (yosys-slang).
+read_verilog -sv <<EOT
+package p;
+  typedef struct packed { logic lock; logic [1:0] mode; logic r; } cfg_t;
+endpackage
+module m8(input p::cfg_t c [2][2], input logic i, input logic [1:0] j,
+  output logic l10, output logic m01h, output logic [1:0] mij, output logic rij, output p::cfg_t o [2][2]);
+  assign l10 = c[1][0].lock;
+  assign m01h = c[0][1].mode[1];
+  assign mij = c[i][j].mode;
+  assign rij = c[i][j].r;
+  always_comb begin
+    o[0][0] = '0; o[0][1] = '0; o[1][0] = '0; o[1][1] = '0;
+    o[1][0].lock = 1'b1;
+    o[i][j].mode = 2'b11;
+  end
+endmodule
+EOT
+hierarchy -top m8
+proc
+memory
+opt
+select -assert-none A:sv_degraded
+# c = {4, 8, a, 1} left to right: c[1][0] = 4'b1010 (lock 1, mode 01, r 0),
+# c[0][1] = 4'b1000 (mode 00)
+sat -verify -set c 16'h48a1 -set i 1 -set j 0 -prove l10 1'b1 -prove m01h 1'b0 -prove mij 2'b01 -prove rij 1'b0 -prove o 16'h00e0
+# j = 2 is out of range of [2]: reads x, the mode write is dropped
+sat -verify -enable_undef -set-def-inputs -set c 16'h48a1 -set i 0 -set j 2 -prove mij 2'bxx -prove rij 1'bx -prove o 16'h0080
+design -reset
+read_verilog -sv <<EOT
+package p; typedef struct packed { logic lock; logic [1:0] mode; logic r; } cfg_t; endpackage
+module l(input logic [3:0] x, output logic y);
+  p::cfg_t loc [2][2];
+  always_comb begin loc[0][0] = x; loc[0][1] = x; loc[1][0] = x; loc[1][1] = x; end
+  assign y = loc[1][0].lock;
+endmodule
+EOT
+hierarchy -top l
+proc
+# a local array of the struct: the element member select indexes it
+select -assert-none A:sv_degraded
+sat -verify -set x 4'h9 -prove y 1'b1
+sat -verify -set x 4'h6 -prove y 1'b0
+design -reset
+# constant functions: a member of an element of a packed array-of-struct
+# local, one or two indices, either direction (v[1][1].b used to read the
+# member of element 0; w[1].b did not evaluate)
+read_verilog -sv <<EOT
+module cf(output logic [3:0] z1, z2, z3, z4);
+  typedef struct packed { logic [1:0] a; logic [1:0] b; } s_t;
+  function automatic logic [3:0] f1(input logic [15:0] a); s_t [1:0] w; w = a; return w[1].b; endfunction
+  function automatic logic [3:0] f2(input logic [15:0] a); s_t [1:0][1:0] v; v = a; return v[1][1].b; endfunction
+  function automatic logic [3:0] f3(input logic [15:0] a); s_t [1:0][1:0] v; v = a; return {v[1][0].a, v[0][1].b}; endfunction
+  function automatic logic [3:0] f4(input logic [15:0] a); s_t [0:1][1:0] v; v = a; return {v[0][1].a, v[0][0].b}; endfunction
+  assign z1 = f1(16'h1234);
+  assign z2 = f2(16'h1234);
+  assign z3 = f3(16'h1234);
+  assign z4 = f4(16'h1234);
+endmodule
+EOT
+proc
+# 16'h1234: w[1] = 4'h3 (b 11); v[1][1] = 1 (b 01); v[1][0] = 2 (a 00),
+# v[0][1] = 3 (b 11); on [0:1]: v[0] = 8'h12, v[0][1] = 1 (a 00), v[0][0] = 2 (b 10)
+sat -verify -prove z1 4'h3 -prove z2 4'h1 -prove z3 4'h3 -prove z4 4'h2
+design -reset
+logger -expect error "A member select on the multi-dimensional unpacked port `c' must index every unpacked dimension" 1
+read_verilog -sv <<EOT
+package p; typedef struct packed { logic lock; logic [1:0] mode; logic r; } cfg_t; endpackage
+module e(input p::cfg_t c [2][2], output logic y);
+  assign y = c[1].lock;
+endmodule
+EOT

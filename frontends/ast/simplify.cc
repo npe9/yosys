@@ -9278,11 +9278,79 @@ skip_memory_read:;
 				found_nontrivial_member = true;
 		}
 
+		// A member with a non-constant select (`{e[a], w[a]} = x`): the
+		// dynamic lvalue expansion below only sees a whole identifier on the
+		// left, so the assignment never wrote its members. Split it, and each
+		// member then expands by itself (OpenTitan otp_ctrl_ecc_reg).
+		std::function<bool(const AstNode *)> nonconst_select = [&](const AstNode *n) {
+			if (!n)
+				return false;
+			if (n->type == AST_CONCAT) {
+				for (auto &c : n->children)
+					if (nonconst_select(c.get()))
+						return true;
+				return false;
+			}
+			if (n->type != AST_IDENTIFIER)
+				return false;
+			// a memory's word select is handled below, as a whole word
+			const AstNode *decl = n->id2ast;
+			if (!decl && current_scope.count(n->str))
+				decl = current_scope.at(n->str);
+			if (decl && decl->type == AST_MEMORY)
+				return false;
+			std::function<bool(const AstNode *)> nonconst_range = [&](const AstNode *r) {
+				if (r->type == AST_MULTIRANGE) {
+					for (auto &c : r->children)
+						if (nonconst_range(c.get()))
+							return true;
+					return false;
+				}
+				if (r->type != AST_RANGE)
+					return false;
+				for (auto &b : r->children)
+					if (b && b->type != AST_CONSTANT)
+						return true;
+				return false;
+			};
+			for (auto &c : n->children)
+				if (c && nonconst_range(c.get()))
+					return true;
+			return false;
+		};
+		bool nonconst_member = nonconst_select(children[0].get());
+		if (nonconst_member)
+			found_nontrivial_member = true;
+		// detectSignWidth takes a non-constant select for one bit; size such a
+		// member as its dynamic expansion will
+		std::function<int(AstNode *)> lvalue_width = [&](AstNode *n) -> int {
+			if (n->type == AST_CONCAT) {
+				int sum = 0;
+				for (auto &c : n->children)
+					sum += lvalue_width(c.get());
+				return sum;
+			}
+			if (nonconst_select(n)) {
+				auto probe = n->clone();
+				while (probe->simplify(true, stage, -1, false)) { }
+				int w = 1;
+				if (probe->type != AST_IDENTIFIER || probe->children.empty() ||
+						!try_determine_range_width(probe->children[0].get(), w))
+					n->input_error("Unsupported non-constant select in a concatenation on the left of an assignment.\n");
+				return w;
+			}
+			int w = -1;
+			bool sign = true;
+			n->detectSignWidth(w, sign);
+			return w;
+		};
+
 		if (found_nontrivial_member)
 		{
 			newNode = std::make_unique<AstNode>(location, AST_BLOCK);
 
-			auto wire_tmp_owned = std::make_unique<AstNode>(location, AST_WIRE, std::make_unique<AstNode>(location, AST_RANGE, mkconst_int(location, width_hint-1, true), mkconst_int(location, 0, true)));
+			int tmp_width = nonconst_member ? std::max(width_hint, lvalue_width(children[0].get())) : width_hint;
+			auto wire_tmp_owned = std::make_unique<AstNode>(location, AST_WIRE, std::make_unique<AstNode>(location, AST_RANGE, mkconst_int(location, tmp_width-1, true), mkconst_int(location, 0, true)));
 			auto wire_tmp = wire_tmp_owned.get();
 			wire_tmp->str = stringf("$splitcmplxassign$%s:%d$%d", RTLIL::encode_filename(*location.begin.filename), location.begin.line, autoidx++);
 			current_scope[wire_tmp->str] = wire_tmp;
@@ -9303,7 +9371,10 @@ skip_memory_read:;
 			{
 				int child_width_hint = -1;
 				bool child_sign_hint = true;
-				child->detectSignWidth(child_width_hint, child_sign_hint);
+				if (nonconst_member)
+					child_width_hint = lvalue_width(child.get());
+				else
+					child->detectSignWidth(child_width_hint, child_sign_hint);
 
 				auto rhs = wire_tmp_id->clone();
 				rhs->children.push_back(std::make_unique<AstNode>(location, AST_RANGE, AstNode::mkconst_int(location, cursor+child_width_hint-1, true), AstNode::mkconst_int(location, cursor, true)));

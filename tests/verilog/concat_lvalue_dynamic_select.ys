@@ -1,0 +1,36 @@
+# A concatenation on the left of a procedural assignment with a non-constant
+# select in a member (IEEE 1800-2017 10.8, `{e[a], w[a]} = x`): each member
+# takes its bits. The dynamic lvalue expansion only handles a whole identifier
+# on the left, so the assignment never wrote its members, and the members' reads
+# ended up driving the right side (OpenTitan otp_ctrl_ecc_reg:
+# `{ecc_d[addr_i], data_d[addr_i]} = ecc_enc`).
+read_verilog -sv <<EOT
+module top (input logic [1:0] a, input logic [11:0] enc, input logic [3:0] nar,
+	output logic [7:0] w, output logic [3:0] e,
+	output logic [2:0][7:0] wc, output logic [2:0][3:0] ec,
+	output logic [15:0] nw, output logic [3:0] ne, output logic [7:0] q1,
+	output logic [7:0] t, output logic [3:0] u, output logic [3:0] mq, output logic [1:0] mb);
+	// a bit select and an indexed part select
+	always_comb begin w = '0; e = '0; {e[a], w[a +: 2]} = enc; end
+	// elements of packed arrays: the member width is the element's
+	always_comb begin wc = '0; ec = '0; {ec[a], wc[a]} = enc; end
+	// nested, and a constant member
+	always_comb begin nw = '0; ne = '0; q1 = '0; {{ne[a], nw[a +: 4]}, q1[3:0]} = {nar, enc}; q1[7:4] = 4'h5; end
+	// a right side narrower than the left is extended
+	always_comb begin t = '0; u = '0; {t[a +: 6], u} = nar; end
+	// beside a memory word, which is a whole word wide
+	logic [3:0] m [0:3];
+	always_comb begin
+		for (int i = 0; i < 4; i++) m[i] = '0;
+		mb = '0;
+		{m[a], mb[a]} = 5'b10110;
+		mq = m[1];
+	end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+# The members must not drive enc: a contradiction would make the proof vacuous
+sat -verify -set a 2'd1 -set enc 12'hab5 -set nar 4'h9
+sat -verify -prove-asserts -set a 2'd1 -set enc 12'hab5 -set nar 4'h9 -prove w 8'h02 -prove e 4'b0010 -prove wc 24'h00b500 -prove ec 12'h0a0 -prove nw 16'h0016 -prove ne 4'h0 -prove q1 8'h55 -prove t 8'h00 -prove u 4'h9 -prove mq 4'hb -prove mb 2'b00

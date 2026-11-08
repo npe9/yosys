@@ -1,0 +1,45 @@
+# fe135: an element select with a packed sub-select on a flattened
+# unpacked-array port (`q[i][a:b]', `q[i][b]', `q[i][j +: 2]') parses as one
+# MULTIRANGE; it used to skip the element offset, so every element read the
+# flat wire's low word (silently).  The sub-select bounds are packed indices
+# of the element (ascending and offset packed ranges too), and the lvalue
+# side writes the selected element.  Values agree with slang (yosys-slang).
+read_verilog -sv <<EOT
+module t(input logic [3:0] q[3], input logic [0:3] u[2], input logic [8:5] f[2], input logic [1:0] j,
+  output logic [1:0] a0, a1, a2, output logic b1, output logic [3:0] w1,
+  output logic c1, output logic [1:0] ua, output logic fb, output logic [1:0] fs, output logic [1:0] px);
+  assign a0 = q[0][2:1];
+  assign a1 = q[1][2:1];
+  assign a2 = q[2][2:1];
+  assign b1 = q[1][3];
+  assign w1 = q[1][3:0];
+  assign c1 = q[2][j];
+  assign ua = u[1][0:1];
+  assign fb = f[0][8];
+  assign fs = f[1][6:5];
+  assign px = q[0][j +: 2];
+endmodule
+EOT
+hierarchy -top t
+proc
+opt_clean
+# q = {c, 6, a}: q[0] = 4'b1100, q[1] = 4'b0110, q[2] = 4'b1010
+sat -verify -set q 12'hc6a -prove a0 2'b10 -prove a1 2'b11 -prove a2 2'b01 -prove b1 1'b0 -prove w1 4'h6
+sat -verify -set q 12'hc6a -set j 2 -prove c1 1'b0 -prove px 2'b11
+# u[1] = 4'hc on [0:3]: u[1][0:1] = 2'b11; f[0] = 4'h9 on [8:5], f[1] = 4'h3
+sat -verify -set u 8'h5c -prove ua 2'b11
+sat -verify -set f 8'h93 -prove fb 1'b1 -prove fs 2'b11
+design -reset
+read_verilog -sv <<EOT
+module l(input logic [1:0] x, input logic y, output logic [3:0] o[2]);
+  always_comb begin
+    o[0] = 4'h0; o[1] = 4'h0;
+    o[1][2:1] = x;
+    o[0][3] = y;
+  end
+endmodule
+EOT
+hierarchy -top l
+proc
+opt_clean
+sat -verify -set x 2'b11 -set y 1 -prove o 8'h86

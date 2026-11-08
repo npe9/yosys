@@ -362,10 +362,12 @@ static std::unique_ptr<AstNode> unpacked_pos(Location loc, AstNode *ix, int ulo,
 }
 
 static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, int w, AstNode *port_node,
-		int ulo = 0, int uhi = 0, bool udesc = false)
+		int ulo = 0, int uhi = 0, bool udesc = false, int pl = -1, int pr = 0, bool pasc = false)
 {
 	if (!node)
 		return;
+	if (pl < 0)
+		pl = w - 1;   // packed range not given: [w-1:0]
 	// Element member select on a flattened struct-array port:
 	// W[idx].member -> W[idx][member_bits] so the identifier branch below
 	// can turn it into a part-select on the wide wire.
@@ -398,6 +400,19 @@ static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, i
 				node->type = AST_IDENTIFIER;
 			}
 		}
+	}
+	// fe135: an element select with a packed sub-select, `p[i][a:b]' or
+	// `p[i][b]', parses as one MULTIRANGE child; it used to miss the branch
+	// below, so the element index was dropped and the sub-select read the
+	// flat wire's low word (every element read the same bits, silently).
+	// Split it into the two-range shape the branch works on.
+	if (node->type == AST_IDENTIFIER && node->str == name && node->children.size() == 1 &&
+			node->children[0]->type == AST_MULTIRANGE && node->children[0]->children.size() == 2 &&
+			node->children[0]->children[0]->type == AST_RANGE && node->children[0]->children[1]->type == AST_RANGE) {
+		auto mr = std::move(node->children[0]);
+		node->children.clear();
+		node->children.push_back(std::move(mr->children[0]));
+		node->children.push_back(std::move(mr->children[1]));
 	}
 	if (node->type == AST_IDENTIFIER && node->str == name && !node->children.empty() &&
 			node->children[0]->type == AST_RANGE) {
@@ -432,22 +447,43 @@ static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, i
 		}
 		node->children.erase(node->children.begin());
 		std::unique_ptr<AstNode> left, right;
-		if (!node->children.empty() && node->children[0]->type == AST_RANGE && node->children[0]->range_valid) {
-			// word select plus packed sub-select [a:b]
-			int a = node->children[0]->range_left, b = node->children[0]->range_right;
+		if (!node->children.empty() && node->children[0]->type == AST_RANGE &&
+				(node->children[0]->range_valid || !node->children[0]->children.empty())) {
+			// word select plus packed sub-select [a:b] or bit select [a].
+			// fe135: the bounds need not be folded yet (constant children
+			// without range_valid, or expressions), and they are packed
+			// indices: position-from-LSB is a - R on a descending packed
+			// range, L - a on an ascending one (pasc, L/R normalized
+			// left >= right as simplify leaves them).  The full-word case
+			// [w-1:0] used to produce the one-bit [off:off].
+			auto sub = std::move(node->children[0]);
 			node->children.erase(node->children.begin());
-			if (a == w - 1 && b == 0) {
-				left = off->clone();
-				right = std::move(off);
-			} else if (off->type == AST_CONSTANT) {
-				left = AstNode::mkconst_int(loc, off->integer + a, true);
-				right = AstNode::mkconst_int(loc, off->integer + b, true);
+			auto ppos = [&](std::unique_ptr<AstNode> ix) -> std::unique_ptr<AstNode> {
+				if (ix->type == AST_CONSTANT) {
+					int k = ix->asInt(true);
+					return AstNode::mkconst_int(loc, pasc ? pl - k : k - pr, true);
+				}
+				if (pasc)
+					return std::make_unique<AstNode>(loc, AST_SUB, AstNode::mkconst_int(loc, pl, true), std::move(ix));
+				if (pr)
+					return std::make_unique<AstNode>(loc, AST_SUB, std::move(ix), AstNode::mkconst_int(loc, pr, true));
+				return ix;
+			};
+			std::unique_ptr<AstNode> pa, pb;
+			if (sub->range_valid) {
+				pa = ppos(AstNode::mkconst_int(loc, sub->range_swapped ? sub->range_right : sub->range_left, true));
+				pb = ppos(AstNode::mkconst_int(loc, sub->range_swapped ? sub->range_left : sub->range_right, true));
 			} else {
-				left = std::make_unique<AstNode>(loc, AST_ADD, off->clone(), AstNode::mkconst_int(loc, a, true));
-				right = std::move(off);
-				if (b != 0)
-					right = std::make_unique<AstNode>(loc, AST_ADD, std::move(right), AstNode::mkconst_int(loc, b, true));
+				pa = ppos(sub->children[0]->clone());
+				pb = ppos((sub->children.size() > 1 ? sub->children[1] : sub->children[0])->clone());
 			}
+			auto add = [&](std::unique_ptr<AstNode> p) -> std::unique_ptr<AstNode> {
+				if (off->type == AST_CONSTANT && p->type == AST_CONSTANT)
+					return AstNode::mkconst_int(loc, off->integer + p->asInt(true), true);
+				return std::make_unique<AstNode>(loc, AST_ADD, off->clone(), std::move(p));
+			};
+			left = add(std::move(pa));
+			right = add(std::move(pb));
 		} else {
 			if (off->type == AST_CONSTANT) {
 				left = AstNode::mkconst_int(loc, off->integer + w - 1, true);
@@ -463,9 +499,9 @@ static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, i
 		node->basic_prep = false;
 	}
 	for (auto &child : node->children)
-		rewrite_unpacked_port_refs(child.get(), name, w, port_node, ulo, uhi, udesc);
+		rewrite_unpacked_port_refs(child.get(), name, w, port_node, ulo, uhi, udesc, pl, pr, pasc);
 	for (auto &attr : node->attributes)
-		rewrite_unpacked_port_refs(attr.second.get(), name, w, port_node, ulo, uhi, udesc);
+		rewrite_unpacked_port_refs(attr.second.get(), name, w, port_node, ulo, uhi, udesc, pl, pr, pasc);
 }
 
 // Information about a plain 1-D unpacked memory (packed range + exactly one
@@ -4166,6 +4202,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				continue;
 			int w = std::abs(packed->range_left - packed->range_right) + 1;
 			int n = std::abs(unpacked->range_left - unpacked->range_right) + 1;
+			// fe135: the packed range, for sub-selects of an element
+			int ppl = std::max(packed->range_left, packed->range_right);
+			int ppr = std::min(packed->range_left, packed->range_right);
+			bool ppasc = packed->range_swapped;
 			int ulo = std::min(unpacked->range_left, unpacked->range_right);
 			int uhi = std::max(unpacked->range_left, unpacked->range_right);
 			// fe134: the rightmost element in the LSBs (leftmost in the
@@ -4189,7 +4229,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			port->unpacked_dimensions = 0;
 			if (port->type == AST_MEMORY)
 				port->type = AST_WIRE;
-			rewrite_unpacked_port_refs(this, port->str, w, port, ulo, uhi, udesc);
+			rewrite_unpacked_port_refs(this, port->str, w, port, ulo, uhi, udesc, ppl, ppr, ppasc);
 		}
 		// a port that stays a memory (zero-size or non-constant dimension,
 		// e.g. a default configuration with zero requesters) is left a wire

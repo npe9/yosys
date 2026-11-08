@@ -3065,9 +3065,22 @@ static bool is_autonamed_block(const std::string &str) {
 	return str.rfind(".$") == last_dot; // e.g., `\foo.bar.$fordecl_block$1`
 }
 
+// whether an identifier under node, outside of skip, names target
+static bool referenced_outside(const AstNode *node, const AstNode *skip, const std::string &target)
+{
+	if (node == skip)
+		return false;
+	if (node->type == AST_IDENTIFIER && node->str == target)
+		return true;
+	for (auto &child : node->children)
+		if (referenced_outside(child.get(), skip, target))
+			return true;
+	return false;
+}
+
 // check a procedural block for auto-nosync markings, remove them, and add
 // nosync to local variables as necessary
-static void check_auto_nosync(AstNode *node)
+static void check_auto_nosync(AstNode *node, const AstNode *mod)
 {
 	std::vector<RTLIL::IdString> attrs_to_drop;
 	for (const auto& elem : node->attributes) {
@@ -3090,6 +3103,13 @@ static void check_auto_nosync(AstNode *node)
 		if (ident_usage != IdentUsage::Assigned)
 			continue;
 
+		// a named block's local can be read from outside the block by its
+		// hierarchical name, and then must keep its value
+		size_t last_dot = wire_name.rfind('.');
+		bool autonamed = last_dot != std::string::npos && is_autonamed_block(wire_name.substr(0, last_dot));
+		if (!autonamed && referenced_outside(mod, node, wire_name))
+			continue;
+
 		// mark the wire with `nosync`
 		AstNode *wire = it->second;
 		log_assert(wire->type == AST_WIRE);
@@ -3104,7 +3124,7 @@ static void check_auto_nosync(AstNode *node)
 
 	// check local variables in any nested blocks
 	for (auto& child : node->children)
-		check_auto_nosync(child.get());
+		check_auto_nosync(child.get(), mod);
 }
 
 class PackageImporter {
@@ -4914,7 +4934,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		for (auto& child : children)
 			if (child && child->type == AST_ALWAYS &&
 					child->attributes.count(ID::always_comb))
-				check_auto_nosync(child.get());
+				check_auto_nosync(child.get(), this);
 	}
 
 	// create name resolution entries for all objects with names
@@ -8661,9 +8681,9 @@ skip_for_unroll:
 		if (!get_bool_attribute(ID(sv_noexpand)))
 			expand_genblock(str + ".");
 
-		// if this is an autonamed block is in an always_comb
-		if (current_always && current_always->attributes.count(ID::always_comb)
-				&& is_autonamed_block(str))
+		// if this block is in an always_comb (check_auto_nosync sorts out
+		// a named block's locals, which a hierarchical name could read)
+		if (current_always && current_always->attributes.count(ID::always_comb))
 			// track local variables in this block so we can consider adding
 			// nosync once the block has been fully elaborated
 			for (auto& child : children)

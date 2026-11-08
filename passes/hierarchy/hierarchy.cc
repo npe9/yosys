@@ -765,6 +765,25 @@ void hierarchy_worker(RTLIL::Design *design, std::set<RTLIL::Module*, IdString::
 	}
 }
 
+// The modules elaborated as they stand: a cell with parameter overrides is about
+// to be replaced by a derived module, so the module it names is only a template,
+// with its parameters' defaults. Those need not be legal (`parameter N = -1`
+// that every instance overrides, IEEE 1800-2017 23.10), and its contents are not
+// part of the design.
+static void elaborated_modules(RTLIL::Design *design, pool<RTLIL::Module*> &seen, RTLIL::Module *mod)
+{
+	if (!seen.insert(mod).second)
+		return;
+	for (auto cell : mod->cells()) {
+		std::string celltype = cell->type.str();
+		if (celltype.compare(0, strlen("$array:"), "$array:") == 0)
+			celltype = basic_cell_type(celltype);
+		RTLIL::Module *sub = design->module(celltype);
+		if (sub && (cell->parameters.empty() || sub->get_blackbox_attribute()))
+			elaborated_modules(design, seen, sub);
+	}
+}
+
 void hierarchy_clean(RTLIL::Design *design, RTLIL::Module *top, bool purge_lib)
 {
 	std::set<RTLIL::Module*, IdString::compare_ptr_by_name<Module>> used;
@@ -1266,7 +1285,12 @@ struct HierarchyPass : public Pass {
 			}
 
 			pool<RTLIL::Module*> used_pool(used_modules.begin(), used_modules.end());
+			pool<RTLIL::Module*> elaborated;
+			if (top_mod != NULL)
+				elaborated_modules(design, elaborated, top_mod);
 			for (auto module : used_modules) {
+				if (top_mod != NULL && !elaborated.count(module))
+					continue;
 				if (expand_module(design, module, flag_check, flag_simcheck, flag_smtcheck, libdirs, top_mod ? &used_pool : nullptr))
 					did_something = true;
 			}

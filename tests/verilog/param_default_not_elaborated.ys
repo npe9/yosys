@@ -1,0 +1,19 @@
+# A parameter default that every instance overrides is not elaborated (IEEE
+# 1800-2017 23.10): M = -1 made leaf's N 2**32-1 and its loop never ended
+# (pulp-platform stream_arbiter: `parameter integer N_INP = -1`).
+read_verilog -sv <<EOT
+module leaf #(parameter int unsigned N = 2)(output logic [N-1:0] y);
+  for (genvar i = 0; i < N; i++) assign y[i] = 1'b1;
+endmodule
+module mid #(parameter integer M = -1)(output logic [M-1:0] y);
+  leaf #(.N(M)) l(.y(y));
+endmodule
+module top(output logic [1:0] o);
+  mid #(.M(2)) u(.y(o));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt_clean
+sat -verify -prove o 2'b11

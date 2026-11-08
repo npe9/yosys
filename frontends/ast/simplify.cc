@@ -1287,6 +1287,13 @@ static int size_packed_struct(AstNode *snode, int base_offset)
 		}
 		else {
 			log_assert(node->type == AST_STRUCT_ITEM);
+			// The range children are the member's whole shape. A member
+			// grafted from an already simplified typedef (a package's
+			// `typedef logic [63:0] w64_t` used as `w64_t data`) still
+			// carries that wire's dimensions; adding to them made
+			// `[64][64]`, and `s.data[31:24]` was scaled by 64.
+			if (node->children.size() > 0 && (node->children[0]->type == AST_RANGE || node->children[0]->type == AST_MULTIRANGE))
+				node->dimensions.clear();
 			if (node->children.size() > 0 && node->children[0]->type == AST_RANGE) {
 				// member width e.g. bit [7:0] a
 				width = range_width(node, node->children[0].get());

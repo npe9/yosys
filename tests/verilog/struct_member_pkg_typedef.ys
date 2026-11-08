@@ -1,0 +1,23 @@
+# A packed struct member declared with another typedef of the same package
+# (IEEE 1800-2017 7.2.1): `s.data[31:24]` selects bits 31:24 of the member.
+# The member kept the typedef wire's dimensions and gained its own range
+# on top, so the select was scaled by the member width (prim_sha2_pad).
+read_verilog -sv <<EOT
+package pk;
+	typedef logic [15:0] w16_t;
+	typedef struct packed { w16_t data; logic [3:0] mask; } f_t;
+	typedef struct packed { w16_t [1:0] d2; logic [3:0] mask; } g_t;
+endpackage
+module top (input pk::f_t fi, input pk::g_t gi,
+	output logic [3:0] o_hi, output logic [7:0] o_mid, output logic o_bit,
+	output logic [15:0] o_el, output logic [3:0] o_elsl);
+	assign o_hi = fi.data[15:12];
+	assign o_mid = fi.data[11:4];
+	assign o_bit = fi.data[0];
+	assign o_el = gi.d2[1];
+	assign o_elsl = gi.d2[0][7:4];
+endmodule
+EOT
+hierarchy -top top
+proc
+sat -verify -prove-asserts -set fi 20'hc95a3 -set gi 36'h12345678f -prove o_hi 4'hc -prove o_mid 8'h95 -prove o_bit 1'b0 -prove o_el 16'h1234 -prove o_elsl 4'h7

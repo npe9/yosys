@@ -361,6 +361,97 @@ static std::unique_ptr<AstNode> unpacked_pos(Location loc, AstNode *ix, int ulo,
 	return ix->clone();
 }
 
+// fe136: a port with K >= 2 unpacked dimensions (`logic [7:0] m [2][3]') is
+// flattened as the one-dimensional [0:N-1] of its elements in row-major,
+// left-to-right order (1800-2017 7.4.5: the rightmost dimension varies
+// fastest), so the leftmost element is in the MSBs as for one dimension
+// (fe134).  A reference with K indices becomes one with the linear index,
+// and keeps any packed sub-select after them, for the one-dimensional
+// rewrite below.  It used to be left a plain wire of the element width:
+// m[i][j] read out of range (x) with only a warning.
+struct UnpackedDim { int lo, hi; bool asc; };
+
+static void linearize_multidim_port_refs(AstNode *node, const std::string &name, const std::vector<UnpackedDim> &dims)
+{
+	if (!node)
+		return;
+	if (node->type == AST_IDENTIFIER && node->str == name && !node->children.empty()) {
+		// the selects as a flat list: one MULTIRANGE child or several RANGEs
+		std::vector<std::unique_ptr<AstNode>> sel;
+		if (node->children.size() == 1 && node->children[0]->type == AST_MULTIRANGE) {
+			for (auto &c : node->children[0]->children)
+				sel.push_back(std::move(c));
+		} else {
+			for (auto &c : node->children)
+				sel.push_back(std::move(c));
+		}
+		node->children.clear();
+		bool ok = sel.size() >= dims.size();
+		for (size_t d = 0; ok && d < dims.size(); d++)
+			ok = sel[d]->type == AST_RANGE && sel[d]->children.size() == 1;
+		if (!ok)
+			node->input_error("Slice or part-select of an unpacked dimension of the multi-dimensional "
+					"unpacked port `%s' is not supported; index every unpacked dimension.\n", name.c_str() + 1);
+		auto loc = node->location;
+		// L = sum r_d * stride_d, r_d the left-to-right position in dim d
+		std::unique_ptr<AstNode> lin, inr;
+		bool all_const = true, const_oob = false;
+		int lin_c = 0, stride = 1;
+		std::vector<int> strides(dims.size());
+		for (int d = (int)dims.size() - 1; d >= 0; d--) {
+			strides[d] = stride;
+			stride *= dims[d].hi - dims[d].lo + 1;
+		}
+		for (size_t d = 0; d < dims.size(); d++) {
+			AstNode *ix = sel[d]->children[0].get();
+			std::unique_ptr<AstNode> r;
+			if (ix->type == AST_CONSTANT) {
+				int k = ix->asInt(true);
+				if (k < dims[d].lo || k > dims[d].hi)
+					const_oob = true;
+				lin_c += (dims[d].asc ? k - dims[d].lo : dims[d].hi - k) * strides[d];
+				continue;
+			}
+			all_const = false;
+			// an index outside its own dimension must not alias another
+			// element through the linear index (7.4.6: a read returns
+			// the default value, a write is ignored)
+			auto c = std::make_unique<AstNode>(loc, AST_LOGIC_AND,
+					std::make_unique<AstNode>(loc, AST_GE, ix->clone(), AstNode::mkconst_int(loc, dims[d].lo, true)),
+					std::make_unique<AstNode>(loc, AST_LE, ix->clone(), AstNode::mkconst_int(loc, dims[d].hi, true)));
+			inr = inr ? std::make_unique<AstNode>(loc, AST_LOGIC_AND, std::move(inr), std::move(c)) : std::move(c);
+			if (dims[d].asc)
+				r = dims[d].lo ? std::make_unique<AstNode>(loc, AST_SUB, ix->clone(), AstNode::mkconst_int(loc, dims[d].lo, true))
+					       : ix->clone();
+			else
+				r = std::make_unique<AstNode>(loc, AST_SUB, AstNode::mkconst_int(loc, dims[d].hi, true), ix->clone());
+			if (strides[d] != 1)
+				r = std::make_unique<AstNode>(loc, AST_MUL, std::move(r), AstNode::mkconst_int(loc, strides[d], true));
+			lin = lin ? std::make_unique<AstNode>(loc, AST_ADD, std::move(lin), std::move(r)) : std::move(r);
+		}
+		int n_elems = stride;
+		if (const_oob)
+			lin = AstNode::mkconst_int(loc, n_elems, true);    // out of range of the flat array
+		else if (all_const)
+			lin = AstNode::mkconst_int(loc, lin_c, true);
+		else {
+			if (lin_c)
+				lin = std::make_unique<AstNode>(loc, AST_ADD, std::move(lin), AstNode::mkconst_int(loc, lin_c, true));
+			lin = std::make_unique<AstNode>(loc, AST_TERNARY, std::move(inr), std::move(lin),
+					AstNode::mkconst_int(loc, n_elems, true));
+		}
+		node->children.push_back(std::make_unique<AstNode>(loc, AST_RANGE, std::move(lin)));
+		for (size_t d = dims.size(); d < sel.size(); d++)
+			node->children.push_back(std::move(sel[d]));
+		node->integer = 0;
+		node->basic_prep = false;
+	}
+	for (auto &child : node->children)
+		linearize_multidim_port_refs(child.get(), name, dims);
+	for (auto &attr : node->attributes)
+		linearize_multidim_port_refs(attr.second.get(), name, dims);
+}
+
 static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, int w, AstNode *port_node,
 		int ulo = 0, int uhi = 0, bool udesc = false, int pl = -1, int pr = 0, bool pasc = false)
 {
@@ -4164,6 +4255,45 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				continue;
 			}
 			AstNode *port = child.get();
+			// fe136: K >= 2 unpacked dimensions: references take the
+			// row-major linear index, and the port continues below as the
+			// size form [N] (ascending: the leftmost element in the MSBs)
+			if (port->children.size() >= 2 && port->children[1] && port->children[1]->type == AST_MULTIRANGE &&
+					port->children[0] && (port->children[0]->type == AST_RANGE ||
+					// a typedef'd element: stage 1 resolves the type and
+					// then flattens the [N] form as a one-dimensional port
+					(port->children[0]->type == AST_WIRETYPE && port->attributes.count(ID(sv_port_unpacked)))) &&
+					port->children[1]->children.size() >= 2) {
+				AstNode *mr = port->children[1].get();
+				std::vector<UnpackedDim> dims;
+				long long n = 1;
+				for (auto &r : mr->children) {
+					if (r->type != AST_RANGE || r->children.empty() || r->children.size() > 2)
+						port->input_error("Unsupported unpacked dimension on port `%s'.\n", port->str.c_str() + 1);
+					if (r->children.size() == 1) {
+						auto probe = r->children[0]->clone();
+						while (probe->simplify(true, 1, -1, false)) { }
+						if (probe->type != AST_CONSTANT || probe->asInt(true) < 1)
+							port->input_error("Non-constant or empty unpacked dimension on the multi-dimensional "
+									"unpacked port `%s' is not supported.\n", port->str.c_str() + 1);
+						dims.push_back({0, (int)probe->asInt(true) - 1, true});
+					} else {
+						auto probe = r->clone();
+						while (!probe->range_valid && probe->simplify(true, 1, -1, false)) { }
+						if (!probe->range_valid)
+							port->input_error("Non-constant unpacked dimension on the multi-dimensional "
+									"unpacked port `%s' is not supported.\n", port->str.c_str() + 1);
+						dims.push_back({std::min(probe->range_left, probe->range_right),
+								std::max(probe->range_left, probe->range_right), probe->range_swapped});
+					}
+					n *= dims.back().hi - dims.back().lo + 1;
+					if (n > (1 << 20))
+						port->input_error("Unpacked port `%s' is too large to flatten.\n", port->str.c_str() + 1);
+				}
+				linearize_multidim_port_refs(this, port->str, dims);
+				auto loc = mr->location;
+				port->children[1] = std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, (int)n, true));
+			}
 			if (port->children.size() < 2 || !port->children[1] || port->children[1]->type != AST_RANGE)
 				continue;
 			AstNode *packed = port->children[0].get();

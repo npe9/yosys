@@ -181,13 +181,48 @@ struct proc_dlatch_db_t
 		return rules_db(node);
 	}
 
+	// The mux trees are DAGs: a dynamic-index write in a loop
+	// (`v[idx[k]] = 1` for k < N) makes a $pmux per step whose arms mostly
+	// carry the previous step's bit, and walking that as a tree took N^N
+	// steps (prim_lfsr's sbox_perm_test). The walks are memoized per entry
+	// call on (bit, set_undef). With set_undef false a walk only reads the
+	// netlist. set_undef is cleared at a bit with more than one user, so a
+	// bit reached with it set has a single path from the root and is never
+	// visited twice. The memo is cleared per entry call, as the set_undef
+	// walks change mux inputs between calls.
+	dict<pair<SigBit, bool>, int> walk_memo;
+
 	int find_mux_feedback(SigBit haystack, SigBit needle, bool set_undef)
+	{
+		walk_memo.clear();
+		return find_mux_feedback_walk(haystack, needle, set_undef);
+	}
+
+	int find_mux_constant(SigBit haystack, State needle, bool set_undef)
+	{
+		walk_memo.clear();
+		return find_mux_constant_walk(haystack, needle, set_undef);
+	}
+
+	int find_mux_feedback_walk(SigBit haystack, SigBit needle, bool set_undef)
 	{
 		if (sigusers[haystack] > 1)
 			set_undef = false;
 
 		if (haystack == needle)
 			return true_node;
+
+		auto key = make_pair(haystack, set_undef);
+		auto memo = walk_memo.find(key);
+		if (memo != walk_memo.end())
+			return memo->second;
+		int result = find_mux_feedback_step(haystack, needle, set_undef);
+		walk_memo[key] = result;
+		return result;
+	}
+
+	int find_mux_feedback_step(SigBit haystack, SigBit needle, bool set_undef)
+	{
 
 		auto it = mux_drivers.find(haystack);
 		if (it == mux_drivers.end())
@@ -205,7 +240,7 @@ struct proc_dlatch_db_t
 
 		pool<int> children;
 
-		int n = find_mux_feedback(sig_a[index], needle, set_undef);
+		int n = find_mux_feedback_walk(sig_a[index], needle, set_undef);
 		if (n != false_node) {
 			if (set_undef && sig_a[index] == needle) {
 				SigSpec sig = cell->getPort(ID::A);
@@ -228,7 +263,7 @@ struct proc_dlatch_db_t
 		}
 
 		for (int i = 0; i < (is_bwmux ? 1 : GetSize(sig_s)); i++) {
-			n = find_mux_feedback(sig_b[i*width + index], needle, set_undef);
+			n = find_mux_feedback_walk(sig_b[i*width + index], needle, set_undef);
 			if (n != false_node) {
 				if (set_undef && sig_b[i*width + index] == needle) {
 					SigSpec sig = cell->getPort(ID::B);
@@ -252,13 +287,25 @@ struct proc_dlatch_db_t
 		return make_inner(children);
 	}
 
-	int find_mux_constant(SigBit haystack, State needle, bool set_undef)
+	int find_mux_constant_walk(SigBit haystack, State needle, bool set_undef)
 	{
 		if (sigusers[haystack] > 1)
 			set_undef = false;
 
 		if (haystack == SigBit(needle))
 			return true_node;
+
+		auto key = make_pair(haystack, set_undef);
+		auto memo = walk_memo.find(key);
+		if (memo != walk_memo.end())
+			return memo->second;
+		int result = find_mux_constant_step(haystack, needle, set_undef);
+		walk_memo[key] = result;
+		return result;
+	}
+
+	int find_mux_constant_step(SigBit haystack, State needle, bool set_undef)
+	{
 
 		auto it = mux_drivers.find(haystack);
 		if (it == mux_drivers.end())
@@ -276,7 +323,7 @@ struct proc_dlatch_db_t
 
 		pool<int> children;
 
-		int n = find_mux_constant(sig_a[index], needle, set_undef);
+		int n = find_mux_constant_walk(sig_a[index], needle, set_undef);
 		if (n != false_node) {
 			if (set_undef && sig_a[index] == SigBit(needle)) {
 				SigSpec sig = cell->getPort(ID::A);
@@ -293,7 +340,7 @@ struct proc_dlatch_db_t
 		}
 
 		for (int i = 0; i < (is_bwmux ? 1 : GetSize(sig_s)); i++) {
-			n = find_mux_constant(sig_b[i*width + index], needle, set_undef);
+			n = find_mux_constant_walk(sig_b[i*width + index], needle, set_undef);
 			if (n != false_node) {
 				if (set_undef && sig_b[i*width + index] == SigBit(needle)) {
 					SigSpec sig = cell->getPort(ID::B);

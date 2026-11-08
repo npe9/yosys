@@ -1,0 +1,20 @@
+# proc_dlatch walks mux trees that are DAGs. A dynamic-index bit write in a
+# loop (`pt[idx[k]] = 1` for k < N) gives one $pmux per step whose arms
+# mostly carry the previous step's bit; walking that as a tree took N^N steps
+# (12 s at N=8, hours at 64: OpenTitan prim_lfsr's sbox_perm_test).
+# The memoized walk builds the same netlist and finishes at once.
+read_verilog -sv <<EOT
+module top #(parameter int N = 32, parameter int W = $clog2(N)) (
+	input logic [N-1:0][W-1:0] idx, output logic t);
+	logic [N-1:0] pt;
+	always @* begin
+		for (int k = 0; k < N; k++) pt[idx[k]] = 1'b1;
+	end
+	assign t = &pt;
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+select -assert-count 32 t:$adlatch
+select -assert-count 0 t:$dlatch

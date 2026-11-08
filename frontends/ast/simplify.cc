@@ -4348,10 +4348,13 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					if (r->children.size() == 1) {
 						auto probe = r->children[0]->clone();
 						while (probe->simplify(true, 1, -1, false)) { }
-						if (probe->type != AST_CONSTANT || probe->asInt(true) < 1)
+						// the size takes the constant's own signedness: an
+						// unsigned `3'd4` (an enum item of a `logic [2:0]`
+						// base) read signed was -4
+						if (probe->type != AST_CONSTANT || probe->asInt(probe->is_signed) < 1)
 							port->input_error("Non-constant or empty unpacked dimension on the multi-dimensional "
 									"unpacked port `%s' is not supported.\n", port->str.c_str() + 1);
-						dims.push_back({0, (int)probe->asInt(true) - 1, true});
+						dims.push_back({0, (int)probe->asInt(probe->is_signed) - 1, true});
 					} else {
 						auto probe = r->clone();
 						while (!probe->range_valid && probe->simplify(true, 1, -1, false)) { }
@@ -4388,13 +4391,17 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			bool size_form = unpacked->type == AST_RANGE && unpacked->children.size() == 1;
 			if (size_form) {
 				int n = -1;
+				// fe140: N takes the constant's own signedness. Read signed,
+				// an unsigned size with its top bit set (`TargCR_Count`, item
+				// 7 of a `logic [2:0]` enum) was negative, and the port was
+				// silently left one element wide (OpenTitan i3c_target_ccc).
 				if (unpacked->children[0]->type == AST_CONSTANT) {
-					n = unpacked->children[0]->asInt(true);
+					n = unpacked->children[0]->asInt(unpacked->children[0]->is_signed);
 				} else {
 					auto probe = unpacked->children[0]->clone();
 					while (probe->simplify(true, 1, -1, false)) { }
 					if (probe->type == AST_CONSTANT)
-						n = probe->asInt(true);
+						n = probe->asInt(probe->is_signed);
 				}
 				if (n < 1 || n > (1 << 20))
 					continue;

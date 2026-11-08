@@ -2215,6 +2215,19 @@ static void mark_auto_nosync(AstNode *block, const AstNode *wire)
 	block->set_attribute(auto_nosync_prefix + wire->str, AstNode::mkconst_int(block->location, 1, false));
 }
 
+// A declaration expanded out of a generate block is simplified to a fixpoint,
+// as the module body does for its own declarations: a single pass leaves a
+// typedef'd packed array (`w32_t [7:0] q`) with an unflattened multirange,
+// and a later `q[i]` in the same block then selected bit i, not element i.
+static void simplify_generated_item(AstNode *node, bool const_fold, int stage)
+{
+	if (node->type == AST_PARAMETER || node->type == AST_LOCALPARAM || node->type == AST_WIRE ||
+			node->type == AST_AUTOWIRE || node->type == AST_MEMORY || node->type == AST_TYPEDEF)
+		while (node->simplify(const_fold, stage, -1, false)) { }
+	else
+		node->simplify(const_fold, stage, -1, false);
+}
+
 // IEEE 1800-2009 12.8: break/continue in a constant iteration stop or skip it.
 // 1 = break, 2 = continue, 0 = neither. The control statement and everything
 // after it in this list are removed.
@@ -8517,7 +8530,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 			if (type == AST_GENFOR) {
 				for (size_t i = 0; i < buf->children.size(); i++) {
-					buf->children[i]->simplify(const_fold, stage, -1, false);
+					simplify_generated_item(buf->children[i].get(), const_fold, stage);
 					current_ast_mod->children.push_back(std::move(buf->children[i]));
 				}
 			} else {
@@ -8668,7 +8681,7 @@ skip_for_unroll:
 		}
 
 		for (size_t i = 0; i < children.size(); i++) {
-			children[i]->simplify(const_fold, stage, -1, false);
+			simplify_generated_item(children[i].get(), const_fold, stage);
 			current_ast_mod->children.push_back(std::move(children[i]));
 		}
 
@@ -8700,7 +8713,7 @@ skip_for_unroll:
 			}
 
 			for (size_t i = 0; i < buf->children.size(); i++) {
-				buf->children[i]->simplify(const_fold, stage, -1, false);
+				simplify_generated_item(buf->children[i].get(), const_fold, stage);
 				current_ast_mod->children.push_back(std::move(buf->children[i]));
 			}
 
@@ -8780,7 +8793,7 @@ skip_for_unroll:
 			}
 
 			for (size_t i = 0; i < buf->children.size(); i++) {
-				buf->children[i]->simplify(const_fold, stage, -1, false);
+				simplify_generated_item(buf->children[i].get(), const_fold, stage);
 				current_ast_mod->children.push_back(std::move(buf->children[i]));
 			}
 

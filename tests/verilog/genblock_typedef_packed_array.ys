@@ -1,0 +1,40 @@
+# A packed array of a typedef'd element declared in a generate block
+# (IEEE 1800-2017 7.4.5): `q[i]` selects element i, as at module scope.
+# The declaration used to be simplified only once on expansion, so a use
+# later in the same block selected bit i (prim_sha2's gen_256 digest_o).
+read_verilog -sv <<EOT
+typedef logic [7:0] w8_t;
+module top #(parameter bit M = 0) (
+	input  w8_t [1:0] a,
+	output logic [1:0][15:0] o_if,
+	output logic [7:0] o_case, o_bare,
+	output logic [1:0][7:0] o_for
+);
+	if (!M) begin : gb
+		w8_t [1:0] q;
+		assign q = a;
+		for (genvar i = 0; i < 2; i++) begin : ga
+			assign o_if[i][7:0] = q[i];
+			assign o_if[i][15:8] = 8'b0;
+		end
+	end
+	case (M) 0: begin : gk
+		w8_t [1:0] q;
+		assign q = a;
+		assign o_case = q[1];
+	end endcase
+	for (genvar i = 0; i < 2; i++) begin : gf
+		w8_t [1:0] q;
+		assign q = a;
+		assign o_for[i] = q[i];
+	end
+	begin : gu
+		w8_t [1:0] q;
+		assign q = a;
+		assign o_bare = q[1];
+	end
+endmodule
+EOT
+hierarchy -top top
+proc
+sat -verify -prove-asserts -set a 16'hc95a -prove o_if 32'h00c9005a -prove o_case 8'hc9 -prove o_bare 8'hc9 -prove o_for 16'hc95a

@@ -1,0 +1,27 @@
+# A module derived with an interface port is reprocessed for a sub-module that
+# has become available (`'1` on a parameterized instance needs its port width):
+# its ports were exploded a second time, "Incompatible re-declaration".
+read_verilog -sv <<EOT
+interface x_if;
+  logic [4:0] d;
+  modport m (output d);
+endinterface
+module sub #(parameter int N = 1)(input logic [N-1:0] a, output logic [N-1:0] y);
+  assign y = a;
+endmodule
+module mid #(parameter bit P = 0)(x_if.m q);
+  logic [4:0] y;
+  sub #(.N(5)) s(.a('1), .y(y));
+  assign q.d = y;
+endmodule
+module top(output logic [4:0] o);
+  x_if i();
+  mid #(.P(1)) u(.q(i));
+  assign o = i.d;
+endmodule
+EOT
+hierarchy -check -top top
+proc
+flatten
+opt_clean
+sat -verify -prove o 5'h1f

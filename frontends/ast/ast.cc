@@ -2215,7 +2215,33 @@ bool AstModule::reprocess_if_necessary(RTLIL::Design *design)
 			log("Reprocessing module %s because instantiated module %s has become available.\n",
 					name.unescape(), RTLIL::unescape_id(modname));
 			loadconfig();
-			process_and_replace_module(design, this, ast.get(), NULL);
+			// A module derived with interfaces was exploded once, and its AST
+			// holds the members; what derive() did after generating RTLIL has
+			// to be done again, or hierarchy explodes the ports a second time.
+			std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> intf_cells;
+			if (get_bool_attribute(ID::interfaces_replaced_in_module))
+				for (auto c : cells())
+					if (c->get_bool_attribute(ID::is_interface))
+						intf_cells.push_back({c->name, c->type});
+			RTLIL::Module *old_module = this;
+			RTLIL::Module *new_module = process_and_replace_module(design, this, ast.get(), NULL);
+			bool ports_replaced = false;
+			for (auto &intf : intf_cells) {
+				RTLIL::Wire *port = new_module->wire(intf.first);
+				if (port == nullptr || !port->get_bool_attribute(ID::is_interface))
+					continue;
+				pool<RTLIL::Wire*> to_remove;
+				to_remove.insert(port);
+				new_module->remove(to_remove);
+				new_module->fixup_ports();
+				RTLIL::Cell *subcell = new_module->addCell(intf.first, intf.second);
+				subcell->set_bool_attribute(ID::is_interface);
+				ports_replaced = true;
+			}
+			if (ports_replaced) {
+				new_module->set_bool_attribute(ID::interfaces_replaced_in_module);
+				carry_degraded(old_module, new_module);
+			}
 			return true;
 		}
 	}

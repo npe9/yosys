@@ -4315,7 +4315,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	// dumpAst(nullptr, "> ");
 #endif
 
-		auto flatten_unpacked_ports = [&](bool include_resolved) {
+		auto flatten_unpacked_ports = [&](bool include_resolved, bool skip_header = false) {
 		// Flatten unpacked array ports (logic [w-1:0] p [n]) into wide packed
 		// wires before child simplification: ports cannot be memories in
 		// RTLIL, and indexed accesses become part-selects on the wide wire.
@@ -4325,6 +4325,15 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		for (auto &child : children) {
 			if (!child || child->port_id == 0 ||
 					(child->type != AST_WIRE && !(include_resolved && child->type == AST_MEMORY))) {
+				// fe140: an ANSI header's parameters and the imports
+				// (`module m import p::*; #(parameter N = 2) (...)`) come
+				// before the ports. Only the call from the declaration
+				// fixpoint loop, where they are in scope, steps over them:
+				// at stage 0 a size naming an imported name does not
+				// resolve yet, and probing it is a degradation.
+				if (skip_header && child && (child->type == AST_PARAMETER || child->type == AST_LOCALPARAM ||
+						child->type == AST_IMPORT || child->type == AST_TYPEDEF || child->type == AST_ENUM))
+					continue;
 				if (!include_resolved)
 					break; // legacy semantics: ports lead the child list
 				continue;
@@ -4342,6 +4351,23 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				AstNode *mr = port->children[1].get();
 				std::vector<UnpackedDim> dims;
 				long long n = 1;
+				// fe140: a size naming a parameter is constant only once the
+				// module scope holds its parameters; the earlier calls defer
+				// it to the call after the scope is built
+				bool deferred = false;
+				if (!include_resolved)
+					for (auto &r : mr->children) {
+						if (r->type != AST_RANGE || r->children.empty() || r->children.size() > 2)
+							break;
+						for (auto &b : r->children) {
+							auto probe = b->clone();
+							while (probe->simplify(true, 1, -1, false)) { }
+							if (probe->type != AST_CONSTANT)
+								deferred = true;
+						}
+					}
+				if (deferred)
+					continue;
 				for (auto &r : mr->children) {
 					if (r->type != AST_RANGE || r->children.empty() || r->children.size() > 2)
 						port->input_error("Unsupported unpacked dimension on port `%s'.\n", port->str.c_str() + 1);
@@ -4864,6 +4890,12 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			AstNode *node = children[i].get();
 			if (!node)
 				continue;
+			// fe140: a multi-dimensional unpacked port whose sizes name
+			// parameters was deferred above; the parameters before it are
+			// simplified now, and the port still has its multirange
+			if (node->type == AST_WIRE && node->port_id != 0 && node->children.size() >= 2 && node->children[1] &&
+					node->children[1]->type == AST_MULTIRANGE)
+				flatten_unpacked_ports(false, true);
 			if (node->type == AST_PARAMETER || node->type == AST_LOCALPARAM || node->type == AST_WIRE || node->type == AST_AUTOWIRE || node->type == AST_MEMORY || node->type == AST_TYPEDEF)
 				while (i < children.size() && children[i] && children[i]->simplify(true, 1, -1, false))
 					did_something = true;

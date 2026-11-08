@@ -1,21 +1,29 @@
-# An unpacked port size `[N]` (IEEE 1800-2017 7.4.2) takes N's own signedness.
-# N with its top bit set (`I_Count` = 4, an item of a `logic [2:0]` enum; a
-# `logic [2:0]` parameter of 4) was read as -4, and the port was silently
-# left one element wide (OpenTitan i3c_target_ccc's `r_i[TargCR_Count]`).
+# Unpacked port sizes `[N]` (IEEE 1800-2017 7.4.2) in a module whose header
+# has an import or parameters:
+# - N takes its own signedness. N with its top bit set (`I_Count` = 4, an
+#   item of a `logic [2:0]` enum; a `logic [2:0]` parameter of 4) was read
+#   as -4, and the port was silently left one element wide (OpenTitan
+#   i3c_target_ccc's `r_i[TargCR_Count]`).
+# - a multi-dimensional port was skipped when the header's parameters or
+#   imports came before the ports, or when a size named a parameter, and
+#   was also left one element wide.
 read_verilog -sv <<EOT
 package sp;
 	typedef enum logic [2:0] { I0, I1, I2, I3, I_Count } e_t;
 	localparam logic [2:0] LP = 3'd4;
 endpackage
-module top import sp::*; #(parameter logic [2:0] PP = 3'd4) (
+module top import sp::*; #(parameter logic [2:0] PP = 3'd4, parameter int PI = 3) (
 	input [7:0] r_i [I_Count], input [7:0] p_i [LP], input [7:0] q_i [PP],
-	output [7:0] o_r1, o_r3, o_p0, o_q2);
+	input [7:0] m_i [LP][2], input [7:0] n_i [PI][2],
+	output [7:0] o_r1, o_r3, o_p0, o_q2, o_m31, o_n20);
 	assign o_r1 = r_i[I1];
 	assign o_r3 = r_i[I3];
 	assign o_p0 = p_i[0];
 	assign o_q2 = q_i[2];
+	assign o_m31 = m_i[3][1];
+	assign o_n20 = n_i[2][0];
 endmodule
 EOT
 hierarchy -top top
 proc
-sat -verify -prove-asserts -set r_i 32'h11223344 -set p_i 32'h55667788 -set q_i 32'h99aabbcc -prove o_r1 8'h22 -prove o_r3 8'h44 -prove o_p0 8'h55 -prove o_q2 8'hbb
+sat -verify -prove-asserts -set r_i 32'h11223344 -set p_i 32'h55667788 -set q_i 32'h99aabbcc -set m_i 64'h0102030405060708 -set n_i 48'ha1a2a3a4a5a6 -prove o_r1 8'h22 -prove o_r3 8'h44 -prove o_p0 8'h55 -prove o_q2 8'hbb -prove o_m31 8'h08 -prove o_n20 8'ha5

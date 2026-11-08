@@ -2584,6 +2584,39 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 		}
 	}
 
+	// A port connection selecting a modport of an interface (`.p(i.m)`, IEEE
+	// 1800-2017 25.5) connects the interface; the sub-module's port says which
+	// view it takes. Left alone it was an implicit wire, and the port stayed
+	// unconnected (CV32E40S cv32e40s_core).
+	for (auto &cell : new_ast->children) {
+		if (cell->type != AST_CELL)
+			continue;
+		for (auto &arg : cell->children) {
+			if (arg->type != AST_ARGUMENT || arg->children.size() != 1)
+				continue;
+			AstNode *id = arg->children[0].get();
+			if (id->type != AST_IDENTIFIER || !id->children.empty())
+				continue;
+			size_t dot = id->str.rfind('.');
+			if (dot == std::string::npos)
+				continue;
+			RTLIL::IdString base = id->str.substr(0, dot);
+			RTLIL::Module *intf = nullptr;
+			if (local_interfaces.count(base) > 0)
+				intf = local_interfaces.at(base);
+			else if (local_interfaces.count(base.str() + "_inst_from_top_dummy") > 0)
+				intf = local_interfaces.at(base.str() + "_inst_from_top_dummy");
+			else
+				for (auto &ch : new_ast->children)
+					if (ch->type == AST_CELL && ch->str == base.str() + "_inst_from_top_dummy" && !ch->children.empty())
+						intf = design->module(ch->children[0]->str);
+			if (intf == nullptr || dynamic_cast<AstModule*>(intf) == nullptr)
+				continue;
+			if (find_modport(static_cast<AstModule*>(intf)->ast.get(), "\\" + id->str.substr(dot + 1)) != nullptr)
+				id->str = base.str();
+		}
+	}
+
 	// Generate RTLIL from AST for the new module and add to the design,
 	// renaming this module to move it out of the way.
 	bool intf_logic = false;

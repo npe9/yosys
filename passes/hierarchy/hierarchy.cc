@@ -198,6 +198,9 @@ struct IFExpander
 	std::vector<RTLIL::SigSpec>             connections_to_add_signal;
 	dict<RTLIL::IdString, RTLIL::Module*>   interfaces_to_add_to_submodule;
 	dict<RTLIL::IdString, RTLIL::IdString>  modports_used_in_submodule;
+	// members of an interface that the parent, itself holding a modport view,
+	// does not have: (port member in the sub-module, name in the parent)
+	std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> members_outside_view;
 
 	// Reset the per-cell state
 	void start_cell()
@@ -209,6 +212,7 @@ struct IFExpander
 		connections_to_add_signal.clear();
 		interfaces_to_add_to_submodule.clear();
 		modports_used_in_submodule.clear();
+		members_outside_view.clear();
 	}
 
 	// Set has_interfaces_not_found if there are pending interfaces that
@@ -276,15 +280,21 @@ struct IFExpander
 		for (auto mod_wire : mod_replace_ports->wires()) {
 			std::string signal_name1 = port_name.str() + "." + mod_wire->name.unescape();
 			std::string signal_name2 = interface_name.str() + "." + mod_wire->name.unescape();
-			connections_to_add_name.push_back(RTLIL::IdString(signal_name1));
-			if(module.wire(signal_name2) == nullptr) {
+			RTLIL::Wire *wire_in_parent = module.wire(signal_name2);
+			if (wire_in_parent == nullptr) {
+				// The parent holds this interface through a modport, which
+				// narrows it to that modport's members (IEEE 1800-2017 25.5).
+				// A sub-module's own modport may still not need this one;
+				// only its derived ports tell, so check_view_members() decides.
+				if (!submodule.wire(port_name)->get_string_attribute(ID::interface_modport).empty()) {
+					members_outside_view.push_back({RTLIL::IdString(signal_name1), RTLIL::IdString(signal_name2)});
+					continue;
+				}
 				log_error("Could not find signal '%s' in '%s'\n",
 					  signal_name2.c_str(), module.name.unescape());
 			}
-			else {
-				RTLIL::Wire *wire_in_parent = module.wire(signal_name2);
-				connections_to_add_signal.push_back(wire_in_parent);
-			}
+			connections_to_add_name.push_back(RTLIL::IdString(signal_name1));
+			connections_to_add_signal.push_back(wire_in_parent);
 		}
 		connections_to_remove.push_back(conn_name);
 		interfaces_to_add_to_submodule[port_name] = interfaces_in_module.at(interface_name2);
@@ -296,6 +306,20 @@ struct IFExpander
 		if (!modport_name.empty()) {
 			modports_used_in_submodule[port_name] = "\\" + modport_name;
 		}
+	}
+
+	// With the sub-module derived: a member its modport does use must exist in
+	// the parent's view.
+	void check_view_members(RTLIL::Cell &cell, const RTLIL::Module &derived)
+	{
+		for (auto &it : members_outside_view)
+			if (derived.wire(it.first) != nullptr)
+				log_error("Could not find signal '%s' in '%s'\n",
+					  it.second.c_str(), module.name.unescape());
+		// The members its modport leaves out are not ports of the derived module
+		for (auto &name : connections_to_add_name)
+			if (derived.wire(name) == nullptr)
+				cell.unsetPort(name);
 	}
 
 	// Handle a single connection from the module, making a note to expand
@@ -645,6 +669,7 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 					 cell->parameters,
 					 if_expander.interfaces_to_add_to_submodule,
 					 if_expander.modports_used_in_submodule);
+		if_expander.check_view_members(*cell, *design->module(cell->type));
 		cell->parameters.clear();
 		did_something = true;
 

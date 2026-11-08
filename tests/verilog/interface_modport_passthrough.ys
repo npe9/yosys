@@ -1,0 +1,56 @@
+# A modport view passed on to a sub-module (IEEE 1800-2017 25.5): the interface
+# members outside the modport are not in the parent, and the sub-module's own
+# modport does not need them (CV32E40S cv32e40s_controller).
+read_verilog -sv <<EOT
+interface x_if; logic a; logic b;
+  modport m (output a); modport n (input b);
+endinterface
+module leaf(x_if.m p); assign p.a = 1'b1; endmodule
+module mid(x_if.m p); leaf l(.p(p)); endmodule
+module top(output logic o);
+  x_if i();
+  mid u(.p(i.m));
+  assign o = i.a;
+endmodule
+EOT
+hierarchy -check -top top
+proc
+flatten
+opt_clean
+sat -verify -prove o 1'b1
+design -reset
+
+# The same through a plain connection of the instance, under -check
+read_verilog -sv <<EOT
+interface x_if; logic a; logic b;
+  modport m (output a); modport n (input b);
+endinterface
+module leaf(x_if.m p); assign p.a = 1'b1; endmodule
+module top(output logic o);
+  x_if i();
+  leaf u(.p(i));
+  assign o = i.a;
+endmodule
+EOT
+hierarchy -check -top top
+proc
+flatten
+opt_clean
+sat -verify -prove o 1'b1
+design -reset
+
+# A sub-module's modport with a member the parent's view lacks is still an error
+logger -expect error "Could not find signal '.p\.b' in 'mid'" 1
+read_verilog -sv <<EOT
+interface x_if; logic a; logic b;
+  modport m (output a); modport n (input b);
+endinterface
+module leaf(x_if.n p); endmodule
+module mid(x_if.m p); leaf l(.p(p)); endmodule
+module top();
+  x_if i();
+  mid u(.p(i.m));
+endmodule
+EOT
+hierarchy -top top
+logger -check-expected

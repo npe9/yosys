@@ -1,0 +1,33 @@
+# Task and function ports with an implicit data type (IEEE 1800-2017 13.4):
+# `[2:0] x`, `signed [1:0] y`. The direction is the previous port's, input at
+# first (basejump_stl bsg_mul_booth_dot).
+read_verilog -sv <<EOT
+module top(input logic [2:0] s, input logic y, input logic m,
+	output logic o, output logic p, output logic n, output logic [1:0] q);
+  function automatic [0:0] dot([2:0] sdn, [0:0] y0, [0:0] ym1);
+    return ((sdn[2] & y0) | (sdn[1] & ym1)) ^ sdn[0];
+  endfunction
+  function automatic logic g(signed [1:0] v, w);
+    return v[0] ^ w;
+  endfunction
+  function automatic logic neg(signed [1:0] v);
+    return (v < 0);
+  endfunction
+  task automatic t(output [1:0] a, [1:0] b, input c);
+    a = {c, c};
+    b = {c, ~c};
+  endtask
+  assign o = dot(s, y, m);
+  assign p = g(s[1:0], y);
+  assign n = neg(s[1:0]);
+  logic [1:0] ta, tb;
+  always_comb begin
+    t(ta, tb, y);
+    q = tb;
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+opt_clean
+sat -verify -set s 3'd3 -set y 1'b1 -set m 1'b0 -prove o 1'b1 -prove p 1'b0 -prove n 1'b1 -prove q 2'b10

@@ -1105,6 +1105,7 @@
 %type <string_t> type_name bind_name static_method_name scoped_type_name foreach_dotted_opt class_name rs_ident
 %type <ast_t> opt_enum_init enum_type struct_type enum_struct_type func_return_type typedef_base_type
 %type <ast_t> param_type_rhs
+%type <std::pair<bool, ast_t>> implicit_port_type
 %type <ast_t> opt_chained_method chained_method rvalue_call_stmt call_args_tail
 %type <boolean_t> opt_property always_comb_or_latch always_or_always_ff
 %type <boolean_t> opt_signedness_default_signed opt_signedness_default_unsigned
@@ -2804,6 +2805,12 @@ task_func_args_opt:
 task_func_args:
 	task_func_port | task_func_args TOK_COMMA task_func_port;
 
+implicit_port_type:
+	TOK_SIGNED range_or_multirange { $$ = std::make_pair(true, std::move($2)); } |
+	TOK_UNSIGNED range_or_multirange { $$ = std::make_pair(false, std::move($2)); } |
+	non_opt_range { $$ = std::make_pair(false, std::move($1)); } |
+	non_opt_multirange { $$ = std::make_pair(false, std::move($1)); };
+
 task_func_port:
 	attr wire_type range_or_multirange {
 		bool prev_was_input = true;
@@ -2825,6 +2832,31 @@ task_func_port:
 			extra->astbuf1->is_input = prev_was_input;
 			extra->astbuf1->is_output = prev_was_output;
 		}
+	} wire_name port_default |
+	attr implicit_port_type {
+		// IEEE 1800-2017 13.4: an implicit data type (`[2:0] x`, `signed [1:0] y`)
+		// without a direction takes the previous port's direction, input at first
+		bool prev_was_input = true;
+		bool prev_was_output = false;
+		if (extra->albuf) {
+			prev_was_input = extra->astbuf1->is_input;
+			prev_was_output = extra->astbuf1->is_output;
+			(void)extra->astbuf1.reset();
+			if (extra->astbuf2 != nullptr)
+				(void)extra->astbuf2.reset();
+			extra->albuf.reset();
+		}
+		if (!mode->sv)
+			err_at_loc(@2, "task/function argument direction missing");
+		extra->albuf = std::move($1);
+		extra->astbuf1 = std::make_unique<AstNode>(@2, AST_WIRE);
+		extra->current_wire_rand = false;
+		extra->current_wire_const = false;
+		extra->astbuf1->is_logic = true;
+		extra->astbuf1->is_signed = $2.first;
+		extra->astbuf1->is_input = prev_was_input;
+		extra->astbuf1->is_output = prev_was_output;
+		extra->astbuf2 = checkRange(extra->astbuf1.get(), std::move($2.second));
 	} wire_name port_default |
 	{
 		if (!extra->astbuf1) {

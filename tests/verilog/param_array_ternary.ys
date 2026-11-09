@@ -1,0 +1,19 @@
+# An unpacked-array parameter with `c ? '{...} : '{...}` (black-parrot
+# coh_noc_cord_markers_pos_p): its element sized a port "non-constant".
+read_verilog -sv <<EOT
+module sub #(parameter t = 0, localparam d = 2,
+  localparam int mk[d:0] = t ? '{5, 2, 0} : '{7, 3, 0},
+  localparam w = mk[d])
+  (input logic [w-1:0] a, output logic [w-1:0] y);
+  assign y = a;
+endmodule
+module top(input logic [6:0] a7, input logic [4:0] a5, output logic [6:0] y7, output logic [4:0] y5);
+  sub #(.t(0)) u0(.a(a7), .y(y7));
+  sub #(.t(1)) u1(.a(a5), .y(y5));
+endmodule
+EOT
+hierarchy -check -top top
+proc
+flatten
+opt_clean
+sat -verify -set a7 7'h55 -set a5 5'h15 -prove y7 7'h55 -prove y5 5'h15

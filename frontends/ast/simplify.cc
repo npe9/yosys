@@ -3540,6 +3540,18 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	}
 	recursion_counter++;
 
+	// An unpacked-array parameter whose value is `c ? '{...} : '{...}`: the
+	// pattern handling below only sees a pattern, so take the branch here
+	if ((type == AST_PARAMETER || type == AST_LOCALPARAM) && GetSize(children) >= 1 &&
+			children[0]->type == AST_TERNARY && GetSize(children[0]->children) == 3 &&
+			(children[0]->children[1]->type == AST_ASSIGN_PATTERN || children[0]->children[2]->type == AST_ASSIGN_PATTERN)) {
+		AstNode *cond = children[0]->children[0].get();
+		while (cond->simplify(true, stage, -1, false)) { }
+		if (cond->type == AST_CONSTANT && cond->bits_only_01()) {
+			auto chosen = std::move(children[0]->children[cond->asBool() ? 1 : 2]);
+			children[0] = std::move(chosen);
+		}
+	}
 
 	// fe137: a member select after several indices (`W[i][j].m', kept by the
 	// parser as a MULTIRANGE prefix) that no flattened multi-dimensional port

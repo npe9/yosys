@@ -6058,8 +6058,9 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					width = 1;   // the parser's "no range" marker (`int` carries [31:0] without range_valid)
 				node = mkconst_int(child->location, width, child->is_signed);
 			} else {
-				// User defined type
-				log_assert(child->children[0]->type == AST_WIRETYPE);
+				// User defined type (a real has a range, and no type name)
+				if (child->children[0]->type != AST_WIRETYPE)
+					input_error("Static cast to this type (a real?) is not supported.\n");
 
 				const std::string &type_name = child->children[0]->str;
 				if (!current_scope.count(type_name))

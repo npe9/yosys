@@ -1,0 +1,7 @@
+# A static cast to real is unsupported: an error, not an assertion failure
+logger -expect error "Static cast to this type" 1
+read_verilog -sv <<EOT
+module top(input logic clk, input int a);
+  always @(posedge clk) $display("%f", real'(a));
+endmodule
+EOT

@@ -2168,11 +2168,95 @@ AstNode * AST::find_modport(AstNode *intf, std::string name)
 }
 
 // Iterate over all wires in an interface and add them as wires in the AST module:
+// fe145: an interface member declared with a user-defined type (`gpr_t gpr;`)
+// became a plain vector in the module using the interface, so a member select
+// through it (`r.gpr.rd0`) was an implicit 1-bit wire.  The member wire now
+// keeps the type.  A type name is rewritten so it resolves in the module: a
+// typedef of the interface itself is copied in as `<intfname>.<T>`, one from
+// a package the interface imports becomes `p::T`, and a compilation-unit
+// typedef (also in the module) stays as is.
+static AstNode *find_typedef_child(AstNode *scope, const std::string &name)
+{
+	for (auto &c : scope->children)
+		if (c->type == AST_TYPEDEF && c->str == name)
+			return c.get();
+	return nullptr;
+}
+
+static bool qualify_intf_types(RTLIL::Design *design, AstNode *node, AstNode *intf_ast, const std::string &intfname, AstNode *module_ast, int depth)
+{
+	if (depth > 16)
+		return false;
+	for (auto &c : node->children) {
+		if (c->type == AST_WIRETYPE && c->str.find("::") == std::string::npos) {
+			if (AstNode *td = find_typedef_child(intf_ast, c->str)) {
+				// a compilation-unit typedef is in the module too
+				if (find_typedef_child(module_ast, c->str))
+					continue;
+				std::string nn = intfname + "." + c->str.substr(1);
+				if (!find_typedef_child(module_ast, nn)) {
+					auto copy = td->clone();
+					copy->str = nn;
+					if (!qualify_intf_types(design, copy.get(), intf_ast, intfname, module_ast, depth + 1))
+						return false;
+					module_ast->children.push_back(std::move(copy));
+				}
+				c->str = nn;
+				continue;
+			}
+			bool found = false;
+			for (auto &imp : intf_ast->children) {
+				if (imp->type != AST_IMPORT || !design)
+					continue;
+				std::string qn = imp->str + "::" + c->str.substr(1);
+				for (auto &pk : design->verilog_packages)
+					if (pk->str == imp->str && (find_typedef_child(pk.get(), c->str) || find_typedef_child(pk.get(), qn)))
+						found = true;
+				if (found) {
+					c->str = qn;
+					break;
+				}
+			}
+			if (!found && !find_typedef_child(module_ast, c->str))
+				return false;
+			continue;
+		}
+		if (!qualify_intf_types(design, c.get(), intf_ast, intfname, module_ast, depth + 1))
+			return false;
+	}
+	return true;
+}
+
+static std::unique_ptr<AstNode> intf_member_wire(AstNode *module_ast, RTLIL::Module *intfmodule, RTLIL::Wire *w, const std::string &intfname)
+{
+	auto loc = module_ast->location;
+	AstModule *am = dynamic_cast<AstModule*>(intfmodule);
+	if (am && am->ast && w->has_attribute(ID::wiretype)) {
+		for (auto &c : am->ast->children) {
+			if (c->type != AST_WIRE || c->str != w->name.str())
+				continue;
+			if (GetSize(c->children) != 1 || c->children[0]->type != AST_WIRETYPE)
+				break;
+			auto wire = c->clone();
+			size_t before = module_ast->children.size();
+			if (!qualify_intf_types(intfmodule->design, wire.get(), am->ast.get(), intfname, module_ast, 0)) {
+				// a type the module cannot name: keep the plain vector
+				module_ast->children.resize(before);
+				break;
+			}
+			wire->str = intfname + "." + w->name.unescape();
+			wire->is_input = wire->is_output = false;
+			wire->port_id = 0;
+			return wire;
+		}
+	}
+	return std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, w->width -1, true), AstNode::mkconst_int(loc, 0, true)));
+}
+
 void AST::explode_interface_port(AstNode *module_ast, RTLIL::Module * intfmodule, std::string intfname, AstNode *modport)
 {
 	for (auto w : intfmodule->wires()){
-		auto loc = module_ast->location;
-		auto wire = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, w->width -1, true), AstNode::mkconst_int(loc, 0, true)));
+		auto wire = intf_member_wire(module_ast, intfmodule, w, intfname);
 		std::string origname = w->name.unescape();
 		std::string newname = intfname + "." + origname;
 		wire->str = newname;
@@ -2559,7 +2643,7 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 		std::string intfname = intf.first.str();
 		RTLIL::Module *intfmodule = intf.second;
 		for (auto w : intfmodule->wires()){
-			auto wire = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, w->width -1, true), AstNode::mkconst_int(loc, 0, true)));
+			auto wire = intf_member_wire(new_ast.get(), intfmodule, w, intfname);
 			std::string newname = w->name.unescape();
 			newname = intfname + "." + newname;
 			wire->str = newname;

@@ -1,0 +1,49 @@
+# A connection selecting a modport of a local interface (`.e(loc.m)', IEEE
+# 1800-2017 25.5) inside a generate block, in a module that is itself derived
+# with an interface port (caliptra el2_mem: `.iccm_mem_export(
+# mem_export_local.veer_iccm)' in the `iccm' block).  The rewrite to the
+# interface ran only for module-level cells and only in expand_interfaces, so
+# `loc.m' was an implicit wire: degraded, and with `.*' the interface members
+# were "No matching wire for implicit port connection `e.clk'".
+read_verilog -sv <<EOT
+interface mif;
+  logic clk;
+  logic [7:0] d;
+  logic [7:0] q;
+  modport m (input clk, output d, input q);
+endinterface
+module leaf (input logic [7:0] x, mif.m e, output logic [7:0] y);
+  assign e.d = x;
+  assign y = e.q;
+endmodule
+module mem #(parameter EN = 1) (input logic clk, input logic [7:0] x, mif.m ext, output logic [7:0] y, output logic [7:0] w);
+  assign ext.d = x;
+  mif loc ();
+  assign loc.clk = clk;
+  assign loc.q = loc.d + 8'd1;
+  mif loc2 ();
+  assign loc2.clk = clk;
+  assign loc2.q = loc2.d;
+  if (EN == 1) begin : g
+    leaf l (.*, .e(loc.m));
+  end else begin : g
+    assign y = x;
+  end
+  if (EN == 1) begin : h
+    leaf l2 (.x(x ^ 8'h0f), .e(loc2.m), .y(w));
+  end
+endmodule
+module top (input logic clk, input logic [7:0] x, output logic [7:0] y, output logic [7:0] w, output logic [7:0] z, output logic ok);
+  mif ext ();
+  mem #(.EN(1)) u (.*, .ext(ext));
+  assign z = ext.d;
+  assign ok = z == x && y == x + 8'd1 && w == (x ^ 8'h0f);
+endmodule
+EOT
+hierarchy -check
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none =A:sv_degraded
+sat -verify -prove ok 1

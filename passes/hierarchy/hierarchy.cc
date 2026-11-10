@@ -192,6 +192,8 @@ struct IFExpander
 	dict<RTLIL::IdString, RTLIL::Module*>   interfaces_in_module;
 
 	bool                                    has_interfaces_not_found;
+	// fe145: an interface port connected by `.*' (the cell has no module_not_derived mark)
+	bool                                    wildcard_interface = false;
 	std::vector<RTLIL::IdString>            connections_to_remove;
 	std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> positional_renames;
 	std::vector<RTLIL::IdString>            connections_to_add_name;
@@ -206,6 +208,7 @@ struct IFExpander
 	void start_cell()
 	{
 		has_interfaces_not_found = false;
+		wildcard_interface = false;
 		connections_to_remove.clear();
 		positional_renames.clear();
 		connections_to_add_name.clear();
@@ -397,6 +400,31 @@ struct IFExpander
 	{
 		for (const auto &conn : cell.connections()) {
 			on_connection(submodule, conn.first, conn.second);
+		}
+		// fe145: `.*` connects an interface port to the parent's interface
+		// of the same name (IEEE 1800-2017 23.3.2.4).  The wildcard is only
+		// expanded after the hierarchy loop, too late to derive the
+		// sub-module with that interface, so it is taken as `.p(p)' here.
+		if (!cell.get_bool_attribute(ID::wildcard_port_conns))
+			return;
+		for (auto wire : submodule.wires()) {
+			if (!wire->port_id || !wire->get_bool_attribute(ID::is_interface) || cell.connections().count(wire->name))
+				continue;
+			// named as genrtlil names it (on_interface strips the 23-character prefix `$dummywireforinterface\\`)
+			RTLIL::IdString dummy_name = "$dummywireforinterface" + wire->name.str();
+			RTLIL::Wire *parent_port = module.wire(wire->name);
+			bool parent_has = interfaces_in_module.count(wire->name) ||
+					interfaces_in_module.count(wire->name.str() + "_inst_from_top_dummy") ||
+					(parent_port && parent_port->port_id && parent_port->get_bool_attribute(ID::is_interface));
+			if (!parent_has)
+				continue;
+			RTLIL::Wire *dummy = module.wire(dummy_name);
+			if (!dummy) {
+				dummy = module.addWire(dummy_name);
+				dummy->set_bool_attribute(ID::is_interface);
+			}
+			on_connection(submodule, wire->name, RTLIL::SigSpec(dummy));
+			wildcard_interface = true;
 		}
 	}
 
@@ -656,7 +684,7 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 		// for the cell:
 		if (cell->parameters.size() == 0 &&
 		    (if_expander.interfaces_to_add_to_submodule.size() == 0 ||
-		     !(cell->get_bool_attribute(ID::module_not_derived)))) {
+		     !(cell->get_bool_attribute(ID::module_not_derived) || if_expander.wildcard_interface))) {
 			// If the cell being processed is an the interface instance itself, go down to "handle_interface_instance:",
 			// so that the signals of the interface are added to the parent module.
 			if (mod->get_bool_attribute(ID::is_interface)) {

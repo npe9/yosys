@@ -4615,6 +4615,23 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				mem2reg_set.insert(mem);
 			}
 
+			// fe150: an unpacked-array member of an interface is split into
+			// element wires, which modules using the interface connect by
+			// name; so is its image `<intf>.a' in such a module (see
+			// intf_member_memory in ast.cc), whether or not it is accessed
+			for (auto &child : children) {
+				if (!child || child->type != AST_MEMORY || child->get_bool_attribute(ID::nomem2reg))
+					continue;
+				if (type != AST_INTERFACE && !child->get_bool_attribute(ID(sv_intf_mem)))
+					continue;
+				// a large array stays a memory (as above), and its
+				// member stays unconnected: degraded, as before
+				AstNode *r = GetSize(child->children) >= 2 ? child->children[1].get() : nullptr;
+				if (!r || r->type != AST_RANGE || !r->range_valid || std::abs(r->range_left - r->range_right) + 1 > 1024)
+					continue;
+				mem2reg_set.insert(child.get());
+			}
+
 			for (auto node : mem2reg_set)
 			{
 				auto is_range = [](const std::unique_ptr<AstNode> &child) {
@@ -4652,8 +4669,21 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					reg->is_reg = true;
 					reg->is_signed = node->is_signed;
 					for (auto &it : node->attributes)
-						if (it.first != ID::mem2reg)
+						if (it.first != ID::mem2reg && it.first != ID(sv_intf_mem))
 							reg->set_attribute(it.first, it.second->clone());
+					if (type == AST_INTERFACE) {
+						// the declared order, so that the image's mem2reg
+						// numbers the elements the same way
+						int ml = node->children[1]->range_left, mr = node->children[1]->range_right;
+						if (node->children[1]->range_swapped)
+							std::swap(ml, mr);
+						reg->set_attribute(ID(sv_intf_mem), mkconst_str(loc, node->str));
+						reg->set_attribute(ID(sv_intf_mem_left), mkconst_int(loc, ml, true));
+						reg->set_attribute(ID(sv_intf_mem_right), mkconst_int(loc, mr, true));
+					} else if (node->get_bool_attribute(ID(sv_intf_mem))) {
+						reg->is_input = node->is_input;
+						reg->is_output = node->is_output;
+					}
 					reg->location.begin.filename = node->location.begin.filename;
 					reg->location = node->location;
 					while (reg->simplify(true, 1, -1, false)) { }

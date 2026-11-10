@@ -2279,11 +2279,51 @@ static std::unique_ptr<AstNode> intf_member_wire(AstNode *module_ast, RTLIL::Mod
 	return std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, w->width -1, true), AstNode::mkconst_int(loc, 0, true)));
 }
 
+// fe150: an unpacked-array member of an interface (`logic [7:0] a [2];') is
+// split by mem2reg into the element wires `a[0]', `a[1]' (simplify forces
+// it in an interface and marks each element with sv_intf_mem).  The module
+// using the interface sees it as a memory again, `<intfname>.a', which its
+// own mem2reg splits into `<intfname>.a[0]', ...: the element wires that
+// hierarchy connects by name, while `r.a[i]' still reads as an array.
+// Returns nullptr for an element of a memory already declared.
+static std::unique_ptr<AstNode> intf_member_memory(AstNode *module_ast, RTLIL::Wire *w, const std::string &intfname, pool<std::string> &done, std::string &origname)
+{
+	std::string memname = w->get_string_attribute(ID(sv_intf_mem));
+	origname = RTLIL::unescape_id(memname);
+	if (!done.insert(memname).second)
+		return nullptr;
+	auto loc = module_ast->location;
+	int lo = w->start_offset, hi = w->start_offset + w->width - 1;
+	auto data = w->upto ? std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, lo, true), AstNode::mkconst_int(loc, hi, true))
+			: std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, hi, true), AstNode::mkconst_int(loc, lo, true));
+	auto elems = std::make_unique<AstNode>(loc, AST_RANGE,
+			AstNode::mkconst_int(loc, w->attributes.at(ID(sv_intf_mem_left)).as_int(true), true),
+			AstNode::mkconst_int(loc, w->attributes.at(ID(sv_intf_mem_right)).as_int(true), true));
+	auto mem = std::make_unique<AstNode>(loc, AST_MEMORY, std::move(data), std::move(elems));
+	mem->str = intfname + "." + origname;
+	mem->is_logic = true;
+	mem->is_signed = w->is_signed;
+	mem->set_attribute(ID(sv_intf_mem), AstNode::mkconst_int(loc, 1, false));
+	return mem;
+}
+
+static bool is_intf_mem_element(RTLIL::Wire *w)
+{
+	return w->has_attribute(ID(sv_intf_mem)) && w->has_attribute(ID(sv_intf_mem_left)) && w->has_attribute(ID(sv_intf_mem_right));
+}
+
 void AST::explode_interface_port(AstNode *module_ast, RTLIL::Module * intfmodule, std::string intfname, AstNode *modport)
 {
+	pool<std::string> mems_done;
 	for (auto w : intfmodule->wires()){
-		auto wire = intf_member_wire(module_ast, intfmodule, w, intfname);
 		std::string origname = w->name.unescape();
+		std::unique_ptr<AstNode> wire;
+		if (is_intf_mem_element(w)) {
+			wire = intf_member_memory(module_ast, w, intfname, mems_done, origname);
+			if (!wire)
+				continue;
+		} else
+			wire = intf_member_wire(module_ast, intfmodule, w, intfname);
 		std::string newname = intfname + "." + origname;
 		wire->str = newname;
 		if (modport != NULL) {
@@ -2766,7 +2806,14 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 	for (auto &intf : local_interfaces) {
 		std::string intfname = intf.first.str();
 		RTLIL::Module *intfmodule = intf.second;
+		pool<std::string> mems_done;
 		for (auto w : intfmodule->wires()){
+			if (is_intf_mem_element(w)) {
+				std::string origname;
+				if (auto mem = intf_member_memory(new_ast.get(), w, intfname, mems_done, origname))
+					new_ast->children.push_back(std::move(mem));
+				continue;
+			}
 			auto wire = intf_member_wire(new_ast.get(), intfmodule, w, intfname);
 			std::string newname = w->name.unescape();
 			newname = intfname + "." + newname;

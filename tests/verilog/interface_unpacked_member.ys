@@ -1,0 +1,55 @@
+# An unpacked-array member of an interface (`logic [7:0] arr [2];') used
+# through modports and a generic interface port.  It was an RTLIL memory in
+# the interface and hierarchy connects interface members wire by wire, so
+# `r.arr[0]' in a module using the interface was an implicit wire: degraded.
+# The array is split into element wires on both sides (mem2reg).
+read_verilog -sv <<EOT
+interface aif;
+  logic [7:0] arr [2];
+  logic [0:3] dn [3:1];
+  modport src (output arr, output dn);
+  modport snk (input arr, input dn);
+endinterface
+module prod (input logic [7:0] x, aif.src r);
+  assign r.arr[0] = x;
+  assign r.arr[1] = ~x;
+  always_comb for (int k = 1; k <= 3; k++) r.dn[k] = x[3:0] + k;
+endmodule
+module cons (aif.snk r, input logic s, input logic [1:0] k, output logic [7:0] y, output logic [3:0] d);
+  assign y = r.arr[s];
+  assign d = r.dn[k];
+endmodule
+module top (input logic [7:0] x, input logic s, input logic [1:0] k, output logic ok);
+  aif i ();
+  logic [7:0] y; logic [3:0] d;
+  prod p (.x, .r(i.src));
+  cons c (.r(i.snk), .s, .k, .y, .d);
+  assign ok = y == (s ? ~x : x) && (k == 0 || d == x[3:0] + k) && i.arr[1] == ~x;
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1
+design -reset
+read_verilog -sv <<EOT
+interface pif #(parameter N = 2) ();
+  logic [3:0] a [N];
+endinterface
+module w4 (pif r, input logic [3:0] x);
+  always_comb for (int k = 0; k < 4; k++) r.a[k] = x + k;
+endmodule
+module top (input logic [3:0] x, input logic [1:0] s, output logic ok);
+  pif #(.N(4)) i ();
+  w4 m (.r(i), .x);
+  assign ok = i.a[3] == 4'(x + 3) && i.a[s] == 4'(x + s);
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1

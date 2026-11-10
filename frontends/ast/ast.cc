@@ -2397,6 +2397,7 @@ static void redo_interface_ports(RTLIL::Module *old_module, RTLIL::Module *new_m
 		new_module->fixup_ports();
 		RTLIL::Cell *subcell = new_module->addCell(intf.first, intf.second);
 		subcell->set_bool_attribute(ID::is_interface);
+		subcell->set_bool_attribute(ID(sv_intf_port_copy));
 		ports_replaced = true;
 	}
 	if (ports_replaced) {
@@ -2869,18 +2870,33 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 
 	// Generate RTLIL from AST for the new module and add to the design,
 	// renaming this module to move it out of the way.
-	bool intf_logic = false;
+	// fe151: the logic of an interface instance drives the members only
+	// once flatten joins them (flatten_cell), so until then the module
+	// carries a pending mark per such instance, which flatten drops.  The
+	// interface of a top module's interface port is not instantiated
+	// anywhere: its logic stays disconnected (h22 A7), a lasting mark.
+	std::vector<std::string> intf_marks;
 	for (auto &intf : local_interfaces)
-		intf_logic |= interface_has_logic(intf.second);
+		if (interface_has_logic(intf.second))
+			intf_marks.push_back(stringf("Interface `%s' (%s) has logic that is connected only by flatten. @cell %s",
+					intf.first.unescape(), intf.second->name.unescape(), intf.first.unescape()));
 	for (auto &ch : new_ast->children)
 		if (ch->type == AST_CELL && ch->str.size() > 20 && ch->str.compare(ch->str.size() - 20, 20, "_inst_from_top_dummy") == 0 &&
-				!ch->children.empty() && ch->children[0]->type == AST_CELLTYPE)
-			intf_logic |= interface_has_logic(design->module(ch->children[0]->str));
-	RTLIL::Module *old_module = this;
+				!ch->children.empty() && ch->children[0]->type == AST_CELLTYPE &&
+				interface_has_logic(design->module(ch->children[0]->str)))
+			intf_marks.push_back(stringf("Interface port `%s' (%s) has logic, which is not connected to its members. @cell %s",
+					RTLIL::unescape_id(ch->str.substr(0, ch->str.size() - 20)), RTLIL::unescape_id(ch->children[0]->str),
+					RTLIL::unescape_id(ch->str)));
 	RTLIL::Module* new_module =
 		process_and_replace_module(design, this, new_ast.get(), std::move(ast_before_replacing_interface_ports));
-	if (intf_logic)
-		carry_degraded(old_module, new_module);
+	if (!intf_marks.empty()) {
+		IdString attr = IdString("\\sv_degraded");
+		std::string cur = new_module->attributes.count(attr) ? new_module->attributes.at(attr).decode_string() : std::string();
+		for (auto &m : intf_marks)
+			if (cur.find(m) == std::string::npos)
+				cur += (cur.empty() ? "" : "; ") + m;
+		new_module->attributes[attr] = RTLIL::Const(cur);
+	}
 
 	// Set the attribute "interfaces_replaced_in_module" so that it does not happen again.
 	new_module->set_bool_attribute(ID::interfaces_replaced_in_module);
@@ -2910,12 +2926,9 @@ RTLIL::IdString AstModule::derive(RTLIL::Design *design, const dict<RTLIL::IdStr
 
 
 	if (!design->has(new_modname)) {
-		// fe130: the module the re-derivation is cloned from
-		RTLIL::Module *src_mod = nullptr;
 		if (!new_ast) {
 			auto mod = dynamic_cast<AstModule*>(design->module(modname));
 			new_ast = mod->ast->clone();
-			src_mod = mod;
 		}
 		modname = new_modname;
 		new_ast->str = modname;
@@ -2958,6 +2971,8 @@ RTLIL::IdString AstModule::derive(RTLIL::Design *design, const dict<RTLIL::IdStr
 				//   can further be found if it is propagated down to sub-sub-modules etc.
 				RTLIL::Cell *new_subcell = mod->addCell(intf.first, intf.second->name);
 				new_subcell->set_bool_attribute(ID::is_interface);
+				// fe151: flatten drops it (the interface is instantiated in a parent)
+				new_subcell->set_bool_attribute(ID(sv_intf_port_copy));
 			}
 			else {
 				log_error("No port with matching name found (%s) in %s. Stopping\n", intf.first, modname);
@@ -2969,11 +2984,9 @@ RTLIL::IdString AstModule::derive(RTLIL::Design *design, const dict<RTLIL::IdStr
 			mod->set_bool_attribute(ID::interfaces_replaced_in_module);
 		}
 
-		bool intf_logic = false;
-		for (auto &intf : interfaces)
-			intf_logic |= interface_has_logic(intf.second);
-		if (intf_logic)
-			carry_degraded(src_mod, mod);
+		// fe151: the members are this module's ports, connected to the
+		// instance whose parent carries the pending mark until flatten
+		// joins the interface's logic (expand_interfaces)
 
 	} else {
 		modname = new_modname;

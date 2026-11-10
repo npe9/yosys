@@ -102,13 +102,19 @@ static void inherit_degradation(RTLIL::Module *module, RTLIL::Module *tpl)
 // remove the frontend's "Identifier `NAME' is implicitly declared." entries
 // for a joined hierarchical reference from the module's sv_degraded list
 // (entries are "<reason> @file:line", joined by "; ")
+static void drop_degradation(RTLIL::Module *module, const std::string &prefix);
+
 static void drop_hierref_degradation(RTLIL::Module *module, IdString name)
+{
+	drop_degradation(module, stringf("Identifier `%s' is implicitly declared. @", name.c_str()));
+}
+
+static void drop_degradation(RTLIL::Module *module, const std::string &prefix)
 {
 	IdString attr = IdString("\\sv_degraded");
 	if (!module->attributes.count(attr))
 		return;
 	std::string cur = module->attributes.at(attr).decode_string();
-	std::string prefix = stringf("Identifier `%s' is implicitly declared. @", name.c_str());
 	std::string out;
 	size_t pos = 0;
 	while (pos <= cur.size()) {
@@ -198,6 +204,34 @@ struct FlattenWorker
 	{
 		inherit_degradation(module, tpl);
 
+		// fe151: an interface instance.  Its members are already wires of
+		// the parent, `<cell>.<member>' (expand_interfaces), which modules
+		// using the interface connect to; inlining joins each one to the
+		// interface's own wire of that name, so the interface's logic
+		// drives it (before, the inlined wire was uniquified to
+		// `<cell>.<member>_1' and the parent's wire stayed undriven).  A
+		// joined member is no longer an implicit wire.  The copy of the
+		// interface that derive puts into a module using it through a port
+		// (sv_intf_port_copy) stands for that instance: its members are the
+		// module's ports, so it is dropped rather than inlined a second time.
+		bool intf_instance = tpl->get_bool_attribute(ID::is_interface) && cell->get_bool_attribute(ID::is_interface);
+		if (intf_instance && cell->get_bool_attribute(ID(sv_intf_port_copy))) {
+			// only a member that is a port here: one outside the
+			// port's modport, read anyway, is a free implicit wire
+			for (auto tpl_wire : tpl->wires()) {
+				if (tpl_wire->name[0] != '\\')
+					continue;
+				IdString mname = concat_name(cell, tpl_wire->name, separator);
+				RTLIL::Wire *mw = module->wire(mname);
+				if (mw && (mw->port_input || mw->port_output) && !mw->get_bool_attribute(ID(sv_hierref)))
+					drop_hierref_degradation(module, mname);
+			}
+			log("Dropping %s.%s (the interface of port `%s', instantiated in a parent).\n", module, cell, cell->name.unescape());
+			module->remove(cell);
+			return;
+		}
+		bool intf_all_joined = true;
+
 		// Copy the contents of the flattened cell
 
 		dict<IdString, IdString> memory_map;
@@ -237,6 +271,20 @@ struct FlattenWorker
 						drop_hierref_degradation(module, hier_wire->name);
 					}
 				}
+				if (intf_instance && hier_wire != nullptr && !hier_wire->get_bool_attribute(ID::hierconn) &&
+						!hier_wire->port_input && !hier_wire->port_output) {
+					if (GetSize(hier_wire) == GetSize(tpl_wire)) {
+						drop_hierref_degradation(module, hier_wire->name);
+						// the interface's initial value (`logic c = 0;')
+						if (tpl_wire->attributes.count(ID::init) && !hier_wire->attributes.count(ID::init))
+							hier_wire->attributes[ID::init] = tpl_wire->attributes.at(ID::init);
+						new_wire = hier_wire;
+					} else {
+						log_warning("Interface member %s.%s is not joined to %s.%s (width %d, not %d).\n",
+							module, hier_wire, tpl, tpl_wire, GetSize(hier_wire), GetSize(tpl_wire));
+						intf_all_joined = false;
+					}
+				}
 				if (hier_wire != nullptr && hier_wire->get_bool_attribute(ID::hierconn)) {
 					hier_wire->attributes.erase(ID::hierconn);
 					if (GetSize(hier_wire) < GetSize(tpl_wire)) {
@@ -257,6 +305,12 @@ struct FlattenWorker
 			wire_map[tpl_wire] = new_wire;
 			design->select(module, new_wire);
 		}
+
+		// the pending mark of expand_interfaces holds until every member
+		// is joined
+		if (intf_instance && intf_all_joined)
+			drop_degradation(module, stringf("Interface `%s' (%s) has logic that is connected only by flatten. @cell %s",
+					cell->name.unescape(), tpl->name.unescape(), cell->name.unescape()));
 
 		for (auto &tpl_proc_it : tpl->processes) {
 			RTLIL::Process *new_proc = module->addProcess(map_name(cell, tpl_proc_it.second, separator), tpl_proc_it.second);

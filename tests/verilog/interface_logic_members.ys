@@ -1,0 +1,166 @@
+# An interface with its own logic (`assign tot = v + 2;', an always_ff with
+# an initial value) drives members that its users read.  flatten inlined the
+# instance with its wires uniquified (`i.tot_1'), so the parent's member wire
+# `i.tot' stayed undriven, and the copy of the interface in each module using
+# it through a port was inlined as well.  Now flatten joins the instance's
+# wires to the members and drops the copies.
+read_verilog -sv <<EOT
+interface pif ();
+  logic [3:0] v;
+  logic [3:0] tot;
+  assign tot = v + 2;
+  modport w (output v, input tot);
+endinterface
+module w4 (pif.w r, input logic [3:0] x);
+  assign r.v = x;
+endmodule
+module top (input logic [3:0] x, output logic ok);
+  pif i ();
+  w4 m (.r(i), .x);
+  assign ok = i.tot == 4'(x + 2) && i.v == x;
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1
+design -reset
+read_verilog -sv <<EOT
+interface pif;
+  logic [3:0] v, tot;
+  assign tot = v + 2;
+endinterface
+module w (pif r, input logic [3:0] x);
+  assign r.v = x;
+endmodule
+module holder (input logic [3:0] x, output logic [3:0] y);
+  pif i ();
+  w u (.r(i), .x);
+  assign y = i.tot;
+endmodule
+module top (input logic [3:0] x, output logic ok);
+  logic [3:0] y0, y1;
+  holder h0 (.x, .y(y0));
+  holder h1 (.x(~x), .y(y1));
+  generate if (1) begin : g
+    pif j ();
+    w u2 (.r(j), .x(x ^ 4'h5));
+  end endgenerate
+  assign ok = y0 == 4'(x + 2) && y1 == 4'(~x + 2) && g.j.tot == 4'((x ^ 4'h5) + 2);
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1
+design -reset
+read_verilog -sv <<EOT
+interface cif (input logic clk);
+  logic [3:0] inc;
+  logic [3:0] cnt = 0;
+  always_ff @(posedge clk) cnt <= cnt + inc;
+  modport drv (output inc);
+  modport mon (input cnt);
+endinterface
+module leaf (cif.drv d, input logic [3:0] x);
+  assign d.inc = x;
+endmodule
+module mid (cif.drv d, input logic [3:0] x);
+  leaf l (.d(d), .x);
+endmodule
+module obs (cif.mon m, output logic [3:0] c);
+  assign c = m.cnt;
+endmodule
+module top (input logic clk, input logic [3:0] x, output logic [3:0] c);
+  cif i (.clk);
+  mid u (.d(i.drv), .x);
+  obs o (.m(i.mon), .c);
+endmodule
+module chk (input logic clk, input logic [3:0] x, output logic ok);
+  logic [3:0] c;
+  logic [3:0] n = 0;
+  top t (.clk, .x, .c);
+  always_ff @(posedge clk) n <= n + x;
+  assign ok = c == n;
+endmodule
+EOT
+hierarchy -top chk -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -seq 6 -prove ok 1 -set-init-undef -set-def-inputs
+design -reset
+# the interface of a top module's interface port is not instantiated: its
+# logic is not connected, and the design stays marked
+read_verilog -sv <<EOT
+interface pif;
+  logic [3:0] v, tot;
+  assign tot = v + 2;
+endinterface
+module dtop (pif p, input logic [3:0] x, output logic [3:0] y);
+  assign p.v = x;
+  assign y = p.tot;
+endmodule
+EOT
+hierarchy -top dtop
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+# a module with an interface port and a local interface instance with logic
+read_verilog -sv <<EOT
+interface pif;
+  logic [3:0] v, tot;
+  assign tot = v + 2;
+endinterface
+interface qif;
+  logic [3:0] a;
+endinterface
+module w (pif r, input logic [3:0] x);
+  assign r.v = x;
+endmodule
+module mid (qif q, input logic [3:0] x, output logic [3:0] y);
+  pif loc ();
+  w u (.r(loc), .x(x ^ q.a));
+  assign y = loc.tot;
+endmodule
+module top (input logic [3:0] x, input logic [3:0] k, output logic ok);
+  qif qi ();
+  assign qi.a = k;
+  logic [3:0] y;
+  mid m (.q(qi), .x, .y);
+  assign ok = y == 4'((x ^ k) + 2);
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1
+design -reset
+# a member outside the port's modport, read anyway, is a free wire: the
+# copy of the interface that flatten drops does not clear its mark
+read_verilog -sv <<EOT
+interface pif;
+  logic [3:0] v, tot;
+  modport w (output v);
+endinterface
+module m (pif.w r, input logic [3:0] x, output logic [3:0] y);
+  assign r.v = x;
+  assign y = r.tot;
+endmodule
+module top (input logic [3:0] x, output logic [3:0] y);
+  pif i ();
+  m u (.r(i), .x, .y);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded

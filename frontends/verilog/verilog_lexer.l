@@ -525,7 +525,7 @@ ASSOC_DIM "["[ \t\r\n]*([a-zA-Z_$][a-zA-Z0-9_$]*|"\*")([ \t\r\n]|"/*"([^*]|\*+[^
 "checker"    { if (mode->formal) return parser::make_TOK_CHECKER(out_loc); SV_KEYWORD(parser::make_TOK_CHECKER(out_loc)); }
 "endchecker" { if (mode->formal) return parser::make_TOK_ENDCHECKER(out_loc); SV_KEYWORD(parser::make_TOK_ENDCHECKER(out_loc)); }
 "final"      { SV_KEYWORD(parser::make_TOK_FINAL(out_loc)); }
-"logic"      { SV_KEYWORD(parser::make_TOK_LOGIC(out_loc)); }
+"logic"      { SV_KEYWORD(parser::make_TOK_LOGIC(false, out_loc)); }
 	/* IEEE 1800-2009 6.23: `var type(expr) name;' declares a variable whose
 	   data type is taken from an expression's type. The type operator is
 	   opaque to elaboration (like its parameter-type use), so the whole
@@ -542,7 +542,7 @@ ASSOC_DIM "["[ \t\r\n]*([a-zA-Z_$][a-zA-Z0-9_$]*|"\*")([ \t\r\n]|"/*"([^*]|\*+[^
 	return parser::make_TOK_VAR(out_loc);
 }
 "var"        { SV_KEYWORD(parser::make_TOK_VAR(out_loc)); }
-"bit"        { SV_KEYWORD(parser::make_TOK_LOGIC(out_loc)); }
+"bit"        { SV_KEYWORD(parser::make_TOK_LOGIC(true, out_loc)); }
 "int"        { SV_KEYWORD(parser::make_TOK_INT(out_loc)); }
 "byte"       { SV_KEYWORD(parser::make_TOK_BYTE(out_loc)); }
 "shortint"   { SV_KEYWORD(parser::make_TOK_SHORTINT(out_loc)); }

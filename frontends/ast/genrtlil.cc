@@ -536,6 +536,17 @@ struct AST_INTERNAL::ProcessGenerator
 		outputSignals = RTLIL::SigSpec(subst_lvalue_from);
 	}
 
+	// a constant x or z bit assigned to a 2-state variable is 0 (IEEE
+	// 1800-2017 6.11.2, 7.2.1); a non-constant x (a free value) stays free
+	static void zero_2state_const_bits(AstNode *lhs, RTLIL::SigSpec &rvalue)
+	{
+		if (!lhs || lhs->type != AST_IDENTIFIER || !lhs->id2ast || !lhs->id2ast->get_bool_attribute(ID(sv_2state)))
+			return;
+		for (int i = 0; i < GetSize(rvalue); i++)
+			if (!rvalue[i].wire && (rvalue[i].data == RTLIL::State::Sx || rvalue[i].data == RTLIL::State::Sz))
+				rvalue[i] = RTLIL::State::S0;
+	}
+
 	void remove_unwanted_lvalue_bits(RTLIL::SigSpec &lhs, RTLIL::SigSpec &rhs)
 	{
 		RTLIL::SigSpec new_lhs, new_rhs;
@@ -711,6 +722,7 @@ struct AST_INTERNAL::ProcessGenerator
 			{
 				RTLIL::SigSpec unmapped_lvalue = ast->children[0]->genRTLIL(), lvalue = unmapped_lvalue;
 				RTLIL::SigSpec rvalue = ast->children[1]->genWidthRTLIL(lvalue.size(), true, &subst_rvalue_map.stdmap());
+				zero_2state_const_bits(ast->children[0].get(), rvalue);
 
 				pool<SigBit> lvalue_sigbits;
 				for (int i = 0; i < GetSize(lvalue); i++) {
@@ -1808,6 +1820,7 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 
 			AST::AstNode *member_node = nullptr;
 			int add_undef_bits_msb = 0;
+			RTLIL::State oob_fill = RTLIL::State::Sx;
 			int add_undef_bits_lsb = 0;
 
 			if (id2ast == nullptr) {
@@ -1987,6 +2000,9 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			}
 
 		use_const_chunk:
+			// an out-of-range bit or part select of a 2-state variable reads
+			// 0, of a 4-state one x (IEEE 1800-2017 7.4.6, 11.5.1)
+			oob_fill = id2ast->get_bool_attribute(ID(sv_2state)) ? RTLIL::State::S0 : RTLIL::State::Sx;
 			if (!children.empty() && children[0]->type == AST_MULTIRANGE)
 				children.clear();
 			if (children.size() != 0) {
@@ -2033,7 +2049,10 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 					}
 					if (GetSize(shift_val) >= 32)
 						fake_ast->children[1]->is_signed = true;
-					RTLIL::SigSpec sig = binop2rtlil(fake_ast.get(), ID($shiftx), width, fake_ast->children[0]->genRTLIL(), shift_val);
+					RTLIL::SigSpec shift_src = fake_ast->children[0]->genRTLIL();
+					if (oob_fill == RTLIL::State::S0)
+						fake_ast->children[0]->is_signed = false;	// zero-fill, not sign bits
+					RTLIL::SigSpec sig = binop2rtlil(fake_ast.get(), oob_fill == RTLIL::State::S0 ? ID($shift) : ID($shiftx), width, shift_src, shift_val);
 					return sig;
 				} else {
 					chunk.width = children[0]->range_left - children[0]->range_right + 1;
@@ -2047,7 +2066,7 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 						else
 							log_file_warning(location.to_loc(), "Range select [%d:%d] out of bounds on signal `%s': Setting all %d result bits to undef.\n",
 									children[0]->range_left, children[0]->range_right, str.c_str(), chunk.width);
-						chunk = RTLIL::SigChunk(RTLIL::State::Sx, chunk.width);
+						chunk = RTLIL::SigChunk(oob_fill, chunk.width);
 					} else {
 						if (chunk.offset + chunk.width - 1 > chunk_left) {
 							add_undef_bits_msb = (chunk.offset + chunk.width - 1) - chunk_left;
@@ -2068,7 +2087,7 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				}
 			}
 
-			RTLIL::SigSpec sig = { RTLIL::SigSpec(RTLIL::State::Sx, add_undef_bits_msb), chunk, RTLIL::SigSpec(RTLIL::State::Sx, add_undef_bits_lsb) };
+			RTLIL::SigSpec sig = { RTLIL::SigSpec(oob_fill, add_undef_bits_msb), chunk, RTLIL::SigSpec(oob_fill, add_undef_bits_lsb) };
 
 			if (genRTLIL_subst_ptr)
 				sig.replace(*genRTLIL_subst_ptr);
@@ -2457,6 +2476,20 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			if (!sign_hint)
 				is_signed = false;
 
+			// 2-state element type: an address out of range reads 0
+			// (IEEE 1800-2017 7.4.6), not x and not an aliased word
+			if (id2ast->get_bool_attribute(ID(sv_2state))) {
+				RTLIL::Memory *mem = current_module->memories[str];
+				int w = std::max(GetSize(addr_sig) + 1, 34);
+				RTLIL::SigSpec a = addr_sig;
+				a.extend_u0(w, children[0]->is_signed);
+				RTLIL::SigSpec lo = RTLIL::Const((long long)mem->start_offset, w);
+				RTLIL::SigSpec hi = RTLIL::Const((long long)mem->start_offset + mem->size - 1, w);
+				RTLIL::SigSpec in_range = current_module->LogicAnd(NEW_ID,
+						current_module->Ge(NEW_ID, a, lo, true), current_module->Le(NEW_ID, a, hi, true));
+				return current_module->Mux(NEW_ID, RTLIL::SigSpec(RTLIL::State::S0, wire->width), RTLIL::SigSpec(wire), in_range);
+			}
+
 			return RTLIL::SigSpec(wire);
 		}
 
@@ -2547,6 +2580,11 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				refuse_sva_operand(this);
 			RTLIL::SigSpec left = children[0]->genRTLIL();
 			RTLIL::SigSpec right = children[1]->genWidthRTLIL(left.size(), true);
+			{
+				RTLIL::SigSpec r = right;
+				ProcessGenerator::zero_2state_const_bits(children[0].get(), r);
+				right = r;
+			}
 			if (left.has_const()) {
 				RTLIL::SigSpec new_left, new_right;
 				for (int i = 0; i < GetSize(left); i++)

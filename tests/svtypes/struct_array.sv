@@ -19,9 +19,10 @@ module top;
 	end
 
 	always_comb assert(s==64'h4200_0012_3400_FFFC);
-	always_comb assert(s.a[0][3:-4]===8'h0x);
-	always_comb assert(s.b[23:16]===8'hxx);
-	always_comb assert(s.b[19:12]===8'hxf);
+	// all members are 2-state (bit): out-of-bounds bits read as 0 (IEEE 1800-2017 7.4.6, 11.5.1)
+	always_comb assert(s.a[0][3:-4]===8'h00);
+	always_comb assert(s.b[23:16]===8'h00);
+	always_comb assert(s.b[19:12]===8'h0f);
 
 	// Same as s, but defining dimensions in stages with typedef
 	typedef bit [7:0] bit8_t;
@@ -42,9 +43,9 @@ module top;
 	end
 
 	always_comb assert(s_s==64'h4200_0012_3400_FFFC);
-	always_comb assert(s_s.a[0][3:-4]===8'h0x);
-	always_comb assert(s_s.b[23:16]===8'hxx);
-	always_comb assert(s_s.b[19:12]===8'hxf);
+	always_comb assert(s_s.a[0][3:-4]===8'h00);
+	always_comb assert(s_s.b[23:16]===8'h00);
+	always_comb assert(s_s.b[19:12]===8'h0f);
 
 	struct packed {
 		bit [7:0] [7:0] a;	// 8 element packed array of bytes

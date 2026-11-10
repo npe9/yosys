@@ -86,6 +86,10 @@
 			// variables are unpacked arrays (empty until the first one)
 			std::string anon_struct_type;
 			int anon_struct_count = 0;
+			// set by integer_atom_type / integer_vector_type for the
+			// rule that reduces them: the type is 2-state (bit, int,
+			// byte, shortint, longint; not integer, logic, reg)
+			bool atom_2state = false;
 			// io_wire_type: the port wire (astbuf3) and the buffers an inline
 			// `input struct packed {...} p` clobbers while its body is parsed
 			std::vector<std::unique_ptr<AstNode>> port_struct_save;
@@ -1038,7 +1042,9 @@
 %token TOK_PROGRAM TOK_ENDPROGRAM TOK_GLOBAL
 %token TOK_PACKAGE TOK_ENDPACKAGE TOK_PACKAGESEP
 %token TOK_INTERFACE TOK_ENDINTERFACE TOK_MODPORT TOK_VAR TOK_WILDCARD_CONNECT
-%token TOK_INPUT TOK_OUTPUT TOK_INOUT TOK_WIRE TOK_WAND TOK_WOR TOK_REG TOK_LOGIC
+%token TOK_INPUT TOK_OUTPUT TOK_INOUT TOK_WIRE TOK_WAND TOK_WOR TOK_REG
+// TOK_LOGIC is `logic' (false) or `bit' (true, a 2-state type)
+%token <boolean_t> TOK_LOGIC
 %token TOK_INTEGER TOK_SIGNED TOK_ASSIGN TOK_ALIAS TOK_ALWAYS TOK_INITIAL
 %token TOK_ALWAYS_FF TOK_ALWAYS_COMB TOK_ALWAYS_LATCH
 %token TOK_BEGIN TOK_END TOK_IF TOK_ELSE TOK_IFNONE TOK_FOR TOK_WHILE TOK_REPEAT TOK_DO TOK_BREAK TOK_CONTINUE
@@ -2275,16 +2281,20 @@ net_type:
 
 logic_type:
 	TOK_LOGIC {
+		if ($1) extra->astbuf3->set_attribute(ID(sv_2state), AstNode::mkconst_int(@$, 1, false)); else extra->astbuf3->attributes.erase(ID(sv_2state));
 	} |
 	integer_atom_type {
+		if (extra->atom_2state) extra->astbuf3->set_attribute(ID(sv_2state), AstNode::mkconst_int(@$, 1, false)); else extra->astbuf3->attributes.erase(ID(sv_2state));
 		extra->astbuf3->range_left = $1 - 1;
 		extra->astbuf3->range_right = 0;
 		extra->astbuf3->is_signed = true;
 	} |
 	hierarchical_type_id {
+		extra->astbuf3->attributes.erase(ID(sv_2state));
 		extra->addWiretypeNode($1.get(), extra->astbuf3.get());
 	} |
 	TOK_SCOPED_ID {
+		extra->astbuf3->attributes.erase(ID(sv_2state));
 		extra->addWiretypeNode($1.get(), extra->astbuf3.get());
 	} |
 	hierarchical_type_id TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN {
@@ -2309,15 +2319,15 @@ opt_type_cast:
 	OP_CAST TOK_LPAREN expr TOK_RPAREN { $$ = std::move($3); };
 
 integer_atom_type:
-	TOK_INTEGER	{ $$ = 32; } |
-	TOK_INT		{ $$ = 32; } |
-	TOK_SHORTINT	{ $$ = 16; } |
-	TOK_LONGINT	{ $$ = 64; } |
-	TOK_BYTE	{ $$ =  8; } ;
+	TOK_INTEGER	{ $$ = 32; extra->atom_2state = false; } |
+	TOK_INT		{ $$ = 32; extra->atom_2state = true; } |
+	TOK_SHORTINT	{ $$ = 16; extra->atom_2state = true; } |
+	TOK_LONGINT	{ $$ = 64; extra->atom_2state = true; } |
+	TOK_BYTE	{ $$ =  8; extra->atom_2state = true; } ;
 
 integer_vector_type:
-	TOK_LOGIC { $$ = token::TOK_LOGIC; } |
-	TOK_REG   { $$ = token::TOK_REG; } ;
+	TOK_LOGIC { $$ = token::TOK_LOGIC; extra->atom_2state = $1; } |
+	TOK_REG   { $$ = token::TOK_REG; extra->atom_2state = false; } ;
 
 non_opt_range:
 	TOK_LBRA expr TOK_COL expr TOK_RBRA {
@@ -3606,6 +3616,7 @@ type_atom:
 		// astbuf1 can be unset when error recovery parses a type in a
 		// context where struct_member_type never ran.
 		if (extra->astbuf1) {
+			if (extra->atom_2state) extra->astbuf1->set_attribute(ID(sv_2state), AstNode::mkconst_int(@$, 1, false)); else extra->astbuf1->attributes.erase(ID(sv_2state));
 			extra->astbuf1->is_reg = true;
 			extra->astbuf1->is_signed = true;
 			addRange(extra->astbuf1.get(), $1 - 1, 0);
@@ -3620,7 +3631,7 @@ type_atom:
 	};
 
 type_vec: TOK_REG		{ if (extra->astbuf1) extra->astbuf1->is_reg   = true; }		// unsigned
-	| TOK_LOGIC		{ if (extra->astbuf1) extra->astbuf1->is_logic = true; }		// unsigned
+	| TOK_LOGIC		{ if (extra->astbuf1) { extra->astbuf1->is_logic = true; if ($1) extra->astbuf1->set_attribute(ID(sv_2state), AstNode::mkconst_int(@$, 1, false)); else extra->astbuf1->attributes.erase(ID(sv_2state)); } }		// unsigned
 	;
 
 type_signing:
@@ -4294,6 +4305,7 @@ typedef_base_type:
 	} |
 	integer_vector_type opt_signedness_default_unsigned {
 		$$ = std::make_unique<AstNode>(@$, AST_WIRE);
+		if (extra->atom_2state) $$->set_attribute(ID(sv_2state), AstNode::mkconst_int(@$, 1, false)); else $$->attributes.erase(ID(sv_2state));
 		if ($1 == token::TOK_REG) {
 			$$->is_reg = true;
 		} else {
@@ -4303,6 +4315,7 @@ typedef_base_type:
 	} |
 	integer_atom_type opt_signedness_default_signed {
 		$$ = std::make_unique<AstNode>(@$, AST_WIRE);
+		if (extra->atom_2state) $$->set_attribute(ID(sv_2state), AstNode::mkconst_int(@$, 1, false)); else $$->attributes.erase(ID(sv_2state));
 		$$->is_logic = true;
 		$$->is_signed = $2;
 		$$->range_left = $1 - 1;

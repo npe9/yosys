@@ -1697,6 +1697,27 @@ static void prepend_ranges(std::unique_ptr<AstNode> &range, AstNode *range_add);
 // [3:0][E-1:0], so `x[i]` is one element and `x[i].m` (rewritten below in
 // the AST_PREFIX branch) is that element's member bits; without it the
 // outer dimension was silently dropped and the wire was one element wide.
+// A packed struct or union is 2-state only if every member is (IEEE
+// 1800-2017 7.2.1); a member typed by a typedef carries no mark here and
+// counts as 4-state, the conservative side (x stays free).
+static bool struct_is_2state(AstNode *n)
+{
+	if (n->type == AST_STRUCT || n->type == AST_UNION) {
+		bool any = false;
+		for (auto &c : n->children) {
+			if (!c || c->type == AST_RANGE || c->type == AST_MULTIRANGE)
+				continue;
+			if (!struct_is_2state(c.get()))
+				return false;
+			any = true;
+		}
+		return any;
+	}
+	if (n->type == AST_STRUCT_ITEM)
+		return n->get_bool_attribute(ID(sv_2state));
+	return false;
+}
+
 std::unique_ptr<AstNode> make_packed_struct(AstNode *template_node, std::string &name, decltype(AstNode::attributes) &attributes, AstNode *packed_dims = nullptr)
 {
 	// create a wire for the packed struct
@@ -1709,6 +1730,10 @@ std::unique_ptr<AstNode> make_packed_struct(AstNode *template_node, std::string 
 	for (auto &pair : attributes) {
 		wnode->set_attribute(pair.first, pair.second->clone());
 	}
+	if (struct_is_2state(template_node))
+		wnode->set_attribute(ID(sv_2state), AstNode::mkconst_int(loc, 1, false));
+	else
+		wnode->attributes.erase(ID(sv_2state));
 	if (packed_dims) {
 		prepend_ranges(wnode->children[0], packed_dims);
 		wnode->range_valid = false;
@@ -12911,9 +12936,10 @@ bool AstNode::mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod,
 
 				delete_children();
 
+				// out of range: 0 for a 2-state element type, else x (7.4.6)
 				std::vector<RTLIL::State> x_bits;
 				for (int i = 0; i < width; i++)
-					x_bits.push_back(RTLIL::State::Sx);
+					x_bits.push_back(id2ast->get_bool_attribute(ID(sv_2state)) ? RTLIL::State::S0 : RTLIL::State::Sx);
 				auto constant = AstNode::mkconst_bits(location, x_bits, false);
 				constant->cloneInto(*this);
 			}
@@ -12927,8 +12953,18 @@ bool AstNode::mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod,
 			int mem_width, mem_size, addr_bits;
 			bool mem_signed = id2ast->is_signed;
 			id2ast->meminfo(mem_width, mem_size, addr_bits);
+			// 2-state element type: keep the whole index, so an address
+			// out of range takes the default (0) instead of aliasing the
+			// element its low bits name
+			int case_bits = addr_bits;
+			if (id2ast->get_bool_attribute(ID(sv_2state))) {
+				int idx_width = 0;
+				bool idx_signed = false;
+				children[0]->children[0]->detectSignWidth(idx_width, idx_signed);
+				case_bits = std::max(addr_bits, idx_width + 1);
+			}
 
-			auto wire_addr = std::make_unique<AstNode>(location, AST_WIRE, std::make_unique<AstNode>(location, AST_RANGE, mkconst_int(location, addr_bits-1, true), mkconst_int(location, 0, true)));
+			auto wire_addr = std::make_unique<AstNode>(location, AST_WIRE, std::make_unique<AstNode>(location, AST_RANGE, mkconst_int(location, case_bits-1, true), mkconst_int(location, 0, true)));
 			wire_addr->str = id_addr;
 			wire_addr->is_reg = true;
 			wire_addr->was_checked = true;
@@ -12957,7 +12993,7 @@ bool AstNode::mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod,
 			for (int i = 0; i < mem_size; i++) {
 				if (children[0]->children[0]->type == AST_CONSTANT && int(children[0]->children[0]->integer) != i)
 					continue;
-				auto cond_node = std::make_unique<AstNode>(location, AST_COND, AstNode::mkconst_int(location, i, false, addr_bits), std::make_unique<AstNode>(location, AST_BLOCK));
+				auto cond_node = std::make_unique<AstNode>(location, AST_COND, AstNode::mkconst_int(location, i, false, case_bits), std::make_unique<AstNode>(location, AST_BLOCK));
 				auto assign_reg = std::make_unique<AstNode>(location, AST_ASSIGN_EQ, std::make_unique<AstNode>(location, AST_IDENTIFIER), std::make_unique<AstNode>(location, AST_IDENTIFIER));
 				assign_reg->children[0]->str = id_data;
 				assign_reg->children[0]->was_checked = true;
@@ -12966,9 +13002,11 @@ bool AstNode::mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod,
 				case_node->children.push_back(std::move(cond_node));
 			}
 
+			// the default (an address out of range): 0 for a 2-state
+			// element type, else x (7.4.6)
 			std::vector<RTLIL::State> x_bits;
 			for (int i = 0; i < mem_width; i++)
-				x_bits.push_back(RTLIL::State::Sx);
+				x_bits.push_back(id2ast->get_bool_attribute(ID(sv_2state)) ? RTLIL::State::S0 : RTLIL::State::Sx);
 
 			auto cond_node = std::make_unique<AstNode>(location, AST_COND, std::make_unique<AstNode>(location, AST_DEFAULT), std::make_unique<AstNode>(location, AST_BLOCK));
 			auto assign_reg = std::make_unique<AstNode>(location, AST_ASSIGN_EQ, std::make_unique<AstNode>(location, AST_IDENTIFIER), AstNode::mkconst_bits(location, x_bits, false));

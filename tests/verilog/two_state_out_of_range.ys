@@ -1,0 +1,98 @@
+# 2-state types (bit, int, byte, shortint, longint, and packed structs and
+# typedefs of them) read 0, not x, out of range (IEEE 1800-2017 7.4.6,
+# 11.5.1), and a constant x/z assigned to one is 0 (6.11.2).  `bit' was lexed
+# as `logic', so these were free x values.  4-state types are unchanged.
+read_verilog -sv <<EOT
+module top(input logic [2:0] idx, input logic [3:0] j, input logic [3:0] din, output ok);
+  bit [7:0] x;
+  logic [7:0] lx;
+  int  si;
+  integer ii;
+  bit [7:2] xd;
+  bit [0:7] xa;
+  struct packed { bit f1, f2; bit [6:0] f3; } s;
+  struct packed { bit f1; logic f2; } ms;
+  typedef bit [3:0] nib_t;
+  nib_t n;
+  bit [3:0] mem [0:3];
+  bit [3:0] b0 = 4'b1x00;
+  bit a; logic b;
+  bit c, d; logic e;
+  assign x = 8'hff; assign lx = 8'hff; assign si = -1; assign ii = -1;
+  assign xd = 6'h3f; assign xa = 8'hff;
+  assign s = '{1'b1, 1'b0, 7'b1110010}; assign ms = 2'b11; assign n = din;
+  assign a = 1; assign b = 1; assign c = 1; assign d = 1; assign e = 1;
+  always_comb begin mem[0] = 1; mem[1] = 2; mem[2] = 3; mem[3] = 4; end
+  assign ok = x[8] == 0 && x[-1] == 0 && x[8:7] == 1 && x[8:-1] == 10'b0111111110
+           && s[-1] == 0 && si[32] == 0 && x[j] == (j < 8) && si[{2'b0,j} + 6'd28] == (j < 4)
+           && xd[j] == (j inside {[2:7]}) && xa[j] == (j <= 7) && n[j] == (j < 4 ? din[j[1:0]] : 1'b0)
+           && mem[idx] == (idx < 4 ? 4'(idx + 1) : 4'h0) && b0 == 4'b1000;
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1
+design -reset
+# a memory kept as $mem: the read port is guarded
+read_verilog -sv <<EOT
+module top(input clk, input logic [2:0] idx, input logic [1:0] wa, input logic [3:0] wd, input we, output ok);
+  bit [3:0] mem [0:3];
+  always_ff @(posedge clk) if (we) mem[wa] <= wd;
+  assign ok = idx < 4 || mem[idx] == 0;
+endmodule
+EOT
+hierarchy -top top -check
+proc
+select -assert-count 1 t:$memrd
+memory
+opt
+sat -seq 3 -verify -set-def-inputs -set-init-undef -prove ok 1
+design -reset
+# which declarations are 2-state (no leak across a declaration list)
+read_verilog -sv <<EOT
+module top(input bit pa, input logic pb, input bit pc, pd, output ok);
+  bit a; logic b;
+  bit c, d; logic e;
+  typedef bit [1:0] t2; logic [1:0] f;
+  int i0; integer i1; byte y0; shortint s0; longint l0;
+  assign {a,b,c,d,e,f} = 0; assign {i0,i1,y0,s0,l0} = 0;
+  assign ok = 1;
+endmodule
+EOT
+hierarchy -top top
+select -assert-count 10 a:sv_2state
+select -assert-count 10 w:a w:c w:d w:i0 w:l0 w:pa w:pc w:pd w:s0 w:y0 %u %u %u %u %u %u %u %u %u a:sv_2state %i
+design -reset
+read_verilog -sv <<EOT
+module top(input bit [3:0] q, input logic r, output ok);
+  typedef bit [1:0] t2; typedef logic [1:0] t4;
+  t2 g; logic [1:0] h; t4 k; t2 [1:0] gg;
+  typedef struct packed { bit x; t2 y; } st_t; st_t sv; typedef struct packed { bit x; t4 y; } st3_t; st3_t sv3;
+  typedef struct packed { bit x; bit [1:0] y; } st2_t; st2_t sv2;
+  assign {g,h,k,gg,sv,sv2,sv3} = 0;
+  assign ok = 1;
+endmodule
+EOT
+hierarchy -top top
+select -assert-count 5 a:sv_2state
+select -assert-count 5 w:g w:gg w:q w:sv w:sv2 %u %u %u %u a:sv_2state %i
+design -reset
+# 4-state types keep x out of range
+read_verilog -sv <<EOT
+module top(input logic [3:0] j, output ok);
+  logic [7:0] lx; integer ii; reg [3:0] rr;
+  struct packed { bit f1; logic f2; } ms;
+  typedef logic [3:0] lt; lt ln;
+  assign lx = 8'hff; assign ii = -1; assign ms = 2'b11; assign rr = 4'hf; assign ln = 4'hf;
+  assign ok = lx[8] === 1'bx && ii[32] === 1'bx && ms[-1] === 1'bx && rr[4] === 1'bx
+           && ((j < 8) || lx[j] === 1'bx) && ((j < 4) || ln[j] === 1'bx);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+opt
+sat -enable_undef -set-def-inputs -verify -prove ok 1

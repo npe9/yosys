@@ -1,0 +1,27 @@
+# A module derived with an interface port that also holds a local interface
+# array (caliptra el2_veer_lockstep): resolving `d[0].a' rederives it from its
+# AST. The rederive kept the placeholder port `mr' next to `mr.a', so a later
+# `.*' on the cell looked for a wire `mr' in the parent and failed. Hierarchy
+# runs without -top first, as the ladder does.
+read_verilog -sv <<EOT
+interface rif; logic [3:0] a; modport src(output a); modport snk(input a); endinterface
+module src_m #(parameter P = 1) (input logic [3:0] x, rif.src r); assign r.a = x + P[3:0] - 4'd1; endmodule
+module ls #(parameter P = 1) (rif.snk mr, output logic [3:0] y);
+  rif d[1:0] ();
+  assign d[0].a = mr.a;
+  assign d[1].a = d[0].a;
+  assign y = d[1].a;
+endmodule
+module top(input logic [3:0] x, output logic [3:0] y);
+  rif i();
+  src_m #(.P(1)) s(.r(i.src), .*);
+  ls #(.P(2)) l(.mr(i.snk), .*);
+endmodule
+EOT
+hierarchy -check
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none =A:sv_degraded
+sat -verify -prove y x

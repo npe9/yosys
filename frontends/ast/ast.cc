@@ -2286,6 +2286,44 @@ void AST::explode_interface_port(AstNode *module_ast, RTLIL::Module * intfmodule
 	}
 }
 
+// A module derived with interfaces was exploded once, and its AST holds the
+// members; a rederive from that AST (reprocess_if_necessary, fe143;
+// resolve_hierrefs, fe145) has to redo what derive() did after generating
+// RTLIL: remove each interface's placeholder port and add the interface
+// subcell back, or hierarchy explodes the ports a second time (and `.*`
+// looks for a wire named after the placeholder).
+static std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> interface_cells_of(RTLIL::Module *module)
+{
+	std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> intf_cells;
+	if (module->get_bool_attribute(ID::interfaces_replaced_in_module))
+		for (auto c : module->cells())
+			if (c->get_bool_attribute(ID::is_interface))
+				intf_cells.push_back({c->name, c->type});
+	return intf_cells;
+}
+
+static void redo_interface_ports(RTLIL::Module *old_module, RTLIL::Module *new_module,
+		const std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> &intf_cells)
+{
+	bool ports_replaced = false;
+	for (auto &intf : intf_cells) {
+		RTLIL::Wire *port = new_module->wire(intf.first);
+		if (port == nullptr || !port->get_bool_attribute(ID::is_interface))
+			continue;
+		pool<RTLIL::Wire*> to_remove;
+		to_remove.insert(port);
+		new_module->remove(to_remove);
+		new_module->fixup_ports();
+		RTLIL::Cell *subcell = new_module->addCell(intf.first, intf.second);
+		subcell->set_bool_attribute(ID::is_interface);
+		ports_replaced = true;
+	}
+	if (ports_replaced) {
+		new_module->set_bool_attribute(ID::interfaces_replaced_in_module);
+		carry_degraded(old_module, new_module);
+	}
+}
+
 // AstModules may contain cells marked with ID::reprocess_after, which indicates
 // that it should be reprocessed once the specified module has been elaborated.
 bool AstModule::reprocess_if_necessary(RTLIL::Design *design)
@@ -2302,30 +2340,10 @@ bool AstModule::reprocess_if_necessary(RTLIL::Design *design)
 			// A module derived with interfaces was exploded once, and its AST
 			// holds the members; what derive() did after generating RTLIL has
 			// to be done again, or hierarchy explodes the ports a second time.
-			std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> intf_cells;
-			if (get_bool_attribute(ID::interfaces_replaced_in_module))
-				for (auto c : cells())
-					if (c->get_bool_attribute(ID::is_interface))
-						intf_cells.push_back({c->name, c->type});
+			auto intf_cells = interface_cells_of(this);
 			RTLIL::Module *old_module = this;
 			RTLIL::Module *new_module = process_and_replace_module(design, this, ast.get(), NULL);
-			bool ports_replaced = false;
-			for (auto &intf : intf_cells) {
-				RTLIL::Wire *port = new_module->wire(intf.first);
-				if (port == nullptr || !port->get_bool_attribute(ID::is_interface))
-					continue;
-				pool<RTLIL::Wire*> to_remove;
-				to_remove.insert(port);
-				new_module->remove(to_remove);
-				new_module->fixup_ports();
-				RTLIL::Cell *subcell = new_module->addCell(intf.first, intf.second);
-				subcell->set_bool_attribute(ID::is_interface);
-				ports_replaced = true;
-			}
-			if (ports_replaced) {
-				new_module->set_bool_attribute(ID::interfaces_replaced_in_module);
-				carry_degraded(old_module, new_module);
-			}
+			redo_interface_ports(old_module, new_module, intf_cells);
 			return true;
 		}
 	}
@@ -2611,7 +2629,10 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		new_ast->children.push_back(std::move(wire));
 	}
 	bool intf_done = get_bool_attribute(ID::interfaces_replaced_in_module);
+	auto intf_cells = interface_cells_of(this);
+	RTLIL::Module *old_module = this;
 	RTLIL::Module *new_module = process_and_replace_module(design, this, new_ast.get(), NULL);
+	redo_interface_ports(old_module, new_module, intf_cells);
 	new_module->set_bool_attribute(ID(sv_hierrefs_resolved));
 	// an upward-reference port is connected by flatten only
 	// (connect_upward_refs): until then it is a free input, so the module

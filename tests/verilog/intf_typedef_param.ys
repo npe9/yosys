@@ -1,0 +1,72 @@
+# An interface member typed by an interface typedef whose ranges use the
+# interface's parameters (`logic [W/XLEN-1:0] we').  The typedef is copied
+# into the module using the interface, where W and XLEN are not visible:
+# "Range bound uses implicitly declared identifier `\W' from a missing
+# package" (error).  Now the interface's parameter values (the instance's
+# overrides, in a derived interface) are substituted into the copy.
+read_verilog -sv <<EOT
+package p; localparam int Q = 1; endpackage
+interface ifx import p::*; #(parameter int W = 32);
+  localparam int XLEN = 32;
+  typedef struct packed { logic [W/XLEN-1:0] we; logic [3:0] d; } r_t;
+  r_t r;
+endinterface
+module top (input logic [4:0] a, output logic ok);
+  ifx i ();
+  assign i.r = a;
+  assign ok = i.r == a && i.r.we == a[4] && i.r.d == a[3:0] && $bits(i.r) == 5;
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1
+design -reset
+
+# A parameter override, and a localparam computed from a parameter
+read_verilog -sv <<EOT
+interface ifx #(parameter int W = 32);
+  localparam int XLEN = 32;
+  localparam int N = W/XLEN;
+  typedef struct packed { logic [N-1:0] we; logic [3:0] d; } r_t;
+  r_t r;
+endinterface
+module top (input logic [5:0] a, output logic ok);
+  ifx #(.W(64)) i ();
+  assign i.r = a;
+  assign ok = i.r.we == a[5:4] && i.r.d == a[3:0] && $bits(i.r) == 6;
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1
+design -reset
+
+# The parameter's declared type applies to its value: a narrow localparam
+# truncates (`bit [1:0] N = W/8' is 0 for W=64), a signed one is negative
+# (S = -6), and an ascending range sizes the same (R = 65 in 3 bits is 1)
+read_verilog -sv <<EOT
+interface ifx #(parameter int W = 32);
+  localparam bit [1:0] N = W/8;
+  localparam logic signed [3:0] S = W - 70;
+  localparam logic [0:2] R = W + 1;
+  typedef struct packed { logic [N:0] we; logic [(S < 0 ? 2 : 5):0] a; logic [R:0] b; } r_t;
+  r_t r;
+endinterface
+module top (input logic [5:0] x, output logic ok);
+  ifx #(.W(64)) i ();
+  assign i.r = x;
+  assign ok = $bits(i.r) == 6 && i.r.we == x[5] && i.r.a == x[4:2] && i.r.b == x[1:0];
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1

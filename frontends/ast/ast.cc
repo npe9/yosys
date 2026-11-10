@@ -2188,6 +2188,45 @@ static bool qualify_intf_types(RTLIL::Design *design, AstNode *node, AstNode *in
 	if (depth > 16)
 		return false;
 	for (auto &c : node->children) {
+		// fe154: a parameter or localparam of the interface (`W/XLEN-1' in
+		// a member's range) is not visible in the module: substitute its
+		// value, which in a derived interface is the instance's override
+		if (c->type == AST_IDENTIFIER && c->children.empty()) {
+			AstNode *par = nullptr;
+			for (auto &ic : intf_ast->children)
+				if ((ic->type == AST_PARAMETER || ic->type == AST_LOCALPARAM) && ic->str == c->str && !ic->children.empty())
+					par = ic.get();
+			if (par) {
+				auto val = par->children[0]->clone();
+				if (val->type != AST_CONSTANT) {
+					auto wrap = std::make_unique<AstNode>(val->location, AST_NONE, std::move(val));
+					if (!qualify_intf_types(design, wrap.get(), intf_ast, intfname, module_ast, depth + 1))
+						return false;
+					val = std::move(wrap->children[0]);
+				}
+				// the parameter's declared type applies to its value
+				// (`localparam bit [1:0] N = W/8' is 0 for W=64): a
+				// constant range becomes a size cast and the declared
+				// signedness a $signed/$unsigned; any other type (a
+				// typedef, several dimensions) is not substituted and
+				// the member falls back to the plain vector
+				for (size_t k = 1; k < par->children.size(); k++) {
+					AstNode *t = par->children[k].get();
+					if (t->type != AST_RANGE || t->children.size() != 2 ||
+							t->children[0]->type != AST_CONSTANT || t->children[1]->type != AST_CONSTANT)
+						return false;
+					int msb = t->children[0]->asInt(true), lsb = t->children[1]->asInt(true);
+					int width = (msb > lsb ? msb - lsb : lsb - msb) + 1;
+					val = std::make_unique<AstNode>(val->location, AST_CAST_SIZE,
+							AstNode::mkconst_int(val->location, width, true), std::move(val));
+				}
+				if (par->children.size() > 1 || par->is_signed)
+					val = std::make_unique<AstNode>(val->location,
+							par->is_signed ? AST_TO_SIGNED : AST_TO_UNSIGNED, std::move(val));
+				c = std::move(val);
+				continue;
+			}
+		}
 		if (c->type == AST_WIRETYPE && c->str.find("::") == std::string::npos) {
 			if (AstNode *td = find_typedef_child(intf_ast, c->str)) {
 				// a compilation-unit typedef is in the module too

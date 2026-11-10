@@ -1,0 +1,38 @@
+# A port whose data type is an inline struct or union (`input struct packed
+# {...} p', IEEE 1800-2017 23.2.2.3) in an ANSI port list, a non-ANSI port
+# declaration and a function argument.  This used to be a syntax error
+# ("unexpected TOK_STRUCT").
+read_verilog -sv <<EOT
+module leaf(input struct packed { logic [3:0] hi; logic [3:0] lo; } a, b,
+            output union packed { logic [7:0] w; struct packed { logic [3:0] x, y; } s; } u,
+            input var struct packed signed { logic [1:0] k; } [1:0] pk,
+            output logic [3:0] q);
+  assign u.s.x = a.hi;
+  assign u.s.y = b.lo;
+  assign q = {pk[1].k, pk[0].k};
+endmodule
+module nonansi(p, r);
+  input struct packed { logic [2:0] f; logic g; } p;
+  output logic [2:0] r;
+  assign r = p.g ? p.f : ~p.f;
+endmodule
+module fn(input logic [7:0] x, output logic [3:0] y);
+  function automatic logic [3:0] sw(input struct packed { logic [3:0] a, b; } v);
+    return v.a + v.b;
+  endfunction
+  assign y = sw(x);
+endmodule
+module top(input logic [7:0] x, output logic ok);
+  logic [7:0] w; logic [3:0] q, fy; logic [2:0] r;
+  leaf l(.a(x), .b(~x), .u(w), .pk(4'b1001), .q(q));
+  nonansi n(.p(x[3:0]), .r(r));
+  fn f(.x(x), .y(fy));
+  assign ok = w == {x[7:4], ~x[3:0]} && q == 4'b1001 && r == (x[0] ? x[3:1] : ~x[3:1]) && fy == x[7:4] + x[3:0];
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1

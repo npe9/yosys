@@ -86,6 +86,9 @@
 			// variables are unpacked arrays (empty until the first one)
 			std::string anon_struct_type;
 			int anon_struct_count = 0;
+			// io_wire_type: the port wire (astbuf3) and the buffers an inline
+			// `input struct packed {...} p` clobbers while its body is parsed
+			std::vector<std::unique_ptr<AstNode>> port_struct_save;
 			size_t bind_mark = 0;
 			AstNode* cell_hack;
 			AstNode* member_hack;
@@ -2116,8 +2119,37 @@ delay:
 
 io_wire_type:
 	{ extra->astbuf3 = std::make_unique<AstNode>(@$, AST_WIRE); extra->current_wire_rand = false; extra->current_wire_const = false; extra->current_wire_automatic = false; }
-	wire_type_token_io wire_type_const_rand opt_wire_type_token wire_type_signedness
+	wire_type_token_io wire_type_const_rand io_wire_type_token wire_type_signedness
 	{ $$ = std::move(extra->astbuf3); SET_RULE_LOC(@$, @2, @$); };
+
+io_wire_type_token:
+	opt_wire_type_token |
+	io_port_struct_type;
+
+// IEEE 1800-2017 23.2.2.3: a port's data type may be an inline struct or
+// union (`input struct packed {...} p`).  The struct becomes a hidden
+// typedef in the enclosing scope, as for an anonymous struct variable
+// (struct_var), and the port wire takes that type.
+io_port_struct_type:
+	opt_var_or_net {
+		extra->port_struct_save.push_back(std::move(extra->astbuf1));
+		extra->port_struct_save.push_back(std::move(extra->astbuf2));
+		extra->port_struct_save.push_back(std::move(extra->astbuf3));
+	} struct_type {
+		extra->astbuf3 = std::move(extra->port_struct_save.back());
+		extra->port_struct_save.pop_back();
+		extra->astbuf2 = std::move(extra->port_struct_save.back());
+		extra->port_struct_save.pop_back();
+		extra->astbuf1 = std::move(extra->port_struct_save.back());
+		extra->port_struct_save.pop_back();
+		std::string tname = stringf("\\__sv_anon_struct_%d", ++extra->anon_struct_count);
+		extra->addTypedefNode(&tname, std::move($3));
+		extra->astbuf3->is_logic = true;
+		extra->addWiretypeNode(&tname, extra->astbuf3.get());
+	};
+
+opt_var_or_net:
+	%empty | TOK_VAR | net_type;
 
 non_io_wire_type:
 	{ extra->astbuf3 = std::make_unique<AstNode>(@$, AST_WIRE); extra->current_wire_rand = false; extra->current_wire_const = false; extra->current_wire_automatic = false; }

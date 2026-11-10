@@ -1,0 +1,34 @@
+# An always_comb with a missing default infers a real latch.  read_verilog
+# errors by default.  With the opt-in scratchpad flag
+# proc_dlatch.always_comb_warn the latch is built with a warning and listed
+# in (* sv_comb_latch *); it is modelled exactly, so the module is not
+# marked sv_degraded and a check over it is decided.
+read_verilog -sv <<EOT
+module top (input logic en, input logic [3:0] d, output logic [3:0] q);
+  always_comb if (en) q = d;
+endmodule
+EOT
+scratchpad -set proc_dlatch.always_comb_warn 1
+logger -expect warning "Latch inferred for signal .* \(built as a latch\)" 1
+hierarchy -top top
+proc
+select -assert-none A:sv_degraded
+select -assert-mod-count 1 A:sv_comb_latch
+select -assert-count 1 t:$dlatch
+logger -check-expected
+async2sync
+# transparent while en is high
+sat -verify -seq 1 -set en 1 -prove q d
+# holds while en is low: d loaded at step 1, en low and d changed at step 2
+sat -verify -seq 2 -set-at 1 en 1 -set-at 1 d 4'b1010 -set-at 2 en 0 -set-at 2 d 4'b0101 -prove-skip 1 -prove q 4'b1010 -set-init-undef
+design -reset
+
+# Without the flag: the default error is unchanged
+scratchpad -unset proc_dlatch.always_comb_warn
+read_verilog -sv <<EOT
+module top (input logic en, input logic [3:0] d, output logic [3:0] q);
+  always_comb if (en) q = d;
+endmodule
+EOT
+logger -expect error "Latch inferred for signal" 1
+proc

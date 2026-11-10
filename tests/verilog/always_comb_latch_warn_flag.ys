@@ -1,6 +1,7 @@
 # fe122: scratchpad proc_dlatch.always_comb_warn makes an always_comb latch
-# a warning (the latch is built and the module marked sv_degraded) while
-# the read stays strict; without the flag strict mode still errors
+# a warning while the read stays strict; without the flag strict mode still
+# errors.  fe155: the latch is built exactly, so the module is no longer
+# marked sv_degraded; it is listed in (* sv_comb_latch *) instead
 read_verilog -sv <<EOT
 module top(input en, input [3:0] d, output logic [3:0] q);
   always_comb if (en) q = d;
@@ -10,7 +11,8 @@ scratchpad -set proc_dlatch.always_comb_warn 1
 logger -expect warning "Latch inferred for signal `\\top.\\q' from always_comb" 1
 proc
 select -assert-count 1 t:$dlatch
-select -assert-mod-count 1 A:sv_degraded
+select -assert-none A:sv_degraded
+select -assert-mod-count 1 A:sv_comb_latch
 logger -check-expected
 design -reset
 scratchpad -unset proc_dlatch.always_comb_warn

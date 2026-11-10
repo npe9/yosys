@@ -2047,12 +2047,17 @@ const RTLIL::Module* AstNode::lookup_cell_module()
 	if (cell_params_map.size()) // not named_parameters to cover hierarchical defparams
 		modname = derived_module_name(celltype->str, named_parameters);
 
-	// try to find the resolved module
-	module = lookup_module(modname);
+	// try to find the resolved module (fe146: or its interface variant)
+	module = module_or_interface_variant(simplify_design_context, modname);
 	if (!module) {
 		reprocess_after(modname);
 		return nullptr;
 	}
+	// a variant lacks the interface ports, so positions would not match
+	if (module->name != modname)
+		for (auto& child : children)
+			if (child->type == AST_ARGUMENT && child->str.empty())
+				return nullptr; // let hierarchy handle these connections
 	return module;
 }
 
@@ -5582,6 +5587,10 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 
 				// find the port's wire in the underlying module
 				const RTLIL::Wire *ref = module->wire(port_name);
+				// an interface port of an interface variant (fe146) is a
+				// subcell there; hierarchy connects it
+				if (ref == nullptr && module->name.contains("$interfaces$"))
+					continue;
 				if (ref == nullptr)
 					input_error("Cell instance refers to port %s which does not exist in module %s!.\n",
 							port_name.unescape(), module->name.unescape());

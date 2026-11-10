@@ -1,0 +1,33 @@
+# `.*' to a sub-module with an interface port and an unpacked-array port
+# (caliptra el2_veer's `el2_dec dec(.*)': `regfile' and `pmp_pmpaddr').  The
+# AST connects the unpacked array once the sub-module is known, waiting for
+# its plain derived name; since `.*' derives such a cell only with its
+# interface (`...$interfaces$rif'), that name never appeared and the array
+# was left to hierarchy ("No matching wire for implicit port connection `a'").
+read_verilog -sv <<EOT
+interface rif; logic [7:0] v; modport src(output v); endinterface
+module drv #(parameter N = 2) (input logic [7:0] x, rif.src r, output logic [7:0] a [N]);
+  assign r.v = x;
+  for (genvar i = 0; i < N; i++) begin : g
+    assign a[i] = x + 8'(i);
+  end
+endmodule
+module mid #(parameter N = 2) (input logic [7:0] x, rif.src r, output logic [7:0] y);
+  logic [7:0] a [N];
+  drv #(.N(N)) d (.*);
+  assign y = a[0] ^ a[N-1];
+endmodule
+module top(input logic [7:0] x, output logic [7:0] y, output logic [7:0] z, output logic ok);
+  rif r ();
+  mid #(.N(4)) m (.x, .r, .y);
+  assign z = r.v;
+  assign ok = y == (x ^ (x + 8'd3)) && z == x;
+endmodule
+EOT
+hierarchy -check
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none =A:sv_degraded
+sat -verify -prove ok 1

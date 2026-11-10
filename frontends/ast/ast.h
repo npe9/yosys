@@ -518,6 +518,11 @@ namespace AST_INTERNAL
 	                           RTLIL::Module *old_module,
 	                           AST::AstNode *new_ast,
 	                           std::unique_ptr<AST::AstNode> original_ast = nullptr);
+
+	// `modname' (a derive_common name), or else a variant of it derived
+	// with interfaces (`modname$interfaces$...'): a cell with an interface
+	// port may only ever be derived that way.  Its other ports are the same.
+	const RTLIL::Module *module_or_interface_variant(const RTLIL::Design *design, const std::string &modname);
 }
 
 YOSYS_NAMESPACE_END

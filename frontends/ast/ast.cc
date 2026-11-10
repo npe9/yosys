@@ -2286,6 +2286,21 @@ void AST::explode_interface_port(AstNode *module_ast, RTLIL::Module * intfmodule
 	}
 }
 
+// fe146: since fe145, `.*' derives a cell with an interface port only with
+// its interfaces, so the plain derived name a parent waits for (the
+// reprocess_after of lookup_cell_module, which `.*' needs to see unpacked
+// ports) may never appear.
+const RTLIL::Module *AST_INTERNAL::module_or_interface_variant(const RTLIL::Design *design, const std::string &modname)
+{
+	if (const RTLIL::Module *m = design->module(modname))
+		return m;
+	std::string prefix = modname + "$interfaces$";
+	for (auto &it : design->modules_)
+		if (it.first.begins_with(prefix))
+			return it.second;
+	return nullptr;
+}
+
 // A module derived with interfaces was exploded once, and its AST holds the
 // members; a rederive from that AST (reprocess_if_necessary, fe143;
 // resolve_hierrefs, fe145) has to redo what derive() did after generating
@@ -2333,7 +2348,7 @@ bool AstModule::reprocess_if_necessary(RTLIL::Design *design)
 		std::string modname = cell->get_string_attribute(ID::reprocess_after);
 		if (modname.empty())
 			continue;
-		if (design->module(modname) || design->module("$abstract" + modname)) {
+		if (module_or_interface_variant(design, modname) || design->module("$abstract" + modname)) {
 			log("Reprocessing module %s because instantiated module %s has become available.\n",
 					name.unescape(), RTLIL::unescape_id(modname));
 			loadconfig();

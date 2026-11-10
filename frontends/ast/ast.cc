@@ -2233,6 +2233,32 @@ static std::unique_ptr<AstNode> intf_member_wire(AstNode *module_ast, RTLIL::Mod
 	AstModule *am = dynamic_cast<AstModule*>(intfmodule);
 	if (am && am->ast && w->has_attribute(ID::wiretype)) {
 		for (auto &c : am->ast->children) {
+			if ((c->type == AST_STRUCT || c->type == AST_UNION) && c->str == w->name.str()) {
+				// fe148: an inline anonymous struct/union member
+				// (`struct packed {...} s;') becomes a typedef of the
+				// module, `<intfname>.$anon$<member>', and the member a
+				// wire of that type
+				std::string tn = intfname + ".$anon$" + w->name.unescape();
+				if (!find_typedef_child(module_ast, tn)) {
+					auto type = c->clone();
+					type->str.clear();
+					auto td = std::make_unique<AstNode>(c->location, AST_TYPEDEF, std::move(type));
+					td->str = tn;
+					size_t before = module_ast->children.size();
+					if (!qualify_intf_types(intfmodule->design, td.get(), am->ast.get(), intfname, module_ast, 0)) {
+						module_ast->children.resize(before);
+						break;
+					}
+					module_ast->children.push_back(std::move(td));
+				}
+				auto wt = std::make_unique<AstNode>(c->location, AST_WIRETYPE);
+				wt->str = tn;
+				auto wire = std::make_unique<AstNode>(c->location, AST_WIRE, std::move(wt));
+				wire->is_logic = true;
+				wire->is_custom_type = true;
+				wire->str = intfname + "." + w->name.unescape();
+				return wire;
+			}
 			if (c->type != AST_WIRE || c->str != w->name.str())
 				continue;
 			if (GetSize(c->children) != 1 || c->children[0]->type != AST_WIRETYPE)

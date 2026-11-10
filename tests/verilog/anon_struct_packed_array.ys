@@ -1,0 +1,44 @@
+# A module-scope anonymous packed struct with packed dimensions
+# (`struct packed {...} [1:0] v;') is a packed vector of structs (7.4.1).
+# The packed dimensions were folded into the unpacked ones, making `v' a
+# memory: `v[1].b' did not resolve, and `assign v = d' silently lost its
+# value.  Now it takes the hidden typedef, as in a procedure.
+read_verilog -sv <<EOT
+module top(input logic [13:0] d, output ok);
+  struct packed { logic [3:0] a; logic [2:0] b; } [1:0] v;
+  assign v = d;
+  assign ok = v == d && v[1].a == d[13:10] && v[0].b == d[2:0];
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1
+design -reset
+read_verilog -sv <<EOT
+module top(input logic [3:0] a, input logic [2:0] b, input logic [1:0] j, input logic i, input clk, output ok);
+  struct packed { logic [3:0] a; logic [2:0] b; } [1:0] v, w [3];
+  struct packed { logic [1:0] p; logic q; } [2:0][1:0] m;
+  struct packed { logic [1:0] p; logic q; } [1:0] z = 6'b101_110;
+  assign v = {a, b, ~a, ~b};
+  assign w[0] = v; assign w[1] = ~v; assign w[2] = 14'h1234;
+  assign m = 18'h2abcd;
+  generate if (1) begin : g
+    struct packed { logic [3:0] a; logic [2:0] b; } [1:0] gv;
+    assign gv = {b, a, b, a};
+  end endgenerate
+  assign ok = v[1].a == a && v[0].b == ~b && v[i].a == (i ? a : ~a)
+           && w[1][0].a == a && w[2][1].b == 3'h4 && $bits(v) == 14 && $bits(w[0]) == 14
+           && m[2][1].p == 2'h2 && m[0][0].q == 1'b1 && m[1][0] == 3'h7
+           && z[1].p == 2'b10 && z[0].q == 1'b0
+           && g.gv[1].a == {b[2:0], a[3]} && g.gv[0].b == a[2:0];
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1

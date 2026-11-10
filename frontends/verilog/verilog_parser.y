@@ -3930,9 +3930,12 @@ struct_var:
 		bool in_proc = scope_type == AST_FUNCTION || scope_type == AST_TASK || scope_type == AST_BLOCK;
 		// packed dims (`struct packed {...} [1:0][3:0] v;`) go on the
 		// variable after the hidden typedef, as for `T [1:0][3:0] v;`
-		bool packed_dim = extra->astbuf3 && in_proc &&
+		// (in any scope: at module scope the packed dims were folded
+		// into the unpacked ones, making `v` a memory, so `v[1].b` did
+		// not resolve and a whole-vector assignment was lost)
+		bool packed_dim = extra->astbuf3 &&
 				(extra->astbuf3->type == AST_RANGE || extra->astbuf3->type == AST_MULTIRANGE);
-		if ((!extra->astbuf3 || packed_dim) && ($2 || in_proc) && (extra->astbuf2->type == AST_STRUCT || extra->astbuf2->type == AST_UNION)) {
+		if ((!extra->astbuf3 || packed_dim) && ($2 || in_proc || packed_dim) && (extra->astbuf2->type == AST_STRUCT || extra->astbuf2->type == AST_UNION)) {
 			// `struct packed {...} q [N];`: an unpacked array of an
 			// anonymous struct is declared as `typedef struct {...} T;
 			// T q [N];`, so element member selects (`q[i].m`, i dynamic)

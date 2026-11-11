@@ -1,0 +1,27 @@
+# `cls ::type_id::create(...)' (uvma_cvxif_agent.sv, a space before `::'):
+# the rest lexes as one scoped token, which a hierarchical name followed by
+# `::' did not accept ("unexpected TOK_SCOPED_ID, expecting TOK_ID").
+# Whitespace between the tokens of a scoped name is legal.
+read_verilog -sv <<EOT
+package p;
+  localparam int W = 3;
+  class a_c;
+    static function a_c create(string n); return null; endfunction
+  endclass
+  class b_c;
+    a_c m;
+    extern function void build();
+  endclass
+  function void b_c::build();
+    m = a_c ::type_id::create("m");
+    m = a_c :: create("m");
+  endfunction
+endpackage
+module top(output logic [p:: W-1:0] o, output logic ok);
+  assign o = '1;
+  assign ok = $bits(o) == 3;
+endmodule
+EOT
+hierarchy -top top
+proc
+sat -verify -prove ok 1

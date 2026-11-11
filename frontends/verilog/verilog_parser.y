@@ -1291,6 +1291,15 @@ hierarchical_id:
 			*$1 += "::" + *$3;
 		$$ = std::move($1);
 	} |
+	// fe165: `cls ::type_id::create' (space before `::'): the rest lexes
+	// as one scoped token
+	hierarchical_id TOK_PACKAGESEP TOK_SCOPED_ID {
+		if ($3->compare(0, 1, "\\") == 0)
+			*$1 += "::" + $3->substr(1);
+		else
+			*$1 += "::" + *$3;
+		$$ = std::move($1);
+	} |
 	hierarchical_id TOK_DOT TOK_ID {
 		if ($3->compare(0, 1, "\\") == 0)
 			*$1 += "." + $3->substr(1);

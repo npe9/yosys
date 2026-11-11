@@ -1,0 +1,30 @@
+# ic3 liveness (fe158): a state survives the gfp only if, under one input,
+# !p holds at this tick AND the successor stays in S && !p.  The
+# consecution query assumed !p at the successor only, so a property that
+# reads an input (`done = rst || sig') let the transition take rst = 1 --
+# under which p holds now -- and nothing was pruned: `s_eventually done'
+# was disproved although every path reaches done.
+read_verilog -sv -formal <<EOT
+module t (input clk, input rst);
+  reg [2:0] cnt;
+  reg sig;
+  always @(posedge clk) begin
+    if (rst) cnt = 0; else cnt = cnt + 1;
+    if (cnt > 5) begin sig = 1; cnt = 0; end else sig = 0;
+  end
+  wire done = rst || sig;
+  p1: assert property (@(posedge clk) s_eventually done);
+  // negative control: rst may stay low forever
+  n1: assert property (@(posedge clk) s_eventually rst);
+endmodule
+EOT
+hierarchy -top t
+sva2check
+proc
+async2sync
+flatten
+opt_clean
+logger -expect log "p1: proved" 1
+logger -expect log "n1: disproved" 1
+ic3 -check-cells -kind 0 -max 20 -timeout 60
+logger -check-expected

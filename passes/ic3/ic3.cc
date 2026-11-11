@@ -1626,9 +1626,16 @@ struct Ic3Solver
 					// consecution: does it have a successor in S ∧ !p?
 					// (the S twin over state2 is activated here and in
 					// generalization only -- never in candidate queries)
+					// fe158: !p at this tick too, under the same inputs
+					// that drive the transition -- a path that stays in !p
+					// must satisfy it at every tick; without bad1 a
+					// property reading an input (done = rst || ...) let the
+					// successor use an input under which p holds now, and
+					// nothing was ever pruned (false disproof)
 					std::vector<int> a2 = act_assumptions(sf);
 					push_assum(a2, -live2_act);
 					push_cube(a2, csub, state1);
+					a2.push_back(bad1);
 					a2.push_back(bad2);
 					n_blockq++;
 					if (!solve_assum(a2))
@@ -1919,6 +1926,7 @@ private:
 				std::vector<int> a = act_assumptions(sf);
 				push_assum(a, -live2_act);
 				push_cube(a, cube, state1);
+				a.push_back(bad1);	// fe158: as in the consecution query
 				a.push_back(bad2);
 				n_gen++;
 				if (solve_assum(a))

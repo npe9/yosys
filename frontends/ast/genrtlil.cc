@@ -1905,7 +1905,32 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				if (never_implicit)
 					degrade(location.to_loc(), "Identifier `%s' did not resolve (a package-qualified or element-member name is never an implicit net).\n", str.c_str());
 				else if (!is_sequence_method_name(str) && !sva_decl_ref) {
-					if (flag_autowire) {
+					// fe157: IEEE 1800-2017 6.10: an undotted identifier
+					// that is (or is part of a concatenation that is) the
+					// left-hand side of a continuous assignment is an
+					// implicit scalar net -- exactly the 1-bit wire built
+					// here -- so it is legal and not a degradation
+					bool lhs_net = false;
+					if (flag_autowire && current_ast_mod && str.find('.') == std::string::npos) {
+						std::function<bool(AstNode *)> names = [&](AstNode *n) {
+							if (n->type == AST_IDENTIFIER)
+								return n->str == str && n->children.empty();
+							if (n->type == AST_CONCAT) {
+								for (auto &ch : n->children)
+									if (names(ch.get()))
+										return true;
+							}
+							return false;
+						};
+						for (auto &ch : current_ast_mod->children)
+							if (ch && ch->type == AST_ASSIGN && !ch->children.empty() && names(ch->children[0].get())) {
+								lhs_net = true;
+								break;
+							}
+					}
+					if (lhs_net) {
+						log_file_warning(location.to_loc(), "Identifier `%s' is implicitly declared (an implicit scalar net, IEEE 1800-2017 6.10).\n", str);
+					} else if (flag_autowire) {
 						// upstream's own leniency under `default_nettype wire`;
 						// dotted names included: interface-port members
 						// (`intf.driver`) are implicit wires here by design,

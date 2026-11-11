@@ -1,0 +1,39 @@
+# IEEE 1800-2017 6.10: under `default_nettype wire, an undeclared identifier
+# on the left of a continuous assignment (alone or in a concatenation) is an
+# implicit scalar net.  That is the 1-bit wire read_verilog builds, so it is
+# a warning, not an sv_degraded mark (fe157).  An undeclared name that is
+# only read stays degraded.
+logger -expect warning "Identifier `.s' is implicitly declared \(an implicit scalar net" 1
+read_verilog -sv <<EOT
+module t (input logic a, b, input logic [1:0] w, input logic [3:0] v, output logic o, output logic [3:0] y);
+  assign n = a & b;
+  assign {m, k} = w;
+  assign s = v;
+  assign o = n ^ m ^ k;
+  assign y = {3'b0, s};
+endmodule
+EOT
+hierarchy -top t
+proc
+logger -check-expected
+select -assert-none A:sv_degraded
+rename t gold
+read_verilog -sv <<EOT
+module t (input logic a, b, input logic [1:0] w, input logic [3:0] v, output logic o, output logic [3:0] y);
+  assign o = (a & b) ^ w[1] ^ w[0];
+  assign y = {3'b0, v[0]};
+endmodule
+EOT
+proc
+rename t gate
+miter -equiv -flatten gold gate m
+sat -verify -prove trigger 0 m
+design -reset
+
+read_verilog -sv <<EOT
+module t (input logic a, output logic p);
+  assign p = q & a;
+endmodule
+EOT
+hierarchy -top t
+select -assert-mod-count 1 A:sv_degraded

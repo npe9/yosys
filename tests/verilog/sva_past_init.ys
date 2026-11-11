@@ -1,0 +1,91 @@
+# IEEE 1800-2017 16.9.3: before k clock ticks have elapsed, $past(e, k) is e
+# evaluated on the initial values of its variables (fe156).  The $past
+# registers were free (or 0 under -init-zero) at the first tick, so a
+# $past/$rose/$stable assertion over an initialised register was disproved
+# at depth 0.  proc_past_init gives each $past register its argument's
+# initial value; bits that depend on an input or an uninitialised register
+# stay free.  Both orders (sva2check before and after proc) are covered.
+read_verilog -sv -formal <<EOT
+module t (input logic clk, input logic [3:0] x);
+  logic [3:0] c = 4'd5;
+  always_ff @(posedge clk) c <= (c == 4'd7) ? 4'd7 : c + 4'd1;
+  logic r = 1'b1;
+  always_ff @(posedge clk) r <= 1'b1;
+  logic [3:0] u;
+  always_ff @(posedge clk) u <= 4'd5;
+  p_past:  assert property (@(posedge clk) $past(c) >= 4'd5);
+  p_past2: assert property (@(posedge clk) $past(c, 2) >= 4'd5);
+  p_rose:  assert property (@(posedge clk) !$rose(r));
+  p_stab:  assert property (@(posedge clk) $stable(r));
+  n_in:    assert property (@(posedge clk) $past(c ^ x) != 4'd3);
+  n_u:     assert property (@(posedge clk) $past(u) == 4'd5);
+  always @(posedge clk) begin
+    i_past: assert ($past(c) >= 4'd5);
+  end
+endmodule
+EOT
+hierarchy -top t
+design -save src
+
+sva2check
+proc
+async2sync
+logger -expect log "p_past: proved" 1
+logger -expect log "p_past2: proved" 1
+logger -expect log "p_rose: proved" 1
+logger -expect log "p_stab: proved" 1
+logger -expect log "i_past: proved" 1
+logger -expect log "n_in: disproved \(depth 0\)" 1
+logger -expect log "n_u: disproved \(depth 0\)" 1
+ic3 -check-cells -max 20
+logger -check-expected
+
+design -load src
+proc
+sva2check
+async2sync
+logger -expect log "7 properties: proved=5 disproved=2 undecided=0" 1
+ic3 -check-cells -max 20
+logger -check-expected
+
+# The initial value is not a free pass: it fails where it should
+design -reset
+read_verilog -sv -formal <<EOT
+module t (input logic clk);
+  logic [3:0] c = 4'd5;
+  always_ff @(posedge clk) c <= 4'd9;
+  logic r = 1'b0;
+  always_ff @(posedge clk) r <= 1'b1;
+  f_past: assert property (@(posedge clk) $past(c) == 4'd9);
+  f_rose: assert property (@(posedge clk) !$rose(r));
+endmodule
+EOT
+hierarchy -top t
+sva2check
+proc
+async2sync
+logger -expect log "f_past: disproved \(depth 0\)" 1
+logger -expect log "f_rose: disproved \(depth 1\)" 1
+ic3 -check-cells -max 20
+logger -check-expected
+
+# An immediate $past whose argument is blocking-assigned in the block: the
+# frontend register samples the value after the assignment (counter+1), so
+# that value on the initial values (1) is not the argument's initial value
+# (0); the register stays free.  (With init 1 the assertion would be proved.)
+design -reset
+read_verilog -sv -formal <<EOT
+module t (input clk);
+  reg [7:0] counter = 0;
+  always @(posedge clk) begin : blk
+    counter++;
+    w1: assert(counter == 1 -> $past(counter, 1) == 1);
+  end
+endmodule
+EOT
+hierarchy -top t
+proc
+async2sync
+logger -expect log "w1: disproved" 1
+ic3 -check-cells -max 20
+logger -check-expected

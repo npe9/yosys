@@ -31,6 +31,9 @@ yosys_pass(proc_dff
 yosys_pass(proc_memwr
   proc_memwr.cc
 )
+yosys_pass(proc_past_init
+  proc_past_init.cc
+)
 yosys_pass(proc
   proc.cc
 	REQUIRES
@@ -44,5 +47,6 @@ yosys_pass(proc
 		proc_dlatch
 		proc_dff
 		proc_memwr
+		proc_past_init
 		opt_expr
 )

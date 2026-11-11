@@ -46,6 +46,7 @@ struct ProcPass : public Pass {
 		log("    proc_dff\n");
 		log("    proc_memwr\n");
 		log("    proc_clean\n");
+		log("    proc_past_init\n");
 		log("    opt_expr -keepdc\n");
 		log("\n");
 		log("This replaces the processes in the design with multiplexers,\n");
@@ -136,6 +137,7 @@ struct ProcPass : public Pass {
 		Pass::call(design, "proc_dff");
 		Pass::call(design, "proc_memwr");
 		Pass::call(design, "proc_clean");
+		Pass::call(design, "proc_past_init");
 		if (!noopt)
 			Pass::call(design, "opt_expr -keepdc");
 

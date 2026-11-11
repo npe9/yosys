@@ -476,7 +476,8 @@ struct SvaCompiler {
 	// constant (a constant-1 D, the age bit of a constant-true
 	// antecedent, folded to 1 made attempts "start" before time 0 and fail
 	// at depth 0 after `opt`; a free ring phase could start past the
-	// slot count).  Sampled data ($past chains, slot files) keeps no init.
+	// slot count).  Sampled data keeps no init here: slot files stay
+	// free, $past chains get theirs after proc (fe156, proc_past_init).
 	static void init_zero(SigSpec q)
 	{
 		for (auto &c : q.chunks()) {
@@ -527,6 +528,10 @@ struct SvaCompiler {
 			return Const(0, d.size());
 		Wire *q = wn(role, d.size());
 		bool past = strcmp(role, "past") == 0;
+		// fe156: a $past register's init is set after proc
+		// (proc_past_init): its argument on the initial values
+		if (past)
+			q->set_bool_attribute(ID(sv_past));
 		ffd(past ? d : dis_gate(d), q, true, past);
 		return q;
 	}
@@ -8114,13 +8119,14 @@ struct Sva2CheckPass : public Pass {
 			// `x >= x' and was proved (hw-cbmc ebmc/k-induction/past1),
 			// $stable / $changed took the whole argument and $rose / $fell
 			// bit 0.  Like the clocked chains (reg(..., "past")) the
-			// registers keep no init: before n steps of history $past is a
-			// free value (EBMC reads the initial value there instead).
+			// registers get the argument's initial value (fe156,
+			// proc_past_init; free where it depends on a free value).
 			{
 				std::vector<Cell *> rm;
 				std::vector<Cell *> scan(mod->cells().begin(), mod->cells().end());
 				auto step_past = [&](SigSpec d) {
 					Wire *w = mod->addWire(NEW_ID, d.size());
+					w->set_bool_attribute(ID(sv_past));
 					mod->addFf(NEW_ID, d, w);
 					return SigSpec(w);
 				};
@@ -8170,6 +8176,11 @@ struct Sva2CheckPass : public Pass {
 		}
 
 		log("Converted %d $check cells, %d unsupported.\n", converted, unsupported);
+		// fe156: modules already through proc get their $past inits
+		// here; the others get them from proc
+		for (auto mod : design->selected_modules())
+			if (mod->processes.empty())
+				Pass::call_on_module(design, mod, "proc_past_init");
 		// say it as a warning, with names: a run whose checks were all
 		// skipped otherwise looks like a quiet success downstream
 		if (unsupported) {

@@ -269,6 +269,56 @@ void AstNode::annotateTypedEnums(AstNode *template_node)
 	}
 }
 
+// fe156: the frontend $past register is assigned at the end of its
+// always block, so its D input is the argument after the block's blocking
+// assignments.  proc_past_init evaluates D on the initial values; that is
+// the argument on the initial values (IEEE 1800-2017 16.9.3) only when
+// nothing the argument reads is blocking-assigned in the block (and it
+// calls no function).  Otherwise the register stays free.
+static void past_collect_reads(AstNode *n, pool<std::string> &names, bool &calls)
+{
+	if (n->type == AST_FCALL || n->type == AST_TCALL)
+		calls = true;
+	if (n->type == AST_IDENTIFIER)
+		names.insert(n->str);
+	for (auto &ch : n->children)
+		if (ch)
+			past_collect_reads(ch.get(), names, calls);
+}
+
+static void past_collect_lvalue(AstNode *n, pool<std::string> &names)
+{
+	if (n->type == AST_IDENTIFIER)
+		names.insert(n->str);
+	if (n->type == AST_CONCAT)
+		for (auto &ch : n->children)
+			if (ch)
+				past_collect_lvalue(ch.get(), names);
+}
+
+static void past_collect_blocking(AstNode *n, pool<std::string> &names)
+{
+	if (n->type == AST_ASSIGN_EQ && !n->children.empty() && n->children[0])
+		past_collect_lvalue(n->children[0].get(), names);
+	for (auto &ch : n->children)
+		if (ch)
+			past_collect_blocking(ch.get(), names);
+}
+
+static bool past_init_on_initial_values(AstNode *arg, AstNode *block)
+{
+	pool<std::string> reads, assigned;
+	bool calls = false;
+	past_collect_reads(arg, reads, calls);
+	if (calls)
+		return false;
+	past_collect_blocking(block, assigned);
+	for (auto &r : reads)
+		if (assigned.count(r))
+			return false;
+	return true;
+}
+
 static std::unique_ptr<AstNode> make_range(AstSrcLocType loc, int left, int right, bool is_signed = false)
 {
 	// generate a pre-validated range node for a fixed signal range.
@@ -10456,6 +10506,7 @@ skip_memory_write:;
 
 				int myidx = autoidx++;
 				AstNode* outreg = nullptr;
+				bool past_init = past_init_on_initial_values(children.at(0).get(), block);
 
 				for (int i = 0; i < num_steps; i++)
 				{
@@ -10467,6 +10518,10 @@ skip_memory_write:;
 					reg->str = stringf("$past$%s:%d$%d$%d", RTLIL::encode_filename(*location.begin.filename), location.begin.line, myidx, i);
 					reg->is_reg = true;
 					reg->is_signed = sign_hint;
+					// fe156: its init is set after proc (proc_past_init)
+					// when D is the argument on the initial values
+					if (past_init)
+						reg->set_attribute(ID(sv_past), AstNode::mkconst_int(location, 1, false));
 
 
 					while (reg->simplify(true, 1, -1, false)) { }

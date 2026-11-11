@@ -4824,7 +4824,11 @@ modport_args:
 
 modport_arg:
     modport_type_token modport_member |
-    modport_member
+    modport_member |
+	// fe163: a modport clocking item (IEEE 1800-2017 25.5) names a clocking
+	// block; clocking blocks are not modelled, so it adds no member (its
+	// signals read through the block stay implicit, i.e. degraded)
+	TOK_CLOCKING TOK_ID
 
 modport_member:
     TOK_ID {

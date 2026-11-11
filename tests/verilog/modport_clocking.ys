@@ -1,0 +1,53 @@
+# A modport clocking item (`modport passive (clocking cb, input v)', IEEE
+# 1800-2017 25.5; uvma_axi_intf.sv) was a syntax error.  Clocking blocks are
+# not modelled, so it adds no member: a plain member read through the port
+# resolves exactly, and a clocking-block member (`a.cb.v') stays an implicit
+# net marked sv_degraded (warned on read and again when hierarchy
+# re-derives the module).
+read_verilog -sv -formal <<EOT
+interface ifc(input logic clk);
+  logic v;
+  logic [3:0] id;
+  clocking cb @(posedge clk);
+    input v, id;
+  endclocking
+  modport passive (clocking cb, input v, id);
+endinterface
+module chk(ifc.passive a, input logic clk);
+  always_comb begin
+    p_w: assert ($bits(a.id) == 4);
+    n_v: assert (a.v);
+  end
+endmodule
+EOT
+hierarchy -check -top chk
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+design -save d
+delete chk/c:n_v
+sat -verify -prove-asserts -set-init-zero chk
+design -load d
+delete chk/c:p_w
+sat -falsify -prove-asserts -set-init-zero chk
+design -reset
+
+logger -expect warning "Identifier `.a\.cb\.v' is implicitly declared" 2
+read_verilog -sv -formal <<EOT
+interface ifc(input logic clk);
+  logic v;
+  clocking cb @(posedge clk);
+    input v;
+  endclocking
+  modport passive (clocking cb);
+endinterface
+module chk(ifc.passive a, input logic clk);
+  always @(posedge clk) p_cb: assert (a.cb.v);
+endmodule
+EOT
+hierarchy -check -top chk
+proc
+flatten
+select -assert-any A:sv_degraded
+logger -check-expected

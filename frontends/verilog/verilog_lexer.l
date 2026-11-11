@@ -576,6 +576,41 @@ pullup|pulldown {
 			if (buf.size() >= 8 && buf.compare(buf.size() - 8, 8, "endgroup") == 0)
 				break;
 		}
+		// fe164: an end label (`endgroup : name', IEEE 1800-2017 19.3) is
+		// part of the skipped declaration; anything else is put back
+		std::string la;
+		int c = yyinput();
+		while (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+			la.push_back((char)c);
+			c = yyinput();
+		}
+		if (c == ':') {
+			int d = yyinput();
+			if (d == ':') {
+				unput(d);
+				unput(c);
+				for (auto it = la.rbegin(); it != la.rend(); ++it)
+					unput(*it);
+			} else {
+				c = d;
+				while (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+					la.push_back((char)c);
+					c = yyinput();
+				}
+				while (c != 0 && (isalnum(c) || c == '_' || c == '$'))
+					c = yyinput();
+				if (c != 0)
+					unput(c);
+				for (char ch : la)
+					if (ch == '\n')
+						out_loc.lines(1);
+			}
+		} else {
+			if (c != 0)
+				unput(c);
+			for (auto it = la.rbegin(); it != la.rend(); ++it)
+				unput(*it);
+		}
 		return parser::make_TOK_SEMICOL(out_loc);
 	}
 	auto val = std::make_unique<std::string>(std::string("\\") + YYText());

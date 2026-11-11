@@ -1,0 +1,25 @@
+# A covergroup's end label (`endgroup : name', IEEE 1800-2017 19.3) was left
+# behind by the lexer's covergroup skip ("syntax error, unexpected ':'",
+# uvma_cvxif_cov_model.sv); it is now skipped with the declaration, in a
+# package and in a module.  Line numbers after the skip are unchanged.
+read_verilog -sv <<EOT
+package p;
+  localparam int W = 5;
+  class item_c; int a; endclass
+  covergroup cg_a(string name) with function sample(item_c it);
+    cp_a : coverpoint it.a { bins B[] = {[0:$]}; }
+  endgroup: cg_a
+  covergroup cg_b;
+  endgroup
+  localparam int V = W + 1;
+endpackage
+module top(input logic clk, output logic [p::V-1:0] o, output logic ok);
+  covergroup cg_m @(posedge clk);
+  endgroup : cg_m
+  assign o = '1;
+  assign ok = $bits(o) == 6;
+endmodule
+EOT
+hierarchy -top top
+proc
+sat -verify -prove ok 1

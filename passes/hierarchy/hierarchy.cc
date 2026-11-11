@@ -622,6 +622,26 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 		}
 	}
 
+	// fe159: the interface type of an interface port that nothing connects
+	// (a top module's: a standalone checker `module chk(my_intf.mp a)') is
+	// what gives `a.<member>' its declaration.  Without the interface the
+	// members silently became implicit 1-bit nets; under -check name the
+	// missing interface like a missing module.
+	if (has_interface_ports && flag_check) {
+		for (auto wire : module->wires()) {
+			if (!(wire->port_input || wire->port_output) || !wire->get_bool_attribute(ID::is_interface))
+				continue;
+			std::string itype = wire->get_string_attribute(ID::interface_type);
+			if (itype.empty() || design->module(RTLIL::escape_id(itype)) != nullptr)
+				continue;
+			if (!hierarchy_permissive)
+				log_error("Interface `%s' of interface port `%s' in module `%s' is not part of the design.\n",
+						RTLIL::unescape_id(itype), log_id(wire->name), log_id(module->name));
+			log_warning("Interface `%s' of interface port `%s' in module `%s' is not part of the design; its members are implicit nets.\n",
+					RTLIL::unescape_id(itype), log_id(wire->name), log_id(module->name));
+		}
+	}
+
 	IFExpander if_expander(*design, *module);
 
 	for (auto cell : module->cells())

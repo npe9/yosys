@@ -1,0 +1,34 @@
+# With the interface in the design, a top module's interface port is
+# expanded (a dummy instance): its members have their declared widths, no
+# message, nothing degraded.  The members are free: a property over them
+# alone is disproved.  (The read, before the interface port is expanded,
+# warns once for `a.v'; hierarchy must not warn again.)
+logger -expect warning "Identifier `.a\.v' is implicitly declared" 1
+read_verilog -sv -formal <<EOT
+interface ifc(input logic clk);
+  logic v;
+  logic [3:0] id;
+  modport passive (input v, id);
+endinterface
+module chk(ifc.passive a, input logic clk);
+  always_comb begin
+    p_w: assert ($bits(a.id) == 4);
+    n_v: assert (a.v);
+  end
+endmodule
+EOT
+hierarchy -check -top chk
+proc
+flatten
+select -assert-none A:sv_degraded
+select -assert-count 1 chk/w:a.id
+logger -check-expected
+
+chformal -lower
+design -save d
+select -assert-count 1 chk/c:n_v
+delete chk/c:n_v
+sat -verify -prove-asserts -set-init-zero chk
+design -load d
+delete chk/c:p_w
+sat -falsify -prove-asserts -set-init-zero chk

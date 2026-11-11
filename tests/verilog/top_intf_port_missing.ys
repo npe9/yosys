@@ -1,0 +1,21 @@
+# A standalone checker whose interface port's interface is not in the
+# design: `a.v' has no declaration (it became an implicit 1-bit net, without
+# naming the cause).  `hierarchy -check' now names the missing interface like
+# a missing module: an error, or a warning with -permissive.
+read_verilog -sv <<EOT
+module chk(ifc.passive a, input logic clk);
+  always @(posedge clk) assert (a.v == a.id[0]);
+endmodule
+EOT
+logger -expect warning "Interface `ifc' of interface port `a' in module `chk' is not part of the design; its members are implicit nets" 1
+hierarchy -check -permissive -top chk
+logger -check-expected
+design -reset
+
+read_verilog -sv <<EOT
+module chk(ifc.passive a, input logic clk);
+  always @(posedge clk) assert (a.v == a.id[0]);
+endmodule
+EOT
+logger -expect error "Interface `ifc' of interface port `a' in module `chk' is not part of the design" 1
+hierarchy -check -top chk

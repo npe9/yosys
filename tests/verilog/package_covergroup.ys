@@ -1,0 +1,23 @@
+# A covergroup declared in a package (uvma_cvxif_cov_model.sv) is skipped by
+# the lexer as simulation-only and leaves a bare `;', which a package body
+# rejected ("syntax error, unexpected ';'").  An empty package item is legal
+# (IEEE 1800-2017 A.1.11); the package's other items still read.
+read_verilog -sv <<EOT
+package p;
+  localparam int W = 5;
+  class item_c; int a; endclass
+  covergroup cg_request(string name) with function sample(item_c req_item);
+    option.per_instance = 1;
+    cp_a: coverpoint req_item.a;
+  endgroup
+  ;
+  localparam int V = W + 1;
+endpackage
+module top(output logic [p::V-1:0] o, output logic ok);
+  assign o = '1;
+  assign ok = $bits(o) == 6;
+endmodule
+EOT
+hierarchy -top top
+proc
+sat -verify -prove ok 1

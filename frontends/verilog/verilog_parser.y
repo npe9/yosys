@@ -1667,7 +1667,10 @@ module_header_imports:
 package_body_stmt:
 	typedef_decl | localparam_decl | param_decl | task_func_decl | import_stmt |
 	dpi_export_decl | sva_sequence_decl | sva_property_decl | sva_let_decl |
-	wire_decl | class_decl | timeunit_decl;
+	wire_decl | class_decl | timeunit_decl |
+	// fe162: an empty item (IEEE 1800-2017 A.1.11); also what a skipped
+	// covergroup lexes as
+	TOK_SEMICOL;
 
 // SystemVerilog class declarations (IEEE 1800-2017 8). Classes are
 // simulation-only: the declaration is parsed into an AST_CLASS node whose

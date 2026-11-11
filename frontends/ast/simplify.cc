@@ -1059,9 +1059,14 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 		// tests/svtypes/multirange_subarray_access.)
 		// (a connection to a known module's port may already have been
 		// moved into `assign $indirect$<port>... = <arg>`)
+		// fe160: an output port's connection is `assign <arg> =
+		// $indirect$<port>...', the row on the left
+		auto is_indirect = [&](int k) {
+			return node->children.size() == 2 && node->children[k] &&
+					node->children[k]->type == AST_IDENTIFIER && node->children[k]->str.rfind("$indirect$", 0) == 0;
+		};
 		bool is_connection = node->type == AST_ARGUMENT ||
-				(node->type == AST_ASSIGN && i == 1 && node->children.size() == 2 && node->children[0] &&
-				 node->children[0]->type == AST_IDENTIFIER && node->children[0]->str.rfind("$indirect$", 0) == 0);
+				(node->type == AST_ASSIGN && ((i == 1 && is_indirect(0)) || (i == 0 && is_indirect(1))));
 		if (is_connection && child->type == AST_IDENTIFIER && child->id2ast &&
 				child->id2ast->type == AST_MEMORY && child->attributes.count(ID(sv_subarray_row))) {
 			int ew, lo0, hi0, lo1, hi1;
@@ -1091,6 +1096,18 @@ static void rewrite_whole_array_refs(AstNode *node, bool in_lvalue = false, bool
 							elem->id2ast = mem2;
 							elem->integer = 2;
 							elem->basic_prep = false;
+							if (i == 0) {
+								// fe160: an output row is written: give the
+								// element the flattened constant index stage 1
+								// gives a source `m[k][j]', so mem2reg turns the
+								// writes into register drivers (left as a
+								// multirange it became a $memrd on the left)
+								auto fr = elem->make_index_range(mem2, true);
+								while (fr->simplify(true, 1, -1, false)) { }
+								elem->children.clear();
+								elem->children.push_back(std::move(fr));
+								elem->basic_prep = true;
+							}
 							child->children.push_back(std::move(elem));
 						}
 						mem2->set_attribute(ID::mem2reg, AstNode::mkconst_int(loc, 1, false));

@@ -1,0 +1,50 @@
+# A row of a 2-D unpacked array as an OUTPUT port actual (`.o(m[k])').
+# The output connection is `assign m[k] = $indirect$o', with the row on the
+# left; only the input form was expanded into the row's elements, so one
+# element was connected (m[k][first] took the port's low word) and the rest
+# of the row was left undriven, without a warning.  The elements map left
+# to right, as in read_slang.
+read_verilog -sv <<EOT
+typedef struct packed { logic [10:0] a; logic [10:0] b; } t_s;
+module child(input logic [21:0] x, y, output logic [21:0] o [0:1]);
+  assign o[0] = x;
+  assign o[1] = y;
+endmodule
+module top(input logic [21:0] x, y, output logic ok);
+  t_s m [0:1][0:1];
+  child c(.x(x), .y(y), .o(m[0]));
+  assign m[1][0] = 22'h11;
+  assign m[1][1] = 22'h22;
+  assign ok = m[0][0] == x && m[0][1].a == y[21:11] && m[0][1].b == y[10:0] &&
+              m[1][0] == 22'h11 && m[1][1] == 22'h22;
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1
+design -reset
+
+# Descending ranges: the leftmost element of the row (m[1][1]) is the
+# port's leftmost (o[0])
+read_verilog -sv <<EOT
+module child(input logic [21:0] x, y, output logic [21:0] o [0:1]);
+  assign o[0] = x;
+  assign o[1] = y;
+endmodule
+module top(input logic [21:0] x, y, output logic ok);
+  logic [21:0] m [1:0][1:0];
+  child c(.x(x), .y(y), .o(m[1]));
+  assign m[0][0] = 0;
+  assign m[0][1] = 0;
+  assign ok = m[1][1] == x && m[1][0] == y && m[0][0] == 0 && m[0][1] == 0;
+endmodule
+EOT
+hierarchy -top top -check
+proc
+flatten
+opt
+select -assert-none A:sv_degraded a:sv_degraded
+sat -verify -prove ok 1

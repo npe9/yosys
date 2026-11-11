@@ -1,0 +1,57 @@
+# A macro argument used as the name of a directive in the macro's body
+# (`ifndef name / `define name value, uvma_axi_macros.sv IFNDEF_DEFINE)
+# stands for the argument's text (IEEE 1800-2017 22.5.1); it used to be read
+# as the placeholder `macro_<M>_arg<N>: "Invalid name for macro definition".
+# An escaped newline in the body is read as a space, so a nested `define's
+# body ends at an `endif/`else/`elsif it did not open.
+read_verilog -sv <<EOT
+`define IFNDEF_DEFINE(name,value) \
+  `ifndef name \
+    `define name value \
+  `endif
+`define IS_SET(name,r) \
+  `ifdef name \
+    assign r = 1; \
+  `elsif DUMMY_NEVER \
+    assign r = 0; \
+  `else \
+    assign r = 0; \
+  `endif
+`define ELS(name,r) \
+  `ifdef NEVER_DEFINED \
+    assign r = 0; \
+  `elsif name \
+    assign r = 1; \
+  `else \
+    assign r = 0; \
+  `endif
+`define UNDEF(name) `undef name
+`define PLAIN_IFDEF(r) \
+  `ifdef W_B \
+    assign r = 1; \
+  `else \
+    assign r = 0; \
+  `endif
+
+// the escaped newline ends the inner `define: its text is `value', not
+// `value `endif' (a macro defined and never used left the `ifndef open)
+  `IFNDEF_DEFINE(NEVER_USED   , 1  )
+`IFNDEF_DEFINE(W_A, 64)
+`define W_B 8
+`IFNDEF_DEFINE(W_B, 16)
+`define GONE 1
+`UNDEF(GONE)
+module top(output logic [`W_A-1:0] a, output logic [`W_B-1:0] b,
+           output logic s1, s0, e1, e0, p1, wa, wb);
+  assign a = '1; assign b = '1;
+  assign wa = $bits(a) == 64; assign wb = $bits(b) == 8;
+  `IS_SET(W_A, s1)
+  `IS_SET(GONE, s0)
+  `ELS(W_B, e1)
+  `ELS(GONE, e0)
+  `PLAIN_IFDEF(p1)
+endmodule
+EOT
+hierarchy -top top
+proc
+sat -verify -prove s1 1 -prove s0 0 -prove e1 1 -prove e0 0 -prove p1 1 -prove wa 1 -prove wb 1

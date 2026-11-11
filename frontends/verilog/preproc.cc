@@ -518,6 +518,26 @@ static bool read_argument(std::string &dest)
 
 using macro_arg_stack_t = std::stack<std::pair<std::string, define_body_t>>;
 
+// fe161: a directive's name token that is a macro-argument placeholder
+// (`macro_<M>_arg<N>, bound while the macro body is re-read) stands for the
+// argument's text (IEEE 1800-2017 22.5.1)
+static std::string directive_name(const define_map_t &defines, std::string name)
+{
+	if (name.size() > 7 && name.compare(0, 7, "`macro_") == 0) {
+		size_t a = name.rfind("_arg");
+		bool placeholder = a != std::string::npos && a + 4 < name.size();
+		for (size_t i = a + 4; placeholder && i < name.size(); i++)
+			placeholder = isdigit((unsigned char)name[i]);
+		if (placeholder)
+			if (const define_body_t *body = defines.find(name.substr(1))) {
+				std::string v = body->body;
+				size_t b = v.find_first_not_of(" \t\r\n"), e = v.find_last_not_of(" \t\r\n");
+				return b == std::string::npos ? std::string() : v.substr(b, e - b + 1);
+			}
+	}
+	return name;
+}
+
 static void restore_macro_arg(define_map_t &defines, macro_arg_stack_t &macro_arg_stack)
 {
 	log_assert(!macro_arg_stack.empty());
@@ -729,7 +749,7 @@ read_define(const std::string &filename,
 	arg_map_t args;
 
 	skip_spaces();
-	name = next_token(true);
+	name = directive_name(defines_map, next_token(true));
 
 	bool here_doc_mode = false;
 	int newline_count = 0;
@@ -747,10 +767,31 @@ read_define(const std::string &filename,
 	if (skip_spaces() != "")
 		state = 1;
 
+	// fe161: an escaped newline in a macro body is read as a space, so a
+	// `define inside an expanded macro body (`define name value \ `endif,
+	// uvma_axi_macros.sv IFNDEF_DEFINE) would take the rest of the body as
+	// its text.  Where the escaped newline would have ended it (IEEE
+	// 1800-2017 22.5.1), an `endif/`else/`elsif not opened inside this body
+	// ends the body and is read as a directive.
+	int cond_depth = 0;
+
 	for (;;) {
 		std::string tok = next_token();
 		if (tok.empty())
 			break;
+
+		if (!here_doc_mode && state != 0) {
+			if (tok == "`ifdef" || tok == "`ifndef")
+				cond_depth++;
+			else if (tok == "`endif" || tok == "`else" || tok == "`elsif") {
+				if (cond_depth == 0) {
+					insert_input(tok);
+					break;
+				}
+				if (tok == "`endif")
+					cond_depth--;
+			}
+		}
 
 		// printf("define-tok: >>%s<<\n", tok != "\n" ? tok.c_str() : "NEWLINE");
 
@@ -803,6 +844,18 @@ read_define(const std::string &filename,
 		if (args.find(tok, &arg_pos)) {
 			value += '`' + args.str_token(name, arg_pos);
 			continue;
+		}
+
+		// fe161: a `define inside an expanded macro body holds the outer
+		// macro's argument placeholders; they stand for the arguments of
+		// this expansion (IEEE 1800-2017 22.5.1), not of whichever
+		// expansion is bound when the new macro is used
+		if (tok.size() > 7 && tok.compare(0, 7, "`macro_") == 0) {
+			std::string actual = directive_name(defines_map, tok);
+			if (actual != tok) {
+				value += actual;
+				continue;
+			}
 		}
 
 		// This token is nothing special. Insert it verbatim into the macro body.
@@ -886,7 +939,7 @@ frontend_verilog_preproc(std::istream                 &f,
 
 		if (tok == "`elsif") {
 			skip_spaces();
-			std::string name = next_token(true);
+			std::string name = directive_name(defines, next_token(true));
 			if (ifdef_fail_level == 0) {
 				if (ifdef_pass_level == 0)
 					log_error("Found %s outside of macro conditional branch!\n", tok);
@@ -903,7 +956,7 @@ frontend_verilog_preproc(std::istream                 &f,
 
 		if (tok == "`ifdef") {
 			skip_spaces();
-			std::string name = next_token(true);
+			std::string name = directive_name(defines, next_token(true));
 			if (ifdef_fail_level > 0 || !defines.find(name)) {
 				ifdef_fail_level++;
 			} else {
@@ -917,7 +970,7 @@ frontend_verilog_preproc(std::istream                 &f,
 
 		if (tok == "`ifndef") {
 			skip_spaces();
-			std::string name = next_token(true);
+			std::string name = directive_name(defines, next_token(true));
 			if (ifdef_fail_level > 0 || defines.find(name)) {
 				ifdef_fail_level++;
 			} else {
@@ -1019,7 +1072,7 @@ frontend_verilog_preproc(std::istream                 &f,
 		if (tok == "`undef") {
 			std::string name;
 			skip_spaces();
-			name = next_token(true);
+			name = directive_name(defines, next_token(true));
 			// printf("undef: >>%s<<\n", name.c_str());
 			defines.erase(name);
 			global_defines_cache.erase(name);

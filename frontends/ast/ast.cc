@@ -1520,6 +1520,12 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 			return nullptr;
 		};
 		for (const auto &node : ast->children)
+			if (node->type == AST_ENUM)
+				for (auto &item : node->children)
+					if (item && item->type == AST_ENUM_ITEM && !item->children.empty() && item->children[0] &&
+							item->children[0]->type == AST_CONSTANT)
+						module->enum_items[item->str] = {item->children[0]->bitsAsConst(), item->children[0]->is_signed};
+		for (const auto &node : ast->children)
 			if (node->type == AST_WIRE)
 				if (AstNode *snode = struct_of(node.get(), 0))
 					if (node->range_valid) {
@@ -2589,6 +2595,45 @@ static std::string source_module_name(RTLIL::IdString id)
 // (`u_lsu.req_port_o.kill_req`): the instance's wire, and where in it
 struct HierrefMember { std::string path; int offset = 0, width = 0; bool is_signed = false; };
 
+// fe169: `inst...name' naming an enum item or a parameter of the module the
+// path ends in (not a wire): its value
+static bool walk_hierref_const(RTLIL::Design *design, RTLIL::Module *mod, std::string rest, RTLIL::Const &value, bool &is_signed,
+		bool local = false)
+{
+	for (int depth = 0; depth < 64 && mod; depth++) {
+		RTLIL::Cell *cell = nullptr;
+		size_t cut = std::string::npos;
+		for (size_t dot = rest.find('.'); dot != std::string::npos; dot = rest.find('.', dot + 1))
+			if (RTLIL::Cell *c = mod->cell(RTLIL::escape_id(rest.substr(0, dot))))
+				cell = c, cut = dot;
+		if (!cell) {
+			if ((depth == 0 && !local) || rest.find('.') != std::string::npos || mod->wire(RTLIL::escape_id(rest)))
+				return false;
+			auto am = dynamic_cast<AST::AstModule*>(mod);
+			if (!am)
+				return false;
+			std::string id = RTLIL::escape_id(rest);
+			auto e = am->enum_items.find(id);
+			if (e != am->enum_items.end()) {
+				value = e->second.first, is_signed = e->second.second;
+				return true;
+			}
+			auto p = am->folded_params.find(id);
+			if (p != am->folded_params.end() && p->second && p->second->type == AST_CONSTANT) {
+				value = p->second->bitsAsConst(), is_signed = p->second->is_signed;
+				return true;
+			}
+			return false;
+		}
+		RTLIL::Module *sub = design->module(cell->type);
+		if (!sub || sub->get_blackbox_attribute() || cell->type.str().rfind("$paramod", 0) != 0 && !cell->parameters.empty())
+			return false;
+		rest = rest.substr(cut + 1);
+		mod = sub;
+	}
+	return false;
+}
+
 // `wire.member[.member]' of a packed struct / union wire of `mod'
 static RTLIL::Wire *find_struct_member(RTLIL::Module *mod, const std::string &rest, HierrefMember *member)
 {
@@ -2733,7 +2778,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	if (get_bool_attribute(ID(sv_hierrefs_resolved)))
 		return false;
 	struct Target { std::string name; int width; bool is_signed; std::string up_rest; std::string member_base = std::string(); int member_offset = -1;
-		int up_offset = -1, up_base_width = 0; };
+		int up_offset = -1, up_base_width = 0; bool is_const = false; RTLIL::Const value = RTLIL::Const(); };
 	std::vector<Target> targets;
 	bool any_wide = false, any_up = false, any_member = false;
 	auto mark_members = [&](RTLIL::Module *m) {
@@ -2784,6 +2829,15 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				any_member = true;
 				continue;
 			}
+			RTLIL::Const cv;
+			bool cs = false;
+			if (!bw && !wire_is_driven(this, wire, true) && walk_hierref_const(design, this, path, cv, cs)) {
+				Target t{wire->name.str(), GetSize(cv), cs, std::string()};
+				t.is_const = true, t.value = cv;
+				targets.push_back(t);
+				any_wide = true;
+				continue;
+			}
 		}
 		// no wire of that name: an unpacked array the child keeps as one
 		// register per element (mem2reg's `rf[3]`), read here with constant
@@ -2832,9 +2886,12 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		// wire and offset below every parent)
 		HierrefMember up_member;
 		int up_base_width = 0;
+		bool up_const = false;
+		RTLIL::Const up_value;
 		auto resolve_up = [&](const std::string &r, int &width, bool &is_signed) -> int {
 			width = -1, is_signed = false;
 			up_member = HierrefMember(), up_base_width = 0;
+			up_const = false, up_value = RTLIL::Const();
 			bool first = true;
 			for (auto &pc : parents) {
 				RTLIL::Module *parent = pc.first;
@@ -2846,13 +2903,26 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				if (pending)
 					return -1;
 				HierrefMember m;
+				// fe169: an enum item or parameter of the parent (or below)
+				if (!t) {
+					RTLIL::Const cv;
+					bool cs = false;
+					if (walk_hierref_const(design, parent, r, cv, cs, true)) {
+						if (!first && (!up_const || cv != up_value || cs != is_signed))
+							return 0;
+						up_const = true, up_value = cv;
+						width = GetSize(cv), is_signed = cs;
+						first = false;
+						continue;
+					}
+				}
 				if (!t && r.find('.') != std::string::npos) {
 					t = find_struct_member(parent, r, &m);
 					if (!t)
 						t = walk_hierref_down(design, parent, r, nullptr, &m);
 					if (!t || t->get_bool_attribute(ID(sv_hierref)))
 						return 0;
-					if (!first && (up_member.width == 0 || m.path != up_member.path || m.offset != up_member.offset ||
+					if (!first && (up_member.width == 0 || up_const || m.path != up_member.path || m.offset != up_member.offset ||
 							t->width != up_base_width))
 						return 0;
 					up_member = m, up_base_width = t->width;
@@ -2860,15 +2930,23 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 					first = false;
 					continue;
 				}
-				if (!first && up_member.width != 0)
+				if (!first && (up_member.width != 0 || up_const))
 					return 0;
 				if (!t || t->get_bool_attribute(ID(sv_hierref)) || (width >= 0 && (t->width != width || t->is_signed != is_signed)))
 					return 0;
 				// a downward reference wire already in the parent must agree
 				if (r.find('.') != std::string::npos)
 					if (RTLIL::Wire *pw = parent->wire(RTLIL::escape_id(r)))
-						if (pw->width != t->width)
+						if (pw->width != t->width) {
+							// fe169: the parent's own reference is still implicit (it
+							// resolves this round): come back in the next round, since
+							// rederiving now (another reference here resolved) would
+							// drop this one for good
+							if (pw->get_bool_attribute(ID(sv_hierref)) &&
+									!parent->get_bool_attribute(ID(sv_hierrefs_resolved)))
+								return -1;
 							return 0;
+						}
 				width = t->width, is_signed = t->is_signed;
 				first = false;
 			}
@@ -2879,6 +2957,14 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		int res = resolve_up(rest, width, is_signed);
 		if (res < 0)
 			return false;
+		if (res > 0 && up_const) {
+			// a constant: declared here with its value, no port
+			Target t{wire->name.str(), width, is_signed, std::string()};
+			t.is_const = true, t.value = up_value;
+			targets.push_back(t);
+			any_wide = true;
+			continue;
+		}
 		if (res > 0) {
 			if (up_member.width != 0) {
 				// the port reads the member's slice of the wire `base'
@@ -2925,6 +3011,16 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				AstNode::mkconst_int(loc, t.width - 1, true), AstNode::mkconst_int(loc, 0, true)));
 		wire->str = t.name;
 		wire->is_signed = t.is_signed;
+		if (t.is_const) {
+			log("Hierarchical reference %s.%s is the constant %s; rederiving the module.\n",
+					log_id(name), log_id(t.name), log_signal(t.value));
+			auto asgn = std::make_unique<AstNode>(loc, AST_ASSIGN, std::make_unique<AstNode>(loc, AST_IDENTIFIER),
+					AstNode::mkconst_bits(loc, t.value.to_bits(), t.is_signed));
+			asgn->children[0]->str = t.name;
+			new_ast->children.push_back(std::move(wire));
+			new_ast->children.push_back(std::move(asgn));
+			continue;
+		}
 		if (t.up_rest.empty()) {
 			wire->set_attribute(ID::hierconn, AstNode::mkconst_int(loc, 1, false));
 			wire->set_attribute(ID(sv_hierref), AstNode::mkconst_int(loc, 1, false));
@@ -3650,6 +3746,7 @@ RTLIL::Module *AstModule::clone() const
 	for (auto &it : folded_params)
 		new_mod->folded_params[it.first] = it.second->clone();
 	new_mod->struct_members = struct_members;
+	new_mod->enum_items = enum_items;
 
 	return new_mod;
 }

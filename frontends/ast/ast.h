@@ -424,6 +424,10 @@ namespace AST
 		// a slice of the instance's wire (resolve_hierrefs, flatten);
 		// entries are (dotted member path, lsb, width, signed)
 		std::map<std::string, std::vector<std::tuple<std::string, int, int, bool>>> struct_members;
+		// fe169: the module's enum items as simplify folded them, so a
+		// hierarchical reference to one (`u_rx.InitReq', an enum of the
+		// instance's module) is its value
+		std::map<std::string, std::pair<RTLIL::Const, bool>> enum_items;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, bool mayfail) override;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, const dict<RTLIL::IdString, RTLIL::Module*> &interfaces, const dict<RTLIL::IdString, RTLIL::IdString> &modports, bool mayfail) override;
 		std::string derive_common(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, std::unique_ptr<AstNode>* new_ast_out, bool quiet = false);

@@ -634,6 +634,10 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 			std::string itype = wire->get_string_attribute(ID::interface_type);
 			if (itype.empty() || design->module(RTLIL::escape_id(itype)) != nullptr)
 				continue;
+			// fe173: read with -defer, the interface is still `$abstract'
+			// (expand_interfaces derives it with its default parameters)
+			if (design->module("$abstract" + RTLIL::escape_id(itype)) != nullptr)
+				continue;
 			if (!hierarchy_permissive)
 				log_error("Interface `%s' of interface port `%s' in module `%s' is not part of the design.\n",
 						RTLIL::unescape_id(itype), log_id(wire->name), log_id(module->name));

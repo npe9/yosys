@@ -1,0 +1,50 @@
+# A top module's interface port whose (parametric) interface was read with
+# `read_verilog -defer' (pulp-platform's axi_to_axi_lite_intf with its
+# `AXI_BUS.Slave slv' as the ladder's context top): the interface was
+# still `$abstract' when the port was expanded, so the port was skipped
+# and `mo.d' became a 1-bit implicit net (and `hierarchy -check' said the
+# interface was not part of the design).  The port now gets the interface
+# with its default parameters, as without -defer.
+read_verilog -sv -formal -defer <<EOF
+interface bus #(parameter W = 4);
+  logic v; logic [W-1:0] d;
+  modport m(output v, output d);
+  modport s(input v, input d);
+endinterface
+module top(input logic clk, bus.s si, bus.m mo);
+  assign mo.v = si.v;
+  assign mo.d = si.d + 1;
+  always_comb begin
+    p_d: assert (mo.d == si.d + 4'd1);
+    p_v: assert (mo.v == si.v);
+  end
+endmodule
+EOF
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+select -assert-count 1 top/w:mo.d
+chformal -lower
+select -assert-count 2 top/c:p_*
+sat -verify -prove-asserts top
+design -reset
+
+# falsified twin: true only for a 1-bit `d'
+read_verilog -sv -formal -defer <<EOF
+interface bus #(parameter W = 4);
+  logic [W-1:0] d;
+  modport m(output d);
+  modport s(input d);
+endinterface
+module top(bus.s si, bus.m mo);
+  assign mo.d = si.d;
+  always_comb n_d: assert (mo.d <= 4'd1);
+endmodule
+EOF
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+sat -falsify -prove-asserts top

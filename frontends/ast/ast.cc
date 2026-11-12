@@ -3326,6 +3326,12 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 						std::pair<std::string,std::string> res = split_modport_from_type(ch->str);
 						std::string interface_type = res.first;
 						std::string interface_modport = res.second; // Is "", if no modport
+						// fe173: read with -defer, the interface is still
+						// `$abstract' here; a top module's interface port
+						// gets the interface with its default parameters
+						// (without it the members became 1-bit implicit nets)
+						if (design->module(interface_type) == nullptr && design->module("$abstract" + interface_type) != nullptr)
+							design->module("$abstract" + interface_type)->derive(design, {});
 						if (design->module(interface_type) != nullptr) {
 							// Add a cell to the module corresponding to the interface port such that
 							// it can further propagated down if needed:

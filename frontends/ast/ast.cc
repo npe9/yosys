@@ -3098,7 +3098,22 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 			continue;
 		std::string head = RTLIL::escape_id(path.substr(0, dot)), rest = path.substr(dot + 1);
 		if (!parents_known) {
+			bool replaced_parent = false;
 			for (auto mod : design->modules()) {
+				// fe177b: a parent being replaced this round (the old copy
+				// process_and_replace_module renamed `<name>_before_...' and
+				// marked to_delete; caliptra's kv, replaced to expand its
+				// bound keyvault_cov_if instance in the round in which the
+				// bound keyvault_cov_props resolves) is no parent: matching
+				// against it failed every upward reference, and the module
+				// was then marked resolved for good.  Come back next round
+				// (the replacement is in use then).
+				if (mod->get_bool_attribute(ID::to_delete)) {
+					for (auto c : mod->cells())
+						if (c->type == name)
+							replaced_parent = true;
+					continue;
+				}
 				// only modules in use (the undervived base of a
 				// parametric target also holds the bound instance)
 				if (used_modules && !used_modules->count(mod))
@@ -3107,6 +3122,8 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 					if (c->type == name)
 						parents.push_back({mod, c});
 			}
+			if (replaced_parent)
+				return false;
 			parents_known = true;
 		}
 		if (parents.empty() || wire_is_driven(this, wire))

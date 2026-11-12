@@ -1,0 +1,73 @@
+# A bound checker's upward references (`kv.clk', IEEE 1800-2017 23.8) were
+# resolved against the old copy of a bind target that hierarchy was
+# replacing in the same round (process_and_replace_module renames it
+# `kv_before_process_and_replace_module_N' and marks it to_delete).  Its
+# name did not match, so every reference failed, and the checker was then
+# marked resolved for good: all of its checks degraded.  caliptra's kv is
+# reprocessed once its `'1'-connected child is derived, then replaced again
+# to expand the bound keyvault_cov_if interface, while keyvault_cov_props
+# resolves.  fe177b: such a copy is no parent; the checker waits a round.
+logger -expect log "p_ok: proved" 1
+logger -expect log "n_bad: disproved" 1
+read_verilog -defer -sv -formal <<EOT
+module kv(input logic clk, input logic a);
+  leaf u_leaf(.clk, .be('1), .q());
+endmodule
+module leaf(input logic clk, input logic [3:0] be, output logic [3:0] q);
+  always_ff @(posedge clk) q <= be;
+endmodule
+EOT
+read_verilog -defer -sv -formal <<EOT
+interface cov_if(input logic clk);
+  logic v;
+endinterface
+module chk();
+  p_ok: assert property (@(posedge kv.clk) kv.a == kv.a);
+  n_bad: assert property (@(posedge kv.clk) kv.a);
+endmodule
+bind kv cov_if i_cov_if(.*);
+bind kv chk i_chk();
+EOT
+hierarchy -check -top kv
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the same target under a parent module
+logger -expect log "p_ok: proved" 1
+logger -expect log "n_bad: disproved" 1
+read_verilog -defer -sv -formal <<EOT
+module top(input logic clk, input logic a);
+  kv u_kv(.clk, .a);
+endmodule
+module kv(input logic clk, input logic a);
+  leaf u_leaf(.clk, .be('1), .q());
+endmodule
+module leaf(input logic clk, input logic [3:0] be, output logic [3:0] q);
+  always_ff @(posedge clk) q <= be;
+endmodule
+EOT
+read_verilog -defer -sv -formal <<EOT
+interface cov_if(input logic clk);
+  logic v;
+endinterface
+module chk();
+  p_ok: assert property (@(posedge kv.clk) kv.a == kv.a);
+  n_bad: assert property (@(posedge kv.clk) kv.a);
+endmodule
+bind kv cov_if i_cov_if(.*);
+bind kv chk i_chk();
+EOT
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected

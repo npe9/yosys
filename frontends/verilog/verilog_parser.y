@@ -2130,6 +2130,10 @@ interface_body:
 	interface_body interface_body_stmt |
 	interface_body gen_stmt |
 	interface_body gen_block |
+	// fe175: a generate region (IEEE 1800-2017 27.3) in an interface, as in
+	// a module (caliptra's keyvault_cov_if: `generate for (...) assign ...
+	// endgenerate'); a bare generate loop was already accepted
+	interface_body TOK_GENERATE module_gen_body TOK_ENDGENERATE |
 	interface_body TOK_SEMICOL |
 	%empty;
 

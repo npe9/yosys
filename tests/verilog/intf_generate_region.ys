@@ -1,0 +1,50 @@
+# A generate region (`generate ... endgenerate', IEEE 1800-2017 27.3) in an
+# interface was a syntax error (caliptra's keyvault_cov_if); a bare
+# generate loop was accepted.  The region's items now elaborate as in a
+# module: here a per-bit loop, read through an interface instance.
+read_verilog -sv -formal <<EOF2
+interface ifc(input logic clk);
+  logic [3:0] a, b;
+  generate
+    for (genvar k = 0; k < 4; k++) begin : g
+      assign b[k] = ~a[3 - k];
+    end
+  endgenerate
+endinterface
+module top(input logic clk, input logic [3:0] d);
+  ifc u(.clk(clk));
+  assign u.a = d;
+  always_comb begin
+    p_b: assert (u.b == ~{d[0], d[1], d[2], d[3]});
+  end
+endmodule
+EOF2
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+sat -verify -prove-asserts top
+design -reset
+
+# falsified twin: the loop without the reversal
+read_verilog -sv -formal <<EOF2
+interface ifc(input logic clk);
+  logic [3:0] a, b;
+  generate
+    for (genvar k = 0; k < 4; k++) begin : g
+      assign b[k] = ~a[3 - k];
+    end
+  endgenerate
+endinterface
+module top(input logic clk, input logic [3:0] d);
+  ifc u(.clk(clk));
+  assign u.a = d;
+  always_comb n_b: assert (u.b == ~d);
+endmodule
+EOF2
+hierarchy -check -top top
+proc
+flatten
+chformal -lower
+sat -falsify -prove-asserts top

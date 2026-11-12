@@ -82,6 +82,17 @@
 			dict<std::string, AstNode*> pkg_user_types;
 			std::vector<AstNode*> ast_stack;
 			std::unique_ptr<AstNode> astbuf1, astbuf2, astbuf3;
+			// fe174: the clocking block being parsed (IEEE 1800-2017 14.3):
+			// its items, whether any skew was given (an item's or the
+			// block's default), the event terms written with `iff' (their
+			// node pointers, since the guard is not kept in the AST), and
+			// per module the input clockvars that were modelled
+			struct ClockingItem { std::string name; bool input, skew, expr; };
+			std::vector<ClockingItem> cb_items;
+			bool cb_dir_input = false, cb_skew = false, cb_block_skew = false;
+			pool<const AstNode*> iff_event_nodes;
+			std::map<std::pair<const AstNode*, std::string>, std::vector<std::string>> clocking_vars;
+			void model_clocking(const std::string &cb, const AstNode *event, const parser::location_type &loc);
 			// struct_decl: the hidden typedef of an anonymous struct whose
 			// variables are unpacked arrays (empty until the first one)
 			std::string anon_struct_type;
@@ -164,6 +175,7 @@
 			std::map<std::string, std::vector<std::pair<std::string, std::unique_ptr<AstNode>>>> struct_defaults_by_type;
 
 			AstNode* saveChild(std::unique_ptr<AstNode> child);
+			std::string clocking_event_terms(const AstNode *event);
 			AstNode* pushChild(std::unique_ptr<AstNode> child);
 			void addWiretypeNode(std::string *name, AstNode* node);
 			void addTypedefNode(std::string *name, std::unique_ptr<AstNode> node);
@@ -372,6 +384,77 @@
 			auto* child_leaky = saveChild(std::move(child));
 			ast_stack.push_back(child_leaky);
 			return child_leaky;
+		}
+
+		// fe174: a clocking event as `p\\clk,a\\rst_n' (posedge / negedge / any
+		// edge of a plain identifier); other terms (expressions, `iff' guards)
+		// are left out, so they can only make a read inexact, never exact
+		std::string ParseState::clocking_event_terms(const AstNode *ev)
+		{
+			if (!ev)
+				return "";
+			if (ev->type == AST_IDENTIFIER)
+				return ev->children.empty() ? "a" + ev->str : "";
+			if (ev->type != AST_SVA)
+				return "";
+			if (ev->str == "or_event") {
+				std::string l = ev->children.size() > 0 ? clocking_event_terms(ev->children[0].get()) : "";
+				std::string r = ev->children.size() > 1 ? clocking_event_terms(ev->children[1].get()) : "";
+				return l.empty() ? r : r.empty() ? l : l + "," + r;
+			}
+			if ((ev->str == "posedge" || ev->str == "negedge" || ev->str == "edge") && ev->children.size() == 1 &&
+					!iff_event_nodes.count(ev) && ev->children[0]->type == AST_IDENTIFIER && ev->children[0]->children.empty())
+				return std::string(ev->str == "posedge" ? "p" : ev->str == "negedge" ? "n" : "a") + ev->children[0]->str;
+			return "";
+		}
+
+		// fe174: a named clocking block's input clockvars, read in a concurrent
+		// assertion, are the signal's sampled value when the check's clock ticks
+		// on the block's event (IEEE 1800-2017 14.13, 16.9.x / 16.19 example).
+		// Each plain `input x' of a block with no skew gets an alias wire
+		// `<cb>.x' (x's declaration, `assign <cb>.x = x') carrying the event
+		// (sv_clockvar), and the module the attribute `sv_clocking$<cb>' so an
+		// interface port through a `modport (clocking <cb>)' can rebuild it.
+		// Reads outside a concurrent assertion's sampled operands degrade
+		// (genrtlil); sva2check tags reads on another clock approx.
+		void ParseState::model_clocking(const std::string &cb, const AstNode *event, const parser::location_type &loc)
+		{
+			AstNode *mod = current_ast_mod;
+			std::string ev = clocking_event_terms(event);
+			if (!mod || cb_block_skew || ev.empty())
+				return;
+			std::vector<std::string> vars;
+			for (auto &it : cb_items) {
+				if (!it.input || it.skew || it.expr)
+					continue;
+				const AstNode *decl = nullptr;
+				for (auto &c : mod->children)
+					if (c->type == AST_WIRE && c->str == it.name)
+						decl = c.get();
+				if (!decl || std::find(vars.begin(), vars.end(), it.name.substr(1)) != vars.end())
+					continue;
+				auto w = decl->clone();
+				w->str = cb + "." + it.name.substr(1);
+				w->is_input = w->is_output = false;
+				w->port_id = 0;
+				w->set_attribute(ID(sv_clockvar), AstNode::mkconst_str(loc, ev));
+				auto lhs = std::make_unique<AstNode>(loc, AST_IDENTIFIER);
+				lhs->str = w->str;
+				auto rhs = std::make_unique<AstNode>(loc, AST_IDENTIFIER);
+				rhs->str = decl->str;
+				auto as = std::make_unique<AstNode>(loc, AST_ASSIGN, std::move(lhs), std::move(rhs));
+				as->set_attribute(ID(sv_clockvar_alias), AstNode::mkconst_int(loc, 1, false));
+				mod->children.push_back(std::move(w));
+				mod->children.push_back(std::move(as));
+				vars.push_back(it.name.substr(1));
+			}
+			if (vars.empty())
+				return;
+			clocking_vars[{mod, cb}] = vars;
+			std::string desc = "ev=" + ev + ";vars=";
+			for (size_t k = 0; k < vars.size(); k++)
+				desc += (k ? "," : "") + vars[k];
+			mod->set_attribute(RTLIL::IdString("\\sv_clocking$" + cb.substr(1)), AstNode::mkconst_str(loc, desc));
 		}
 
 		void ParseState::addWiretypeNode(std::string *name, AstNode* node)
@@ -4826,9 +4909,18 @@ modport_arg:
     modport_type_token modport_member |
     modport_member |
 	// fe163: a modport clocking item (IEEE 1800-2017 25.5) names a clocking
-	// block; clocking blocks are not modelled, so it adds no member (its
-	// signals read through the block stay implicit, i.e. degraded)
-	TOK_CLOCKING TOK_ID
+	// block.  fe174: a block whose input clockvars were modelled adds a
+	// marker member; explode_interface_port gives the port the clockvars
+	// (their signals and the event's, as inputs, and the alias wires)
+	TOK_CLOCKING TOK_ID {
+		if (extra->clocking_vars.count({extra->current_ast_mod, *$2})) {
+			AstNode* m = extra->saveChild(std::make_unique<AstNode>(@$, AST_MODPORTMEMBER));
+			m->str = *$2;
+			m->is_input = true;
+			m->is_output = false;
+			m->set_attribute(ID(sv_modport_clocking), AstNode::mkconst_int(@$, 1, false));
+		}
+	}
 
 modport_member:
     TOK_ID {
@@ -7556,18 +7648,21 @@ sva_event_item:
 	} |
 	TOK_POSEDGE expr TOK_IFF expr {
 		$$ = sva_add(mk_sva(@$, "posedge"), std::move($2));
+		extra->iff_event_nodes.insert($$.get());
 	} |
 	TOK_NEGEDGE expr {
 		$$ = sva_add(mk_sva(@$, "negedge"), std::move($2));
 	} |
 	TOK_NEGEDGE expr TOK_IFF expr {
 		$$ = sva_add(mk_sva(@$, "negedge"), std::move($2));
+		extra->iff_event_nodes.insert($$.get());
 	} |
 	expr {
 		$$ = sva_add(mk_sva(@$, "edge"), std::move($1));
 	} |
 	expr TOK_IFF expr {
 		$$ = sva_add(mk_sva(@$, "edge"), std::move($1));
+		extra->iff_event_nodes.insert($$.get());
 	};
 
 sva_event:
@@ -8294,11 +8389,16 @@ clocking_decl:
 		// used to become an undriven implicit `$global_clock` net)
 		extra->sva_global_clock = $4->clone();
 		checkLabelsMatch(@7, "Clocking block label", $3.get(), $8.get());
+		extra->cb_items.clear(); extra->cb_block_skew = false; extra->iff_event_nodes.clear();
 	} |
 	TOK_CLOCKING TOK_ID sva_at_clock TOK_SEMICOL clocking_items TOK_ENDCLOCKING opt_label {
 		checkLabelsMatch(@6, "Clocking block label", $2.get(), $7.get());
+		extra->model_clocking(*$2, $3.get(), @$);
+		extra->cb_items.clear(); extra->cb_block_skew = false; extra->iff_event_nodes.clear();
 	} |
 	TOK_DEFAULT TOK_CLOCKING TOK_ID sva_at_clock TOK_SEMICOL clocking_items TOK_ENDCLOCKING opt_label {
+		extra->model_clocking(*$3, $4.get(), @$);
+		extra->cb_items.clear(); extra->cb_block_skew = false; extra->iff_event_nodes.clear();
 		extra->sva_default_clock = $4->clone();
 		// marks a default (LRM 16.16: an assertion's own clock governs an
 		// unclocked declaration body; the retrofitted default must not)
@@ -8309,6 +8409,7 @@ clocking_decl:
 		checkLabelsMatch(@7, "Clocking block label", $3.get(), $8.get());
 	} |
 	TOK_DEFAULT TOK_CLOCKING sva_at_clock TOK_SEMICOL clocking_items TOK_ENDCLOCKING opt_label {
+		extra->cb_items.clear(); extra->cb_block_skew = false; extra->iff_event_nodes.clear();
 		extra->sva_default_clock = $3->clone();
 		// marks a default (LRM 16.16: an assertion's own clock governs an
 		// unclocked declaration body; the retrofitted default must not)
@@ -8323,9 +8424,17 @@ clocking_items:
 	clocking_items clocking_item;
 
 clocking_item:
-	TOK_DEFAULT clocking_dir clocking_skew clocking_dir clocking_skew TOK_SEMICOL |
-	TOK_DEFAULT clocking_dir clocking_skew TOK_SEMICOL |
-	clocking_dir clocking_skew clocking_assign_list TOK_SEMICOL |
+	TOK_DEFAULT clocking_dir clocking_skew clocking_dir clocking_skew TOK_SEMICOL {
+		if (extra->cb_skew) extra->cb_block_skew = true;
+		extra->cb_skew = false;
+	} |
+	TOK_DEFAULT clocking_dir clocking_skew TOK_SEMICOL {
+		if (extra->cb_skew) extra->cb_block_skew = true;
+		extra->cb_skew = false;
+	} |
+	clocking_dir clocking_skew clocking_assign_list TOK_SEMICOL {
+		extra->cb_skew = false;
+	} |
 	TOK_SEMICOL;
 
 clocking_assign_list:
@@ -8333,21 +8442,27 @@ clocking_assign_list:
 	clocking_assign_list TOK_COMMA clocking_assign;
 
 clocking_assign:
-	TOK_ID |
-	TOK_ID TOK_EQ expr;
+	TOK_ID {
+		extra->cb_items.push_back({*$1, extra->cb_dir_input, extra->cb_skew, false});
+	} |
+	TOK_ID TOK_EQ expr {
+		extra->cb_items.push_back({*$1, extra->cb_dir_input, extra->cb_skew, true});
+	};
 
 clocking_dir:
-	TOK_INPUT | TOK_OUTPUT | TOK_INOUT;
+	TOK_INPUT { extra->cb_dir_input = true; } |
+	TOK_OUTPUT { extra->cb_dir_input = false; } |
+	TOK_INOUT { extra->cb_dir_input = true; };
 
 clocking_skew:
-	TOK_POSEDGE clocking_delay_opt |
-	TOK_NEGEDGE clocking_delay_opt |
+	TOK_POSEDGE clocking_delay_opt { extra->cb_skew = true; } |
+	TOK_NEGEDGE clocking_delay_opt { extra->cb_skew = true; } |
 	clocking_delay_opt;
 
 clocking_delay_opt:
-	TOK_HASH TOK_CONSTVAL |
-	TOK_HASH TOK_REALVAL |
-	TOK_HASH TOK_TIME_SCALE |
+	TOK_HASH TOK_CONSTVAL { extra->cb_skew = true; } |
+	TOK_HASH TOK_REALVAL { extra->cb_skew = true; } |
+	TOK_HASH TOK_TIME_SCALE { extra->cb_skew = true; } |
 	%empty;
 
 sva_inside_items:

@@ -1538,6 +1538,84 @@ struct SvaCompiler {
 	};
 
 	// Does this subtree sample local variables ("assign" ops)?
+	// fe174: clocking block variables (the frontend's alias wires
+	// `cb.x', sv_clockvar = the block's event terms `p\\clk,a\\rst_n')
+	// read by this check.  IEEE 1800-2017 14.13 / 16.19: in a concurrent
+	// assertion a clockvar is the value its block sampled at its latest
+	// event, which is this check's sampled value of x exactly when every
+	// tick of the check's clock is an event of the block: the clock bit is
+	// one of the event's terms with a matching edge.  Otherwise the read is
+	// an approximation ('clockvar'); a clocked sub-sequence makes every
+	// clockvar read of the check one.
+	void check_clockvars(Cell *root)
+	{
+		pool<Wire *> cvs;
+		pool<Cell *> seen;
+		pool<Wire *> wseen;
+		bool inner_clock = false;
+		auto scan = [&](SigSpec s) {
+			std::vector<SigSpec> work = {s};
+			while (!work.empty()) {
+				SigSpec x = work.back();
+				work.pop_back();
+				for (auto bit : x) {
+					if (!bit.is_wire() || !wseen.insert(bit.wire).second)
+						continue;
+					if (bit.wire->has_attribute(ID(sv_clockvar))) {
+						cvs.insert(bit.wire);
+						continue;
+					}
+					if (subst.count(bit.wire))
+						work.push_back(subst[bit.wire]);
+					auto it = expr_drv.find(bit.wire);
+					if (it == expr_drv.end())
+						continue;
+					for (auto &conn : it->second->connections())
+						if (conn.first != ID(Y) && conn.first != ID(DATA))
+							work.push_back(conn.second);
+				}
+			}
+		};
+		std::function<void(Cell *)> walk = [&](Cell *c) {
+			if (!c || !seen.insert(c).second)
+				return;
+			if (sva_op(c) == "clocked")
+				inner_clock = true;
+			if (Cell *d = decl_by_name(sva_op(c)))
+				walk(d);
+			for (auto pr : ports_of(c)) {
+				SigSpec ps = c->getPort(pr);
+				if (Cell *d = child_cell(ps))
+					walk(d);
+				else
+					scan(ps);
+			}
+		};
+		walk(root);
+		if (cvs.empty())
+			return;
+		SigMap sm(mod);
+		SigBit ck = sm(clk);
+		for (auto w : cvs) {
+			bool match = false;
+			if (!inner_clock)
+				for (auto &t : split_tokens(w->get_string_attribute(ID(sv_clockvar)), ",")) {
+					if (t.size() < 2)
+						continue;
+					Wire *ew = mod->wire(RTLIL::IdString(t.substr(1)));
+					if (!ew || GetSize(ew) < 1 || sm(SigBit(ew, 0)) != ck)
+						continue;
+					if (t[0] == 'a' || (t[0] == 'p') == clk_pos) {
+						match = true;
+						break;
+					}
+				}
+			if (!match)
+				approx("clockvar", stringf("`%s' is sampled on its clocking block's event, which this check's clock is not",
+						log_id(w)));
+		}
+	}
+
 	bool tree_has_locals(Cell *n, pool<Cell *> &seen)
 	{
 		if (!n || !seen.insert(n).second)
@@ -6879,6 +6957,7 @@ struct Sva2CheckPass : public Pass {
 				}
 				comp.clk = clksig[0];
 				comp.clk_pos = clop != "negedge";
+				comp.check_clockvars(spec);
 				if (disable && sva_op(disable) == "disable_iff")
 					comp.dis = comp.reduce1(disable->getPort(ID(A)));
 

@@ -1616,7 +1616,8 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 static bool intf_drives_member(const RTLIL::SigSpec &s)
 {
 	for (auto &c : s.chunks())
-		if (c.wire && c.wire->name.isPublic() && c.wire->name.str().find("::") == std::string::npos)
+		if (c.wire && c.wire->name.isPublic() && c.wire->name.str().find("::") == std::string::npos &&
+				!c.wire->has_attribute(ID(sv_clockvar)))
 			return true;
 	return false;
 }
@@ -2529,10 +2530,102 @@ static bool is_intf_mem_element(RTLIL::Wire *w)
 	return w->has_attribute(ID(sv_intf_mem)) && w->has_attribute(ID(sv_intf_mem_left)) && w->has_attribute(ID(sv_intf_mem_right));
 }
 
+// fe174: a clocking event's terms (`p\\clk,a\\rst_n') named through an
+// interface port or instance `intfname'
+static std::string clockvar_event_through(const std::string &ev, const std::string &intfname)
+{
+	std::string out;
+	for (auto &t : split_tokens(ev, ",")) {
+		if (t.size() < 3 || t[1] != '\\')
+			continue;
+		out += (out.empty() ? "" : ",") + t.substr(0, 1) + intfname + "." + t.substr(2);
+	}
+	return out;
+}
+
+// fe174: the clocking blocks a port exposes (every one without a modport,
+// else the modport's `clocking cb' items): their clockvars become alias
+// wires of the module, `intf.cb.x' = `intf.x', with x and the event's
+// signals as input members.  Built here rather than taken from the
+// interface's own alias wires, which drive nothing for a top module's
+// interface port (whose interface instance is never connected, h22 A7).
+static void explode_clocking_vars(AstNode *module_ast, RTLIL::Module *intfmodule, const std::string &intfname, AstNode *modport)
+{
+	std::vector<std::string> blocks;
+	if (modport == NULL) {
+		for (auto &a : intfmodule->attributes)
+			if (a.first.begins_with("\\sv_clocking$"))
+				blocks.push_back(a.first.str().substr(13));
+	} else {
+		for (auto &ch : modport->children)
+			if (ch->type == AST_MODPORTMEMBER && ch->get_bool_attribute(ID(sv_modport_clocking)))
+				blocks.push_back(ch->str.substr(1));
+	}
+	auto loc = module_ast->location;
+	auto find = [&](const std::string &name) -> AstNode * {
+		for (auto &c : module_ast->children)
+			if ((c->type == AST_WIRE || c->type == AST_MEMORY) && c->str == name)
+				return c.get();
+		return nullptr;
+	};
+	auto member = [&](const std::string &sig) -> AstNode * {
+		std::string name = intfname + "." + sig;
+		if (AstNode *n = find(name))
+			return n;
+		RTLIL::Wire *w = intfmodule->wire("\\" + sig);
+		if (!w)
+			return nullptr;
+		auto wire = intf_member_wire(module_ast, intfmodule, w, intfname);
+		wire->str = name;
+		wire->is_input = true;
+		wire->is_output = false;
+		module_ast->children.push_back(std::move(wire));
+		return module_ast->children.back().get();
+	};
+	for (auto &cb : blocks) {
+		RTLIL::IdString attr("\\sv_clocking$" + cb);
+		if (!intfmodule->attributes.count(attr))
+			continue;
+		std::string desc = intfmodule->attributes.at(attr).decode_string();
+		size_t semi = desc.find(";vars=");
+		if (desc.compare(0, 3, "ev=") != 0 || semi == std::string::npos)
+			continue;
+		std::string ev = desc.substr(3, semi - 3);
+		for (auto &t : split_tokens(ev, ","))
+			if (t.size() > 2)
+				member(t.substr(2));
+		std::string ev_here = clockvar_event_through(ev, intfname);
+		for (auto &x : split_tokens(desc.substr(semi + 6), ",")) {
+			std::string alias = intfname + "." + cb + "." + x;
+			if (find(alias))
+				continue;
+			AstNode *base = member(x);
+			if (!base)
+				continue;
+			auto w = base->clone();
+			w->str = alias;
+			w->is_input = w->is_output = false;
+			w->port_id = 0;
+			w->set_attribute(ID(sv_clockvar), AstNode::mkconst_str(loc, ev_here));
+			auto lhs = std::make_unique<AstNode>(loc, AST_IDENTIFIER);
+			lhs->str = alias;
+			auto rhs = std::make_unique<AstNode>(loc, AST_IDENTIFIER);
+			rhs->str = base->str;
+			auto as = std::make_unique<AstNode>(loc, AST_ASSIGN, std::move(lhs), std::move(rhs));
+			as->set_attribute(ID(sv_clockvar_alias), AstNode::mkconst_int(loc, 1, false));
+			module_ast->children.push_back(std::move(w));
+			module_ast->children.push_back(std::move(as));
+		}
+	}
+}
+
 void AST::explode_interface_port(AstNode *module_ast, RTLIL::Module * intfmodule, std::string intfname, AstNode *modport)
 {
 	pool<std::string> mems_done;
 	for (auto w : intfmodule->wires()){
+		// fe174: an interface's own clockvar aliases are rebuilt below
+		if (w->has_attribute(ID(sv_clockvar)))
+			continue;
 		std::string origname = w->name.unescape();
 		std::unique_ptr<AstNode> wire;
 		if (is_intf_mem_element(w)) {
@@ -2567,6 +2660,7 @@ void AST::explode_interface_port(AstNode *module_ast, RTLIL::Module * intfmodule
 			module_ast->children.push_back(std::move(wire));
 		}
 	}
+	explode_clocking_vars(module_ast, intfmodule, intfname, modport);
 }
 
 // fe146: since fe145, `.*' derives a cell with an interface port only with
@@ -3349,6 +3443,11 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 			std::string newname = w->name.unescape();
 			newname = intfname + "." + newname;
 			wire->str = newname;
+			// fe174: driven by the instance's alias; the event is named
+			// through the instance
+			if (w->has_attribute(ID(sv_clockvar)))
+				wire->set_attribute(ID(sv_clockvar), AstNode::mkconst_str(wire->location,
+						clockvar_event_through(w->get_string_attribute(ID(sv_clockvar)), intfname)));
 			new_ast->children.push_back(std::move(wire));
 		}
 	}

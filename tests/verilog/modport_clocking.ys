@@ -1,9 +1,11 @@
 # A modport clocking item (`modport passive (clocking cb, input v)', IEEE
-# 1800-2017 25.5; uvma_axi_intf.sv) was a syntax error.  Clocking blocks are
-# not modelled, so it adds no member: a plain member read through the port
-# resolves exactly, and a clocking-block member (`a.cb.v') stays an implicit
-# net marked sv_degraded (warned on read and again when hierarchy
-# re-derives the module).
+# 1800-2017 25.5; uvma_axi_intf.sv) was a syntax error.  A plain member read
+# through the port resolves exactly.  fe174: a clockvar (`a.cb.v') is
+# modelled only as a concurrent assertion's sampled operand
+# (clocking_var_assert.ys); in an immediate assertion it is a held sample,
+# so the read stays sv_degraded (an implicit net when the module is first
+# read, a warned clockvar read once hierarchy re-derives it with the
+# interface).
 read_verilog -sv -formal <<EOT
 interface ifc(input logic clk);
   logic v;
@@ -33,7 +35,8 @@ delete chk/c:p_w
 sat -falsify -prove-asserts -set-init-zero chk
 design -reset
 
-logger -expect warning "Identifier `.a\.cb\.v' is implicitly declared" 2
+logger -expect warning "Identifier `.a\.cb\.v' is implicitly declared" 1
+logger -expect warning "Clocking block variable `.a\.cb\.v' read outside a concurrent assertion" 1
 read_verilog -sv -formal <<EOT
 interface ifc(input logic clk);
   logic v;

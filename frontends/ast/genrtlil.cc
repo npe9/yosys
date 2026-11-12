@@ -37,6 +37,10 @@
 
 YOSYS_NAMESPACE_BEGIN
 
+// fe174: concurrent-assertion operand context of genRTLIL (clockvar reads)
+static int sva_operand_depth = 0, sva_unsampled_depth = 0;
+static bool sva_clockvar_lhs = false;
+
 using namespace AST;
 using namespace AST_INTERNAL;
 
@@ -1823,6 +1827,14 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			RTLIL::State oob_fill = RTLIL::State::Sx;
 			int add_undef_bits_lsb = 0;
 
+			// fe174: a clocking block variable is the signal itself only as
+			// a sampled operand of a concurrent assertion (sva2check checks
+			// the clocks); elsewhere it is a held sample, not modelled
+			if (id2ast && id2ast->type == AST_WIRE && id2ast->attributes.count(ID(sv_clockvar)) &&
+					!sva_clockvar_lhs && (sva_operand_depth == 0 || sva_unsampled_depth > 0))
+				degrade_warn(location.to_loc(), "Clocking block variable `%s' read outside a concurrent assertion's sampled operands "
+						"(a held sample, read as the signal).\n", str.c_str());
+
 			if (id2ast == nullptr) {
 				degrade(location.to_loc(), "Identifier `%s' has no declaration; using a 1-bit wire.\n", str.c_str());
 				if (current_module) {
@@ -2603,7 +2615,10 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 		{
 			if (keep_sva_cells)
 				refuse_sva_operand(this);
+			// fe174: the clockvar alias `assign cb.x = x' writes the alias
+			sva_clockvar_lhs = get_bool_attribute(ID(sv_clockvar_alias));
 			RTLIL::SigSpec left = children[0]->genRTLIL();
+			sva_clockvar_lhs = false;
 			RTLIL::SigSpec right = children[1]->genWidthRTLIL(left.size(), true);
 			{
 				RTLIL::SigSpec r = right;
@@ -3082,6 +3097,13 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 		if (str == "checker_decl")
 			break;
 		{
+			// fe174: operands below are a concurrent assertion's; disable iff
+			// and the asynchronous abort conditions are not sampled
+			struct SvaDepth {
+				bool unsampled;
+				SvaDepth(bool u) : unsampled(u) { sva_operand_depth++; if (unsampled) sva_unsampled_depth++; }
+				~SvaDepth() { sva_operand_depth--; if (unsampled) sva_unsampled_depth--; }
+			} sva_depth_guard(str == "disable_iff" || str == "accept_on" || str == "reject_on");
 			static bool warned = false;
 			if (!warned && str != "sequence_decl" && str != "property_decl" && str != "let_decl") {
 				warned = true;

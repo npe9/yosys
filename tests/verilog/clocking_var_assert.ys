@@ -1,0 +1,109 @@
+# A clocking block input variable read in a concurrent assertion
+# (`axi_assert.psv_axi_cb.aw_valid' in core-v-verif's uvma_axi checkers,
+# through `modport passive (clocking psv_axi_cb)') was an implicit 1-bit
+# net: every such checker was degraded.  IEEE 1800-2017 14.13: a clockvar
+# is the value its block sampled at its latest event; 16.19: in a
+# concurrent assertion that is the check's own sampled value when the
+# check's clock ticks on the block's event.  Such a read is now the
+# signal, with the lowering `exact' when the check's clock is one of the
+# block's event terms (same signal, matching edge) and `approx:clockvar'
+# otherwise.  Reads anywhere else (continuous assign, disable iff), of an
+# output clockvar, or of a block with a skew stay degraded.
+
+# exact: the block's own clock; an or-list event; a falsified twin (4 bits)
+logger -expect log "p_eq: proved.*lowering=exact" 1
+logger -expect log "p_or: proved.*lowering=exact" 1
+logger -expect log "n_cb: disproved.*lowering=exact" 1
+logger -expect log "p_ck2: proved.*lowering=approx:clockvar" 1
+logger -expect log "p_neg: proved.*lowering=approx:clockvar" 1
+read_verilog -sv -formal <<EOT
+module m(input logic clk, input logic clk2, input logic rst_n, input logic [3:0] a, input logic b);
+  clocking cb @(posedge clk); input a, b; endclocking
+  clocking cbo @(posedge clk or rst_n); input a; endclocking
+  clocking cb2 @(posedge clk2); input a; endclocking
+  p_eq: assert property (@(posedge clk) cb.a == a && cb.b == b);
+  p_or: assert property (@(posedge clk) cbo.a == a);
+  n_cb: assert property (@(posedge clk) cb.a != 4'd5);
+  p_ck2: assert property (@(posedge clk) cb2.a == a);
+  p_neg: assert property (@(negedge clk) cb.a == a);
+endmodule
+EOT
+hierarchy -check -top m
+proc
+sva2check
+async2sync
+flatten
+select -assert-none A:sv_degraded
+select -assert-count 4 m/w:cb.a m/w:cb.b m/w:cbo.a m/w:cb2.a
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# through a top module's interface port and `modport (clocking pcb)': the
+# checker's own clock is another signal (approx); with the interface's
+# clock in the modport, the same block is exact
+logger -expect log "p_if: proved.*lowering=approx:clockvar" 1
+logger -expect log "n_if: disproved.*lowering=approx:clockvar" 1
+logger -expect log "p_ix: proved.*lowering=exact" 1
+read_verilog -sv -formal <<EOT
+interface ifc(input logic clk);
+  logic [3:0] d;
+  logic v;
+  clocking pcb @(posedge clk); input d, v; endclocking
+  modport passive(clocking pcb);
+  modport withclk(input clk, clocking pcb);
+endinterface
+module chk(ifc.passive x, ifc.withclk y, input logic clk);
+  p_if: assert property (@(posedge clk) x.pcb.v |-> x.pcb.v);
+  n_if: assert property (@(posedge clk) x.pcb.d != 4'd9);
+  p_ix: assert property (@(posedge y.clk) y.pcb.d == y.pcb.d);
+endmodule
+EOT
+hierarchy -check -top chk
+proc
+sva2check
+async2sync
+flatten
+select -assert-none A:sv_degraded
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# still degraded (an error on a strict read): a continuous assign,
+# disable iff, an output clockvar, a skewed block
+read_verilog -sv -formal -permissive <<EOT
+module d1(input logic clk, input logic a, output logic q);
+  clocking cb @(posedge clk); input a; endclocking
+  assign q = cb.a;
+endmodule
+EOT
+hierarchy -top d1
+select -assert-any A:sv_degraded
+design -reset
+read_verilog -sv -formal -permissive <<EOT
+module d2(input logic clk, input logic a);
+  clocking cb @(posedge clk); input a; endclocking
+  p_d: assert property (@(posedge clk) disable iff (cb.a) a);
+endmodule
+EOT
+hierarchy -top d2
+select -assert-any A:sv_degraded
+design -reset
+read_verilog -sv -formal -permissive <<EOT
+module d3(input logic clk, input logic a);
+  clocking cb @(posedge clk); output a; endclocking
+  p_o: assert property (@(posedge clk) cb.a == a);
+endmodule
+EOT
+hierarchy -top d3
+select -assert-any A:sv_degraded
+design -reset
+read_verilog -sv -formal -permissive <<EOT
+module d4(input logic clk, input logic a, input logic b);
+  clocking cb @(posedge clk); default input #2; input a; endclocking
+  clocking cc @(posedge clk); input #1 b; endclocking
+  p_s: assert property (@(posedge clk) cb.a == a && cc.b == b);
+endmodule
+EOT
+hierarchy -top d4
+select -assert-any A:sv_degraded

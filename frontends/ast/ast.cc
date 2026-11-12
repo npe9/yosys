@@ -1609,17 +1609,61 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 // wire (hw-cbmc interface/port2, port6, port7).  Members driven from outside
 // (a module assigning `bus.data') are connected correctly, so the mark is only
 // carried when an interface has logic of its own.
+// fe174a: logic counts only where it drives a member: a public wire that is
+// not a package variable's copy (`pkg::v', which every module gets: uvm_pkg's
+// `uvm_global_random_seed = $urandom' made every interface of a -DUVM read
+// "have logic", and every reader through a top interface port degraded)
+static bool intf_drives_member(const RTLIL::SigSpec &s)
+{
+	for (auto &c : s.chunks())
+		if (c.wire && c.wire->name.isPublic() && c.wire->name.str().find("::") == std::string::npos)
+			return true;
+	return false;
+}
+
+static bool intf_case_drives_member(const RTLIL::CaseRule *cs)
+{
+	for (auto &a : cs->actions)
+		if (intf_drives_member(a.first))
+			return true;
+	for (auto sw : cs->switches)
+		for (auto c : sw->cases)
+			if (intf_case_drives_member(c))
+				return true;
+	return false;
+}
+
 static bool interface_has_logic(RTLIL::Module *intf)
 {
 	if (!intf)
 		return false;
-	if (!intf->processes.empty() || !intf->connections().empty())
-		return true;
-	for (auto c : intf->cells())
-		if (c->type != ID($scopeinfo) && !c->get_bool_attribute(ID::is_interface))
+	for (auto &conn : intf->connections())
+		if (intf_drives_member(conn.first))
 			return true;
+	for (auto &it : intf->processes) {
+		RTLIL::Process *pr = it.second;
+		if (intf_case_drives_member(&pr->root_case))
+			return true;
+		for (auto sy : pr->syncs) {
+			if (!sy->mem_write_actions.empty())
+				return true;
+			for (auto &a : sy->actions)
+				if (intf_drives_member(a.first))
+					return true;
+		}
+	}
+	for (auto c : intf->cells()) {
+		if (c->type == ID($scopeinfo) || c->get_bool_attribute(ID::is_interface))
+			continue;
+		// a submodule instance: logic
+		if (!c->type.begins_with("$"))
+			return true;
+		for (auto &p : c->connections())
+			if (c->output(p.first) && intf_drives_member(p.second))
+				return true;
+	}
 	for (auto w : intf->wires())
-		if (w->attributes.count(ID::init))
+		if (w->attributes.count(ID::init) && intf_drives_member(RTLIL::SigSpec(w)))
 			return true;
 	return false;
 }

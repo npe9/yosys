@@ -1,0 +1,35 @@
+# A package variable is copied into every module that reads the package
+# (uvm_pkg's `int unsigned uvm_global_random_seed = $urandom'), an
+# interface too, so the interface "had logic" (fe151) and a checker reading
+# it through a top module's interface port, whose interface instance is
+# never connected, was marked sv_degraded.  Only logic that drives a
+# member counts now.
+read_verilog -sv -formal <<EOT
+package pk;
+  int unsigned seed = $urandom;
+endpackage
+interface ifc;
+  logic [3:0] d;
+endinterface
+module chk(ifc x, input logic clk);
+  p_d: assert property (@(posedge clk) x.d == x.d);
+endmodule
+EOT
+hierarchy -check -top chk
+proc
+flatten
+select -assert-none A:sv_degraded
+design -reset
+
+# positive control: logic that drives a member still marks the reader
+read_verilog -sv -formal -permissive <<EOT
+interface ifc;
+  logic [3:0] d, e;
+  assign e = d + 1;
+endinterface
+module chk(ifc x, input logic clk);
+  p_e: assert property (@(posedge clk) x.e == x.d + 4'd1);
+endmodule
+EOT
+hierarchy -check -top chk
+select -assert-any A:sv_degraded=*has?logic*

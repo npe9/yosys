@@ -1,0 +1,77 @@
+# An upward reference from a bound checker into a member of a packed struct
+# wire of its target (OpenTitan prim_alert_rxtx_assert_fpv, bound into
+# prim_alert_rxtx_tb, reading `prim_alert_rxtx_tb.alert_tx_out.alert_p'):
+# it stayed a free implicit net and the design degraded.  It now becomes an
+# input port of the member's width that flatten connects to that slice; a
+# member of a struct further down (`tb.u_sub.o.b') too.
+read_verilog -sv -formal <<EOT
+typedef struct packed { logic p; logic [1:0] mid; logic n; } tx_t;
+module sub(input logic [3:0] x, output tx_t o);
+  assign o = ~x;
+endmodule
+module tb(input logic [3:0] x);
+  tx_t t;
+  assign t = x;
+  sub u_sub(.x(x), .o());
+endmodule
+module chk(input logic [3:0] x);
+  always_comb begin
+    p_p: assert (tb.t.p == x[3]);
+    p_mid: assert (tb.t.mid == x[2:1]);
+    p_sub: assert (tb.u_sub.o.n == ~x[0]);
+    n_n: assert (tb.t.n == ~x[0]);
+  end
+endmodule
+bind tb chk u_chk(.x(x));
+EOT
+hierarchy -check -top tb
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+design -save d
+select -assert-count 1 tb/c:u_chk.n_n
+delete tb/c:u_chk.n_n
+sat -verify -prove-asserts tb
+design -load d
+delete tb/c:u_chk.p_*
+sat -falsify -prove-asserts tb
+design -reset
+
+# The struct type from a package read earlier (prim_alert_pkg::alert_tx_t),
+# imported, and the bind in a module of its own, each a separate read (as
+# the files of a filelist): the layout is found in the design's packages.
+read_verilog -sv -formal <<EOT
+package pk;
+  typedef struct packed { logic p; logic [1:0] n; } tx_t;
+endpackage
+EOT
+read_verilog -sv -formal <<EOT
+module chk(input logic [2:0] x);
+  always_comb begin
+    p_p: assert (tb.t.p == x[2]);
+    p_n: assert (tb.t.n == x[1:0]);
+    p_q: assert (tb.q.p == x[2]);
+  end
+endmodule
+EOT
+read_verilog -sv -formal <<EOT
+module bm;
+  bind tb chk u_chk(.x(x));
+endmodule
+EOT
+read_verilog -sv -formal <<EOT
+module tb import pk::*; (input logic [2:0] x);
+  tx_t t;
+  pk::tx_t q;
+  assign t = x;
+  assign q = x;
+endmodule
+EOT
+hierarchy -check -top tb
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+select -assert-count 3 tb/c:u_chk.p_*
+sat -verify -prove-asserts tb

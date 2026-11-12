@@ -491,16 +491,21 @@ struct FlattenWorker
 				if (!pw || !pw->port_input || !pw->attributes.count(ID(sv_upward_ref)) || cell->hasPort(port))
 					continue;
 				std::string rest = pw->attributes.at(ID(sv_upward_ref)).decode_string();
+				// fe168: a member of the wire `rest' (its offset, and the
+				// wire's width)
+				int moff = pw->attributes.count(ID(sv_upward_ref_offset)) ? pw->attributes.at(ID(sv_upward_ref_offset)).as_int() : -1;
+				int want = moff >= 0 ? pw->attributes.at(ID(sv_upward_ref_width)).as_int() : GetSize(pw);
 				RTLIL::IdString rest_id = RTLIL::escape_id(rest);
 				RTLIL::Wire *src = module->wire(rest_id);
 				if (!src && rest.find('.') != std::string::npos) {
-					src = module->addWire(rest_id, GetSize(pw));
+					src = module->addWire(rest_id, want);
 					src->is_signed = pw->is_signed;
 					src->set_bool_attribute(ID::hierconn);
 					src->set_bool_attribute(ID(sv_hierref));
 				}
 				bool dotted = rest.find('.') != std::string::npos;
-				if (!src || GetSize(src) != GetSize(pw) || (!dotted && src->get_bool_attribute(ID(sv_hierref)))) {
+				if (!src || GetSize(src) != want || (!dotted && src->get_bool_attribute(ID(sv_hierref))) ||
+						(moff >= 0 && moff + GetSize(pw) > want)) {
 					log_warning("Upward reference %s.%s is not connected in %s (no %d-bit `%s' there); it stays a free input.\n",
 							log_id(cell), log_id(port), log_id(module), GetSize(pw), rest.c_str());
 					IdString attr = IdString("\\sv_degraded");
@@ -508,6 +513,12 @@ struct FlattenWorker
 					cur += (cur.empty() ? "" : "; ") + stringf("Upward reference `%s' of %s is not connected (no %d-bit `%s' here). @cell %s",
 							log_id(port), log_id(cell->type), GetSize(pw), rest.c_str(), log_id(cell));
 					module->attributes[attr] = RTLIL::Const(cur);
+					continue;
+				}
+				if (moff >= 0) {
+					log("Connecting upward reference %s.%s to bits %d+:%d of %s.%s.\n", log_id(cell), log_id(port), moff, GetSize(pw),
+							log_id(module), log_id(src));
+					cell->setPort(port, RTLIL::SigSpec(src, moff, GetSize(pw)));
 					continue;
 				}
 				log("Connecting upward reference %s.%s to %s.%s.\n", log_id(cell), log_id(port), log_id(module), log_id(src));

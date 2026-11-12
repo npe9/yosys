@@ -1,0 +1,44 @@
+# A hierarchical reference to a member of one element of a packed array of a
+# struct type (`kv.kv_rd_resp[0].error' in caliptra's keyvault_cov_props,
+# bound into kv: `output kv_rd_resp_t [KV_NUM_READ-1:0] kv_rd_resp') stayed
+# an implicit free wire: struct layouts were recorded only for wires the
+# struct spans.  fe178: the element layout is recorded too, and the
+# reference is element k's slice (elements from the lsb; an ascending
+# range counts from the msb) plus the member's offset.  Checked against a
+# flat copy of the array, upward (bind) and downward (instance path).
+logger -expect log "p_up_err: proved" 1
+logger -expect log "p_up_dat: proved" 1
+logger -expect log "p_up_asc: proved" 1
+logger -expect log "n_up: disproved" 1
+logger -expect log "p_dn: proved" 1
+read_verilog -defer -sv -formal <<EOT
+package p;
+  typedef struct packed { logic error; logic [2:0] data; } resp_t;
+endpackage
+module chk();
+  p_up_err: assert property (@(posedge kv.clk) kv.resp[1].error == kv.flat[7]);
+  p_up_dat: assert property (@(posedge kv.clk) kv.resp[0].data == kv.flat[2:0]);
+  p_up_asc: assert property (@(posedge kv.clk) kv.asc[0].data == kv.aflat[6:4]);
+  n_up: assert property (@(posedge kv.clk) !kv.resp[1].error);
+endmodule
+module kv import p::*; (input logic clk, input resp_t [1:0] resp, input resp_t [0:1] asc);
+  logic [7:0] flat, aflat;
+  assign flat = resp;
+  assign aflat = asc;
+endmodule
+module top import p::*; (input logic clk, input resp_t [1:0] resp, input resp_t [0:1] asc);
+  logic [7:0] tf;
+  assign tf = resp;
+  kv u_kv(.clk, .resp, .asc);
+  p_dn: assert property (@(posedge clk) u_kv.resp[1].data == tf[6:4]);
+endmodule
+bind kv chk i_chk();
+EOT
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected

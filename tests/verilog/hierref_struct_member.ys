@@ -46,8 +46,9 @@ delete top/c:p_*
 sat -falsify -prove-asserts top
 design -reset
 
-# A packed array of the struct is not a struct wire: an element's member
-# (`u.o[1].a') stays an implicit net, and the design degraded.
+# A packed array of the struct: an element's member (`u.o[1].a') was an
+# implicit net (degraded) until fe178; it is element 1's slice plus the
+# member's offset (hierref_packed_struct_array.ys)
 read_verilog -sv -formal <<EOT
 typedef struct packed { logic a; logic b; } s_t;
 module leaf(input logic [3:0] x, output s_t [1:0] o);
@@ -56,12 +57,19 @@ endmodule
 module top(input logic [3:0] x);
   leaf u(.x(x), .o());
   wire w = u.o[1].a;
+  wire v = u.o[0].b;
+  always_comb begin
+    p_w: assert (w == x[3]);
+    p_v: assert (v == x[0]);
+  end
 endmodule
 EOT
 hierarchy -top top
 proc
 flatten
-select -assert-any A:sv_degraded
+select -assert-none A:sv_degraded
+chformal -lower
+sat -verify -prove-asserts top
 design -reset
 
 # Connected to a black box whose ports have no known direction (cva6's

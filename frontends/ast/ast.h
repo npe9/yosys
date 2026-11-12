@@ -424,6 +424,10 @@ namespace AST
 		// a slice of the instance's wire (resolve_hierrefs, flatten);
 		// entries are (dotted member path, lsb, width, signed)
 		std::map<std::string, std::vector<std::tuple<std::string, int, int, bool>>> struct_members;
+		// fe178: the same layout for one element of each wire that is a
+		// packed array of a struct type (`resp_t [3:0] resp', read
+		// `u.resp[1].error'); elements are laid out from the wire's lsb
+		std::map<std::string, std::vector<std::tuple<std::string, int, int, bool>>> struct_elem_members;
 		// fe169: the module's enum items as simplify folded them, so a
 		// hierarchical reference to one (`u_rx.InitReq', an enum of the
 		// instance's module) is its value

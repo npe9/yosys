@@ -1561,9 +1561,13 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 						int hi = -1;
 						for (auto &e : out)
 							hi = std::max(hi, std::get<1>(e) + std::get<2>(e));
-						if (!out.empty() && hi == abs(node->range_left - node->range_right) + 1) {
+						int wwidth = abs(node->range_left - node->range_right) + 1;
+						if (!out.empty() && hi == wwidth) {
 							module->struct_members[node->str] = std::move(out);
 							member_dims(snode, node->str + ".");
+						} else if (!out.empty() && hi > 0 && wwidth > hi && wwidth % hi == 0) {
+							// fe178: one element of a packed array of the struct
+							module->struct_elem_members[node->str] = std::move(out);
 						}
 					}
 		for (const auto &node : ast->children)
@@ -2768,6 +2772,16 @@ struct HierrefMember { std::string path; int offset = 0, width = 0; bool is_sign
 	std::vector<std::tuple<int, int, bool>> dims; };
 typedef std::vector<std::tuple<int, int, bool>> PackedDims;
 
+// the wire part of a member reference `base.m' / `base[k].m' (fe178: an
+// element's member path starts at its index, with no separating dot)
+static std::string hierref_member_base(const std::string &full, const HierrefMember &m)
+{
+	std::string base = full.substr(0, full.size() - m.path.size());
+	if (!base.empty() && base.back() == '.')
+		base.pop_back();
+	return base;
+}
+
 // fe171: the packed dimensions of a wire of an AST module (an element
 // `rf[3]' of a memory kept as registers: the memory's)
 static PackedDims wire_packed_dims(RTLIL::Wire *w)
@@ -2831,6 +2845,39 @@ static RTLIL::Wire *find_struct_member(RTLIL::Module *mod, const std::string &re
 	auto am = dynamic_cast<AST::AstModule*>(mod);
 	if (!am)
 		return nullptr;
+	// fe178: `w[k].m' -- member m of element k of a wire that is a packed
+	// array of a struct type (caliptra kv's `output kv_rd_resp_t
+	// [KV_NUM_READ-1:0] kv_rd_resp', read by a bound checker as
+	// `kv.kv_rd_resp[0].error'): element k's slice, then m's offset in it
+	{
+		size_t lb = rest.find('['), rb = rest.find(']');
+		if (lb != std::string::npos && rb != std::string::npos && rb > lb + 1 && rb + 1 < rest.size() &&
+				rest[rb + 1] == '.' && rest.find('.') > lb) {
+			std::string wn = RTLIL::escape_id(rest.substr(0, lb)), ks = rest.substr(lb + 1, rb - lb - 1);
+			std::string inner = rest.substr(rb + 2);
+			auto it = am->struct_elem_members.find(wn);
+			auto ad = am->packed_dims.find(wn);
+			RTLIL::Wire *w = mod->wire(wn);
+			if (it != am->struct_elem_members.end() && ad != am->packed_dims.end() && w && !ad->second.empty() &&
+					ks.find_first_not_of("0123456789") == std::string::npos && ks.size() <= 9) {
+				int k = atoi(ks.c_str());
+				int lsb = std::get<0>(ad->second[0]), n = std::get<1>(ad->second[0]);
+				bool swapped = std::get<2>(ad->second[0]);
+				int pos = swapped ? lsb + n - 1 - k : k - lsb;
+				int ew = n > 0 && w->width % n == 0 ? w->width / n : 0;
+				if (pos >= 0 && pos < n && ew > 0)
+					for (auto &e : it->second)
+						if (std::get<0>(e) == inner && std::get<1>(e) + std::get<2>(e) <= ew) {
+							member->path = rest.substr(lb);
+							member->offset = pos * ew + std::get<1>(e);
+							member->width = std::get<2>(e);
+							member->is_signed = std::get<3>(e);
+							member->dims = PackedDims();
+							return w;
+						}
+			}
+		}
+	}
 	for (size_t dot = rest.find('.'); dot != std::string::npos; dot = rest.find('.', dot + 1)) {
 		auto it = am->struct_members.find(RTLIL::escape_id(rest.substr(0, dot)));
 		RTLIL::Wire *w = mod->wire(RTLIL::escape_id(rest.substr(0, dot)));
@@ -3056,7 +3103,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 			HierrefMember mr;
 			RTLIL::Wire *bw = walk_hierref_down(design, this, path, nullptr, &mr);
 			if (bw && !bw->get_bool_attribute(ID(sv_hierref)) && !wire_is_driven(this, wire, true)) {
-				std::string base = path.substr(0, path.size() - mr.path.size() - 1);
+				std::string base = hierref_member_base(path, mr);
 				targets.push_back({wire->name.str(), mr.width, mr.is_signed, std::string(), base, mr.offset});
 				targets.back().dims = mr.dims;
 				if (mr.width != 1 || mr.is_signed || !mr.dims.empty())
@@ -3248,7 +3295,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		if (res > 0) {
 			if (up_member.width != 0) {
 				// the port reads the member's slice of the wire `base'
-				std::string base = up_path.substr(0, up_path.size() - up_member.path.size() - 1);
+				std::string base = hierref_member_base(up_path, up_member);
 				Target t{wire->name.str(), width, is_signed, base};
 				t.up_offset = up_member.offset, t.up_base_width = up_base_width;
 				t.dims = up_dims;
@@ -4066,6 +4113,7 @@ RTLIL::Module *AstModule::clone() const
 	for (auto &it : folded_params)
 		new_mod->folded_params[it.first] = it.second->clone();
 	new_mod->struct_members = struct_members;
+	new_mod->struct_elem_members = struct_elem_members;
 	new_mod->enum_items = enum_items;
 	new_mod->packed_dims = packed_dims;
 

@@ -1,0 +1,48 @@
+# A covergroup instance (`cg_t cg_inst = new();', IEEE 1800-2017 19.4;
+# caliptra's kv_boot_flow_cov, bound by the FCOV checkers) named a type the
+# lexer had skipped with its declaration: "Unknown identifier used as type
+# name", and the module was degraded.  fe176: a covergroup name is an opaque
+# simulation-only type, as a class name is; a variable of either type is a
+# handle, its construction (`= new', `= new(args)') writes nothing the
+# design sees, and the module's assertions are checked exactly.
+logger -expect log "p_ok: proved" 1
+logger -expect log "n_bad: disproved" 1
+read_verilog -sv -formal <<EOT
+module m(input logic clk, input logic [1:0] a);
+  covergroup cg_a @(posedge clk);
+    coverpoint a;
+  endgroup : cg_a
+  covergroup cg_b with function sample(logic [1:0] v);
+    coverpoint v;
+  endgroup
+  cg_a cg_a_inst = new();
+  cg_b cg_b_inst;
+  initial cg_b_inst = new;
+  class C; int x; endclass
+  C h = new();
+  p_ok: assert property (@(posedge clk) a == a);
+  n_bad: assert property (@(posedge clk) a != 2'd2);
+endmodule
+EOT
+hierarchy -check -top m
+proc
+select -assert-none A:sv_degraded
+select -assert-count 2 m/a:sv_class_handle=covergroup
+select -assert-count 3 m/a:sv_class_handle
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# a design read of a handle is not modelled: a degradation (an error on a
+# strict read)
+logger -expect error "Covergroup handle `\\c' read \(simulation-only; not modeled\)" 1
+read_verilog -sv -formal <<EOT
+module r(input logic clk, input logic [1:0] a, output logic q);
+  covergroup cg @(posedge clk); coverpoint a; endgroup
+  cg c = new();
+  assign q = (c == c);
+endmodule
+EOT
+hierarchy -top r

@@ -611,6 +611,17 @@ pullup|pulldown {
 			for (auto it = la.rbegin(); it != la.rend(); ++it)
 				unput(*it);
 		}
+		// fe176: the declaration stays skipped, but its name is a type
+		// (`cg_t cg_inst = new();', IEEE 1800-2017 19.3), registered by
+		// the parser as an opaque covergroup (like a class)
+		size_t i = 0;
+		while (i < buf.size() && isspace((unsigned char)buf[i]))
+			i++;
+		size_t j = i;
+		while (j < buf.size() && (isalnum((unsigned char)buf[j]) || buf[j] == '_' || buf[j] == '$'))
+			j++;
+		if (j > i && !isdigit((unsigned char)buf[i]))
+			return parser::make_TOK_COVERGROUP_DECL(std::make_unique<std::string>("\\" + buf.substr(i, j - i)), out_loc);
 		return parser::make_TOK_SEMICOL(out_loc);
 	}
 	auto val = std::make_unique<std::string>(std::string("\\") + YYText());

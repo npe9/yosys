@@ -1827,6 +1827,12 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			RTLIL::State oob_fill = RTLIL::State::Sx;
 			int add_undef_bits_lsb = 0;
 
+			// fe176: a class or covergroup handle is not modelled; only its
+			// construction (`= new') is, as a constant (simplify)
+			if (id2ast && id2ast->type == AST_WIRE && id2ast->attributes.count(ID(sv_class_handle)) && !in_lvalue)
+				degrade(location.to_loc(), "%s handle `%s' read (simulation-only; not modeled).",
+						id2ast->attributes.at(ID(sv_class_handle))->str == "covergroup" ? "Covergroup" : "Class", str.c_str());
+
 			// fe174: a clocking block variable is the signal itself only as
 			// a sampled operand of a concurrent assertion (sva2check checks
 			// the clocks); elsewhere it is a held sample, not modelled

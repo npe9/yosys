@@ -463,6 +463,17 @@
 			node->is_custom_type = true;
 			node->children.push_back(std::make_unique<AstNode>(node->location, AST_WIRETYPE));
 			node->children.back()->str = *name;
+			// fe176: a variable of a class or covergroup type is a handle
+			// (simulation-only; simplify models it, see sv_class_handle)
+			for (auto it = user_type_stack.rbegin(); it != user_type_stack.rend(); ++it) {
+				auto f = it->find(*name);
+				if (f == it->end())
+					continue;
+				if (f->second && f->second->type == AST_CLASS)
+					node->children.back()->set_attribute(ID(sv_class_type), AstNode::mkconst_str(node->location,
+							f->second->attributes.count(ID(sv_covergroup)) ? "covergroup" : "class"));
+				break;
+			}
 		}
 
 		// `parameter type T = ...` / `#(type T = ...)`: a typedef that is also
@@ -1028,7 +1039,9 @@
 				err_at_loc(n->location, "Task declarations in a checker are not supported (functions are allowed).");
 				break;
 			case AST_CLASS:
-				err_at_loc(n->location, "Class declarations in a checker are not supported.");
+				// fe176: a (skipped) covergroup is allowed in a checker
+				if (!n->attributes.count(ID(sv_covergroup)))
+					err_at_loc(n->location, "Class declarations in a checker are not supported.");
 				break;
 			case AST_CELLARRAY:
 				err_at_loc(n->location, "Checker instance arrays are not supported.");
@@ -1116,6 +1129,7 @@
 %token <ast_node_type_t> ast_node_type_t
 
 %token <string_t> TOK_STRING TOK_ID TOK_CONSTVAL TOK_REALVAL TOK_PRIMITIVE TOK_PULLUP
+%token <string_t> TOK_COVERGROUP_DECL
 %token <string_t> TOK_SVA_LABEL TOK_SPECIFY_OPER TOK_MSG_TASKS
 %token <string_t> TOK_BASE TOK_BASED_CONSTVAL TOK_UNBASED_UNSIZED_CONSTVAL
 %token <string_t> TOK_USER_TYPE TOK_PKG_USER_TYPE TOK_SCOPED_ID
@@ -1759,10 +1773,21 @@ module_header_imports:
 package_body_stmt:
 	typedef_decl | localparam_decl | param_decl | task_func_decl | import_stmt |
 	dpi_export_decl | sva_sequence_decl | sva_property_decl | sva_let_decl |
-	wire_decl | class_decl | timeunit_decl |
+	wire_decl | class_decl | timeunit_decl | covergroup_decl |
 	// fe162: an empty item (IEEE 1800-2017 A.1.11); also what a skipped
-	// covergroup lexes as
+	// covergroup lexes as when it has no name
 	TOK_SEMICOL;
+
+// fe176: a covergroup declaration (IEEE 1800-2017 19.3), skipped by the
+// lexer; its name is an opaque simulation-only type, like a class
+covergroup_decl:
+	TOK_COVERGROUP_DECL {
+		auto node = std::make_unique<AstNode>(@$, AST_CLASS);
+		node->str = *$1;
+		node->set_attribute(ID(sv_covergroup), AstNode::mkconst_int(@$, 1, false));
+		extra->user_type_stack.back()[*$1] = node.get();
+		extra->saveChild(std::move(node));
+	};
 
 // SystemVerilog class declarations (IEEE 1800-2017 8). Classes are
 // simulation-only: the declaration is parsed into an AST_CLASS node whose
@@ -1937,6 +1962,7 @@ class_item:
 	class_member_quals enum_decl |
 	class_member_quals sva_let_decl |
 	class_member_quals nested_class_decl |
+	covergroup_decl |
 	TOK_SEMICOL;
 
 class_method_proto:
@@ -2141,7 +2167,7 @@ interface_body_stmt:
 	param_decl | localparam_decl | typedef_decl | defparam_decl | wire_decl | always_stmt | assign_stmt |
 	modport_stmt | import_stmt | assert | cell_stmt | clocking_decl | task_func_decl | bind_stmt |
 	sva_sequence_decl | sva_property_decl | sva_let_decl | sva_default_disable |
-	enum_decl | struct_decl;
+	enum_decl | struct_decl | covergroup_decl;
 
 // bind_target matches the target of the bind (everything before
 // bind_instantiation in the IEEE 1800 spec).
@@ -2559,7 +2585,7 @@ module_body_stmt:
 	enum_decl | struct_decl |
 	always_stmt | TOK_GENERATE module_gen_body TOK_ENDGENERATE | defattr | assert | checker_decl | ignored_specify_block |
 	sva_sequence_decl | sva_property_decl | sva_let_decl | clocking_decl | import_stmt | sva_default_disable |
-	dpi_export_decl | bind_stmt | class_decl;
+	dpi_export_decl | bind_stmt | class_decl | covergroup_decl;
 
 checker_port_default:
 	TOK_EQ expr {

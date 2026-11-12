@@ -3685,6 +3685,23 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		return false;
 	}
 
+	// fe176: a class or covergroup handle (`cg_t cg_inst = new();') is
+	// simulation-only: constructing one (`= new', `= new(args)') models
+	// nothing, so the assignment writes a constant; a design read of the
+	// handle is a degradation (genrtlil)
+	if ((type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE || type == AST_ASSIGN) && children.size() == 2 &&
+			children[0] && children[0]->type == AST_IDENTIFIER && children[0]->children.empty() &&
+			children[1] && (children[1]->type == AST_FCALL || children[1]->type == AST_IDENTIFIER) &&
+			children[1]->str == "\\new" && current_scope.count(children[0]->str)) {
+		AstNode *w = current_scope.at(children[0]->str);
+		bool handle = w && w->type == AST_WIRE && (w->attributes.count(ID(sv_class_handle)) ||
+				(w->is_custom_type && !w->children.empty() && w->children[0] &&
+				 w->children[0]->type == AST_WIRETYPE && w->children[0]->attributes.count(ID(sv_class_type))));
+		if (handle) {
+			children[1] = AstNode::mkconst_int(children[1]->location, 0, false, 1);
+		}
+	}
+
 	// Out-of-block class method definitions (parsed at package scope) are
 	// simulation-only as well: their bodies reference class members and
 	// constructs (this/super) that only make sense in class context.
@@ -6714,6 +6731,16 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				children.insert(children.begin(), make_range(location, string_width - 1, 0));
 				is_logic = true;
 				set_attribute(ID(sv_string), AstNode::mkconst_int(location, 1, false));
+				did_something = true;
+			} else if (!known_typedef && type == AST_WIRE && children[0]->attributes.count(ID(sv_class_type))) {
+				// fe176: a class or covergroup handle: one opaque bit, marked
+				std::string kind = children[0]->attributes.at(ID(sv_class_type))->str;
+				set_attribute(ID(sv_class_handle), AstNode::mkconst_str(location, kind));
+				is_custom_type = false;
+				is_logic = true;
+				children.erase(children.begin());
+				if (children.empty() || !children[0] || children[0]->type != AST_RANGE)
+					children.insert(children.begin(), make_range(location, 0, 0));
 				did_something = true;
 			} else if (!known_typedef) {
 				// The typedef often lives in a package this file did not elaborate.

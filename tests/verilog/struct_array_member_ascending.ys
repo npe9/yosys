@@ -1,0 +1,40 @@
+# A struct member that is a packed array of a struct type with an
+# ascending range (`e_t [0:1] asc`) indexed its elements in reverse: the
+# range is normalized to left >= right with range_swapped set, and the
+# recorded dimension tested left < right only, so `r.asc[0]' was the
+# least significant element (IEEE 1800-2017 7.4: the left bound is the
+# most significant).  A plain `e_t [0:1]' wire was already right.
+read_verilog -sv -formal <<EOF
+typedef struct packed { logic [1:0] p; logic q; } e_t;
+typedef struct packed { e_t [0:1] asc; e_t [1:0] dsc; logic [1:0] z; } r_t;
+module top(input logic [13:0] d, input logic i);
+  r_t r;
+  e_t [0:1] la;
+  assign r = d;
+  assign la = d[13:8];
+  always_comb begin
+    a_q: assert (r.asc[0].q == d[11]);
+    a_e: assert (r.asc[0] == d[13:11] && r.asc[1] == d[10:8]);
+    a_i: assert (r.asc[i].p == (i ? d[10:9] : d[13:12]));
+    a_d: assert (r.dsc[0] == d[4:2] && r.dsc[1].q == d[5]);
+    a_l: assert (la[0] == d[13:11]);
+  end
+endmodule
+EOF
+proc
+chformal -lower
+select -assert-count 5 top/c:a_*
+sat -verify -prove-asserts top
+design -reset
+read_verilog -sv -formal <<EOF
+typedef struct packed { logic [1:0] p; logic q; } e_t;
+typedef struct packed { e_t [0:1] asc; logic [1:0] z; } r_t;
+module top(input logic [7:0] d);
+  r_t r;
+  assign r = d;
+  always_comb n_q: assert (r.asc[0].q == d[2]);
+endmodule
+EOF
+proc
+chformal -lower
+sat -falsify -prove-asserts top

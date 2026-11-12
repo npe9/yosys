@@ -1473,7 +1473,10 @@ static int size_packed_struct(AstNode *snode, int base_offset)
 		AstNode *r = snode->attributes.at(ID(sv_elem_range)).get();
 		int n = std::abs(r->range_left - r->range_right) + 1;
 		snode->dimensions.clear();
-		snode->dimensions.push_back({ std::min(r->range_left, r->range_right), n, r->range_left < r->range_right });
+		// an ascending range (`e_t [0:3] a`) is normalized to left >= right
+		// with range_swapped set: element 0 is then the most significant
+		snode->dimensions.push_back({ std::min(r->range_left, r->range_right), n,
+				r->range_swapped || r->range_left < r->range_right });
 		snode->dimensions.push_back({ 0, width / n, false });
 	} else
 		snode->dimensions.push_back({ 0, width, false });

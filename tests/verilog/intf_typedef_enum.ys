@@ -1,0 +1,49 @@
+# An enum typedef inside an interface (`typedef enum {...} cat_e; cat_e cat;')
+# made `hierarchy' abort when the interface was instantiated in a module:
+# "Assert `current_scope.count(enum_type) == 1' failed" (ibex's
+# core_ibex_fcov_if, bound into ibex_core).  The module's copy of the
+# interface member's typedef (`u_ifc.cat_e', fe148/fe154) named the
+# interface's `$enumN' node, which was not copied.  fe180: the enum comes
+# along, its items prefixed with the instance name.
+read_verilog -sv -formal <<EOT
+interface ifc(input logic clk, input logic a);
+  typedef enum logic [1:0] {CatA, CatB, CatC} cat_e;
+  cat_e cat;
+  assign cat = a ? CatA : CatB;
+  always_comb p_ok: assert (cat != CatC);
+  always_comb p_val: assert (cat == (a ? 2'd0 : 2'd1));
+endinterface
+module m(input logic clk, input logic a);
+  logic CatA;   // a module name equal to an enum item of the interface
+  assign CatA = a;
+  ifc u_ifc(.clk, .a);
+  ifc u_ifc2(.*);
+endmodule
+EOT
+hierarchy -check -top m
+proc
+select -assert-count 1 m/u_ifc.cat
+select -assert-count 1 m/u_ifc2.cat
+flatten
+chformal -lower
+sat -verify -prove-asserts -show-ports
+design -reset
+
+# a negative control: the same member read with a wrong value fails
+logger -expect error "Called with -verify and proof did fail!" 1
+read_verilog -sv -formal <<EOT
+interface ifc(input logic clk, input logic a);
+  typedef enum logic [1:0] {CatA, CatB, CatC} cat_e;
+  cat_e cat;
+  assign cat = a ? CatA : CatB;
+  always_comb n_bad: assert (cat == CatA);
+endinterface
+module m(input logic clk, input logic a);
+  ifc u_ifc(.clk, .a);
+endmodule
+EOT
+hierarchy -check -top m
+proc
+flatten
+chformal -lower
+sat -verify -prove-asserts

@@ -2366,6 +2366,38 @@ static AstNode *find_typedef_child(AstNode *scope, const std::string &name)
 	return nullptr;
 }
 
+// fe180: an enum typedef's template names its AST_ENUM (`enum_type' =
+// `$enumN'), a sibling of the typedef in the interface; a copy of the
+// typedef in the module needs that enum in the module's scope too, or
+// simplify's annotateTypedEnums finds no enum (an assert: ibex's
+// core_ibex_fcov_if, `typedef enum {...} instr_category_e;
+// instr_category_e id_instr_category;', bound into ibex_core).  The
+// enum's items get the instance prefix (`u_fcov_bind.InstrCategoryALU'):
+// only the member's width and value names are needed, and the module's
+// own names must not clash.
+static void copy_intf_enums(AstNode *node, AstNode *intf_ast, const std::string &intfname, AstNode *module_ast)
+{
+	if (node->attributes.count(ID::enum_type)) {
+		const std::string &en = node->attributes.at(ID::enum_type)->str;
+		bool have = false;
+		for (auto &c : module_ast->children)
+			if (c->type == AST_ENUM && c->str == en)
+				have = true;
+		if (!have)
+			for (auto &c : intf_ast->children)
+				if (c->type == AST_ENUM && c->str == en) {
+					auto copy = c->clone();
+					for (auto &item : copy->children)
+						if (item->type == AST_ENUM_ITEM)
+							item->str = intfname + "." + item->str.substr(1);
+					module_ast->children.push_back(std::move(copy));
+					break;
+				}
+	}
+	for (auto &c : node->children)
+		copy_intf_enums(c.get(), intf_ast, intfname, module_ast);
+}
+
 static bool qualify_intf_types(RTLIL::Design *design, AstNode *node, AstNode *intf_ast, const std::string &intfname, AstNode *module_ast, int depth)
 {
 	if (depth > 16)
@@ -2421,6 +2453,7 @@ static bool qualify_intf_types(RTLIL::Design *design, AstNode *node, AstNode *in
 					copy->str = nn;
 					if (!qualify_intf_types(design, copy.get(), intf_ast, intfname, module_ast, depth + 1))
 						return false;
+					copy_intf_enums(copy.get(), intf_ast, intfname, module_ast);
 					module_ast->children.push_back(std::move(copy));
 				}
 				c->str = nn;

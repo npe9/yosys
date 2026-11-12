@@ -1,0 +1,41 @@
+# An upward reference whose head names an instance in the scope the
+# checker is bound into, not that scope's module (IEEE 1800-2017 23.8;
+# OpenTitan prim_alert_rxtx_async_assert_fpv reads
+# `i_prim_alert_sender.state_q' from a checker bound into the tb that
+# holds i_prim_alert_sender).  It was a free implicit 1-bit net, and the
+# design degraded.  A wire, an enum item and a packed-struct member.
+read_verilog -sv -formal <<EOF
+module rx (input logic [2:0] d, output logic [2:0] q);
+  typedef enum logic [2:0] {Idle, Busy, InitReq = 3'd5} state_e;
+  typedef struct packed { logic [1:0] m; logic [3:0] n; } st_t;
+  state_e state_q;
+  st_t o;
+  assign state_q = state_e'(d);
+  assign o = {d[1:0], 1'b0, d};
+  assign q = d;
+endmodule
+module tb(input logic [2:0] d);
+  rx u_rx(.d(d), .q());
+endmodule
+module chk(input logic [2:0] d);
+  always_comb begin
+    p_w: assert (u_rx.state_q == d);
+    p_e: assert ((u_rx.state_q == u_rx.InitReq) == (d == 3'd5));
+    p_m: assert (u_rx.o.n == {1'b0, d} && u_rx.o.m == d[1:0]);
+    n_w: assert (u_rx.state_q != u_rx.Busy);
+  end
+endmodule
+bind tb chk u_chk(.d(d));
+EOF
+hierarchy -check -top tb
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+design -save x
+select -assert-count 1 tb/c:u_chk.n_w
+delete tb/c:u_chk.n_w
+sat -verify -prove-asserts tb
+design -load x
+delete tb/c:u_chk.p_*
+sat -falsify -prove-asserts tb

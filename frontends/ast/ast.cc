@@ -2888,6 +2888,10 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		int up_base_width = 0;
 		bool up_const = false;
 		RTLIL::Const up_value;
+		// fe170: `head' names an instance in each parent scope instead of
+		// the parent module (IEEE 1800-2017 23.8: `i_sender.state_q' in a
+		// checker bound into the module that holds `i_sender')
+		bool by_inst = false;
 		auto resolve_up = [&](const std::string &r, int &width, bool &is_signed) -> int {
 			width = -1, is_signed = false;
 			up_member = HierrefMember(), up_base_width = 0;
@@ -2895,7 +2899,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 			bool first = true;
 			for (auto &pc : parents) {
 				RTLIL::Module *parent = pc.first;
-				if (source_module_name(parent->name) != head)
+				if (by_inst ? !parent->cell(head) : source_module_name(parent->name) != head)
 					return 0;
 				bool pending = false;
 				RTLIL::Wire *t = r.find('.') == std::string::npos ? parent->wire(RTLIL::escape_id(r)) :
@@ -2957,6 +2961,19 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		int res = resolve_up(rest, width, is_signed);
 		if (res < 0)
 			return false;
+		std::string up_path = rest;
+		if (res == 0) {
+			bool all_inst = true;
+			for (auto &pc : parents)
+				if (!pc.first->cell(head))
+					all_inst = false;
+			if (all_inst) {
+				by_inst = true, up_path = path;
+				res = resolve_up(path, width, is_signed);
+				if (res < 0)
+					return false;
+			}
+		}
 		if (res > 0 && up_const) {
 			// a constant: declared here with its value, no port
 			Target t{wire->name.str(), width, is_signed, std::string()};
@@ -2968,12 +2985,12 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		if (res > 0) {
 			if (up_member.width != 0) {
 				// the port reads the member's slice of the wire `base'
-				std::string base = rest.substr(0, rest.size() - up_member.path.size() - 1);
+				std::string base = up_path.substr(0, up_path.size() - up_member.path.size() - 1);
 				Target t{wire->name.str(), width, is_signed, base};
 				t.up_offset = up_member.offset, t.up_base_width = up_base_width;
 				targets.push_back(t);
 			} else
-				targets.push_back({wire->name.str(), width, is_signed, rest});
+				targets.push_back({wire->name.str(), width, is_signed, up_path});
 			any_up = true;
 			continue;
 		}
@@ -2983,7 +3000,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		// reads to
 		if (wire->has_attribute(ID(sv_hierref_idx)))
 			for (auto &idx : split_tokens(wire->get_string_attribute(ID(sv_hierref_idx)), ",")) {
-				std::string er = stringf("%s[%s]", rest.c_str(), idx.c_str());
+				std::string er = stringf("%s[%s]", up_path.c_str(), idx.c_str());
 				res = resolve_up(er, width, is_signed);
 				if (res < 0)
 					return false;

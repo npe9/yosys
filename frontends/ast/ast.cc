@@ -1519,6 +1519,31 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 				return struct_of(t, depth + 1);
 			return nullptr;
 		};
+		auto packed_of = [](AstNode *n) {
+			std::vector<std::tuple<int, int, bool>> d;
+			for (size_t k = std::max(n->unpacked_dimensions, 0); k < n->dimensions.size(); k++)
+				d.emplace_back(n->dimensions[k].range_right, n->dimensions[k].range_width, n->dimensions[k].range_swapped);
+			return d;
+		};
+		std::function<void(AstNode*, const std::string&)> member_dims = [&](AstNode *snode, const std::string &prefix) {
+			for (auto &m : snode->children) {
+				if (!m || m->str.empty())
+					continue;
+				std::string mname = prefix + m->str;
+				if (m->type != AST_STRUCT && m->type != AST_UNION && m->type != AST_STRUCT_ITEM)
+					continue;
+				// a struct / union node is one vector unless it is a packed
+				// array of a struct type (its dimensions are appended on
+				// every simplify pass otherwise)
+				auto d = packed_of(m.get());
+				if (m->type != AST_STRUCT_ITEM && !m->attributes.count(ID(sv_elem_range)))
+					d.clear();
+				if (d.size() > 1 && m->unpacked_dimensions <= 0)
+					module->packed_dims[mname] = d;
+				if (m->type != AST_STRUCT_ITEM)
+					member_dims(m.get(), mname + ".");
+			}
+		};
 		for (const auto &node : ast->children)
 			if (node->type == AST_ENUM)
 				for (auto &item : node->children)
@@ -1536,9 +1561,17 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 						int hi = -1;
 						for (auto &e : out)
 							hi = std::max(hi, std::get<1>(e) + std::get<2>(e));
-						if (!out.empty() && hi == abs(node->range_left - node->range_right) + 1)
+						if (!out.empty() && hi == abs(node->range_left - node->range_right) + 1) {
 							module->struct_members[node->str] = std::move(out);
+							member_dims(snode, node->str + ".");
+						}
 					}
+		for (const auto &node : ast->children)
+			if (node->type == AST_WIRE || node->type == AST_PARAMETER || node->type == AST_LOCALPARAM) {
+				auto d = packed_of(node.get());
+				if (d.size() > 1)
+					module->packed_dims[node->str] = d;
+			}
 	}
 	module->ast = std::move(ast_before_simplify);
 	module->nolatches = flag_nolatches;
@@ -2593,12 +2626,28 @@ static std::string source_module_name(RTLIL::IdString id)
 // only the underived base), so the answer may change in a later round
 // fe166: a reference that ends in a member of a packed struct / union wire
 // (`u_lsu.req_port_o.kill_req`): the instance's wire, and where in it
-struct HierrefMember { std::string path; int offset = 0, width = 0; bool is_signed = false; };
+struct HierrefMember { std::string path; int offset = 0, width = 0; bool is_signed = false;
+	std::vector<std::tuple<int, int, bool>> dims; };
+typedef std::vector<std::tuple<int, int, bool>> PackedDims;
+
+// fe171: the packed dimensions of a wire of an AST module (an element
+// `rf[3]' of a memory kept as registers: the memory's)
+static PackedDims wire_packed_dims(RTLIL::Wire *w)
+{
+	auto am = w ? dynamic_cast<AST::AstModule*>(w->module) : nullptr;
+	if (!am)
+		return PackedDims();
+	std::string n = w->name.str();
+	auto it = am->packed_dims.find(n);
+	if (it == am->packed_dims.end() && !n.empty() && n.back() == ']' && n.rfind('[') != std::string::npos)
+		it = am->packed_dims.find(n.substr(0, n.rfind('[')));
+	return it == am->packed_dims.end() ? PackedDims() : it->second;
+}
 
 // fe169: `inst...name' naming an enum item or a parameter of the module the
 // path ends in (not a wire): its value
 static bool walk_hierref_const(RTLIL::Design *design, RTLIL::Module *mod, std::string rest, RTLIL::Const &value, bool &is_signed,
-		bool local = false)
+		bool local = false, PackedDims *dims = nullptr)
 {
 	for (int depth = 0; depth < 64 && mod; depth++) {
 		RTLIL::Cell *cell = nullptr;
@@ -2621,6 +2670,10 @@ static bool walk_hierref_const(RTLIL::Design *design, RTLIL::Module *mod, std::s
 			auto p = am->folded_params.find(id);
 			if (p != am->folded_params.end() && p->second && p->second->type == AST_CONSTANT) {
 				value = p->second->bitsAsConst(), is_signed = p->second->is_signed;
+				if (dims) {
+					auto d = am->packed_dims.find(id);
+					*dims = d == am->packed_dims.end() ? PackedDims() : d->second;
+				}
 				return true;
 			}
 			return false;
@@ -2651,6 +2704,8 @@ static RTLIL::Wire *find_struct_member(RTLIL::Module *mod, const std::string &re
 				member->offset = std::get<1>(e);
 				member->width = std::get<2>(e);
 				member->is_signed = std::get<3>(e);
+				auto d = am->packed_dims.find(RTLIL::escape_id(rest.substr(0, dot)) + "." + member->path);
+				member->dims = d == am->packed_dims.end() ? PackedDims() : d->second;
 				return w;
 			}
 	}
@@ -2778,7 +2833,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	if (get_bool_attribute(ID(sv_hierrefs_resolved)))
 		return false;
 	struct Target { std::string name; int width; bool is_signed; std::string up_rest; std::string member_base = std::string(); int member_offset = -1;
-		int up_offset = -1, up_base_width = 0; bool is_const = false; RTLIL::Const value = RTLIL::Const(); };
+		int up_offset = -1, up_base_width = 0; bool is_const = false; RTLIL::Const value = RTLIL::Const(); PackedDims dims = PackedDims(); };
 	std::vector<Target> targets;
 	bool any_wide = false, any_up = false, any_member = false;
 	auto mark_members = [&](RTLIL::Module *m) {
@@ -2808,7 +2863,8 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		// a target that is itself an unresolved reference in the child
 		if (target && !target->get_bool_attribute(ID(sv_hierref))) {
 			targets.push_back({wire->name.str(), target->width, target->is_signed, std::string()});
-			if (target->width != 1 || target->is_signed)
+			targets.back().dims = wire_packed_dims(target);
+			if (target->width != 1 || target->is_signed || !targets.back().dims.empty())
 				any_wide = true;
 			continue;
 		}
@@ -2824,16 +2880,18 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 			if (bw && !bw->get_bool_attribute(ID(sv_hierref)) && !wire_is_driven(this, wire, true)) {
 				std::string base = path.substr(0, path.size() - mr.path.size() - 1);
 				targets.push_back({wire->name.str(), mr.width, mr.is_signed, std::string(), base, mr.offset});
-				if (mr.width != 1 || mr.is_signed)
+				targets.back().dims = mr.dims;
+				if (mr.width != 1 || mr.is_signed || !mr.dims.empty())
 					any_wide = true;
 				any_member = true;
 				continue;
 			}
 			RTLIL::Const cv;
 			bool cs = false;
-			if (!bw && !wire_is_driven(this, wire, true) && walk_hierref_const(design, this, path, cv, cs)) {
+			PackedDims cd;
+			if (!bw && !wire_is_driven(this, wire, true) && walk_hierref_const(design, this, path, cv, cs, false, &cd)) {
 				Target t{wire->name.str(), GetSize(cv), cs, std::string()};
-				t.is_const = true, t.value = cv;
+				t.is_const = true, t.value = cv, t.dims = cd;
 				targets.push_back(t);
 				any_wide = true;
 				continue;
@@ -2850,6 +2908,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				if (!et || et->get_bool_attribute(ID(sv_hierref)))
 					continue;
 				targets.push_back({"\\" + ename, et->width, et->is_signed, std::string()});
+				targets.back().dims = wire_packed_dims(et);
 				any_wide = any_elem = true;
 			}
 			if (any_elem)
@@ -2892,8 +2951,10 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		// the parent module (IEEE 1800-2017 23.8: `i_sender.state_q' in a
 		// checker bound into the module that holds `i_sender')
 		bool by_inst = false;
+		PackedDims up_dims;
 		auto resolve_up = [&](const std::string &r, int &width, bool &is_signed) -> int {
 			width = -1, is_signed = false;
+			up_dims.clear();
 			up_member = HierrefMember(), up_base_width = 0;
 			up_const = false, up_value = RTLIL::Const();
 			bool first = true;
@@ -2911,9 +2972,11 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				if (!t) {
 					RTLIL::Const cv;
 					bool cs = false;
-					if (walk_hierref_const(design, parent, r, cv, cs, true)) {
-						if (!first && (!up_const || cv != up_value || cs != is_signed))
+					PackedDims cd;
+					if (walk_hierref_const(design, parent, r, cv, cs, true, &cd)) {
+						if (!first && (!up_const || cv != up_value || cs != is_signed || cd != up_dims))
 							return 0;
+						up_dims = cd;
 						up_const = true, up_value = cv;
 						width = GetSize(cv), is_signed = cs;
 						first = false;
@@ -2927,8 +2990,9 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 					if (!t || t->get_bool_attribute(ID(sv_hierref)))
 						return 0;
 					if (!first && (up_member.width == 0 || up_const || m.path != up_member.path || m.offset != up_member.offset ||
-							t->width != up_base_width))
+							t->width != up_base_width || m.dims != up_dims))
 						return 0;
+					up_dims = m.dims;
 					up_member = m, up_base_width = t->width;
 					width = m.width, is_signed = m.is_signed;
 					first = false;
@@ -2951,6 +3015,10 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 								return -1;
 							return 0;
 						}
+				PackedDims td = wire_packed_dims(t);
+				if (!first && td != up_dims)
+					return 0;
+				up_dims = td;
 				width = t->width, is_signed = t->is_signed;
 				first = false;
 			}
@@ -2977,7 +3045,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		if (res > 0 && up_const) {
 			// a constant: declared here with its value, no port
 			Target t{wire->name.str(), width, is_signed, std::string()};
-			t.is_const = true, t.value = up_value;
+			t.is_const = true, t.value = up_value, t.dims = up_dims;
 			targets.push_back(t);
 			any_wide = true;
 			continue;
@@ -2988,9 +3056,12 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				std::string base = up_path.substr(0, up_path.size() - up_member.path.size() - 1);
 				Target t{wire->name.str(), width, is_signed, base};
 				t.up_offset = up_member.offset, t.up_base_width = up_base_width;
+				t.dims = up_dims;
 				targets.push_back(t);
-			} else
+			} else {
 				targets.push_back({wire->name.str(), width, is_signed, up_path});
+				targets.back().dims = up_dims;
+			}
 			any_up = true;
 			continue;
 		}
@@ -3007,8 +3078,22 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				if (res == 0)
 					continue;
 				targets.push_back({stringf("\\%s[%s]", path.c_str(), idx.c_str()), width, is_signed, er});
+				targets.back().dims = up_dims;
 				any_up = true;
 			}
+	}
+	// fe171: dimensions that do not make up the width (never expected):
+	// leave that reference implicit (degraded) rather than flat
+	for (auto it = targets.begin(); it != targets.end();) {
+		long long prod = 1;
+		for (auto &d : it->dims)
+			prod *= std::get<1>(d);
+		if (!it->dims.empty() && prod != it->width) {
+			log_warning("Hierarchical reference %s.%s: packed dimensions do not make up its %d bits; left unresolved.\n",
+					log_id(name), log_id(it->name), it->width);
+			it = targets.erase(it);
+		} else
+			++it;
 	}
 	if (!any_wide && !any_up) {
 		if (any_member)
@@ -3024,8 +3109,20 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		if (child->type == AST_WIRE && child->port_id > max_port_id)
 			max_port_id = child->port_id;
 	for (auto &t : targets) {
-		auto wire = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE,
-				AstNode::mkconst_int(loc, t.width - 1, true), AstNode::mkconst_int(loc, 0, true)));
+		std::unique_ptr<AstNode> wire;
+		if (t.dims.size() > 1) {
+			// declared with the target's packed dimensions
+			auto mr = std::make_unique<AstNode>(loc, AST_MULTIRANGE);
+			for (auto &d : t.dims) {
+				int lsb = std::get<0>(d), msb = std::get<0>(d) + std::get<1>(d) - 1;
+				bool swapped = std::get<2>(d);
+				mr->children.push_back(std::make_unique<AstNode>(loc, AST_RANGE,
+						AstNode::mkconst_int(loc, swapped ? lsb : msb, true), AstNode::mkconst_int(loc, swapped ? msb : lsb, true)));
+			}
+			wire = std::make_unique<AstNode>(loc, AST_WIRE, std::move(mr));
+		} else
+			wire = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE,
+					AstNode::mkconst_int(loc, t.width - 1, true), AstNode::mkconst_int(loc, 0, true)));
 		wire->str = t.name;
 		wire->is_signed = t.is_signed;
 		if (t.is_const) {
@@ -3764,6 +3861,7 @@ RTLIL::Module *AstModule::clone() const
 		new_mod->folded_params[it.first] = it.second->clone();
 	new_mod->struct_members = struct_members;
 	new_mod->enum_items = enum_items;
+	new_mod->packed_dims = packed_dims;
 
 	return new_mod;
 }

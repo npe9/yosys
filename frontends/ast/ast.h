@@ -428,6 +428,11 @@ namespace AST
 		// hierarchical reference to one (`u_rx.InitReq', an enum of the
 		// instance's module) is its value
 		std::map<std::string, std::pair<RTLIL::Const, bool>> enum_items;
+		// fe171: the packed dimensions (lsb, width, swapped; outermost
+		// first) of the wires, parameters and struct members (`\\w.m.n')
+		// with more than one, so a hierarchical reference to one is
+		// declared alike and `ref[i]' is an element, not a bit
+		std::map<std::string, std::vector<std::tuple<int, int, bool>>> packed_dims;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, bool mayfail) override;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, const dict<RTLIL::IdString, RTLIL::Module*> &interfaces, const dict<RTLIL::IdString, RTLIL::IdString> &modports, bool mayfail) override;
 		std::string derive_common(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, std::unique_ptr<AstNode>* new_ast_out, bool quiet = false);

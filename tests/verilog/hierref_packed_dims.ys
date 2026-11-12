@@ -1,0 +1,110 @@
+# A hierarchical reference to a wire, struct member or parameter with
+# more than one packed dimension (`logic [3:0][7:0] w', a packed array
+# of structs `e_t [3:0] arr' in a struct) was declared flat at the
+# target's width, so `u.w[i]' selected one bit, not one element: a
+# silent wrong value (no degradation).  It is now declared with the
+# target's packed dimensions.  Downward and upward (bound checker,
+# through a parametric target), ascending ranges, a packed array of
+# structs read with a variable index, a 2-D parameter.
+read_verilog -sv -formal <<EOF
+package pk;
+  typedef struct packed { logic [2:0] q; } e_t;
+  typedef struct packed { e_t [3:0] arr; logic [1:0] z; } r_t;
+endpackage
+module sub #(parameter P = 1) (input logic [31:0] d);
+  localparam logic [1:0][3:0] C = 8'h5a;
+  logic [3:0][7:0] w;
+  logic [0:3][7:0] a;
+  typedef struct packed { logic [3:0][7:0] m; logic z; } s_t;
+  s_t s;
+  pk::r_t r;
+  assign w = d;
+  assign a = d;
+  assign s = {d, 1'b0};
+  assign r = d[13:0];
+endmodule
+module top(input logic [31:0] d, input logic [1:0] i);
+  sub #(.P(2)) u(.d(d));
+  always_comb begin
+    p_w: assert (u.w[i] == d[8*i +: 8]);
+    p_m: assert (u.s.m[i] == d[8*i +: 8]);
+    p_a: assert (u.a[0] == d[31:24]);
+    p_c: assert (u.C[1] == 4'h5);
+  end
+endmodule
+EOF
+read_verilog -sv -formal <<EOF
+module chk(input logic [1:0] i, input logic [31:0] d);
+  pk::e_t e;
+  assign e = sub.r.arr[i];
+  always_comb begin
+    p_e: assert (e.q == d[2 + 3*i +: 3]);
+    p_uw: assert (sub.w[i] == d[8*i +: 8]);
+  end
+endmodule
+module bm; bind sub chk c(.i(2'd2), .d(d)); endmodule
+EOF
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+select -assert-count 6 top/c:*p_*
+sat -verify -prove-asserts top
+design -reset
+
+# falsified twin: true only under a flat (bitwise) select
+read_verilog -sv -formal <<EOF
+module sub #(parameter P = 1) (input logic [31:0] d);
+  logic [3:0][7:0] w;
+  assign w = d;
+endmodule
+module top(input logic [31:0] d, input logic [1:0] i);
+  sub #(.P(2)) u(.d(d));
+  always_comb n_w: assert (u.w[i] == {7'b0, d[i]});
+endmodule
+EOF
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+sat -falsify -prove-asserts top
+design -reset
+
+# the checker read before its (parametric) bind target: through the
+# upward-reference resolution, a packed array of structs in a struct
+# read with a variable index, and a 2-D wire
+read_verilog -sv -formal <<EOF
+package pk;
+  typedef struct packed { logic [2:0] q; } e_t;
+  typedef struct packed { e_t [3:0] arr; logic [1:0] z; } r_t;
+endpackage
+module chk(input logic [1:0] i, input logic [31:0] d);
+  pk::e_t e;
+  assign e = sub.r.arr[i];
+  always_comb begin
+    p_e: assert (e.q == d[2 + 3*i +: 3]);
+    p_uw: assert (sub.w[i] == d[8*i +: 8]);
+  end
+endmodule
+EOF
+read_verilog -sv -formal <<EOF
+module sub #(parameter P = 1) (input logic [31:0] d, input logic [1:0] i);
+  logic [3:0][7:0] w;
+  pk::r_t r;
+  assign w = d;
+  assign r = d[13:0];
+endmodule
+module top(input logic [31:0] d, input logic [1:0] i);
+  sub #(.P(2)) u(.d(d), .i(i));
+endmodule
+module bm; bind sub chk c(.i(i), .d(d)); endmodule
+EOF
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+select -assert-count 2 top/c:*p_*
+sat -verify -prove-asserts top

@@ -1,0 +1,33 @@
+# An upward reference by module name (IEEE 1800-2017 23.8) used only in a
+# generate scope of a bound checker (caliptra's keyvault_cov_props, bound
+# into kv: `for (...) cover property (@(posedge kv.clk) kv.cptra_pwrgood ...)')
+# was an implicit net of the block (`genblk1[0].kv.clk'), which the
+# hierarchy-time upward resolution never looks for: every such check was
+# degraded.  fe177: it is named at module scope, as the same reference
+# outside the loop is, and resolves to the target's signal.
+logger -expect log "p_g: proved" 2
+logger -expect log "n_g: disproved" 2
+read_verilog -sv -formal <<EOT
+module chk(input logic c);
+  for (genvar i = 0; i < 2; i++) begin
+    p_g: assert property (@(posedge kv.clk) kv.a == kv.a);
+    n_g: assert property (@(posedge kv.clk) kv.b != 2'd1);
+  end
+endmodule
+module kv(input logic clk, input logic a, input logic [1:0] b);
+endmodule
+module top(input logic clk, input logic a, input logic [1:0] b);
+  kv u(.clk, .a, .b);
+endmodule
+bind kv chk i_chk(.c(clk));
+EOT
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+

@@ -12519,15 +12519,48 @@ void AstNode::expand_genblock(const std::string &prefix)
 								return false;
 							};
 							if (!names_cell(prefix)) {
+								bool found = false;
 								for (size_t ppos = prefix.size() - 1; ppos != std::string::npos; ) {
 									size_t dot = ppos ? prefix.rfind('.', ppos - 1) : std::string::npos;
 									std::string outer = dot == std::string::npos ? std::string() : prefix.substr(0, dot + 1);
 									if (names_cell(outer)) {
 										wire_name = outer.empty() ? identifier_str : prefix_id(outer, identifier_str);
+										found = true;
 										break;
 									}
 									ppos = dot;
 								}
+								// fe177: no instance of any enclosing scope, and
+								// the head names a module: an upward reference
+								// by module name (IEEE 1800-2017 23.8; caliptra's
+								// keyvault_cov_props, bound into kv, reads
+								// `kv.cptra_pwrgood' in a generate loop), resolved
+								// by hierarchy (resolve_hierrefs) only under the
+								// module-level name.  A block named like the
+								// head inside this scope keeps the local name.
+								std::string head = identifier_str.substr(0, identifier_str.find('.'));
+								auto local_block = [&](auto &&self, const AstNode *n) -> bool {
+									for (auto &c : n->children) {
+										if (!c)
+											continue;
+										if ((c->type == AST_GENBLOCK || c->type == AST_BLOCK) && c->str == head)
+											return true;
+										if (c->type == AST_GENBLOCK || c->type == AST_GENFOR || c->type == AST_GENIF ||
+												c->type == AST_GENCASE || c->type == AST_COND)
+											if (self(self, c.get()))
+												return true;
+									}
+									return false;
+								};
+								bool is_module = false;
+								if (simplify_design_context && (lookup_module(head) || lookup_module("$abstract" + head)))
+									is_module = true;
+								if (!is_module && current_ast)
+									for (auto &m : current_ast->children)
+										if (m && (m->type == AST_MODULE || m->type == AST_INTERFACE) && m->str == head)
+											is_module = true;
+								if (!found && is_module && !local_block(local_block, this))
+									wire_name = identifier_str;
 							}
 						}
 						if (current_scope.count(wire_name) == 0) {

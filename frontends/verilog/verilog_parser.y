@@ -1156,6 +1156,7 @@
 %token TOK_RAND TOK_CONST TOK_CHECKER TOK_ENDCHECKER TOK_EVENTUALLY TOK_S_EVENTUALLY
 %token TOK_SEQUENCE TOK_ENDSEQUENCE TOK_ENDPROPERTY TOK_INTERSECT TOK_THROUGHOUT TOK_WITHIN
 %token TOK_FIRST_MATCH TOK_UNTIL TOK_UNTIL_WITH TOK_S_UNTIL TOK_S_UNTIL_WITH TOK_IMPLIES TOK_IFF
+%token TOK_LOGIC_IFF
 %token TOK_NEXTTIME TOK_S_NEXTTIME TOK_S_ALWAYS TOK_ACCEPT_ON TOK_REJECT_ON
 %token TOK_SYNC_ACCEPT_ON TOK_SYNC_REJECT_ON TOK_STRONG TOK_WEAK TOK_DISABLE
 %token TOK_CLOCKING TOK_ENDCLOCKING TOK_UNTYPED TOK_LET TOK_EXPECT TOK_INSIDE TOK_MATCHES TOK_WITH TOK_WITH_SLICE TOK_TIME TOK_TIMEUNIT TOK_TIMEPRECISION TOK_RANDCASE TOK_RANDSEQUENCE TOK_SOFT TOK_DIST
@@ -1235,7 +1236,7 @@
 
 // operator precedence from low to high
 %left TOK_RBRA
-%left TOK_ARROW TOK_IFF
+%left TOK_ARROW TOK_IFF TOK_LOGIC_IFF
 %left OP_LOR
 %left OP_LAND
 %left TOK_PIPE OP_NOR
@@ -1252,7 +1253,6 @@
 
 %define parse.error detailed
 %define parse.lac full
-// State 261 shifts `<->' (TOK_IFF) rather than ending the expression.
 // Class-member conflicts all resolve by shift, which is the intended read:
 // qualifier tokens continue class_member_quals, ATTR_BEGIN starts a member
 // attribute group, TOK_FUNCTION/TOK_TASK select class_method_body over the
@@ -1273,7 +1273,7 @@
 // +1 (2026-11-02, fe99): after `initial', `@' is shifted into the one-shot
 // `initial @(edge) stmt' rule instead of reducing toward a statement-level
 // event control (which the rule covers, with its degradations)
-%expect 142
+%expect 141
 
 %precedence FAKE_THEN
 %precedence TOK_ELSE
@@ -7163,7 +7163,7 @@ basic_expr:
 	basic_expr TOK_ARROW basic_expr {
 		$$ = std::make_unique<AstNode>(@$, AST_LOGIC_OR, std::make_unique<AstNode>(@$, AST_LOGIC_NOT, std::move($1)), std::move($3));
 	} |
-	basic_expr TOK_IFF basic_expr {
+	basic_expr TOK_LOGIC_IFF basic_expr {
 		// IEEE 1800-2009 11.4.7: a <-> b is (a && b) || (!a && !b).
 		auto a = std::move($1);
 		auto b = std::move($3);
@@ -8012,6 +8012,17 @@ sva_bexpr:
 	} |
 	sva_bexpr TOK_ARROW sva_bexpr {
 		$$ = std::make_unique<AstNode>(@$, AST_LOGIC_OR, std::make_unique<AstNode>(@$, AST_LOGIC_NOT, std::move($1)), std::move($3));
+	} |
+	sva_bexpr TOK_LOGIC_IFF sva_bexpr {
+		// fe179: Boolean `<->' in a sequence or property operand
+		// (IEEE 1800-2017 11.4.7): (a && b) || (!a && !b)
+		auto a = std::move($1);
+		auto b = std::move($3);
+		auto both = std::make_unique<AstNode>(@$, AST_LOGIC_AND, a->clone(), b->clone());
+		auto neither = std::make_unique<AstNode>(@$, AST_LOGIC_AND,
+				std::make_unique<AstNode>(@$, AST_LOGIC_NOT, std::move(a)),
+				std::make_unique<AstNode>(@$, AST_LOGIC_NOT, std::move(b)));
+		$$ = std::make_unique<AstNode>(@$, AST_LOGIC_OR, std::move(both), std::move(neither));
 	} |
 	sva_bexpr TOK_INSIDE TOK_LCURL sva_inside_items TOK_RCURL {
 		$$ = mk_sva(@$, "inside");

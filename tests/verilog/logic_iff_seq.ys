@@ -1,0 +1,35 @@
+# `<->' is the Boolean logical equivalence operator (IEEE 1800-2017 11.4.7),
+# never the property operator `iff' (16.12.8).  The lexer returned the same
+# token for both, so in a property `##1 a <-> b' parsed as `(##1 a) iff b':
+# OpenTitan pinmux_assert_fpv's `ASSERT(UsbDppullupEnO_A, ##1 usb_dppullup_en_o
+# <-> u_usbdev_aon_wake.usb_dppullup_en_o, ...)', over two names of one net,
+# was disproved at depth 1; `##1 (a <-> b)' was an error.  fe179: `<->' is
+# its own token, an operand-level operator in expressions and SVA operands.
+logger -expect log "p_seq: proved" 1
+logger -expect log "p_par: proved" 1
+logger -expect log "p_inner: proved" 1
+logger -expect log "p_impl: proved" 1
+logger -expect log "p_imm: proved" 1
+logger -expect log "n_lag: disproved" 1
+logger -expect log "n_prop_iff: disproved" 1
+read_verilog -sv -formal <<EOT
+module m(input logic clk, input logic rst_n, input logic a);
+  logic b, q;
+  assign b = a;
+  always_ff @(posedge clk) q <= a;
+  p_seq:      assert property (@(posedge clk) disable iff (!rst_n) ##1 a <-> b);
+  p_par:      assert property (@(posedge clk) disable iff (!rst_n) (##1 a <-> b));
+  p_inner:    assert property (@(posedge clk) disable iff (!rst_n) ##1 (a <-> b));
+  p_impl:     assert property (@(posedge clk) a |-> b <-> a);
+  always_comb p_imm: assert (a <-> b);
+  // controls: q lags a one cycle; `iff' is the property operator
+  n_lag:      assert property (@(posedge clk) disable iff (!rst_n) ##1 a <-> q);
+  n_prop_iff: assert property (@(posedge clk) disable iff (!rst_n) ##1 a iff b);
+endmodule
+EOT
+hierarchy -top m
+proc
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected

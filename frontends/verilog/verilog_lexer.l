@@ -1132,7 +1132,12 @@ import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+(context[ \t\r\n]+)?(extern[ \t\r\n]+)?
 
  /* SVA multi-character operators. Repetition brackets allow the whitespace the LRM permits. */
 "|->" { return parser::make_TOK_SVA_OV_IMPL(out_loc); }
-"<->" { return parser::make_TOK_IFF(out_loc); }
+"<->" {
+	// fe179: `<->' is the Boolean logical equivalence operator (IEEE
+	// 1800-2017 11.4.7), never the property operator `iff' (16.12.8):
+	// `##1 a <-> b' is `##1 (a <-> b)' (OpenTitan pinmux_assert_fpv)
+	return parser::make_TOK_LOGIC_IFF(out_loc);
+}
 "->" { return parser::make_TOK_ARROW(out_loc); }
 "->>" { return parser::make_TOK_NB_ARROW(out_loc); }
 "|=>" { return parser::make_TOK_SVA_NONOV_IMPL(out_loc); }

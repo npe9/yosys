@@ -1527,6 +1527,11 @@ struct HierarchyPass : public Pass {
 						continue;
 					if (old_connections.count(wire->name))
 						continue;
+					// fe167: an upward reference resolved into an input
+					// port (`kv.clk' of a checker bound into kv with
+					// `.*'): flatten connects it to its target
+					if (wire->attributes.count(ID(sv_upward_ref)))
+						continue;
 					// Make sure a wire of correct name exists in the parent
 					Wire* parent_wire = find_implicit_port_wire(module, cell, wire->name.str());
 

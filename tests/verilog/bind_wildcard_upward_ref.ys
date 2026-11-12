@@ -1,0 +1,33 @@
+# A checker with no ports, bound with `.*' into its target, reading the
+# target through upward references (caliptra keyvault_cov_props:
+# `bind kv keyvault_cov_props i_keyvault_cov_props(.*);' reading `kv.clk').
+# The references become input ports that flatten connects; the `.*'
+# connection looked for parent wires of those names and stopped hierarchy
+# ("No matching wire for implicit port connection `kv.clk'").  It now leaves
+# them to flatten: the checker is bound, reads the target, nothing degraded.
+read_verilog -sv -formal <<EOT
+module kv(input logic [1:0] d, output logic [1:0] q);
+  assign q = ~d;
+endmodule
+module props();
+  always_comb begin
+    p_q: assert (kv.q == ~kv.d);
+    n_d: assert (kv.d == 2'd0);
+  end
+endmodule
+bind kv props i_props(.*);
+EOT
+hierarchy -check -top kv
+proc
+flatten
+select -assert-none A:sv_degraded
+select -assert-count 1 kv/w:d
+chformal -lower
+design -save x
+select -assert-count 1 kv/c:i_props.n_d
+select -assert-count 1 kv/c:i_props.p_q
+delete kv/c:i_props.n_d
+sat -verify -prove-asserts kv
+design -load x
+delete kv/c:i_props.p_q
+sat -falsify -prove-asserts kv

@@ -418,6 +418,12 @@ namespace AST
 		// the child by value, as its definition may call a function local
 		// to this module (`HPDcacheUserCfg = hpdcacheSetConfig()`, cva6)
 		std::map<std::string, std::unique_ptr<AstNode>> folded_params;
+		// fe166: the members of each packed struct / union wire as simplify
+		// laid them out, wire name -> (dotted member path, lsb, width), so
+		// a hierarchical reference to a member (`u.req_o.kill`) resolves to
+		// a slice of the instance's wire (resolve_hierrefs, flatten);
+		// entries are (dotted member path, lsb, width, signed)
+		std::map<std::string, std::vector<std::tuple<std::string, int, int, bool>>> struct_members;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, bool mayfail) override;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, const dict<RTLIL::IdString, RTLIL::Module*> &interfaces, const dict<RTLIL::IdString, RTLIL::IdString> &modports, bool mayfail) override;
 		std::string derive_common(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, std::unique_ptr<AstNode>* new_ast_out, bool quiet = false);

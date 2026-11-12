@@ -1,0 +1,89 @@
+# A downward hierarchical reference to a member of a packed struct wire
+# (`m.u.o.lo', cva6 instr_tracer's `ex_stage_i.lsu_i.i_load_unit.req_port_o.kill_req'):
+# the frontend made it an implicit 1-bit net, free (and the design degraded),
+# because flatten joins references by wire name and a member has no wire.
+# It now reads that slice of the instance's wire: wide, nested, signed and
+# type-parameter struct members; the design is not degraded.
+read_verilog -sv -formal <<EOT
+typedef struct packed { logic [2:0] hi; struct packed { logic a; logic [1:0] b; } n; logic signed [3:0] lo; } s_t;
+module leaf #(parameter type T = logic) (input logic [9:0] x, output s_t o, output T p);
+  assign o = x;
+  assign p = ~x[1:0];
+endmodule
+typedef struct packed { logic c; logic d; } t_t;
+module mid(input logic [9:0] x);
+  leaf #(.T(t_t)) u(.x(x), .o(), .p());
+endmodule
+module top(input logic [9:0] x);
+  mid m(.x(x));
+  wire [2:0] w_hi = m.u.o.hi;
+  wire w_a = m.u.o.n.a;
+  wire [1:0] w_b = m.u.o.n.b;
+  wire [2:0] w_n = m.u.o.n;
+  wire w_c = m.u.p.c;
+  always_comb begin
+    p_hi: assert (w_hi == x[9:7]);
+    p_a: assert (w_a == x[6]);
+    p_b: assert (w_b == x[5:4]);
+    p_n: assert (w_n == x[6:4]);
+    p_lo: assert ((m.u.o.lo < 0) == x[3]);
+    p_c: assert (w_c == ~x[1]);
+    n_d: assert (m.u.p.d == x[0]);
+  end
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+design -save d
+delete top/c:n_d
+sat -verify -prove-asserts top
+design -load d
+select -assert-count 1 top/c:n_d
+delete top/c:p_*
+sat -falsify -prove-asserts top
+design -reset
+
+# A packed array of the struct is not a struct wire: an element's member
+# (`u.o[1].a') stays an implicit net, and the design degraded.
+read_verilog -sv -formal <<EOT
+typedef struct packed { logic a; logic b; } s_t;
+module leaf(input logic [3:0] x, output s_t [1:0] o);
+  assign o = x;
+endmodule
+module top(input logic [3:0] x);
+  leaf u(.x(x), .o());
+  wire w = u.o[1].a;
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# Connected to a black box whose ports have no known direction (cva6's
+# instr_tracer, which the ladder cannot read): an inout port is not a writer;
+# the member still resolves, and the design is not degraded.
+read_verilog -sv -formal <<EOT
+typedef struct packed { logic a; logic b; } s_t;
+module leaf(input logic [1:0] x, output s_t o);
+  assign o = x;
+endmodule
+module top(input logic [1:0] x);
+  leaf u(.x(x), .o());
+  obs t(.q(u.o.b));
+  wire w = u.o.a;
+  always_comb assert (w == x[1]);
+endmodule
+EOT
+hierarchy -top top -permissive
+proc
+flatten
+select -assert-none top/A:sv_degraded
+select -assert-count 1 top/c:t
+delete top/c:t
+chformal -lower
+sat -verify -prove-asserts top

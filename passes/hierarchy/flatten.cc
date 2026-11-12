@@ -306,6 +306,37 @@ struct FlattenWorker
 			design->select(module, new_wire);
 		}
 
+		// fe166: a reference to a member of a packed struct / union wire of
+		// this instance (resolve_hierrefs tagged it with the wire's name
+		// here and the member's offset): it reads that slice
+		{
+			dict<IdString, RTLIL::Wire*> inlined;
+			for (auto &it : wire_map)
+				if (it.first->name[0] == '\\')
+					inlined[concat_name(cell, it.first->name, separator)] = it.second;
+			std::vector<RTLIL::Wire*> refs;
+			for (auto w : module->wires())
+				if (w->has_attribute(ID(sv_hierref_base)) && w->get_bool_attribute(ID(sv_hierref)))
+					refs.push_back(w);
+			for (auto w : refs) {
+				auto it = inlined.find(RTLIL::escape_id(w->get_string_attribute(ID(sv_hierref_base))));
+				if (it == inlined.end())
+					continue;
+				int offset = w->attributes.at(ID(sv_hierref_offset)).as_int();
+				w->attributes.erase(ID(sv_hierref_base));
+				w->attributes.erase(ID(sv_hierref_offset));
+				w->attributes.erase(ID::hierconn);
+				if (offset < 0 || offset + GetSize(w) > GetSize(it->second)) {
+					log_warning("Hierarchical reference %s.%s is not joined to bits %d+:%d of %s (width %d); it stays a free wire.\n",
+						module, w, offset, GetSize(w), log_id(it->second->name), GetSize(it->second));
+					continue;
+				}
+				module->connect(w, RTLIL::SigSpec(it->second, offset, GetSize(w)));
+				w->attributes.erase(ID(sv_hierref));
+				drop_hierref_degradation(module, w->name);
+			}
+		}
+
 		// the pending mark of expand_interfaces holds until every member
 		// is joined
 		if (intf_instance && intf_all_joined)

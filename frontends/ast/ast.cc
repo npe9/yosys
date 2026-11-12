@@ -1439,6 +1439,75 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 			if ((node->type == AST_PARAMETER || node->type == AST_LOCALPARAM) && !node->children.empty() &&
 					node->children[0]->type == AST_CONSTANT)
 				module->folded_params[node->str] = node->children[0]->clone();
+	if (!defer) {
+		std::function<void(AstNode*, const std::string&, std::vector<std::tuple<std::string, int, int, bool>>&)> members =
+				[&](AstNode *snode, const std::string &prefix, std::vector<std::tuple<std::string, int, int, bool>> &out) {
+			for (auto &m : snode->children) {
+				if (!m || m->str.empty())
+					continue;
+				std::string mname = prefix + m->str;
+				if (m->type == AST_STRUCT || m->type == AST_UNION) {
+					int lo = INT_MAX, hi = INT_MIN;
+					std::vector<std::tuple<std::string, int, int, bool>> sub;
+					members(m.get(), mname + ".", sub);
+					for (auto &e : sub) {
+						lo = std::min(lo, std::get<1>(e));
+						hi = std::max(hi, std::get<1>(e) + std::get<2>(e) - 1);
+					}
+					if (lo <= hi)
+						out.emplace_back(mname, lo, hi - lo + 1, false);
+					out.insert(out.end(), sub.begin(), sub.end());
+				} else if (m->type == AST_STRUCT_ITEM && m->range_valid && m->range_left >= m->range_right) {
+					out.emplace_back(mname, m->range_right, m->range_left - m->range_right + 1, m->is_signed);
+				}
+			}
+		};
+		// the struct behind a wire: its wiretype attribute holds the struct
+		// itself or a typedef's name (the module's own typedefs and type
+		// parameters, then the design's and its packages')
+		std::function<AstNode*(AstNode*, int)> struct_of = [&](AstNode *decl, int depth) -> AstNode* {
+			if (depth > 8 || !decl->attributes.count(ID::wiretype))
+				return nullptr;
+			AstNode *wt = decl->attributes.at(ID::wiretype).get();
+			if (wt->type == AST_STRUCT || wt->type == AST_UNION)
+				return wt;
+			if (wt->type != AST_CONSTANT)
+				return nullptr;
+			AstNode *td = nullptr;
+			for (auto &n : ast->children)
+				if (n && n->type == AST_TYPEDEF && n->str == wt->str)
+					td = n.get();
+			if (!td && current_ast)
+				for (auto &n : current_ast->children) {
+					if (n && n->type == AST_TYPEDEF && n->str == wt->str)
+						td = n.get();
+					if (!td && n && n->type == AST_PACKAGE)
+						for (auto &inner : n->children)
+							if (inner && inner->type == AST_TYPEDEF && inner->str == wt->str)
+								td = inner.get();
+				}
+			AstNode *t = (td && !td->children.empty()) ? td->children[0].get() : nullptr;
+			if (t && (t->type == AST_STRUCT || t->type == AST_UNION))
+				return t->attributes.count(ID(sv_elem_type)) ? nullptr : t;
+			if (t && t->type == AST_WIRE)
+				return struct_of(t, depth + 1);
+			return nullptr;
+		};
+		for (const auto &node : ast->children)
+			if (node->type == AST_WIRE)
+				if (AstNode *snode = struct_of(node.get(), 0))
+					if (node->range_valid) {
+						std::vector<std::tuple<std::string, int, int, bool>> out;
+						members(snode, std::string(), out);
+						// the layout spans the whole wire (not, e.g., one
+						// element of a packed array of the struct)
+						int hi = -1;
+						for (auto &e : out)
+							hi = std::max(hi, std::get<1>(e) + std::get<2>(e));
+						if (!out.empty() && hi == abs(node->range_left - node->range_right) + 1)
+							module->struct_members[node->str] = std::move(out);
+					}
+	}
 	module->ast = std::move(ast_before_simplify);
 	module->nolatches = flag_nolatches;
 	module->nomeminit = flag_nomeminit;
@@ -2490,7 +2559,12 @@ static std::string source_module_name(RTLIL::IdString id)
 // *pending is set when the path stops at an instance whose parameters are
 // not derived yet (`mid #(.W(4)) inst`: no `$paramod` module this round, or
 // only the underived base), so the answer may change in a later round
-static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod, std::string rest, bool *pending = nullptr)
+// fe166: a reference that ends in a member of a packed struct / union wire
+// (`u_lsu.req_port_o.kill_req`): the instance's wire, and where in it
+struct HierrefMember { std::string path; int offset = 0, width = 0; bool is_signed = false; };
+
+static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod, std::string rest, bool *pending = nullptr,
+		HierrefMember *member = nullptr)
 {
 	for (int depth = 0; depth < 64 && mod; depth++) {
 		// the longest instance-name prefix of the remaining path
@@ -2499,6 +2573,22 @@ static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod,
 		for (size_t dot = rest.find('.'); dot != std::string::npos; dot = rest.find('.', dot + 1))
 			if (RTLIL::Cell *c = mod->cell(RTLIL::escape_id(rest.substr(0, dot))))
 				cell = c, cut = dot;
+		if (!cell && member && depth > 0)
+			if (auto am = dynamic_cast<AST::AstModule*>(mod))
+				for (size_t dot = rest.find('.'); dot != std::string::npos; dot = rest.find('.', dot + 1)) {
+					auto it = am->struct_members.find(RTLIL::escape_id(rest.substr(0, dot)));
+					RTLIL::Wire *w = mod->wire(RTLIL::escape_id(rest.substr(0, dot)));
+					if (it == am->struct_members.end() || !w)
+						continue;
+					for (auto &e : it->second)
+						if (std::get<0>(e) == rest.substr(dot + 1) && std::get<1>(e) + std::get<2>(e) <= w->width) {
+							member->path = std::get<0>(e);
+							member->offset = std::get<1>(e);
+							member->width = std::get<2>(e);
+							member->is_signed = std::get<3>(e);
+							return w;
+						}
+				}
 		if (!cell)
 			return nullptr;
 		RTLIL::Module *sub = design->module(cell->type);
@@ -2518,7 +2608,10 @@ static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod,
 	return nullptr;
 }
 
-static bool wire_is_driven(RTLIL::Module *mod, RTLIL::Wire *wire)
+// (ignore_inout: an inout cell port is not counted -- a black box whose
+// ports have no known direction, e.g. an observer the ladder could not
+// read, connects every port as inout)
+static bool wire_is_driven(RTLIL::Module *mod, RTLIL::Wire *wire, bool ignore_inout = false)
 {
 	auto hits = [wire](const RTLIL::SigSpec &sig) {
 		for (auto &chunk : sig.chunks())
@@ -2531,7 +2624,7 @@ static bool wire_is_driven(RTLIL::Module *mod, RTLIL::Wire *wire)
 			return true;
 	for (auto cell : mod->cells())
 		for (auto &conn : cell->connections())
-			if (cell->output(conn.first) && hits(conn.second))
+			if (cell->output(conn.first) && !(ignore_inout && cell->input(conn.first)) && hits(conn.second))
 				return true;
 	bool driven = false;
 	for (auto &it : mod->processes) {
@@ -2603,9 +2696,20 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 {
 	if (get_bool_attribute(ID(sv_hierrefs_resolved)))
 		return false;
-	struct Target { std::string name; int width; bool is_signed; std::string up_rest; };
+	struct Target { std::string name; int width; bool is_signed; std::string up_rest; std::string member_base = std::string(); int member_offset = -1; };
 	std::vector<Target> targets;
-	bool any_wide = false, any_up = false;
+	bool any_wide = false, any_up = false, any_member = false;
+	auto mark_members = [&](RTLIL::Module *m) {
+		for (auto &t : targets)
+			if (t.member_offset >= 0)
+				if (RTLIL::Wire *w = m->wire(t.name)) {
+					w->set_string_attribute(ID(sv_hierref_base), t.member_base);
+					w->attributes[ID(sv_hierref_offset)] = RTLIL::Const(t.member_offset);
+					w->set_bool_attribute(ID::hierconn);
+					log("Hierarchical reference %s.%s resolved to bits %d+:%d of %s.\n",
+							log_id(m->name), log_id(t.name), t.member_offset, t.width, t.member_base.c_str());
+				}
+	};
 	std::vector<std::pair<RTLIL::Module*, RTLIL::Cell*>> parents;
 	bool parents_known = false;
 	for (auto wire : wires()) {
@@ -2628,6 +2732,22 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		}
 		if (target)
 			continue;
+		// fe166: a member of a packed struct / union wire of the instance:
+		// declared at the member's width and tagged with the instance's
+		// wire and the member's offset, which flatten connects (a member
+		// written here stays implicit)
+		{
+			HierrefMember mr;
+			RTLIL::Wire *bw = walk_hierref_down(design, this, path, nullptr, &mr);
+			if (bw && !bw->get_bool_attribute(ID(sv_hierref)) && !wire_is_driven(this, wire, true)) {
+				std::string base = path.substr(0, path.size() - mr.path.size() - 1);
+				targets.push_back({wire->name.str(), mr.width, mr.is_signed, std::string(), base, mr.offset});
+				if (mr.width != 1 || mr.is_signed)
+					any_wide = true;
+				any_member = true;
+				continue;
+			}
+		}
 		// no wire of that name: an unpacked array the child keeps as one
 		// register per element (mem2reg's `rf[3]`), read here with constant
 		// indices (genrtlil recorded them): resolve each element
@@ -2719,6 +2839,8 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 			}
 	}
 	if (!any_wide && !any_up) {
+		if (any_member)
+			mark_members(this);
 		set_bool_attribute(ID(sv_hierrefs_resolved));
 		return false;
 	}
@@ -2755,6 +2877,8 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	RTLIL::Module *new_module = process_and_replace_module(design, this, new_ast.get(), NULL);
 	redo_interface_ports(old_module, new_module, intf_cells);
 	new_module->set_bool_attribute(ID(sv_hierrefs_resolved));
+	if (any_member)
+		mark_members(new_module);
 	// an upward-reference port is connected by flatten only
 	// (connect_upward_refs): until then it is a free input, so the module
 	// carries a mark, which flatten does not pass on to the parent
@@ -3452,6 +3576,7 @@ RTLIL::Module *AstModule::clone() const
 	new_mod->svmode = svmode;
 	for (auto &it : folded_params)
 		new_mod->folded_params[it.first] = it.second->clone();
+	new_mod->struct_members = struct_members;
 
 	return new_mod;
 }

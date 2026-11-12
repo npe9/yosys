@@ -1,0 +1,74 @@
+# A hierarchical reference to a member of one element of a struct member
+# that is a packed array of a struct type (`pinmux.reg2hw.wkup_cause[i].q'
+# in OpenTitan's pinmux_assert_fpv, generate-unrolled) was refused at read
+# time once the array itself was resolved (`w[2].m' is never an implicit
+# net), and the run fell back to a degraded one.  It is now that slice:
+# the element's offset in the array plus the member's offset in an
+# element.  Descending and ascending arrays, a two-field element, the
+# whole array read with a variable index alongside, upward and downward.
+read_verilog -sv -formal <<EOF
+package pk;
+  typedef struct packed { logic [1:0] p; logic q; } e_t;
+  typedef struct packed { e_t [3:0] arr; e_t [0:1] asc; logic [1:0] z; } r_t;
+endpackage
+module chk(input logic [1:0] i, input logic [19:0] d);
+  pk::e_t e;
+  logic [3:0] qs;
+  logic [3:0][1:0] ps;
+  assign e = sub.r.arr[i];
+  for (genvar k = 0; k < 4; k++) begin : g
+    assign qs[k] = sub.r.arr[k].q;
+    assign ps[k] = sub.r.arr[k].p;
+  end
+  always_comb begin
+    p_e: assert (e == d[8 + 3*i +: 3]);
+    p_q: assert (qs == {d[17], d[14], d[11], d[8]});
+    p_p: assert (ps == {d[19:18], d[16:15], d[13:12], d[10:9]});
+    p_a0: assert (sub.r.asc[0].q == d[5] && sub.r.asc[0].p == d[7:6]);
+    p_a1: assert (sub.r.asc[1].q == d[2]);
+  end
+endmodule
+EOF
+read_verilog -sv -formal <<EOF
+module sub #(parameter P = 1) (input logic [19:0] d, input logic [1:0] i);
+  pk::r_t r;
+  assign r = d;
+endmodule
+module top(input logic [19:0] d, input logic [1:0] i);
+  sub #(.P(2)) u(.d(d), .i(i));
+  always_comb p_dn: assert (u.r.arr[3].p == d[19:18] && u.r.asc[1].p == d[4:3]);
+endmodule
+module bm; bind sub chk c(.i(i), .d(d)); endmodule
+EOF
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+select -assert-count 6 top/c:*p_*
+design -save x
+sat -verify -prove-asserts top
+design -load x
+
+# falsified twin: element 1's q read as element 2's
+design -reset
+read_verilog -sv -formal <<EOF
+package pk;
+  typedef struct packed { logic [1:0] p; logic q; } e_t;
+  typedef struct packed { e_t [3:0] arr; logic [1:0] z; } r_t;
+endpackage
+module sub #(parameter P = 1) (input logic [13:0] d);
+  pk::r_t r;
+  assign r = d;
+endmodule
+module top(input logic [13:0] d);
+  sub #(.P(2)) u(.d(d));
+  always_comb n_q: assert (u.r.arr[1].q == d[8]);
+endmodule
+EOF
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+chformal -lower
+sat -falsify -prove-asserts top

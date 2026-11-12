@@ -2708,6 +2708,46 @@ static RTLIL::Wire *find_struct_member(RTLIL::Module *mod, const std::string &re
 				member->dims = d == am->packed_dims.end() ? PackedDims() : d->second;
 				return w;
 			}
+		// fe172: `arr[k].m' -- member m of element k of a member that
+		// is a packed array of a struct type (`mreg_t [7:0] arr'): the
+		// element's slice of the array, then m's offset in an element
+		// (the element copies are laid out from the array's lsb)
+		std::string mp = rest.substr(dot + 1);
+		size_t lb = mp.find('['), rb = mp.find(']');
+		if (lb == std::string::npos || rb == std::string::npos || rb < lb || rb + 1 >= mp.size() || mp[rb + 1] != '.' ||
+				mp.find('[', rb) != std::string::npos)
+			continue;
+		std::string an = mp.substr(0, lb), inner = mp.substr(rb + 2), ks = mp.substr(lb + 1, rb - lb - 1);
+		if (ks.empty() || ks.find_first_not_of("0123456789") != std::string::npos || ks.size() > 9)
+			continue;
+		int k = atoi(ks.c_str());
+		auto ad = am->packed_dims.find(RTLIL::escape_id(rest.substr(0, dot)) + "." + an);
+		if (ad == am->packed_dims.end() || GetSize(ad->second) != 2)
+			continue;
+		int lsb = std::get<0>(ad->second[0]), n = std::get<1>(ad->second[0]), ew = std::get<1>(ad->second[1]);
+		bool swapped = std::get<2>(ad->second[0]);
+		int pos = swapped ? lsb + n - 1 - k : k - lsb;
+		if (pos < 0 || pos >= n || ew <= 0)
+			continue;
+		int mo = -1, mw = 0;
+		for (auto &e : it->second)
+			if (std::get<0>(e) == an)
+				mo = std::get<1>(e), mw = std::get<2>(e);
+		if (mo < 0 || mw != n * ew)
+			continue;
+		for (auto &e : it->second)
+			if (std::get<0>(e) == an + "." + inner && std::get<1>(e) >= mo && std::get<1>(e) + std::get<2>(e) <= mo + ew) {
+				int off = mo + pos * ew + (std::get<1>(e) - mo);
+				if (off + std::get<2>(e) > w->width)
+					break;
+				member->path = mp;
+				member->offset = off;
+				member->width = std::get<2>(e);
+				member->is_signed = std::get<3>(e);
+				auto d = am->packed_dims.find(RTLIL::escape_id(rest.substr(0, dot)) + "." + an + "." + inner);
+				member->dims = d == am->packed_dims.end() ? PackedDims() : d->second;
+				return w;
+			}
 	}
 	return nullptr;
 }

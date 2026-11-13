@@ -1,0 +1,132 @@
+# `bind M : p1, p2 X x(...)' (IEEE 1800-2017 23.11, cv32e40s's wrapper:
+# `bind cv32e40s_if_stage: core_i.if_stage_i cv32e40s_if_stage_sva ...') was
+# a syntax error.  fe185: the bound instance goes into M, and `hierarchy'
+# checks the listed paths are all of M's instances; an unlisted instance
+# is a degradation (the checker would observe it too).  A bind inside a
+# generate block is placed in its target (it used to become an instance of
+# the enclosing scope); under a generate if/for/case it is a degradation.
+logger -expect log "p_ok: proved" 1
+logger -expect log "n_bad: disproved" 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p_ok: assert property (@(posedge clk) x == x);
+  n_bad: assert property (@(posedge clk) x != 4'd9);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module top(input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  bind sub : s
+    chk c(.*);
+endmodule
+EOT
+hierarchy -check -top top
+select -assert-count 1 sub/c
+select -assert-none A:sv_degraded
+proc
+flatten
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# two listed instances, nested paths: exact
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module mid(input logic clk, input logic [3:0] a, b);
+  sub s1(.clk(clk), .x(a));
+  sub s2(.clk(clk), .x(b));
+endmodule
+module top(input logic clk, input logic [3:0] a, b);
+  mid m(.*);
+  bind sub : m.s1, m.s2 chk c(.*);
+endmodule
+EOT
+hierarchy -check -top top
+select -assert-count 1 sub/c
+select -assert-none A:sv_degraded
+design -reset
+
+# an unlisted instance: an error on a strict hierarchy
+logger -expect error "lists instance\(s\) m.s1 of `sub' \(in `top'\) but is placed in every instance; also in m.s2" 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module mid(input logic clk, input logic [3:0] a, b);
+  sub s1(.clk(clk), .x(a));
+  sub s2(.clk(clk), .x(b));
+endmodule
+module top(input logic clk, input logic [3:0] a, b);
+  mid m(.*);
+  bind sub : m.s1 chk c(.*);
+endmodule
+EOT
+hierarchy -check -top top
+logger -check-expected
+design -reset
+
+# and a degradation on a permissive one
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module top(input logic clk, input logic [3:0] a, b);
+  sub s1(.clk(clk), .x(a));
+  sub s2(.clk(clk), .x(b));
+  bind sub : s1 chk c(.*);
+endmodule
+EOT
+hierarchy -check -permissive -top top
+select -assert-mod-count 1 A:sv_degraded
+select -assert-any sub A:sv_degraded %i
+design -reset
+
+# a bind in an unconditional generate block is placed in its target
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module top(input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  generate begin : g
+    bind sub chk c(.*);
+  end endgenerate
+endmodule
+EOT
+hierarchy -check -top top
+select -assert-count 1 sub/c
+select -assert-none top/g.c top/c
+select -assert-none A:sv_degraded
+design -reset
+
+# under a generate if: placed in its target, applied unconditionally: a
+# degradation of the target
+read_verilog -sv -formal -permissive <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module top(input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  generate if (1) begin : g
+    bind sub : s chk c(.*);
+  end endgenerate
+endmodule
+EOT
+hierarchy -check -top top
+select -assert-count 1 sub/c
+select -assert-mod-count 1 A:sv_degraded
+select -assert-any sub A:sv_degraded %i

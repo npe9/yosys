@@ -1238,6 +1238,7 @@
 %type <ast_t> range range_or_multirange non_opt_range non_opt_multirange param_unpacked param_packed wire_name_dims timing_event timing_events
 %type <ast_t> wire_type expr basic_expr concat_list assignment_pattern_list member_pattern_list rvalue lvalue lvalue_concat_list non_io_wire_type io_wire_type alias_lvalues match_filter type_operand opt_type_cast
 %type <string_t> sva_seq_method opt_label opt_sva_label tok_prim_wrapper hierarchical_id hierarchical_type_id integral_number
+%type <string_t> bind_instance_list
 %type <string_t> type_name bind_name static_method_name scoped_type_name foreach_dotted_opt class_name rs_ident
 %type <ast_t> opt_enum_init enum_type struct_type enum_struct_type func_return_type typedef_base_type
 %type <ast_t> param_type_rhs
@@ -2236,6 +2237,43 @@ bind_stmt:
 		for (size_t i = extra->bind_mark; i < bound.size(); i++)
 			if (bound[i] && bound[i]->type == AST_CELL)
 				bound[i]->set_attribute(ID(sv_bind_target), AstNode::mkconst_str(@2, *$2));
+	} |
+	// fe185: `bind M : p1, p2 X x(...)' (IEEE 1800-2017 23.11
+	// bind_target_scope [: bind_target_instance_list]; cv32e40s's wrapper,
+	// `bind cv32e40s_if_stage: core_i.if_stage_i cv32e40s_if_stage_sva
+	// if_stage_sva (...)').  The instances go into M like a module-wide
+	// bind, tagged with the listed paths (relative to the module the bind
+	// is written in, sv_bind_scope; empty at file level) for `hierarchy',
+	// which checks that they are all of M's instances
+	TOK_BIND bind_name TOK_COL bind_instance_list bind_name {
+		extra->astbuf1 = std::make_unique<AstNode>(@$, AST_CELL);
+		extra->astbuf1->children.push_back(std::make_unique<AstNode>(@$, AST_CELLTYPE));
+		extra->astbuf1->children[0]->str = *$5;
+		extra->bind_mark = extra->ast_stack.back()->children.size();
+	} cell_parameter_list_opt cell_list TOK_SEMICOL {
+		(void)extra->astbuf1.reset();
+		std::string scope;
+		for (auto it = extra->ast_stack.rbegin(); it != extra->ast_stack.rend(); ++it)
+			if ((*it)->type == AST_MODULE || (*it)->type == AST_INTERFACE) {
+				scope = (*it)->str;
+				break;
+			}
+		auto &bound = extra->ast_stack.back()->children;
+		for (size_t i = extra->bind_mark; i < bound.size(); i++)
+			if (bound[i] && bound[i]->type == AST_CELL) {
+				bound[i]->set_attribute(ID(sv_bind_target), AstNode::mkconst_str(@2, *$2));
+				bound[i]->set_attribute(ID(sv_bind_instances), AstNode::mkconst_str(@4, *$4));
+				bound[i]->set_attribute(ID(sv_bind_scope), AstNode::mkconst_str(@2, scope));
+			}
+	};
+
+bind_instance_list:
+	bind_name {
+		$$ = std::make_unique<std::string>(RTLIL::unescape_id(*$1));
+	} |
+	bind_instance_list TOK_COMMA bind_name {
+		$$ = std::move($1);
+		*$$ += "," + RTLIL::unescape_id(*$3);
 	};
 
 bind_target:

@@ -1958,16 +1958,33 @@ static void apply_binds(RTLIL::Design *design, AstNode *ast)
 {
 	std::vector<std::unique_ptr<AstNode>> binds;
 	binds.swap(pending_binds);
-	auto take = [&](AstNode *scope) {
-		for (auto &c : scope->children)
-			if (c && c->type == AST_CELL && c->attributes.count(ID(sv_bind_target)))
+	// fe185: also a bind inside a generate block (it used to stay there,
+	// an ordinary instance of the enclosing scope: `generate if (SECURE)
+	// begin bind cv32e40s_dummy_instr : ... end'); one under a generate
+	// if/case/for is applied unconditionally, which is a degradation of
+	// the target (reported when it is elaborated, see AST_CELL)
+	auto take = [&](auto &&self, AstNode *scope, bool conditional) -> void {
+		for (auto &c : scope->children) {
+			if (!c)
+				continue;
+			if (c->type == AST_CELL && c->attributes.count(ID(sv_bind_target))) {
+				if (conditional)
+					c->set_attribute(ID(sv_bind_degrade), AstNode::mkconst_str(c->location,
+							"bind inside a conditional or loop generate block is applied unconditionally"));
 				binds.push_back(std::move(c));
+				continue;
+			}
+			if (c->type == AST_GENBLOCK)
+				self(self, c.get(), conditional);
+			else if (c->type == AST_GENIF || c->type == AST_GENCASE || c->type == AST_GENFOR || c->type == AST_COND)
+				self(self, c.get(), true);
+		}
 		scope->children.erase(std::remove(scope->children.begin(), scope->children.end(), nullptr), scope->children.end());
 	};
-	take(ast);
+	take(take, ast, false);
 	for (auto &child : ast->children)
 		if (child && (child->type == AST_MODULE || child->type == AST_INTERFACE))
-			take(child.get());
+			take(take, child.get(), false);
 	dict<std::string, std::vector<std::unique_ptr<AstNode>>> to_existing;
 	for (auto &b : binds) {
 		std::string tgt = bind_target_of(b.get());

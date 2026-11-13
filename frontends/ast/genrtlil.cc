@@ -2664,6 +2664,13 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 		{
 			int port_counter = 0, para_counter = 0;
 
+			// fe185: a bound instance placed with a reservation (ast.cc apply_binds)
+			if (attributes.count(ID(sv_bind_degrade))) {
+				std::string why = attributes.at(ID(sv_bind_degrade))->str;
+				attributes.erase(ID(sv_bind_degrade));
+				degrade(location.to_loc(), "Bound instance `%s': %s.", str.c_str(), why.c_str());
+			}
+
 			RTLIL::IdString id = str;
 			check_unique_id(current_module, id, this, "cell");
 			RTLIL::Cell *cell = current_module->addCell(id, "");

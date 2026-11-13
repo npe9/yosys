@@ -836,6 +836,94 @@ static void elaborated_modules(RTLIL::Design *design, pool<RTLIL::Module*> &seen
 	}
 }
 
+// fe185: `bind M : p1, p2 ...' (IEEE 1800-2017 23.11) binds only the listed
+// instances of M; the frontend places the bound instance in M itself (every
+// instance), tagged with the list.  Exact when the listed instances are all
+// of M's instances under the top; otherwise the checker also observes (or a
+// bound assumption constrains) an unlisted instance: M is degraded.
+static std::string source_module_name(RTLIL::IdString name)
+{
+	std::string s = name.str();
+	if (s.compare(0, 9, "$paramod\\") == 0 || s.compare(0, 9, "$paramod$") == 0) {
+		size_t i = s.find('\\');
+		if (i == std::string::npos)
+			return s;
+		std::string rest = s.substr(i + 1);
+		return "\\" + rest.substr(0, rest.find('\\'));
+	}
+	return s;
+}
+
+static void check_listed_binds(RTLIL::Design *design, RTLIL::Module *top, bool permissive)
+{
+	// instance paths (dotted, from the top) of every source module
+	dict<std::string, pool<std::string>> paths;
+	std::vector<std::pair<RTLIL::Module*, std::string>> work = {{top, std::string()}};
+	pool<std::string> seen;
+	paths[source_module_name(top->name)].insert(std::string());
+	while (!work.empty()) {
+		auto [mod, path] = work.back();
+		work.pop_back();
+		if (GetSize(path) > 4096 || !seen.insert(mod->name.str() + "@" + path).second)
+			continue;
+		for (auto cell : mod->cells()) {
+			RTLIL::Module *sub = design->module(cell->type);
+			if (!sub)
+				continue;
+			std::string p = (path.empty() ? "" : path + ".") + RTLIL::unescape_id(cell->name);
+			paths[source_module_name(sub->name)].insert(p);
+			work.push_back({sub, p});
+		}
+	}
+	for (auto mod : design->modules()) {
+		for (auto cell : mod->cells()) {
+			if (!cell->has_attribute(ID(sv_bind_instances)))
+				continue;
+			std::string list = cell->get_string_attribute(ID(sv_bind_instances));
+			std::string scope = cell->get_string_attribute(ID(sv_bind_scope));
+			cell->attributes.erase(ID(sv_bind_instances));
+			cell->attributes.erase(ID(sv_bind_scope));
+			std::string target = source_module_name(mod->name);
+			if (!paths.count(target))
+				continue; // not under this top
+			pool<std::string> listed;
+			std::vector<std::string> scopes;
+			if (scope.empty())
+				scopes.push_back(std::string());
+			else if (paths.count(scope))
+				for (auto &sp : paths.at(scope))
+					scopes.push_back(sp);
+			for (auto &sp : scopes)
+				for (size_t b = 0; b <= list.size(); ) {
+					size_t e = list.find(',', b);
+					if (e == std::string::npos)
+						e = list.size();
+					std::string p = list.substr(b, e - b);
+					if (!p.empty())
+						listed.insert(sp.empty() ? p : sp + "." + p);
+					b = e + 1;
+				}
+			std::string unlisted;
+			for (auto &p : paths.at(target))
+				if (!listed.count(p))
+					unlisted += (unlisted.empty() ? "" : ", ") + (p.empty() ? std::string("(top)") : p);
+			if (unlisted.empty()) {
+				log("Bound instance %s.%s: bound to exactly the listed instance(s) %s.\n", log_id(mod), log_id(cell), list.c_str());
+				continue;
+			}
+			std::string reason = stringf("bind of `%s' lists instance(s) %s of `%s' (in `%s') but is placed in every instance; "
+					"also in %s", log_id(cell->type), list.c_str(), log_id(target),
+					scope.empty() ? "$unit" : log_id(scope), unlisted.c_str());
+			if (!permissive)
+				log_error("%s.  [`hierarchy -permissive` keeps it and marks the module (* sv_degraded *)]\n", reason.c_str());
+			log_warning("[sv_degraded] %s.\n", reason.c_str());
+			IdString attr = IdString("\\sv_degraded");
+			std::string cur = mod->has_attribute(attr) ? mod->attributes.at(attr).decode_string() : std::string();
+			mod->attributes[attr] = RTLIL::Const(cur.empty() ? reason : cur + "; " + reason);
+		}
+	}
+}
+
 void hierarchy_clean(RTLIL::Design *design, RTLIL::Module *top, bool purge_lib)
 {
 	std::set<RTLIL::Module*, IdString::compare_ptr_by_name<Module>> used;
@@ -1374,6 +1462,7 @@ struct HierarchyPass : public Pass {
 		if (top_mod != NULL) {
 			log_header(design, "Analyzing design hierarchy..\n");
 			hierarchy_clean(design, top_mod, purge_lib);
+			check_listed_binds(design, top_mod, hierarchy_permissive);
 		}
 
 		if (top_mod != NULL) {

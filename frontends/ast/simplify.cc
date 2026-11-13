@@ -3740,10 +3740,45 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			for (auto &child : children)
 				while (child && child->simplify(true, stage, -1, false)) { }
 			auto body = let->children[1]->clone();
+			// fe181: a typed formal (`let lo(logic [3:0] v) = v;') casts
+			// its actual to the formal's type (IEEE 1800-2017 11.12): the
+			// formal's declared wire (sv_typed_formal) is the cast's type
+			auto typed_formal = [&](const std::string &name) -> AstNode * {
+				std::vector<AstNode *> scopes = {current_ast_mod, current_ast};
+				if (current_ast)
+					for (auto &c : current_ast->children)
+						if (c && c->type == AST_PACKAGE)
+							scopes.push_back(c.get());
+				for (AstNode *scope : scopes)
+					if (scope)
+						for (auto &c : scope->children)
+							if (c && c->type == AST_WIRE && c->str == name && c->attributes.count(ID(sv_typed_formal)))
+								return c.get();
+				return nullptr;
+			};
 			std::function<void(AstNode *)> subst = [&](AstNode *node) {
 				for (size_t pi = 2; pi < let->children.size() && pi - 2 < children.size(); pi++) {
 					if (node->type == AST_IDENTIFIER && node->str == let->children[pi]->str) {
-						children[pi - 2]->clone()->cloneInto(*node);
+						auto actual = children[pi - 2]->clone();
+						if (AstNode *tw = typed_formal(let->children[pi]->str)) {
+							auto ty = tw->clone();
+							ty->str.clear();
+							ty->attributes.erase(ID(sv_typed_formal));
+							AstNode *r = ty->children.empty() ? nullptr : ty->children[0].get();
+							if (r && r->type == AST_RANGE && r->children.size() == 2 &&
+									r->children[0]->type == AST_CONSTANT && r->children[1]->type == AST_CONSTANT) {
+								// a packed builtin (`logic [3:0]'): a size cast
+								// and the declared signedness
+								int w = std::abs((int)r->children[0]->asInt(true) - (int)r->children[1]->asInt(true)) + 1;
+								bool sgn = ty->is_signed;
+								actual = std::make_unique<AstNode>(actual->location, AST_CAST_SIZE,
+										mkconst_int(actual->location, w, true), std::move(actual));
+								actual = std::make_unique<AstNode>(actual->location,
+										sgn ? AST_TO_SIGNED : AST_TO_UNSIGNED, std::move(actual));
+							} else
+								actual = std::make_unique<AstNode>(actual->location, AST_CAST_SIZE, std::move(ty), std::move(actual));
+						}
+						actual->cloneInto(*node);
 						return;
 					}
 				}

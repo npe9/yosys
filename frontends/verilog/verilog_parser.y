@@ -957,6 +957,14 @@
 			auto it = extra->sva_local_renames.find(n->str);
 			if (it != extra->sva_local_renames.end())
 				n->str = it->second;
+			else
+				// fe181: a member select of a renamed (typed) formal
+				for (auto &r : extra->sva_local_renames)
+					if (n->str.size() > r.first.size() && n->str.compare(0, r.first.size(), r.first) == 0 &&
+							n->str[r.first.size()] == '.') {
+						n->str = r.second + n->str.substr(r.first.size());
+						break;
+					}
 		}
 		for (auto &c : n->children)
 			sva_rename_locals(extra, c.get());
@@ -988,6 +996,27 @@
 		wire->range_left = 31;
 		wire->range_right = 0;
 		wire->children.push_back(makeRange(loc, 31, 0, true));
+		extra->saveChild(std::move(wire));
+	}
+
+	// fe181: a typed formal (`property p(decoder_ctrl_t c)', `sequence
+	// s(logic [3:0] v)'; IEEE 1800-2017 16.8.1/16.12) is a wire of its type
+	// (extra->astbuf1, built by sva_port_type), so a member select
+	// `c.illegal_insn' resolves; sva2check substitutes the actual bit by bit
+	// and casts it to the formal's width (sv_typed_formal)
+	static void sva_formal_wire_typed(ParseState *extra, const parser::location_type &loc, const std::string &name)
+	{
+		// one wire per declaration (two declarations may type a formal of
+		// the same name differently): renamed in the body like a local
+		auto wire = std::move(extra->astbuf1);
+		std::string mangled = name + stringf("$sva_formal$%d", extra->sva_local_uid++);
+		extra->sva_local_renames[name] = mangled;
+		if (extra->collecting_let_ports)
+			extra->let_port_names.push_back(mangled);
+		wire->location = loc;
+		wire->str = mangled;
+		wire->is_logic = true;
+		wire->set_attribute(ID(sv_typed_formal), AstNode::mkconst_int(loc, 1, false));
 		extra->saveChild(std::move(wire));
 	}
 
@@ -8310,8 +8339,37 @@ sva_action:
 sva_port_list:
 	TOK_ID { sva_formal_wire(extra, @1, *$1); } |
 	TOK_UNTYPED TOK_ID { sva_formal_wire(extra, @2, *$2); } |
+	sva_port_typed |
 	sva_port_list TOK_COMMA TOK_ID { sva_formal_wire(extra, @3, *$3); } |
-	sva_port_list TOK_COMMA TOK_UNTYPED TOK_ID { sva_formal_wire(extra, @4, *$4); };
+	sva_port_list TOK_COMMA TOK_UNTYPED TOK_ID { sva_formal_wire(extra, @4, *$4); } |
+	sva_port_list TOK_COMMA sva_port_typed;
+
+// fe181: a typed sequence/property/let formal (IEEE 1800-2017 16.8.1)
+sva_port_typed:
+	{
+		extra->astbuf1 = std::make_unique<AstNode>(@$, AST_WIRE);
+	} sva_port_type TOK_ID {
+		sva_formal_wire_typed(extra, @3, *$3);
+	};
+
+sva_port_type:
+	param_integer_type |
+	param_range_type |
+	TOK_USER_TYPE range_or_multirange {
+		extra->addWiretypeNode($1.get(), extra->astbuf1.get());
+		if ($2)
+			extra->astbuf1->children.push_back(std::move($2));
+	} |
+	TOK_PKG_USER_TYPE range_or_multirange {
+		extra->addWiretypeNode($1.get(), extra->astbuf1.get());
+		if ($2)
+			extra->astbuf1->children.push_back(std::move($2));
+	} |
+	TOK_SCOPED_ID range_or_multirange {
+		extra->addWiretypeNode($1.get(), extra->astbuf1.get());
+		if ($2)
+			extra->astbuf1->children.push_back(std::move($2));
+	};
 
 sva_ports:
 	%empty |
@@ -8406,6 +8464,7 @@ sva_let_decl:
 	TOK_LET TOK_ID {
 		extra->let_port_names.clear();
 		extra->collecting_let_ports = true;
+		extra->sva_local_renames.clear();
 	} sva_ports {
 		extra->collecting_let_ports = false;
 	} TOK_EQ sva_prop TOK_SEMICOL {
@@ -8413,6 +8472,9 @@ sva_let_decl:
 		id->str = *$2;
 		auto node = mk_sva(@$, "let_decl");
 		node->children.push_back(std::move(id));
+		// fe181: typed formals are renamed per declaration
+		sva_rename_locals(extra, $7.get());
+		extra->sva_local_renames.clear();
 		node->children.push_back(std::move($7));
 		for (auto &port : extra->let_port_names) {
 			auto formal = std::make_unique<AstNode>(@2, AST_IDENTIFIER);

@@ -1393,6 +1393,10 @@ struct SvaCompiler {
 				// `!aresetn` in the FVIP's exit_from_reset): drop it
 				while (a.size() > p.size() && a[a.size() - 1] == State::S0)
 					a.remove(a.size() - 1);
+				// fe181: a typed formal casts its actual to the formal's
+				// type (IEEE 1800-2017 16.8.1): a wider actual is truncated
+				if (a.size() > p.size() && only->get_bool_attribute(ID(sv_typed_formal)))
+					a = a.extract(0, p.size());
 				return a;
 			}
 			SigSpec q;

@@ -1,0 +1,105 @@
+# Typed sequence/property/let formals (IEEE 1800-2017 16.8.1, 11.12:
+# `property p_idle_dec(decoder_ctrl_t dec_ctrl)' in cv32e40s/x
+# decoder_sva) were a syntax error ("expecting TOK_ID or TOK_UNTYPED").
+# fe181: a typed formal is a wire of its type, one per declaration (two
+# declarations may type the same name differently), so a member select
+# resolves; its actual is cast to the formal's type (truncated when wider;
+# a let casts in simplify, a sequence/property in sva2check).
+logger -expect log "a_idle: proved" 1
+logger -expect log "a_trunc: proved" 1
+logger -expect log "a_int: proved" 1
+logger -expect log "n_bad: disproved" 1
+read_verilog -sv -formal <<EOT
+package pk;
+  typedef struct packed {logic ill; logic [2:0] op;} ctrl_t;
+  localparam ctrl_t ILL = '{ill: 1'b1, op: 3'd0};
+endpackage
+module m import pk::*; (input logic clk, input logic rst_n, input logic [7:0] x, input logic e);
+  ctrl_t c;
+  assign c = e ? ILL : '{ill: 1'b0, op: x[2:0]};
+  property p_idle(ctrl_t d);
+    @(posedge clk) disable iff (!rst_n) (d.ill |-> d == ILL);
+  endproperty
+  property p_trunc(logic [3:0] v);
+    @(posedge clk) v == x[3:0];
+  endproperty
+  sequence s_int(int unsigned k); k == 32'(x); endsequence
+  property p_bad(ctrl_t d);
+    @(posedge clk) d.op == 3'd0;
+  endproperty
+  a_idle:  assert property (p_idle(c));
+  a_trunc: assert property (p_trunc(x));
+  a_int:   assert property (@(posedge clk) s_int(x));
+  n_bad:   assert property (p_bad(c));
+endmodule
+EOT
+hierarchy -top m
+proc
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+logger -expect log "a_let: proved" 1
+logger -expect log "a_un: proved" 1
+logger -expect log "a_int: proved" 1
+logger -expect log "a_st: proved" 1
+logger -expect log "a_sx: proved" 1
+logger -expect log "n_bad: disproved" 1
+read_verilog -sv -formal <<EOT
+package pk; typedef struct packed {logic ill; logic [2:0] op;} ctrl_t; endpackage
+module m import pk::*; (input logic clk, input logic [7:0] x, input logic signed [1:0] s);
+  let lo(logic [3:0] v) = v;
+  let inc(v) = v + 1;
+  let w(int k) = k;
+  let st(ctrl_t c) = c;
+  let sx(logic signed [3:0] v) = v;
+  a_let: assert property (@(posedge clk) lo(x) == x[3:0]);
+  a_un:  assert property (@(posedge clk) inc(x[3:0]) == x[3:0] + 1);
+  a_int: assert property (@(posedge clk) w(x) == {24'd0, x});
+  a_st:  assert property (@(posedge clk) st(x) == x[3:0]);
+  logic signed [3:0] xs; assign xs = x[3:0];
+  logic signed [7:0] ys; assign ys = sx(x);
+  a_sx:  assert property (@(posedge clk) ys == {{4{xs[3]}}, xs});
+  n_bad: assert property (@(posedge clk) lo(x) == x);
+endmodule
+EOT
+hierarchy -top m
+proc
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+logger -expect log "a_p1: proved" 1
+logger -expect log "a_p2: proved" 1
+logger -expect log "a_pk: proved" 1
+logger -expect log "a_seq: proved" 1
+logger -expect log "n_p2: disproved" 1
+read_verilog -sv -formal <<EOT
+package pk;
+  typedef struct packed {logic ill; logic [2:0] op;} ctrl_t;
+  let lo(logic [3:0] v) = v;
+  property pp(logic [1:0] d); @(posedge d[0]) 1; endproperty
+endpackage
+module m import pk::*; (input logic clk, input logic [7:0] x, input ctrl_t c);
+  property p1(ctrl_t d);       @(posedge clk) d.op == c.op; endproperty
+  property p2(logic [1:0] d);  @(posedge clk) d == x[1:0]; endproperty
+  sequence s1(ctrl_t d); d.ill; endsequence
+  a_p1:  assert property (p1(c));
+  a_p2:  assert property (p2(x));
+  a_pk:  assert property (@(posedge clk) lo(x) == x[3:0]);
+  a_seq: assert property (@(posedge clk) s1(c) |-> c.ill);
+  n_p2:  assert property (p2(x + 8'd1));
+endmodule
+EOT
+hierarchy -top m
+proc
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+

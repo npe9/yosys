@@ -1,0 +1,27 @@
+# $past of a block-local variable the process blocking-assigns: the fork's
+# constant probe (eval_known_int, erase_uncond_disable) simplified a copy of
+# the statement before the block's locals were hoisted, and its $past
+# expansion left a sampled-value process in the module that read the local
+# by its short name -- an implicit wire, a false sv_degraded mark, and a
+# duplicate warning.  fe190: no $past-family expansion while probing.
+logger -expect warning "reads `\$unnamed_block\$1.t', which this process assigns" 1
+logger -werror "implicitly declared"
+logger -werror "reads `t', which"
+read_verilog -sv <<EOT
+module top(input logic clk, input logic [1:0] a, output logic [1:0] q, r2, r3);
+  logic [1:0] r1;
+  always_ff @(posedge clk) begin r1 <= a; r2 <= r1; r3 <= r2; end
+  always_ff @(posedge clk) begin
+    logic [1:0] t;
+    t = a;
+    q <= $past(t);
+  end
+endmodule
+EOT
+proc
+opt_clean
+select -assert-none A:sv_degraded
+# the sampled value is the value before the edge (IEEE 1800-2017 16.5.1):
+# q lags a by three clocks, as r3 does
+sat -tempinduct -prove q r3 -set-init-zero -verify
+logger -check-expected

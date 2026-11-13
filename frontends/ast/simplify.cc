@@ -10689,6 +10689,15 @@ skip_memory_write:;
 					recursion_counter--;
 					return false;
 				}
+				// fe190: not while probing a throwaway copy for a constant
+				// (eval_known_int): the registers and the sampled-value
+				// process it adds to the module outlived the copy, read a
+				// block-local variable before its block was hoisted, and
+				// implicitly declared it (a false sv_degraded mark)
+				if (probe_eval_depth > 0) {
+					recursion_counter--;
+					return false;
+				}
 
 				if (GetSize(children) == 2)
 				{
@@ -10837,7 +10846,7 @@ skip_memory_write:;
 					input_error("System function %s got %d arguments, expected 1 or 2.\n",
 							RTLIL::unescape_id(str), int(children.size()));
 
-				if (!current_always_clocked) {
+				if (!current_always_clocked || probe_eval_depth > 0) {
 					recursion_counter--;
 					return false;
 				}

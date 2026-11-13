@@ -1,0 +1,60 @@
+# An instance override of an unpacked struct-array parameter with an
+# assignment pattern (`m #(.N(3), .CFG('{'{lo: 1, ..}, ..}))', cv32e40s's
+# PMA_CFG) folded the pattern as ONE struct of the element type: constant
+# elements "Assignment pattern element count mismatch for $override_pattern:
+# got 3, expected 2" (the struct's members), struct elements a hang.
+# fe184: each element folds against the struct type; the array is passed as
+# one flat constant, element 0 (the leftmost) in the most significant bits.
+read_verilog -sv -formal <<EOT
+package p;
+  typedef struct packed { logic [3:0] lo; logic bufferable; } reg_t;
+  parameter reg_t R_DEF = '{lo: 0, bufferable: 1'b0};
+endpackage
+module m import p::*; #(parameter int N = 0, parameter reg_t CFG[N-1:0] = '{default: R_DEF})
+  (output logic [4:0] q0, qn);
+  assign q0 = CFG[0];
+  assign qn = CFG[N-1];
+endmodule
+module a import p::*; #(parameter reg_t CFG[0:2] = '{default: '0})
+  (output logic [4:0] q0);
+  assign q0 = CFG[0];
+endmodule
+module d import p::*; #(parameter reg_t CFG[2:0] = '{default: '0})
+  (output logic [4:0] q1);
+  assign q1 = CFG[1];
+endmodule
+module top(output logic [4:0] s0, sn, c0, cn, a0, d1);
+  // struct elements, descending [N-1:0] with N overridden too
+  m #(.N(3), .CFG('{'{lo: 1, bufferable: 1'b0}, '{lo: 2, bufferable: 1'b1}, '{lo: 3, bufferable: 1'b0}}))
+    us(.q0(s0), .qn(sn));
+  // constant elements
+  m #(.N(3), .CFG('{5'd1, 5'd2, 5'd3})) uc(.q0(c0), .qn(cn));
+  // ascending: element 0 is the leftmost
+  a #(.CFG('{'{lo: 1, bufferable: 1'b0}, '{lo: 2, bufferable: 1'b1}, '{lo: 3, bufferable: 1'b0}})) ua(.q0(a0));
+  // '{default: v} over literal dimensions
+  d #(.CFG('{default: '{lo: 4, bufferable: 1'b1}})) ud(.q1(d1));
+endmodule
+EOT
+hierarchy -check -top top
+proc
+flatten
+opt
+sat -verify -prove s0 5'd6 -prove sn 5'd2 -prove c0 5'd3 -prove cn 5'd1 -prove a0 5'd2 -prove d1 5'd9
+design -reset
+
+# '{default: v} needs the element count: an error when the dimensions depend
+# on another parameter (was a hang)
+logger -expect error "needs the parameter's dimensions to be literal" 1
+read_verilog -sv -formal <<EOT
+package p;
+  typedef struct packed { logic [3:0] lo; logic bufferable; } reg_t;
+endpackage
+module m import p::*; #(parameter int N = 3, parameter reg_t CFG[N-1:0] = '{default: '0})
+  (output logic [4:0] q);
+  assign q = CFG[0];
+endmodule
+module top(output logic [4:0] q);
+  m #(.CFG('{default: '{lo: 4, bufferable: 1'b1}})) u(.q(q));
+endmodule
+EOT
+hierarchy -top top

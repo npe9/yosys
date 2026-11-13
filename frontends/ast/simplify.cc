@@ -1943,7 +1943,7 @@ static const RTLIL::Module* lookup_module(const std::string &name)
 // `amba_axi4_protocol_checker #('{ID_WIDTH:4, ...})`) has no type in the
 // instantiating module: its type is the overridden parameter's.
 static std::unique_ptr<AstNode> override_struct_type(const std::string &modname, const std::string &paraname, int pos,
-		bool *module_missing = nullptr)
+		bool *module_missing = nullptr, bool *unpacked = nullptr, int *elements = nullptr)
 {
 	// the elaborated module's stored ORIGINAL AST first (the copy in
 	// current_ast may already be simplified: its parameter type folded away)
@@ -1977,6 +1977,36 @@ static std::unique_ptr<AstNode> override_struct_type(const std::string &modname,
 		}
 	if (!param)
 		return nullptr;
+	// fe184: an unpacked array of the struct (`parameter pma_region_t
+	// PMA_CFG[N-1:0]'): the caller folds the pattern per element
+	if (unpacked)
+		*unpacked = param->attributes.count(ID(sv_unpacked_dims)) || param->unpacked_dimensions > 0;
+	// the element count when the declared dimensions are literal (`[2:0]',
+	// `[4]'); -1 when they depend on other parameters (`[N-1:0]')
+	if (elements) {
+		*elements = -1;
+		if (param->attributes.count(ID(sv_unpacked_dims))) {
+			AstNode *un = param->attributes.at(ID(sv_unpacked_dims)).get();
+			std::vector<AstNode*> ranges;
+			if (un->type == AST_MULTIRANGE)
+				for (auto &r : un->children)
+					ranges.push_back(r.get());
+			else
+				ranges.push_back(un);
+			int n = 1;
+			for (auto r : ranges) {
+				if (r->children.size() == 1 && r->children[0]->type == AST_CONSTANT)
+					n *= std::max(0, (int)r->children[0]->asInt(true));
+				else if (r->children.size() == 2 && r->children[0]->type == AST_CONSTANT && r->children[1]->type == AST_CONSTANT)
+					n *= std::abs((int)r->children[0]->asInt(true) - (int)r->children[1]->asInt(true)) + 1;
+				else
+					n = -1;
+				if (n < 0)
+					break;
+			}
+			*elements = n;
+		}
+	}
 	auto struct_of = [](AstNode *n) -> std::unique_ptr<AstNode> {
 		if (n && n->type == AST_TYPEDEF && !n->children.empty())
 			n = n->children[0].get();
@@ -5631,8 +5661,9 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				}
 				if (child->children.empty() || child->children[0]->type != AST_ASSIGN_PATTERN)
 					continue;
-				bool module_missing = false;
-				auto stype = override_struct_type(ctype, child->str, my_pos, &module_missing);
+				bool module_missing = false, unpacked = false;
+				int elements = -1;
+				auto stype = override_struct_type(ctype, child->str, my_pos, &module_missing, &unpacked, &elements);
 				// the child is not read yet: its parameter's type is unknown.
 				// Say so in hierarchy's words (read the module before, or with,
 				// its parent; the conformance ladder's closure reads it then)
@@ -5646,6 +5677,58 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 							"which could not be resolved.\n",
 							child->str.empty() ? stringf("#%d", my_pos + 1).c_str() : log_id(child->str), log_id(ctype));
 				size_packed_struct(stype.get(), 0);
+				// fe184: the parameter is an unpacked array of the struct
+				// (cv32e40s's PMA_CFG): its pattern lists elements, each
+				// folded against the struct type, and is passed as ONE flat
+				// constant, element 0 in the most significant bits (the
+				// derived module splits it back, see AST_PARAMETER).  It
+				// used to fold as a single struct: "element count
+				// mismatch" for constant elements, a hang for struct ones
+				// `'{default: v}' repeats v over the declared element count
+				// when it is literal; another keyed pattern is not supported
+				if (unpacked) {
+					auto &pat = child->children[0];
+					bool positional = !pat->children.empty();
+					for (auto &el : pat->children)
+						if (!el || el->attributes.count(ID(sv_member)) || el->type == AST_REPLICATE)
+							positional = false;
+					bool is_default = pat->children.size() == 1 && pat->children[0] &&
+							pat->children[0]->attributes.count(ID(sv_member)) &&
+							pat->children[0]->attributes.at(ID(sv_member))->str == "default";
+					std::string pname = child->str.empty() ? stringf("#%d", my_pos + 1) : std::string(log_id(child->str));
+					if (is_default && elements < 1)
+						input_error("Assignment pattern `'{default: ...}' as the value of unpacked-array parameter %s of `%s' "
+								"needs the parameter's dimensions to be literal.\n", pname.c_str(), log_id(ctype));
+					if (!positional && !is_default)
+						input_error("Assignment pattern as the value of unpacked-array parameter %s of `%s': only a "
+								"positional pattern of elements or `'{default: v}' is supported.\n", pname.c_str(), log_id(ctype));
+					std::unique_ptr<AstNode> temp_default_elem;
+					std::vector<AstNode*> elems;
+					if (is_default) {
+						auto v = pat->children[0]->clone();
+						v->attributes.erase(ID(sv_member));
+						temp_default_elem = std::move(v);
+						for (int i = 0; i < elements; i++)
+							elems.push_back(temp_default_elem.get());
+					} else
+						for (auto &el : pat->children)
+							elems.push_back(el.get());
+					std::vector<RTLIL::State> bits;
+					for (int i = GetSize(elems) - 1; i >= 0; i--) {
+						auto et = std::make_unique<AstNode>(child->location, AST_LOCALPARAM, elems[i]->clone());
+						et->str = "\\$override_pattern";
+						et->set_attribute(ID::wiretype, stype->clone());
+						while (et->simplify(true, 1, -1, false)) { }
+						if (et->children.empty() || et->children[0]->type != AST_CONSTANT)
+							input_error("Element %d of the assignment pattern for parameter %s of `%s' did not fold to a constant.\n",
+									i, pname.c_str(), log_id(ctype));
+						for (auto b : et->children[0]->bits)
+							bits.push_back(b);
+					}
+					child->children[0] = mkconst_bits(child->location, bits, false);
+					did_something = true;
+					continue;
+				}
 				auto tmp = std::make_unique<AstNode>(child->location, AST_LOCALPARAM, child->children[0]->clone());
 				tmp->str = "\\$override_pattern";
 				tmp->set_attribute(ID::wiretype, std::move(stype));

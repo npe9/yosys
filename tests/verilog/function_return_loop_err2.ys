@@ -1,0 +1,12 @@
+# split from function_return_loop.ys: the expected error ends the script, so it is last
+
+logger -expect error "Function `f' has a return in a loop with break or continue \(not supported\)" 1
+read_verilog -sv <<EOT
+module brk (input logic [15:0] p, input logic [2:0] s, output logic [3:0] o);
+  function automatic logic [3:0] f(logic [2:0] e);
+    for (int i = 0; i < 4; i++) begin if (p[i]) continue; if (p[e+i]) return i; end
+    return 4'hf;
+  endfunction
+  always_comb o = f(s);
+endmodule
+EOT

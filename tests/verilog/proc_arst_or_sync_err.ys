@@ -1,0 +1,12 @@
+# split from proc_arst_or_sync.ys: the expected error ends the script, so it is last
+
+# an OR with no term that is the reset edge's level stays an error
+logger -expect error "Multiple edge sensitive events" 1
+read_verilog -sv <<EOT
+module bad (input logic clk, rst_n, clr, d, output logic q);
+  always @(posedge clk or negedge rst_n)
+    if (rst_n || clr) q <= 1'b0;
+    else q <= d;
+endmodule
+EOT
+proc

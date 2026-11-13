@@ -1,0 +1,17 @@
+# split from always_comb_named_block_local.ys: the expected error ends the script, so it is last
+
+# Read before written in the block, the static local holds: still a latch
+logger -expect error "Latch inferred for signal `.top\.\\g\.b\.left'" 1
+read_verilog -sv <<EOT
+module top(input logic s, input logic [2:0] d, output logic [2:0] o);
+  always_comb begin : g
+    o = 3'd0;
+    if (s) begin : b
+      bit [2:0] left;
+      o = left;
+      left = d;
+    end
+  end
+endmodule
+EOT
+proc

@@ -1,0 +1,13 @@
+# split from function_return_loop.ys: the expected error ends the script, so it is last
+
+logger -expect error "Function `f' has returns in two loops \(not supported\)" 1
+read_verilog -sv <<EOT
+module two (input logic [15:0] p, input logic [2:0] s, output logic [3:0] o);
+  function automatic logic [3:0] f(logic [2:0] e);
+    for (int i = 0; i < 4; i++) if (p[e+i]) return i;
+    for (int j = 0; j < 3; j++) if (p[8+j]) return 4+j;
+    return 4'hf;
+  endfunction
+  always_comb o = f(s);
+endmodule
+EOT

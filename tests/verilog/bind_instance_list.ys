@@ -2,7 +2,7 @@
 # `bind cv32e40s_if_stage: core_i.if_stage_i cv32e40s_if_stage_sva ...') was
 # a syntax error.  fe185: the bound instance goes into M, and `hierarchy'
 # checks the listed paths are all of M's instances; an unlisted instance
-# is a degradation (the checker would observe it too).  A bind inside a
+# is placed by copying the module (fe186), or else a degradation.  A bind inside a
 # generate block is placed in its target (it used to become an instance of
 # the enclosing scope); under a generate if/for/case it is a degradation.
 logger -expect log "p_ok: proved" 1
@@ -52,11 +52,14 @@ select -assert-count 1 sub/c
 select -assert-none A:sv_degraded
 design -reset
 
-# an unlisted instance: an error on a strict hierarchy
-logger -expect error "lists instance\(s\) m.s1 of `sub' \(in `top'\) but is placed in every instance; also in m.s2" 1
+# fe186: an unlisted instance of the same module, each parent a module of
+# one instance: the module is copied for the listed instance, so the
+# checker observes m.s1 only (x != 9 fails there, s2 has no checker)
+logger -expect log "m.s1.c.n: disproved" 1
+logger -expect log "copied as" 1
 read_verilog -sv -formal <<EOT
 module chk(input logic clk, input logic [3:0] x);
-  p: assert property (@(posedge clk) x == x);
+  n: assert property (@(posedge clk) x != 4'd9);
 endmodule
 module sub(input logic clk, input logic [3:0] x);
 endmodule
@@ -70,6 +73,59 @@ module top(input logic clk, input logic [3:0] a, b);
 endmodule
 EOT
 hierarchy -check -top top
+select -assert-count 1 */c
+select -assert-mod-count 3 sub* mid
+select -assert-none A:sv_degraded
+proc
+flatten
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# fe186: instances that derive different modules (cv32e40s's two
+# cv32e40s_mpu, IF_STAGE 1 and 0): each derived module is exact, no copy
+logger -expect log "not bound here" 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub #(parameter P = 0) (input logic clk, input logic [3:0] x);
+endmodule
+module top(input logic clk, input logic [3:0] a, b);
+  sub #(.P(1)) s1(.clk(clk), .x(a));
+  sub #(.P(0)) s2(.clk(clk), .x(b));
+  bind sub : s1 chk c(.*);
+endmodule
+EOT
+hierarchy -check -top top
+select -assert-count 1 */c
+select -assert-count 1 $paramod*P=*1*/c
+select -assert-none A:sv_degraded
+logger -check-expected
+design -reset
+
+# an unlisted instance whose parent has two instances (no copy can tell
+# them apart): an error on a strict hierarchy
+logger -expect error "lists instance\(s\) m1.s1 of `sub' \(in `top'\) but is placed in every instance; also in " 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module mid(input logic clk, input logic [3:0] a, b);
+  sub s1(.clk(clk), .x(a));
+  sub s2(.clk(clk), .x(b));
+endmodule
+module top(input logic clk, input logic [3:0] a, b);
+  mid m1(.*);
+  mid m2(.*);
+  bind sub : m1.s1 chk c(.*);
+endmodule
+EOT
+hierarchy -check -top top
 logger -check-expected
 design -reset
 
@@ -80,10 +136,14 @@ module chk(input logic clk, input logic [3:0] x);
 endmodule
 module sub(input logic clk, input logic [3:0] x);
 endmodule
-module top(input logic clk, input logic [3:0] a, b);
+module mid(input logic clk, input logic [3:0] a, b);
   sub s1(.clk(clk), .x(a));
   sub s2(.clk(clk), .x(b));
-  bind sub : s1 chk c(.*);
+endmodule
+module top(input logic clk, input logic [3:0] a, b);
+  mid m1(.*);
+  mid m2(.*);
+  bind sub : m1.s1 chk c(.*);
 endmodule
 EOT
 hierarchy -check -permissive -top top

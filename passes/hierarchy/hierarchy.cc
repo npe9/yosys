@@ -838,9 +838,12 @@ static void elaborated_modules(RTLIL::Design *design, pool<RTLIL::Module*> &seen
 
 // fe185: `bind M : p1, p2 ...' (IEEE 1800-2017 23.11) binds only the listed
 // instances of M; the frontend places the bound instance in M itself (every
-// instance), tagged with the list.  Exact when the listed instances are all
-// of M's instances under the top; otherwise the checker also observes (or a
-// bound assumption constrains) an unlisted instance: M is degraded.
+// instance), tagged with the list.  fe186: per derived module, exact when
+// the listed instances are all of its instances under the top, dropped when
+// none are, and otherwise one copy of the module per set of bound instances
+// when every instantiating parent is a module of one instance; else the
+// checker also observes (or a bound assumption constrains) an unlisted
+// instance: M is degraded.
 static std::string source_module_name(RTLIL::IdString name)
 {
 	std::string s = name.str();
@@ -856,11 +859,16 @@ static std::string source_module_name(RTLIL::IdString name)
 
 static void check_listed_binds(RTLIL::Design *design, RTLIL::Module *top, bool permissive)
 {
-	// instance paths (dotted, from the top) of every source module
-	dict<std::string, pool<std::string>> paths;
+	// instance paths (dotted, from the top) of every module, keyed both by
+	// the module itself (a derived $paramod is its own module) and by its
+	// source name (the bind's scope); and each path's instantiating cell
+	dict<RTLIL::IdString, pool<std::string>> mpaths;
+	dict<std::string, pool<std::string>> spaths;
+	dict<std::string, std::pair<RTLIL::Module*, RTLIL::Cell*>> parent_of;
 	std::vector<std::pair<RTLIL::Module*, std::string>> work = {{top, std::string()}};
 	pool<std::string> seen;
-	paths[source_module_name(top->name)].insert(std::string());
+	mpaths[top->name].insert(std::string());
+	spaths[source_module_name(top->name)].insert(std::string());
 	while (!work.empty()) {
 		auto [mod, path] = work.back();
 		work.pop_back();
@@ -871,11 +879,16 @@ static void check_listed_binds(RTLIL::Design *design, RTLIL::Module *top, bool p
 			if (!sub)
 				continue;
 			std::string p = (path.empty() ? "" : path + ".") + RTLIL::unescape_id(cell->name);
-			paths[source_module_name(sub->name)].insert(p);
+			mpaths[sub->name].insert(p);
+			spaths[source_module_name(sub->name)].insert(p);
+			parent_of[p] = {mod, cell};
 			work.push_back({sub, p});
 		}
 	}
-	for (auto mod : design->modules()) {
+	std::vector<RTLIL::Module*> mods(design->modules().begin(), design->modules().end());
+	for (auto mod : mods) {
+		// the listed bound instances of mod, each with the paths it lists
+		std::vector<std::pair<RTLIL::Cell*, pool<std::string>>> bound;
 		for (auto cell : mod->cells()) {
 			if (!cell->has_attribute(ID(sv_bind_instances)))
 				continue;
@@ -883,15 +896,12 @@ static void check_listed_binds(RTLIL::Design *design, RTLIL::Module *top, bool p
 			std::string scope = cell->get_string_attribute(ID(sv_bind_scope));
 			cell->attributes.erase(ID(sv_bind_instances));
 			cell->attributes.erase(ID(sv_bind_scope));
-			std::string target = source_module_name(mod->name);
-			if (!paths.count(target))
-				continue; // not under this top
 			pool<std::string> listed;
 			std::vector<std::string> scopes;
 			if (scope.empty())
 				scopes.push_back(std::string());
-			else if (paths.count(scope))
-				for (auto &sp : paths.at(scope))
+			else if (spaths.count(scope))
+				for (auto &sp : spaths.at(scope))
 					scopes.push_back(sp);
 			for (auto &sp : scopes)
 				for (size_t b = 0; b <= list.size(); ) {
@@ -903,17 +913,96 @@ static void check_listed_binds(RTLIL::Design *design, RTLIL::Module *top, bool p
 						listed.insert(sp.empty() ? p : sp + "." + p);
 					b = e + 1;
 				}
+			{
+				std::string src = source_module_name(mod->name);
+				for (auto &p : listed)
+					if (spaths.count(src) && !spaths.at(src).count(p))
+						log_warning("bind of `%s' lists `%s', which is not an instance of `%s' under the top.\n",
+								log_id(cell->type), p.c_str(), log_id(src));
+			}
+			cell->set_string_attribute(ID(sv_bind_instances), list);
+			cell->set_string_attribute(ID(sv_bind_scope), scope.empty() ? "$unit" : scope);
+			bound.push_back({cell, listed});
+		}
+		if (bound.empty() || !mpaths.count(mod->name))
+			continue; // not under this top
+		// fe186: group mod's instance paths by the bound instances that
+		// apply to them; one group: drop the others; several: one copy of
+		// mod per group, each instantiating cell retargeted, when every
+		// parent is a module of one instance (else not exact: degraded)
+		dict<std::string, std::vector<std::string>> groups;
+		std::vector<std::string> order;
+		for (auto &p : mpaths.at(mod->name)) {
+			std::string key;
+			for (int i = 0; i < GetSize(bound); i++)
+				key += bound[i].second.count(p) ? '1' : '0';
+			if (!groups.count(key))
+				order.push_back(key);
+			groups[key].push_back(p);
+		}
+		std::sort(order.begin(), order.end());
+		bool clonable = GetSize(order) > 1;
+		for (auto &key : order)
+			for (auto &p : groups.at(key))
+				if (p.empty() || !parent_of.count(p) || GetSize(mpaths.at(parent_of.at(p).first->name)) != 1)
+					clonable = false;
+		auto strip = [&](RTLIL::Module *m, const std::string &key) {
+			for (int i = 0; i < GetSize(bound); i++) {
+				RTLIL::Cell *c = m->cell(bound[i].first->name);
+				if (!c)
+					continue;
+				if (key[i] == '1') {
+					log("Bound instance %s.%s: bound to the listed instance(s) %s.\n", log_id(m), log_id(c),
+							c->get_string_attribute(ID(sv_bind_instances)).c_str());
+					c->attributes.erase(ID(sv_bind_instances));
+					c->attributes.erase(ID(sv_bind_scope));
+				} else {
+					log("Bound instance %s.%s: not bound here (lists %s).\n", log_id(m), log_id(c),
+							c->get_string_attribute(ID(sv_bind_instances)).c_str());
+					m->remove(c);
+				}
+			}
+		};
+		if (GetSize(order) == 1) {
+			strip(mod, order[0]);
+			continue;
+		}
+		if (clonable) {
+			for (int g = 1; g < GetSize(order); g++) {
+				RTLIL::Module *copy = mod->clone();
+				copy->name = design->module(mod->name.str() + "$bind" + order[g]) ? NEW_ID : RTLIL::IdString(mod->name.str() + "$bind" + order[g]);
+				design->add(copy);
+				for (auto &p : groups.at(order[g]))
+					parent_of.at(p).second->type = copy->name;
+				log("Module %s: copied as %s for the bound instance(s) of %s.\n", log_id(mod), log_id(copy), groups.at(order[g])[0].c_str());
+				strip(copy, order[g]);
+			}
+			strip(mod, order[0]);
+			continue;
+		}
+		for (int i = 0; i < GetSize(bound); i++) {
+			RTLIL::Cell *cell = bound[i].first;
 			std::string unlisted;
-			for (auto &p : paths.at(target))
-				if (!listed.count(p))
+			int nlisted = 0;
+			for (auto &p : mpaths.at(mod->name))
+				if (!bound[i].second.count(p))
 					unlisted += (unlisted.empty() ? "" : ", ") + (p.empty() ? std::string("(top)") : p);
-			if (unlisted.empty()) {
-				log("Bound instance %s.%s: bound to exactly the listed instance(s) %s.\n", log_id(mod), log_id(cell), list.c_str());
+				else
+					nlisted++;
+			std::string list = cell->get_string_attribute(ID(sv_bind_instances));
+			std::string scope = cell->get_string_attribute(ID(sv_bind_scope));
+			cell->attributes.erase(ID(sv_bind_instances));
+			cell->attributes.erase(ID(sv_bind_scope));
+			if (unlisted.empty())
+				continue;
+			if (nlisted == 0) {
+				log("Bound instance %s.%s: not bound here (lists %s).\n", log_id(mod), log_id(cell), list.c_str());
+				mod->remove(cell);
 				continue;
 			}
 			std::string reason = stringf("bind of `%s' lists instance(s) %s of `%s' (in `%s') but is placed in every instance; "
-					"also in %s", log_id(cell->type), list.c_str(), log_id(target),
-					scope.empty() ? "$unit" : log_id(scope), unlisted.c_str());
+					"also in %s", log_id(cell->type), list.c_str(), log_id(source_module_name(mod->name)),
+					log_id(scope), unlisted.c_str());
 			if (!permissive)
 				log_error("%s.  [`hierarchy -permissive` keeps it and marks the module (* sv_degraded *)]\n", reason.c_str());
 			log_warning("[sv_degraded] %s.\n", reason.c_str());

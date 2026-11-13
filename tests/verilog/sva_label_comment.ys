@@ -1,0 +1,49 @@
+# A comment between an assertion label, its colon and the keyword
+# (`a_mul_result : // check MUL' with `assert property' on the next line,
+# cv32e40s_mult_sva) was a syntax error: the lexer's lookahead for a label
+# skipped only white space.  fe182: comments are skipped too.
+logger -expect log "p_line: proved" 1
+logger -expect log "p_block: proved" 1
+logger -expect log "p_before: proved" 1
+logger -expect log "n_line: disproved" 1
+read_verilog -sv -formal <<EOT
+module m(input logic clk, input logic [3:0] a, output logic [3:0] r);
+  assign r = a;
+  p_line : // a line comment
+    assert property (@(posedge clk) r == a);
+  p_block : /* a block
+     comment */ assert property (@(posedge clk) r == a);
+  p_before /* c */ : assert property (@(posedge clk) r == a);
+  n_line : // the false control
+    assert property (@(posedge clk) r != 4'd5);
+endmodule
+EOT
+hierarchy -check -top m
+proc
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# procedural; a case item followed by a comment and an assertion is still
+# a case item
+read_verilog -sv -formal <<EOT
+module c(input logic [1:0] s, input logic [3:0] a, r);
+  localparam A = 0;
+  always_comb begin
+    q_proc : // c
+      assert (s != 2'd3 || 1'b1);
+    case (s)
+      A: // c
+        assert (r == a);
+      default: ;
+    endcase
+  end
+endmodule
+EOT
+hierarchy -top c
+proc
+chformal -lower
+select -assert-count 1 c/q_proc
+sat -prove-asserts -set s 1 -verify

@@ -332,6 +332,10 @@ UNSIGNED_NUMBER [0-9][0-9_]*
 FIXED_POINT_NUMBER_DEC [0-9][0-9_]*\.[0-9][0-9_]*([eE][-+]?[0-9_]+)?
 FIXED_POINT_NUMBER_NO_DEC [0-9][0-9_]*[eE][-+]?[0-9_]+
 TIME_SCALE_SUFFIX [munpf]?s
+/* fe182: white space and comments between an assertion label, its colon
+   and the keyword (`a_mul : // check MUL' then `assert property ...' on the
+   next line, cv32e40s_mult_sva) */
+SVA_LABEL_GAP ([ \t\r\n]|"//"[^\n]*\n|"/*"([^*]|"*"+[^*/])*"*"+"/")*
 	/* an associative-array dimension: bracketed type name, `*' wildcard or
 	   `$' queue mark, tolerating whitespace and comments inside; used by
 	   the type-indexed-dimension rewrite below */
@@ -502,7 +506,7 @@ ASSOC_DIM "["[ \t\r\n]*([a-zA-Z_$][a-zA-Z0-9_$]*|"\*")([ \t\r\n]|"/*"([^*]|\*+[^
  /* use special token for labels on assert, assume, cover, and restrict because it's insanley complex
     to fix parsing of cells otherwise. (the current cell parser forces a reduce very early to update some
     global state.. its a mess) */
-[a-zA-Z_$][a-zA-Z0-9_$]*/[ \t\r\n]*:[ \t\r\n]*(assert|assume|cover|restrict|expect)[^a-zA-Z0-9_$\.] {
+[a-zA-Z_$][a-zA-Z0-9_$]*/{SVA_LABEL_GAP}:{SVA_LABEL_GAP}(assert|assume|cover|restrict|expect)[^a-zA-Z0-9_$\.] {
 	if (!strcmp(YYText(), "default"))
 		return parser::make_TOK_DEFAULT(out_loc);
 	string_t val = std::make_unique<std::string>(std::string("\\") + YYText());

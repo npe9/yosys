@@ -1,0 +1,91 @@
+# foreach over an unpacked parameter array (IEEE 1800-2017 12.7.3;
+# cv32e40s's `foreach (PMA_CFG[i]) if (PMA_CFG[i].bufferable) ...' in the
+# constant function bufferable_in_config) was not unrolled: in a constant
+# function "did not evaluate" (the module degraded), in a process an abort.
+# fe183: it unrolls as over a wire, left bound to right bound.
+read_verilog -sv -formal <<EOT
+package p;
+  typedef struct packed { logic [3:0] lo; logic bufferable; } reg_t;
+  parameter reg_t R_DEF = '{lo: 0, bufferable: 1'b0};
+endpackage
+module m import p::*; #(parameter int N = 0, parameter reg_t CFG[N-1:0] = '{default: R_DEF})
+  (output logic [7:0] q, output logic b, output logic signed [7:0] fi);
+  function automatic logic bufferable_in_config;
+    bufferable_in_config = 0;
+    foreach (CFG[i])
+      if (CFG[i].bufferable)
+        bufferable_in_config = 1;
+  endfunction
+  // the visiting order: left bound first
+  function automatic int first_index;
+    first_index = -5;
+    foreach (CFG[i])
+      if (first_index == -5)
+        first_index = i;
+  endfunction
+  assign fi = 8'(first_index());
+  always_comb begin
+    q = 0;
+    foreach (CFG[i])
+      q = q + CFG[i].lo + (CFG[i].bufferable ? 8'd16 : 8'd0);
+  end
+  generate if (N && bufferable_in_config()) begin : g_buf
+    assign b = 1'b1;
+  end else begin : g_nobuf
+    assign b = 1'b0;
+  end endgenerate
+endmodule
+// the same with N = 3 and a literal default (an instance override of a
+// struct-array parameter is a separate register item)
+module m3 import p::*; #(parameter int N = 3,
+    parameter reg_t CFG[N-1:0] = '{'{lo: 1, bufferable: 1'b0}, '{lo: 2, bufferable: 1'b1}, '{lo: 3, bufferable: 1'b0}})
+  (output logic [7:0] q, output logic b, output logic signed [7:0] fi);
+  function automatic logic bufferable_in_config;
+    bufferable_in_config = 0;
+    foreach (CFG[i])
+      if (CFG[i].bufferable)
+        bufferable_in_config = 1;
+  endfunction
+  // the visiting order: left bound first
+  function automatic int first_index;
+    first_index = -5;
+    foreach (CFG[i])
+      if (first_index == -5)
+        first_index = i;
+  endfunction
+  assign fi = 8'(first_index());
+  always_comb begin
+    q = 0;
+    foreach (CFG[i])
+      q = q + CFG[i].lo + (CFG[i].bufferable ? 8'd16 : 8'd0);
+  end
+  generate if (N && bufferable_in_config()) begin : g_buf
+    assign b = 1'b1;
+  end else begin : g_nobuf
+    assign b = 1'b0;
+  end endgenerate
+endmodule
+module top(output logic [7:0] q0, q3, output logic b0, b3, output logic signed [7:0] fi0, fi3);
+  // N = 0: the default array is [-1:0], two default elements, none bufferable
+  m u0(.q(q0), .b(b0), .fi(fi0));
+  m3 u3(.q(q3), .b(b3), .fi(fi3));
+endmodule
+EOT
+hierarchy -check -top top
+proc
+select -assert-none A:sv_degraded
+flatten
+opt
+sat -verify -prove q0 8'd0 -prove b0 1'b0 -prove q3 8'd22 -prove b3 1'b1 -prove fi0 8'hff -prove fi3 8'd2
+design -reset
+
+# a foreach whose array is unknown is a degradation (an error on a strict
+# read), not an abort
+logger -expect error "foreach over `\\nope' was not unrolled" 1
+read_verilog -sv -formal <<EOT
+module d(input logic [3:0] a, output logic [3:0] q);
+  always_comb begin q = a; foreach (nope[i]) q = q + 1; end
+endmodule
+EOT
+hierarchy -top d
+proc

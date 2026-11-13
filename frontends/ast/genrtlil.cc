@@ -1080,6 +1080,16 @@ struct AST_INTERNAL::ProcessGenerator
 		case AST_FOR:
 			break;
 
+		// fe183: a foreach simplify could not unroll (its array's
+		// dimensions unknown) used to abort here
+		case AST_SVA:
+			if (ast->str == "foreach") {
+				degrade(ast->location.to_loc(), "foreach over `%s' was not unrolled; its body is dropped.\n",
+						ast->children.empty() || !ast->children[0] ? "?" : ast->children[0]->str.c_str());
+				break;
+			}
+			log_abort();
+
 		case AST_REPEAT:
 		case AST_WHILE:
 		case AST_GENFOR:

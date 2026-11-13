@@ -4207,7 +4207,12 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		while (arr->simplify(true, stage, -1, false)) { }
 		AstNode *mem = arr->id2ast;
 		int nvars = GetSize(children) - 2;
-		if (mem && (mem->type == AST_WIRE || mem->type == AST_MEMORY) && nvars <= GetSize(mem->dimensions) && nvars > 0) {
+		// fe183: also an unpacked parameter array (`foreach (PMA_CFG[i])',
+		// cv32e40s's bufferable_in_config), whose dimensions are laid out
+		// as a wire's once its sv_unpacked_dims are resolved
+		bool param_array = mem && (mem->type == AST_PARAMETER || mem->type == AST_LOCALPARAM) &&
+				mem->unpacked_dimensions > 0 && !mem->attributes.count(ID(sv_unpacked_dims));
+		if (mem && (mem->type == AST_WIRE || mem->type == AST_MEMORY || param_array) && nvars <= GetSize(mem->dimensions) && nvars > 0) {
 			// An empty slot does not iterate that dimension.
 			struct Slot { int child; int left, right, step, cur; };
 			std::vector<Slot> slots;
@@ -14056,6 +14061,15 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			stmt_leaky->children.clear();
 			block->fixup_hierarchy_flags();
 			continue;
+		}
+
+		// fe183: foreach (IEEE 1800-2017 12.7.3) unrolls as outside a
+		// function (simplify's AST_SVA "foreach"), into a block of bodies
+		// with the loop variables substituted
+		if (stmt->type == AST_SVA && stmt->str == "foreach") {
+			stmt->simplify(true, 1, -1, false);
+			if (stmt->type == AST_BLOCK)
+				continue;
 		}
 
 		// log("C\n");

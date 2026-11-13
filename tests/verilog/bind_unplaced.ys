@@ -1,0 +1,49 @@
+# fe187b: a bind that `hierarchy -top' places (an instance list, or a
+# generate condition) degrades its target until hierarchy has run with a
+# top: a flow without one (here `hierarchy -check' alone) must not keep a
+# not-taken or unlisted checker silently
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  n: assert property (@(posedge clk) x != 4'd9);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module wrap #(parameter bit SECURE = 1) (input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  if (SECURE) begin : g
+    bind sub : s chk c(.*);
+  end
+endmodule
+module top(input logic clk, input logic [3:0] a);
+  wrap #(.SECURE(0)) w(.*);
+endmodule
+EOT
+design -save read
+hierarchy -check
+select -assert-any A:sv_degraded
+select -assert-any sub A:sv_degraded %i
+design -load read
+hierarchy -top top
+select -assert-none A:sv_degraded
+select -assert-none */c
+design -reset
+
+# an instance list alone, the same
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module top(input logic clk, input logic [3:0] a, b);
+  sub s1(.clk(clk), .x(a));
+  sub s2(.clk(clk), .x(b));
+  bind sub : s1 chk c(.*);
+endmodule
+EOT
+design -save read
+select -assert-any sub A:sv_degraded %i
+design -load read
+hierarchy -top top
+select -assert-none A:sv_degraded
+select -assert-count 1 */c

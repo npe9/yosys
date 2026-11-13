@@ -2671,6 +2671,18 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 				degrade(location.to_loc(), "Bound instance `%s': %s.", str.c_str(), why.c_str());
 			}
 
+			// fe187b: a bound instance `hierarchy' still has to place (an
+			// instance list, a generate condition) degrades its module until
+			// hierarchy, run with a top, has placed it (it strips this reason)
+			if (attributes.count(ID(sv_bind_guard)) || attributes.count(ID(sv_bind_instances))) {
+				std::string reason = stringf("[sv_bind_unplaced] bound instance `%s' is placed by `hierarchy -top' (an instance list or generate condition), which has not run",
+						RTLIL::unescape_id(str).c_str());
+				IdString attr = IdString("\\sv_degraded");
+				std::string cur = current_module->has_attribute(attr) ? current_module->attributes.at(attr).decode_string() : std::string();
+				if (cur.find(reason) == std::string::npos)
+					current_module->attributes[attr] = RTLIL::Const(cur.empty() ? reason : cur + "; " + reason);
+			}
+
 			RTLIL::IdString id = str;
 			check_unique_id(current_module, id, this, "cell");
 			RTLIL::Cell *cell = current_module->addCell(id, "");

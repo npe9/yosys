@@ -1629,6 +1629,33 @@ struct HierarchyPass : public Pass {
 			hierarchy_clean(design, top_mod, purge_lib);
 			check_guarded_binds(design, top_mod, hierarchy_permissive);
 			check_listed_binds(design, top_mod, hierarchy_permissive);
+			// fe187b: drop the provisional [sv_bind_unplaced] reasons of the
+			// modules whose bound instances both checks have now decided
+			for (auto mod : design->modules()) {
+				IdString attr = IdString("\\sv_degraded");
+				if (!mod->has_attribute(attr))
+					continue;
+				bool pending = false;
+				for (auto c : mod->cells())
+					if (c->has_attribute(ID(sv_bind_guard)) || c->has_attribute(ID(sv_bind_instances)))
+						pending = true;
+				if (pending)
+					continue;
+				std::string cur = mod->attributes.at(attr).decode_string(), kept;
+				for (size_t b = 0; b <= cur.size(); ) {
+					size_t e = cur.find("; ", b);
+					if (e == std::string::npos)
+						e = cur.size();
+					std::string r = cur.substr(b, e - b);
+					if (!r.empty() && r.rfind("[sv_bind_unplaced]", 0) != 0)
+						kept += (kept.empty() ? "" : "; ") + r;
+					b = e + 2;
+				}
+				if (kept.empty())
+					mod->attributes.erase(attr);
+				else if (kept != cur)
+					mod->attributes[attr] = RTLIL::Const(kept);
+			}
 		}
 
 		if (top_mod != NULL) {

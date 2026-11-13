@@ -106,30 +106,9 @@ select -assert-none A:sv_degraded
 logger -check-expected
 design -reset
 
-# an unlisted instance whose parent has two instances (no copy can tell
-# them apart): an error on a strict hierarchy
-logger -expect error "lists instance\(s\) m1.s1 of `sub' \(in `top'\) but is placed in every instance; also in " 1
-read_verilog -sv -formal <<EOT
-module chk(input logic clk, input logic [3:0] x);
-  p: assert property (@(posedge clk) x == x);
-endmodule
-module sub(input logic clk, input logic [3:0] x);
-endmodule
-module mid(input logic clk, input logic [3:0] a, b);
-  sub s1(.clk(clk), .x(a));
-  sub s2(.clk(clk), .x(b));
-endmodule
-module top(input logic clk, input logic [3:0] a, b);
-  mid m1(.*);
-  mid m2(.*);
-  bind sub : m1.s1 chk c(.*);
-endmodule
-EOT
-hierarchy -check -top top
-logger -check-expected
-design -reset
 
-# and a degradation on a permissive one
+# an unlisted instance whose parent has two instances: a degradation on a
+# permissive hierarchy (bind_instance_list_err.ys: an error on a strict one)
 read_verilog -sv -formal <<EOT
 module chk(input logic clk, input logic [3:0] x);
   p: assert property (@(posedge clk) x == x);
@@ -171,9 +150,9 @@ select -assert-none top/g.c top/c
 select -assert-none A:sv_degraded
 design -reset
 
-# under a generate if: placed in its target, applied unconditionally: a
-# degradation of the target
-read_verilog -sv -formal -permissive <<EOT
+# under a generate if whose branch is taken: placed in its target, exact
+# (fe187; fe185 applied it unconditionally, a degradation)
+read_verilog -sv -formal <<EOT
 module chk(input logic clk, input logic [3:0] x);
   p: assert property (@(posedge clk) x == x);
 endmodule
@@ -188,5 +167,4 @@ endmodule
 EOT
 hierarchy -check -top top
 select -assert-count 1 sub/c
-select -assert-mod-count 1 A:sv_degraded
-select -assert-any sub A:sv_degraded %i
+select -assert-none A:sv_degraded

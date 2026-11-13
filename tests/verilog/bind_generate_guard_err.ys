@@ -1,0 +1,22 @@
+# fe187: a bind under a generate if of a scope whose instances disagree
+# (the expected error ends the script, so it is the last command)
+# two instances of the scope that disagree: an error, or a degradation
+logger -expect error "is under a generate if/case of `wrap' taken in 1 of its 2 instances" 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module wrap #(parameter bit SECURE = 1) (input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  if (SECURE) begin : g
+    bind sub chk c(.*);
+  end
+endmodule
+module top(input logic clk, input logic [3:0] a);
+  wrap #(.SECURE(0)) w0(.*);
+  wrap #(.SECURE(1)) w1(.*);
+endmodule
+EOT
+hierarchy -check -top top

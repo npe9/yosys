@@ -1961,30 +1961,48 @@ static void apply_binds(RTLIL::Design *design, AstNode *ast)
 	// fe185: also a bind inside a generate block (it used to stay there,
 	// an ordinary instance of the enclosing scope: `generate if (SECURE)
 	// begin bind cv32e40s_dummy_instr : ... end'); one under a generate
-	// if/case/for is applied unconditionally, which is a degradation of
-	// the target (reported when it is elaborated, see AST_CELL)
-	auto take = [&](auto &&self, AstNode *scope, bool conditional) -> void {
+	// loop is applied unconditionally, which is a degradation of the
+	// target (reported when it is elaborated, see AST_CELL).  fe187: one
+	// under a generate if/case leaves a marker wire in its place (generated
+	// only where the branch is taken, in each derived scope module);
+	// `hierarchy' keeps the bound instance where the branch is taken in
+	// every instance of the scope, drops it where in none
+	static int guard_counter = 0;
+	auto take = [&](auto &&self, AstNode *scope, const std::string &scope_mod, bool conditional, bool loop) -> void {
 		for (auto &c : scope->children) {
 			if (!c)
 				continue;
 			if (c->type == AST_CELL && c->attributes.count(ID(sv_bind_target))) {
-				if (conditional)
+				if (loop)
 					c->set_attribute(ID(sv_bind_degrade), AstNode::mkconst_str(c->location,
-							"bind inside a conditional or loop generate block is applied unconditionally"));
+							"bind inside a loop generate block is applied unconditionally"));
+				else if (conditional && !scope_mod.empty()) {
+					std::string k = stringf("%d", ++guard_counter);
+					c->set_attribute(ID(sv_bind_guard), AstNode::mkconst_str(c->location, k));
+					c->set_attribute(ID(sv_bind_guard_scope), AstNode::mkconst_str(c->location, scope_mod));
+					auto w = std::make_unique<AstNode>(c->location, AST_WIRE);
+					w->str = "\\$bind_live$" + k;
+					w->set_attribute(ID(sv_bind_live), AstNode::mkconst_str(c->location, k));
+					binds.push_back(std::move(c));
+					c = std::move(w); // in the bind's place (a GENIF's branch stays its branch)
+					continue;
+				}
 				binds.push_back(std::move(c));
 				continue;
 			}
 			if (c->type == AST_GENBLOCK)
-				self(self, c.get(), conditional);
-			else if (c->type == AST_GENIF || c->type == AST_GENCASE || c->type == AST_GENFOR || c->type == AST_COND)
-				self(self, c.get(), true);
+				self(self, c.get(), scope_mod, conditional, loop);
+			else if (c->type == AST_GENIF || c->type == AST_GENCASE || c->type == AST_COND)
+				self(self, c.get(), scope_mod, true, loop);
+			else if (c->type == AST_GENFOR)
+				self(self, c.get(), scope_mod, true, true);
 		}
 		scope->children.erase(std::remove(scope->children.begin(), scope->children.end(), nullptr), scope->children.end());
 	};
-	take(take, ast, false);
+	take(take, ast, std::string(), false, false);
 	for (auto &child : ast->children)
 		if (child && (child->type == AST_MODULE || child->type == AST_INTERFACE))
-			take(take, child.get(), false);
+			take(take, child.get(), child->str, false, false);
 	dict<std::string, std::vector<std::unique_ptr<AstNode>>> to_existing;
 	for (auto &b : binds) {
 		std::string tgt = bind_target_of(b.get());

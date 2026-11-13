@@ -1,0 +1,22 @@
+# fe185/fe186: an unlisted instance of a listed bind that no copy can place
+# (the expected error ends the script, so it is the last command)
+# an unlisted instance whose parent has two instances (no copy can tell
+# them apart): an error on a strict hierarchy
+logger -expect error "lists instance\(s\) m1.s1 of `sub' \(in `top'\) but is placed in every instance; also in " 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module mid(input logic clk, input logic [3:0] a, b);
+  sub s1(.clk(clk), .x(a));
+  sub s2(.clk(clk), .x(b));
+endmodule
+module top(input logic clk, input logic [3:0] a, b);
+  mid m1(.*);
+  mid m2(.*);
+  bind sub : m1.s1 chk c(.*);
+endmodule
+EOT
+hierarchy -check -top top

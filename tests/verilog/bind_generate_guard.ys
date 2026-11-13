@@ -1,0 +1,121 @@
+# fe187: a bind under a generate if/case of its scope module (cv32e40s's
+# wrapper: `if (SECURE) begin bind cv32e40s_dummy_instr : ... end') is
+# applied by the condition: kept when the branch is taken in every instance
+# of the scope, removed when in none; otherwise (or under a generate loop)
+# it is applied unconditionally, a degradation.
+logger -expect log "n: disproved" 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  n: assert property (@(posedge clk) x != 4'd9);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module top #(parameter bit SECURE = 1) (input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  if (SECURE) begin : g
+    bind sub : s chk c(.*);
+  end
+endmodule
+EOT
+hierarchy -check -top top
+select -assert-count 1 sub/c
+select -assert-none A:sv_degraded
+select -assert-none w:*bind_live*
+proc
+flatten
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the branch not taken (SECURE overridden by the top), a bind without
+# begin/end, and an else branch that is taken
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module chk2(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module wrap #(parameter bit SECURE = 1) (input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  if (SECURE)
+    bind sub chk c(.*);
+  else
+    bind sub chk2 c2(.*);
+endmodule
+module top(input logic clk, input logic [3:0] a);
+  wrap #(.SECURE(0)) w(.*);
+endmodule
+EOT
+hierarchy -check -top top
+select -assert-none sub/c
+select -assert-count 1 sub/c2
+select -assert-none A:sv_degraded
+select -assert-none w:*bind_live*
+design -reset
+
+# generate case
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module top #(parameter int K = 2) (input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  case (K)
+    1: begin : g1 bind sub chk c1(.*); end
+    2: begin : g2 bind sub chk c2(.*); end
+  endcase
+endmodule
+EOT
+hierarchy -check -top top
+select -assert-none sub/c1
+select -assert-count 1 sub/c2
+select -assert-none A:sv_degraded
+design -reset
+
+
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module wrap #(parameter bit SECURE = 1) (input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  if (SECURE) begin : g
+    bind sub chk c(.*);
+  end
+endmodule
+module top(input logic clk, input logic [3:0] a);
+  wrap #(.SECURE(0)) w0(.*);
+  wrap #(.SECURE(1)) w1(.*);
+endmodule
+EOT
+hierarchy -check -permissive -top top
+select -assert-count 1 sub/c
+select -assert-any sub A:sv_degraded %i
+design -reset
+
+# under a generate loop: applied unconditionally, a degradation
+read_verilog -sv -formal -permissive <<EOT
+module chk(input logic clk, input logic [3:0] x);
+  p: assert property (@(posedge clk) x == x);
+endmodule
+module sub(input logic clk, input logic [3:0] x);
+endmodule
+module top(input logic clk, input logic [3:0] a);
+  sub s(.clk(clk), .x(a));
+  for (genvar i = 0; i < 1; i++) begin : g
+    bind sub chk c(.*);
+  end
+endmodule
+EOT
+hierarchy -check -top top
+select -assert-count 1 sub/c
+select -assert-any sub A:sv_degraded %i

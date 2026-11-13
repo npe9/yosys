@@ -857,6 +857,82 @@ static std::string source_module_name(RTLIL::IdString name)
 	return s;
 }
 
+// fe187: a bind written under a generate if/case of a scope module S is
+// tagged sv_bind_guard=K (ast.cc apply_binds); S's derived modules where
+// the branch is taken have a marker wire sv_bind_live=K.  The bound
+// instance is kept when every instance of S under the top takes the
+// branch, removed when none does; otherwise (or S not under the top) the
+// condition is not applied: an error, a degradation with -permissive.
+static void check_guarded_binds(RTLIL::Design *design, RTLIL::Module *top, bool permissive)
+{
+	dict<std::string, std::vector<RTLIL::Module*>> scope_mods; // source name -> module of each instance path
+	dict<RTLIL::IdString, pool<std::string>> live;
+	std::vector<std::pair<RTLIL::Module*, std::string>> work = {{top, std::string()}};
+	pool<std::string> seen;
+	scope_mods[source_module_name(top->name)].push_back(top);
+	while (!work.empty()) {
+		auto [mod, path] = work.back();
+		work.pop_back();
+		if (GetSize(path) > 4096 || !seen.insert(mod->name.str() + "@" + path).second)
+			continue;
+		for (auto cell : mod->cells()) {
+			RTLIL::Module *sub = design->module(cell->type);
+			if (!sub)
+				continue;
+			std::string p = (path.empty() ? "" : path + ".") + RTLIL::unescape_id(cell->name);
+			scope_mods[source_module_name(sub->name)].push_back(sub);
+			work.push_back({sub, p});
+		}
+	}
+	for (auto mod : design->modules()) {
+		std::vector<RTLIL::Wire*> markers;
+		for (auto w : mod->wires())
+			if (w->has_attribute(ID(sv_bind_live))) {
+				live[mod->name].insert(w->get_string_attribute(ID(sv_bind_live)));
+				markers.push_back(w);
+			}
+		if (!markers.empty())
+			mod->remove(pool<RTLIL::Wire*>(markers.begin(), markers.end()));
+	}
+	for (auto mod : design->modules()) {
+		std::vector<RTLIL::Cell*> drop;
+		for (auto cell : mod->cells()) {
+			if (!cell->has_attribute(ID(sv_bind_guard)))
+				continue;
+			std::string k = cell->get_string_attribute(ID(sv_bind_guard));
+			std::string scope = cell->get_string_attribute(ID(sv_bind_guard_scope));
+			cell->attributes.erase(ID(sv_bind_guard));
+			cell->attributes.erase(ID(sv_bind_guard_scope));
+			int taken = 0, not_taken = 0;
+			if (scope_mods.count(scope))
+				for (auto sm : scope_mods.at(scope))
+					(live.count(sm->name) && live.at(sm->name).count(k) ? taken : not_taken)++;
+			if (taken > 0 && not_taken == 0) {
+				log("Bound instance %s.%s: its generate branch in `%s' is taken.\n", log_id(mod), log_id(cell), log_id(scope));
+				continue;
+			}
+			if (taken == 0 && not_taken > 0) {
+				log("Bound instance %s.%s: its generate branch in `%s' is not taken; removed.\n", log_id(mod), log_id(cell), log_id(scope));
+				drop.push_back(cell);
+				continue;
+			}
+			std::string reason = taken == 0 ?
+					stringf("bind of `%s' is under a generate if/case of `%s', which is not under the top: applied unconditionally",
+							log_id(cell->type), log_id(scope)) :
+					stringf("bind of `%s' is under a generate if/case of `%s' taken in %d of its %d instances: applied in all",
+							log_id(cell->type), log_id(scope), taken, taken + not_taken);
+			if (!permissive)
+				log_error("%s.  [`hierarchy -permissive` keeps it and marks the module (* sv_degraded *)]\n", reason.c_str());
+			log_warning("[sv_degraded] %s.\n", reason.c_str());
+			IdString attr = IdString("\\sv_degraded");
+			std::string cur = mod->has_attribute(attr) ? mod->attributes.at(attr).decode_string() : std::string();
+			mod->attributes[attr] = RTLIL::Const(cur.empty() ? reason : cur + "; " + reason);
+		}
+		for (auto c : drop)
+			mod->remove(c);
+	}
+}
+
 static void check_listed_binds(RTLIL::Design *design, RTLIL::Module *top, bool permissive)
 {
 	// instance paths (dotted, from the top) of every module, keyed both by
@@ -1551,6 +1627,7 @@ struct HierarchyPass : public Pass {
 		if (top_mod != NULL) {
 			log_header(design, "Analyzing design hierarchy..\n");
 			hierarchy_clean(design, top_mod, purge_lib);
+			check_guarded_binds(design, top_mod, hierarchy_permissive);
 			check_listed_binds(design, top_mod, hierarchy_permissive);
 		}
 

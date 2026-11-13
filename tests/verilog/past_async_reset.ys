@@ -1,0 +1,41 @@
+# fe188: $past/$changed inside a process with an asynchronous reset
+# (cv32e40s_if_stage_sva: `always_ff @(posedge clk, negedge rst_n) if
+# (!rst_n) ... else if ($changed(prefetch_priv_lvl)) ...') -- the sampled
+# value's register was assigned at the end of the process, so also in the
+# reset branch, and proc stopped: "Async reset \rst_n yields non-constant
+# value".  Its register is now clocked by the clock alone (IEEE 1800-2017
+# 16.9.3: sampled values do not depend on the process's reset).
+read_verilog -sv <<EOT
+module top(input logic clk, rst_n, input logic [1:0] a,
+           output logic ch, cr, output logic [1:0] q, qr, q2, q2r);
+  logic [1:0] r, rr;
+  always_ff @(posedge clk) begin
+    r <= a;
+    rr <= r;
+  end
+  always_ff @(posedge clk, negedge rst_n) begin
+    if (!rst_n) begin
+      ch <= 1'b0; q <= 2'd0; q2 <= 2'd3;
+    end else begin
+      ch <= $changed(a);
+      q <= $past(a);
+      q2 <= $past(a, 2);
+    end
+  end
+  // the same with reference registers
+  always_ff @(posedge clk, negedge rst_n) begin
+    if (!rst_n) begin
+      cr <= 1'b0; qr <= 2'd0; q2r <= 2'd3;
+    end else begin
+      cr <= a != r;
+      qr <= r;
+      q2r <= rr;
+    end
+  end
+endmodule
+EOT
+proc
+select -assert-count 6 t:$adff
+select -assert-count 6 t:$dff
+async2sync
+sat -verify -seq 6 -set-init-zero -prove ch cr -prove q qr -prove q2 q2r

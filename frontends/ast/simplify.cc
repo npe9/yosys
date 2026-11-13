@@ -305,6 +305,45 @@ static void past_collect_blocking(AstNode *n, pool<std::string> &names)
 			past_collect_blocking(ch.get(), names);
 }
 
+// fe188: a static variable the process (block) assigns with a blocking
+// assignment that a sampled-value function's argument reads: its sampled
+// value (IEEE 1800-2017 16.5.1) is the value before the clock edge, not the
+// value assigned earlier in the activation (upstream yosys's reading).
+// Automatic (nosync) variables keep their current value.  Empty if none.
+static std::string past_sampled_blocking_var(const AstNode *block, const AstNode *arg)
+{
+	pool<std::string> blocking;
+	std::function<void(const AstNode*)> lhs = [&](const AstNode *n) {
+		if (n->type == AST_ASSIGN_EQ && !n->children.empty() && n->children[0]) {
+			std::function<void(const AstNode*)> ids2 = [&](const AstNode *m) {
+				if (m->type == AST_IDENTIFIER) {
+					if (!(m->id2ast && m->id2ast->attributes.count(ID::nosync)))
+						blocking.insert(m->str);
+					return; // an index expression is read, not assigned
+				}
+				for (auto &c : m->children)
+					if (c)
+						ids2(c.get());
+			};
+			ids2(n->children[0].get());
+		}
+		for (auto &c : n->children)
+			if (c)
+				lhs(c.get());
+	};
+	lhs(block);
+	std::string found;
+	std::function<void(const AstNode*)> reads = [&](const AstNode *n) {
+		if (n->type == AST_IDENTIFIER && blocking.count(n->str) && found.empty())
+			found = n->str;
+		for (auto &c : n->children)
+			if (c)
+				reads(c.get());
+	};
+	reads(arg);
+	return found;
+}
+
 static bool past_init_on_initial_values(AstNode *arg, AstNode *block)
 {
 	pool<std::string> reads, assigned;
@@ -10678,6 +10717,59 @@ skip_memory_write:;
 				AstNode* outreg = nullptr;
 				bool past_init = past_init_on_initial_values(children.at(0).get(), block);
 
+				// fe188: in a process with an asynchronous reset
+				// (`always_ff @(posedge clk, negedge rst_n) if (!rst_n)
+				// ... else ... $changed(x)'), the sampled value's register
+				// is clocked by the clock alone: assigned at the end of the
+				// process body it also ran in the reset branch, and proc
+				// rejected it ("Async reset yields non-constant value").
+				// The clock is the one edge whose signal no top-level
+				// if/case condition of the body reads; else as before
+				std::unique_ptr<AstNode> past_proc;
+				AstNode *past_block = block;
+				std::string sampled_var;
+				{
+					std::vector<AstNode*> edges;
+					for (auto &c : current_always->children)
+						if ((c->type == AST_POSEDGE || c->type == AST_NEGEDGE) && GetSize(c->children) == 1 &&
+								c->children[0]->type == AST_IDENTIFIER)
+							edges.push_back(c.get());
+					sampled_var = past_sampled_blocking_var(block, children.at(0).get());
+					if (GetSize(edges) == 1 && !sampled_var.empty()) {
+						past_proc = std::make_unique<AstNode>(location, AST_ALWAYS, edges[0]->clone(),
+								std::make_unique<AstNode>(location, AST_BLOCK));
+						past_block = past_proc->children.back().get();
+					}
+					if (GetSize(edges) > 1) {
+						pool<std::string> tested;
+						std::function<void(const AstNode*)> ids = [&](const AstNode *n) {
+							if (n->type == AST_IDENTIFIER)
+								tested.insert(n->str);
+							for (auto &c : n->children)
+								if (c)
+									ids(c.get());
+						};
+						std::function<void(const AstNode*)> tops = [&](const AstNode *b) {
+							for (auto &c : b->children)
+								if (c && c->type == AST_BLOCK)
+									tops(c.get());
+								else if (c && c->type == AST_CASE && !c->children.empty())
+									ids(c->children[0].get());
+						};
+						tops(block);
+						AstNode *clk = nullptr;
+						int nclk = 0;
+						for (auto e : edges)
+							if (!tested.count(e->children[0]->str))
+								clk = e, nclk++;
+						if (nclk == 1 && GetSize(tested) > 0) {
+							past_proc = std::make_unique<AstNode>(location, AST_ALWAYS, clk->clone(),
+									std::make_unique<AstNode>(location, AST_BLOCK));
+							past_block = past_proc->children.back().get();
+						}
+					}
+				}
+
 				for (int i = 0; i < num_steps; i++)
 				{
 					auto reg_owned = std::make_unique<AstNode>(location, AST_WIRE, std::make_unique<AstNode>(location, AST_RANGE,
@@ -10711,8 +10803,26 @@ skip_memory_write:;
 						rhs->id2ast = outreg;
 					}
 
-					block->children.push_back(std::make_unique<AstNode>(location, AST_ASSIGN_LE, std::move(regid), std::move(rhs)));
+					past_block->children.push_back(std::make_unique<AstNode>(location, AST_ASSIGN_LE, std::move(regid), std::move(rhs)));
 					outreg = reg;
+				}
+
+				if (past_proc && !sampled_var.empty())
+					log_file_warning(location.to_loc(), "`$past' (or $changed/$stable/$rose/$fell) reads `%s', which this process "
+							"assigns with a blocking assignment: it uses its sampled value, the value before the clock edge "
+							"(IEEE 1800-2017 16.5.1), not the value assigned earlier in this process (upstream yosys's reading).\n",
+							RTLIL::unescape_id(sampled_var).c_str());
+				if (past_proc) {
+					AstNode *pp = past_proc.get();
+					current_ast_mod->children.push_back(std::move(past_proc));
+					auto saved_always = current_always;
+					auto saved_clocked = current_always_clocked;
+					auto saved_block = current_block, saved_block_child = current_block_child, saved_top_block = current_top_block;
+					current_always = nullptr;
+					while (pp->simplify(true, stage, -1, false)) { }
+					current_always = saved_always;
+					current_always_clocked = saved_clocked;
+					current_block = saved_block, current_block_child = saved_block_child, current_top_block = saved_top_block;
 				}
 
 				newNode = std::make_unique<AstNode>(location, AST_IDENTIFIER);
@@ -10741,6 +10851,37 @@ skip_memory_write:;
 				auto present = children.at(0)->clone();
 				auto past = clone();
 				past->str = "\\$past";
+				// fe188: when the argument reads a variable this process
+				// blocking-assigns, its present sampled value is the value
+				// before the edge too: read it outside the process, through
+				// a continuous assignment (the $past above samples likewise)
+				{
+					AstNode *blk = nullptr;
+					for (auto &child : current_always->children)
+						if (child->type == AST_BLOCK)
+							blk = child.get();
+					if (blk && !past_sampled_blocking_var(blk, children.at(0).get()).empty()) {
+						int w = 1;
+						bool sgn = false;
+						children.at(0)->detectSignWidth(w, sgn);
+						if (w < 1)
+							w = 1;
+						auto sw = std::make_unique<AstNode>(location, AST_WIRE, std::make_unique<AstNode>(location, AST_RANGE,
+								mkconst_int(location, w - 1, true), mkconst_int(location, 0, true)));
+						sw->str = stringf("$sampled$%s:%d$%d", RTLIL::encode_filename(*location.begin.filename), location.begin.line, autoidx++);
+						sw->is_signed = sgn;
+						AstNode *swp = sw.get();
+						current_ast_mod->children.push_back(std::move(sw));
+						while (swp->simplify(true, 1, -1, false)) { }
+						auto lhs = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+						lhs->str = swp->str;
+						lhs->id2ast = swp;
+						current_ast_mod->children.push_back(std::make_unique<AstNode>(location, AST_ASSIGN, std::move(lhs), children.at(0)->clone()));
+						present = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+						present->str = swp->str;
+						present->id2ast = swp;
+					}
+				}
 
 				if (str == "\\$stable")
 					newNode = std::make_unique<AstNode>(location, AST_EQ, std::move(past), std::move(present));

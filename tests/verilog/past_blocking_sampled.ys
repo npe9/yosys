@@ -1,0 +1,51 @@
+# fe188: a sampled-value function in a clocked process whose argument reads
+# a static variable the same process blocking-assigns uses the variable's
+# sampled value, its value before the clock edge (IEEE 1800-2017 16.5.1,
+# 16.9.3) -- not the value assigned earlier in this activation, upstream
+# yosys's reading, one cycle earlier.  With `t = a', t is a's value one
+# clock back, so $past(t) is a two clocks back, and q (assigned <=) three.
+# Warned per occurrence.  An automatic variable keeps its current value.
+logger -expect warning "reads `t', which this process assigns with a blocking assignment" 4
+read_verilog -sv <<EOT
+module top(input logic clk, rst_n, input logic [1:0] a,
+           output logic [1:0] qs, qa, qauto, r3, r2, output logic cs, cr, rs, rr, ss, sr);
+  logic [1:0] t, u, r1;
+  always_ff @(posedge clk) begin
+    r1 <= a;
+    r2 <= r1;
+    r3 <= r2;
+  end
+  // synchronous process
+  always_ff @(posedge clk) begin
+    t = a;
+    qs <= $past(t);
+    cs <= $changed(t);
+    rs <= $rose(t[0]);
+    ss <= $stable(t);
+  end
+  // asynchronous reset
+  always_ff @(posedge clk, negedge rst_n) begin
+    if (!rst_n) begin
+      qa <= 2'd0;
+    end else begin
+      u = a;
+      qa <= $past(u);
+    end
+  end
+  // an automatic variable: its sampled value is its current value
+  always_ff @(posedge clk) begin
+    automatic logic [1:0] v;
+    v = a;
+    qauto <= $past(v);
+  end
+  always_ff @(posedge clk) begin
+    cr <= r1 != r2;
+    rr <= r1[0] && !r2[0];
+    sr <= r1 == r2;
+  end
+endmodule
+EOT
+proc
+async2sync
+sat -verify -seq 8 -set-init-zero -set rst_n 1 -prove qs r3 -prove qa r3 -prove qauto r2 -prove cs cr -prove rs rr -prove ss sr
+logger -check-expected

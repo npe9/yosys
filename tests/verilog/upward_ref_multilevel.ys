@@ -1,0 +1,461 @@
+# fe190: a hierarchical reference whose head is an instance two or more
+# levels up (IEEE 1800-2017 23.8: `core_i.data_req_o' read in a checker
+# bound three levels below the wrapper holding core_i) was an implicit
+# 1-bit free net: every check over it was degraded.  The frontend now
+# declares it at the target's width (the nearest instantiating scope that
+# holds the head, all chains agreeing), and flatten forwards the unjoined
+# reference upward under its own name until the scope holding the head
+# joins it.  Until joined the module carries an sv_degraded reason.
+
+# 8 bits, three levels, an intermediate module reading the same name
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [7:0] v);
+  p: assert property (@(posedge clk) v == 8'd42);
+  n: assert property (@(posedge clk) v != 8'd42);
+endmodule
+module leaf(input logic clk);
+endmodule
+module mid(input logic clk, output logic [7:0] seen);
+  leaf l(.clk(clk));
+  assign seen = u_a.x;   // the same upward name, one level nearer the top
+endmodule
+module a(input logic clk, output logic [7:0] x);
+  assign x = 8'd42;
+endmodule
+module top(input logic clk, output logic [7:0] seen);
+  a u_a(.clk(clk), .x());
+  mid m(.clk(clk), .seen(seen));
+  bind leaf chk c(.clk(clk), .v(u_a.x));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the nearest scope holding `u_a' wins (mid1.u_a = 7, not top.u_a = 42)
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [7:0] v);
+  p: assert property (@(posedge clk) v == 8'd7);
+  n: assert property (@(posedge clk) v == 8'd42);
+endmodule
+module leaf(input logic clk);
+  chk c(.clk(clk), .v(u_a.x));
+endmodule
+module mid2(input logic clk);
+  leaf l(.clk(clk));
+endmodule
+module b(input logic clk, output logic [7:0] x);
+  assign x = 8'd7;
+endmodule
+module mid1(input logic clk);
+  b u_a(.clk(clk), .x());
+  mid2 m2(.clk(clk));
+endmodule
+module a(input logic clk, output logic [7:0] x);
+  assign x = 8'd42;
+endmodule
+module top(input logic clk);
+  a u_a(.clk(clk), .x());
+  mid1 m1(.clk(clk));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# not flattened (and the intermediate kept): the reference stays degraded
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [7:0] v);
+  p: assert property (@(posedge clk) v == 8'd42);
+  n: assert property (@(posedge clk) v != 8'd42);
+endmodule
+module leaf(input logic clk);
+endmodule
+module mid(input logic clk, output logic [7:0] seen);
+  leaf l(.clk(clk));
+  assign seen = u_a.x;   // the same upward name, one level nearer the top
+endmodule
+module a(input logic clk, output logic [7:0] x);
+  assign x = 8'd42;
+endmodule
+module top(input logic clk, output logic [7:0] seen);
+  a u_a(.clk(clk), .x());
+  mid m(.clk(clk), .seen(seen));
+  bind leaf chk c(.clk(clk), .v(u_a.x));
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-any A:sv_degraded=*not?joined?yet*
+design -save u3
+setattr -mod -set keep_hierarchy 1 mid
+flatten
+select -assert-any A:sv_degraded
+design -load u3
+flatten
+select -assert-none A:sv_degraded
+design -reset
+
+# two chains resolve `u_a.x' to different widths: stays degraded
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [7:0] v);
+  p: assert property (@(posedge clk) v == 8'd42);
+endmodule
+module leaf(input logic clk);
+  chk c(.clk(clk), .v(u_a.x));
+endmodule
+module mid(input logic clk);
+  leaf l(.clk(clk));
+endmodule
+module a(input logic clk, output logic [7:0] x);
+  assign x = 8'd42;
+endmodule
+module a4(input logic clk, output logic [3:0] x);
+  assign x = 4'd5;
+endmodule
+module p1(input logic clk);
+  a u_a(.clk(clk), .x());
+  mid m(.clk(clk));
+endmodule
+module p2(input logic clk);
+  a4 u_a(.clk(clk), .x());
+  mid m(.clk(clk));
+endmodule
+module top(input logic clk);
+  p1 q1(.clk(clk));
+  p2 q2(.clk(clk));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# mid holds `u_a' without `y': `u_a.y' is downward (23.8) and must not
+# bind to top.u_a.y
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic v);
+  p: assert property (@(posedge clk) v == 1'b1);
+endmodule
+module b(input logic clk, output logic [7:0] x);
+  assign x = 8'd7;
+endmodule
+module mid(input logic clk);
+  b u_a(.clk(clk), .x());
+  chk c(.clk(clk), .v(u_a.y));
+endmodule
+module a(input logic clk, output logic y);
+  assign y = 1'b1;
+endmodule
+module top(input logic clk);
+  a u_a(.clk(clk), .y());
+  mid m(.clk(clk));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# `dut.z' three levels below dut names dut by module name (23.8), not
+# top's instance `dut' (module other): never forwarded past dut, so it
+# stays degraded (multi-level module-name references are not resolved yet)
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic v);
+  p: assert property (@(posedge clk) v == 1'b0);
+endmodule
+module leaf(input logic clk);
+  chk c(.clk(clk), .v(dut.z));
+endmodule
+module wrap(input logic clk);
+  leaf l(.clk(clk));
+endmodule
+module dut(input logic clk);
+  logic z;
+  assign z = 1'b0;
+  wrap w(.clk(clk));
+endmodule
+module other(input logic clk);
+  logic z;
+  assign z = 1'b1;
+endmodule
+module top(input logic clk);
+  dut u_dut(.clk(clk));
+  other dut(.clk(clk));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# mid reads u_a.x itself (an upward input port) while leaf below reads u_a.z two levels up: the port does not hide u_a as a local scope
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [3:0] v);
+  p: assert property (@(posedge clk) v == 4'd9);
+  n: assert property (@(posedge clk) v != 4'd9);
+endmodule
+module leaf(input logic clk);
+  chk c(.clk(clk), .v(u_a.z));
+endmodule
+module mid(input logic clk, output logic [3:0] seen);
+  leaf l(.clk(clk));
+  assign seen = u_a.x;
+endmodule
+module a(input logic clk, output logic [3:0] x, output logic [3:0] z);
+  assign x = 4'd5;
+  assign z = 4'd9;
+endmodule
+module top(input logic clk, output logic [3:0] seen);
+  a u_a(.clk(clk), .x(), .z());
+  mid m(.clk(clk), .seen(seen));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the intermediate scope has an interface port and its parent is rederived for its own one-level upward reference
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal <<EOT
+interface bus_if; logic [7:0] d; endinterface
+module chk(input logic clk, input logic [7:0] v);
+  p: assert property (@(posedge clk) v == 8'd42);
+  n: assert property (@(posedge clk) v != 8'd42);
+endmodule
+module leaf #(parameter R = 0) (input logic clk);
+  chk c(.clk(clk), .v(u_a.y));
+endmodule
+module stage #(parameter Q = 0) (input logic clk, bus_if b);
+  leaf #(.R(Q)) l(.clk(clk));
+  assign b.d = 8'd1;
+endmodule
+module core #(parameter P = 0) (input logic clk, output logic [7:0] seen);
+  bus_if bi();
+  stage #(.Q(P)) s(.clk(clk), .b(bi));
+  assign seen = u_a.y;
+endmodule
+module a(input logic clk, output logic [7:0] y);
+  assign y = 8'd42;
+endmodule
+module top(input logic clk, output logic [7:0] seen);
+  a u_a(.clk(clk), .y());
+  core #(.P(2)) c(.clk(clk), .seen(seen));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# a parameterized top (-chparam) and a second, unresolvable reference in the
+# same module: u_a.x still resolves (the module stays degraded for nosuch.w)
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic [7:0] v, input logic w);
+  p: assert property (@(posedge clk) v == 8'd42);
+  n: assert property (@(posedge clk) v != 8'd42);
+endmodule
+module leaf(input logic clk);
+  chk c(.clk(clk), .v(u_a.x), .w(nosuch.w));
+endmodule
+module mid(input logic clk);
+  leaf l(.clk(clk));
+endmodule
+module a(input logic clk, output logic [7:0] x);
+  assign x = 8'd42;
+endmodule
+module top #(parameter P = 1) (input logic clk);
+  a u_a(.clk(clk), .x());
+  mid m(.clk(clk));
+endmodule
+EOT
+hierarchy -top top -chparam P 3
+proc
+flatten
+select -assert-any A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero -allow-degraded
+logger -check-expected
+design -reset
+
+# mid1 holds u_a without y; u_a.y read two levels below it is downward from mid1 (23.8): never bound to top.u_a.y
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic v);
+  p: assert property (@(posedge clk) v == 1'b1);
+endmodule
+module leaf(input logic clk);
+  chk c(.clk(clk), .v(u_a.y));
+endmodule
+module mid2(input logic clk);
+  leaf l(.clk(clk));
+endmodule
+module b(input logic clk, output logic x);
+  assign x = 1'b0;
+endmodule
+module mid1(input logic clk);
+  b u_a(.clk(clk), .x());
+  mid2 m2(.clk(clk));
+endmodule
+module a(input logic clk, output logic y);
+  assign y = 1'b1;
+endmodule
+module top(input logic clk);
+  a u_a(.clk(clk), .y());
+  mid1 m1(.clk(clk));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# c1 reads its own u_a.y (missing: free) while leaf under c2 reads u_a.y up (joined): the join does not clear c1's free wire
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic v);
+  p: assert property (@(posedge clk) v == 1'b1);
+endmodule
+module b(input logic clk, output logic x);
+  assign x = 1'b0;
+endmodule
+module a(input logic clk, output logic y);
+  assign y = 1'b1;
+endmodule
+module c1(input logic clk);
+  b u_a(.clk(clk), .x());
+  chk k(.clk(clk), .v(u_a.y));
+endmodule
+module leaf(input logic clk);
+  chk k(.clk(clk), .v(u_a.y));
+endmodule
+module c2(input logic clk);
+  leaf l(.clk(clk));
+endmodule
+module top(input logic clk);
+  a u_a(.clk(clk), .y());
+  c1 m1(.clk(clk)); c2 m2(.clk(clk));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# c2 first: as above
+read_verilog -sv -formal <<EOT
+module chk(input logic clk, input logic v);
+  p: assert property (@(posedge clk) v == 1'b1);
+endmodule
+module b(input logic clk, output logic x);
+  assign x = 1'b0;
+endmodule
+module a(input logic clk, output logic y);
+  assign y = 1'b1;
+endmodule
+module c1(input logic clk);
+  b u_a(.clk(clk), .x());
+  chk k(.clk(clk), .v(u_a.y));
+endmodule
+module leaf(input logic clk);
+  chk k(.clk(clk), .v(u_a.y));
+endmodule
+module c2(input logic clk);
+  leaf l(.clk(clk));
+endmodule
+module top(input logic clk);
+  a u_a(.clk(clk), .y());
+  c2 m2(.clk(clk)); c1 m1(.clk(clk));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# a written upward reference is not forwarded (it would drive the target a second time)
+read_verilog -sv -formal <<EOT
+module w(input logic clk);
+  assign u_a.x = 1'b1;
+endmodule
+module mid(input logic clk);
+  w ww(.clk(clk));
+endmodule
+module a(input logic clk, output logic x);
+  assign x = 1'b0;
+endmodule
+module chk(input logic clk, input logic v);
+  p: assert property (@(posedge clk) v == 1'b0);
+endmodule
+module top(input logic clk);
+  a u_a(.clk(clk), .x());
+  mid m(.clk(clk));
+  chk k(.clk(clk), .v(u_a.x));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# an interface port bus without gnt: bus.gnt is not looked up further (a parent's bus.gnt)
+read_verilog -sv -formal <<EOT
+interface ifc; logic req; endinterface
+module chk(input logic clk, input logic v);
+  p: assert property (@(posedge clk) v == 1'b1);
+endmodule
+module sub(input logic clk, ifc bus);
+  chk k(.clk(clk), .v(bus.gnt));
+endmodule
+module g(input logic clk, output logic gnt);
+  assign gnt = 1'b1;
+endmodule
+module top(input logic clk);
+  ifc i0();
+  g bus(.clk(clk), .gnt());
+  sub s(.clk(clk), .bus(i0));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset

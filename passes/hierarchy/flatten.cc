@@ -18,6 +18,7 @@
  */
 
 #include "kernel/yosys.h"
+#include "kernel/celltypes.h"
 #include "kernel/utils.h"
 #include "kernel/sigtools.h"
 
@@ -107,6 +108,9 @@ static void drop_degradation(RTLIL::Module *module, const std::string &prefix);
 static void drop_hierref_degradation(RTLIL::Module *module, IdString name)
 {
 	drop_degradation(module, stringf("Identifier `%s' is implicitly declared. @", name.c_str()));
+	// fe190: a reference hierarchy declared at its target's width, whose
+	// join flatten makes
+	drop_degradation(module, stringf("Hierarchical reference `%s' is not joined yet. @", name.c_str()));
 }
 
 static void drop_degradation(RTLIL::Module *module, const std::string &prefix)
@@ -153,6 +157,136 @@ struct FlattenWorker
 	bool create_scopeinfo = true;
 	bool create_scopename = false;
 	std::string separator = ".";
+	// fe190: per module, the first name component of every instance and
+	// every non-reference dotted name (generate scopes) before flattening:
+	// a dotted reference whose head is one of these is downward (23.8) and
+	// never looked up further up
+	dict<RTLIL::Module*, pool<std::string>> local_heads;
+
+	void collect_local_heads(RTLIL::Design *design)
+	{
+		auto head_of = [](IdString n) { std::string s = n.unescape(); return s.substr(0, s.find('.')); };
+		for (auto mod : design->modules()) {
+			if (local_heads.count(mod))
+				continue;
+			pool<std::string> &h = local_heads[mod];
+			for (auto c : mod->cells())
+				if (c->name[0] == '\\')
+					h.insert(head_of(c->name));
+			for (auto w : mod->wires())
+				if (w->name[0] == '\\' && !w->get_bool_attribute(ID(sv_hierref)) && !w->has_attribute(ID(sv_upward_ref)) &&
+						!w->get_bool_attribute(ID::hierconn) && !w->port_input && !w->port_output &&
+						w->name.str().find('.') != std::string::npos)
+					h.insert(head_of(w->name));
+		}
+	}
+
+	// a module's own name as written (`$paramod$<hash>\\name', `$paramod\\name\\P=..',
+	// `...\\name$interfaces$..' -> name): an upward name may also match a
+	// scope's module name (23.8)
+	static std::string module_base_name(RTLIL::Module *m)
+	{
+		std::string h = m->get_string_attribute(ID::hdlname);
+		if (!h.empty())
+			return h;
+		std::string n = m->name.str();
+		if (!n.empty() && n[0] == '\\')
+			return n.substr(1);
+		size_t p = n.find('\\');
+		if (p == std::string::npos)
+			return n;
+		std::string r = n.substr(p + 1);
+		return r.substr(0, r.find_first_of("\\$"));
+	}
+
+	// wires a module reads (connections, cell inputs, process rules):
+	// a reference nothing reads -- a bind clone's connection to another
+	// clone's checker -- cannot reach a check, so it is neither forwarded
+	// (it would claim the name at the scope above, at its own width, ahead
+	// of a reference that is read) nor marked
+	dict<RTLIL::Module*, pool<RTLIL::Wire*>> read_cache;
+
+	const pool<RTLIL::Wire*> &read_wires(RTLIL::Module *module)
+	{
+		auto it = read_cache.find(module);
+		if (it != read_cache.end())
+			return it->second;
+		pool<RTLIL::Wire*> &read = read_cache[module];
+		auto add_read = [&](const RTLIL::SigSpec &sig) {
+			for (auto &c : sig.chunks())
+				if (c.wire)
+					read.insert(c.wire);
+		};
+		for (auto &conn : module->connections())
+			add_read(conn.second);
+		for (auto c : module->cells())
+			for (auto &conn : c->connections())
+				if (!yosys_celltypes.cell_known(c->type) || yosys_celltypes.cell_input(c->type, conn.first))
+					add_read(conn.second);
+		std::function<void(RTLIL::CaseRule*)> walk = [&](RTLIL::CaseRule *cr) {
+			for (auto &cmp : cr->compare)
+				add_read(cmp);
+			for (auto &a : cr->actions)
+				add_read(a.second);
+			for (auto sw : cr->switches) {
+				add_read(sw->signal);
+				for (auto c : sw->cases)
+					walk(c);
+			}
+		};
+		for (auto &pit : module->processes) {
+			walk(&pit.second->root_case);
+			for (auto sync : pit.second->syncs) {
+				add_read(sync->signal);
+				for (auto &a : sync->actions)
+					add_read(a.second);
+				for (auto &mw : sync->mem_write_actions) {
+					add_read(mw.address);
+					add_read(mw.data);
+					add_read(mw.enable);
+				}
+			}
+		}
+		return read;
+	}
+
+	// fe190: wires a module drives (connections, cell outputs, process
+	// assignments): a written reference is never forwarded (its join would
+	// add a second driver to the target)
+	dict<RTLIL::Module*, pool<RTLIL::Wire*>> driven_cache;
+
+	const pool<RTLIL::Wire*> &driven_wires(RTLIL::Module *m)
+	{
+		auto it = driven_cache.find(m);
+		if (it != driven_cache.end())
+			return it->second;
+		pool<RTLIL::Wire*> &d = driven_cache[m];
+		auto add = [&](const RTLIL::SigSpec &sig) {
+			for (auto &c : sig.chunks())
+				if (c.wire)
+					d.insert(c.wire);
+		};
+		for (auto &conn : m->connections())
+			add(conn.first);
+		for (auto c : m->cells())
+			for (auto &conn : c->connections())
+				if (!yosys_celltypes.cell_known(c->type) || yosys_celltypes.cell_output(c->type, conn.first))
+					add(conn.second);
+		std::function<void(RTLIL::CaseRule*)> walk = [&](RTLIL::CaseRule *cr) {
+			for (auto &a : cr->actions)
+				add(a.first);
+			for (auto sw : cr->switches)
+				for (auto c : sw->cases)
+					walk(c);
+		};
+		for (auto &pit : m->processes) {
+			walk(&pit.second->root_case);
+			for (auto sync : pit.second->syncs)
+				for (auto &a : sync->actions)
+					add(a.first);
+		}
+		return d;
+	}
 
 	template<class T>
 	void map_attributes(RTLIL::Cell *cell, T *object, IdString orig_object_name)
@@ -293,6 +427,44 @@ struct FlattenWorker
 						hier_wire->width = GetSize(tpl_wire);
 					}
 					new_wire = hier_wire;
+				}
+			}
+			// fe190: a dotted reference of the template that is still
+			// unjoined (its head is no instance there: an upward name,
+			// IEEE 1800-2017 23.8, `core_i.data_req_o' read in a checker
+			// bound three levels below the wrapper that holds core_i) is
+			// looked up from here under its own name: joined to this
+			// module's wire of that name (the head instance already
+			// inlined, or another reference forwarded here), else made a
+			// reference here, joined when the head is inlined or forwarded
+			// further.  Unjoined at the top it stays a degraded free wire.
+			if (new_wire == nullptr && tpl_wire->name[0] == '\\' && tpl_wire->get_bool_attribute(ID(sv_hierref)) &&
+					tpl_wire->get_bool_attribute(ID::hierconn) && !tpl_wire->has_attribute(ID(sv_hierref_base)) &&
+					!tpl_wire->port_input && !tpl_wire->port_output &&
+					tpl_wire->name.str().find('.') != std::string::npos &&
+					local_heads.count(tpl) && !local_heads.at(tpl).count(tpl_wire->name.unescape().substr(0, tpl_wire->name.unescape().find('.'))) &&
+					module_base_name(tpl) != tpl_wire->name.unescape().substr(0, tpl_wire->name.unescape().find('.')) &&
+					module_base_name(module) != tpl_wire->name.unescape().substr(0, tpl_wire->name.unescape().find('.')) &&
+					!driven_wires(tpl).count(tpl_wire) && read_wires(tpl).count(tpl_wire)) {
+				// (a head naming the template's or this module's own module
+				// is an upward reference by module name, resolved at that
+				// scope or not at all: never looked up further)
+				RTLIL::Wire *up = module->wire(tpl_wire->name);
+				if (up == nullptr) {
+					up = module->addWire(tpl_wire->name, GetSize(tpl_wire));
+					up->is_signed = tpl_wire->is_signed;
+					up->set_bool_attribute(ID::hierconn);
+					up->set_bool_attribute(ID(sv_hierref));
+					log("Forwarding hierarchical reference %s.%s to %s (no instance `%s' below).\n", log_id(cell), log_id(tpl_wire),
+							log_id(module), tpl_wire->name.unescape().substr(0, tpl_wire->name.unescape().find('.')).c_str());
+					new_wire = up;
+				} else if (GetSize(up) == GetSize(tpl_wire) && !up->port_output &&
+						(!up->port_input || up->attributes.count(ID(sv_upward_ref)))) {
+					// (an input port: this module's own reference to the same
+					// name, resolved one level up -- the same target, 23.8)
+					if (!up->get_bool_attribute(ID(sv_hierref)))
+						drop_hierref_degradation(module, up->name);
+					new_wire = up;
 				}
 			}
 			if (new_wire == nullptr) {
@@ -561,6 +733,31 @@ struct FlattenWorker
 			flatten_cell(design, module, cell, tpl, sigmap, worklist, separator);
 		}
 	}
+
+	// fe190: a reference still unjoined once flattening is done is a free
+	// wire.  The reasons dropped on joins are matched by name, and
+	// references of different templates share a name once forwarded or
+	// inherited, so each one left keeps a reason of its own.  (Run after
+	// every module is flattened: a template's references are joined by its
+	// parents.)
+	void mark_unjoined(RTLIL::Module *module)
+	{
+		read_cache.erase(module);
+		const pool<RTLIL::Wire*> &read = read_wires(module);
+		IdString attr = IdString("\\sv_degraded");
+		std::string cur = module->has_attribute(attr) ? module->attributes.at(attr).decode_string() : std::string();
+		std::string add;
+		for (auto w : module->wires())
+			if (w->name[0] == '\\' && w->get_bool_attribute(ID(sv_hierref)) && !w->port_input && !w->port_output &&
+					w->name.str().find('.') != std::string::npos && read.count(w)) {
+				std::string reason = stringf("Hierarchical reference `%s' is not joined (a free wire). @module %s",
+						log_id(w->name), log_id(module->name));
+				if (cur.find(reason) == std::string::npos && add.find(reason) == std::string::npos)
+					add += (add.empty() && cur.empty() ? "" : "; ") + reason;
+			}
+		if (!add.empty())
+			module->attributes[attr] = RTLIL::Const(cur + add);
+	}
 };
 
 struct FlattenPass : public Pass {
@@ -670,8 +867,12 @@ struct FlattenPass : public Pass {
 		if (!topo_modules.sort())
 			log_error("Cannot flatten a design containing recursive instantiations.\n");
 
+		worker.collect_local_heads(design);
 		for (auto module : topo_modules.sorted)
 			worker.flatten_module(design, module, used_modules, worker.separator);
+		for (auto module : topo_modules.sorted)
+			if (design->selected(module) && !module->get_blackbox_attribute(worker.ignore_wb))
+				worker.mark_unjoined(module);
 
 		if (cleanup && top != nullptr)
 			for (auto module : design->modules().to_vector())

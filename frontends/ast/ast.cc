@@ -3121,12 +3121,96 @@ static bool pending_parent_derivation(RTLIL::Design *design, const std::vector<s
 // downward reference there, which flatten then joins).  A reference this
 // module drives, or one that does not resolve the same way in every parent,
 // stays implicit.
+// fe190: IEEE 1800-2017 23.8 upward name resolution by instance name,
+// any number of levels: on every chain of instantiating modules above
+// `mod' (modules in use only), the nearest one that has an instance named
+// `head' holds the target `path' (`core_i.data_req_o' read by a checker
+// bound three levels below the cv32e40s wrapper, which holds core_i).
+// 1: found on every chain with the same width, signedness and packed
+// dims; 0: not (a chain reaches a top without it, or the chains disagree);
+// -1: an instantiating module or an instance on a path is still to be
+// derived (come back next round).
+static int resolve_upward_by_instance(RTLIL::Design *design, RTLIL::Module *mod, RTLIL::IdString head, const std::string &path,
+		const pool<RTLIL::Module*> *used_modules, int &width, bool &is_signed, PackedDims &dims)
+{
+	width = -1, is_signed = false;
+	dims.clear();
+	bool first = true;
+	auto base_name = [](RTLIL::Module *m) {
+		std::string h = m->get_string_attribute(ID::hdlname);
+		if (!h.empty())
+			return h;
+		std::string n = m->name.str();
+		if (!n.empty() && n[0] == '\\')
+			return n.substr(1);
+		size_t p = n.find('\\');
+		if (p == std::string::npos)
+			return n;
+		std::string r = n.substr(p + 1);
+		return r.substr(0, r.find_first_of("\\$"));
+	};
+	std::string head_s = head.unescape();
+	std::function<int(RTLIL::Module*, int)> up = [&](RTLIL::Module *m, int depth) -> int {
+		if (depth > 32)
+			return 0;
+		// a scope whose module name is the head: an upward reference by
+		// module name (23.8), not to an instance further up
+		if (base_name(m) == head_s)
+			return 0;
+		std::vector<std::pair<RTLIL::Module*, RTLIL::Cell*>> parents;
+		for (auto pm : design->modules()) {
+			if (pm->get_bool_attribute(ID::to_delete))
+				continue;
+			if (used_modules && !used_modules->count(pm))
+				continue;
+			for (auto c : pm->cells())
+				if (c->type == m->name)
+					parents.push_back({pm, c});
+		}
+		if (parents.empty())
+			// a derived module (`$paramod...') is never a top: one no
+			// longer instantiated waits for its parent's re-derivation
+			// (a parent rederived for its own references this round
+			// instantiates the underived module until hierarchy runs)
+			return m->name.begins_with("$") && !m->get_bool_attribute(ID::top) && !m->get_bool_attribute(ID::initial_top) ? -1
+					: 0; // else a top without `head' above
+		if (pending_parent_derivation(design, parents, used_modules))
+			return -1;
+		pool<RTLIL::Module*> seen;
+		for (auto &pc : parents) {
+			RTLIL::Module *pm = pc.first;
+			if (!seen.insert(pm).second)
+				continue;
+			if (!pm->cell(head)) {
+				int r = up(pm, depth + 1);
+				if (r <= 0)
+					return r;
+				continue;
+			}
+			bool pending = false;
+			RTLIL::Wire *t = walk_hierref_down(design, pm, path, &pending);
+			if (pending)
+				return -1;
+			if (!t || t->get_bool_attribute(ID(sv_hierref)))
+				return 0;
+			PackedDims td = wire_packed_dims(t);
+			if (!first && (t->width != width || t->is_signed != is_signed || td != dims))
+				return 0;
+			width = t->width, is_signed = t->is_signed, dims = td;
+			first = false;
+		}
+		return 1;
+	};
+	int r = up(mod, 0);
+	return r > 0 && width >= 1 ? 1 : r < 0 ? -1 : 0;
+}
+
 bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module*> *used_modules)
 {
 	if (get_bool_attribute(ID(sv_hierrefs_resolved)))
 		return false;
 	struct Target { std::string name; int width; bool is_signed; std::string up_rest; std::string member_base = std::string(); int member_offset = -1;
-		int up_offset = -1, up_base_width = 0; bool is_const = false; RTLIL::Const value = RTLIL::Const(); PackedDims dims = PackedDims(); };
+		int up_offset = -1, up_base_width = 0; bool is_const = false; RTLIL::Const value = RTLIL::Const(); PackedDims dims = PackedDims(); bool pending_join = false; };
 	std::vector<Target> targets;
 	bool any_wide = false, any_up = false, any_member = false;
 	auto mark_members = [&](RTLIL::Module *m) {
@@ -3352,6 +3436,24 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 					return false;
 			}
 		}
+		if (res == 0 && !wire->has_attribute(ID(sv_hierref_idx))) {
+			// fe190: the head is an instance further up (23.8): declared at
+			// the target's width, still a reference (sv_hierref, hierconn)
+			// that flatten forwards up to the scope holding the head
+			PackedDims ud;
+			int r2 = resolve_upward_by_instance(design, this, head, path, used_modules, width, is_signed, ud);
+			if (r2 < 0)
+				return false;
+			if (r2 > 0) {
+				log("Hierarchical reference %s.%s: `%s' is an instance further up (IEEE 1800-2017 23.8).\n",
+						log_id(name), log_id(wire->name), log_id(head));
+				targets.push_back({wire->name.str(), width, is_signed, std::string()});
+				targets.back().dims = ud;
+				targets.back().pending_join = true;
+				any_wide = true;
+				continue;
+			}
+		}
 		if (res > 0 && up_const) {
 			// a constant: declared here with its value, no port
 			Target t{wire->name.str(), width, is_signed, std::string()};
@@ -3472,6 +3574,17 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	new_module->set_bool_attribute(ID(sv_hierrefs_resolved));
 	if (any_member)
 		mark_members(new_module);
+	// fe190: a reference to an instance further up is joined only by
+	// flatten (forwarded to the scope holding the head): until then it is
+	// a free wire, so the module carries a reason flatten drops on joining
+	for (auto &t : targets)
+		if (t.pending_join) {
+			IdString attr = IdString("\\sv_degraded");
+			std::string cur = new_module->has_attribute(attr) ? new_module->attributes.at(attr).decode_string() : std::string();
+			std::string reason = stringf("Hierarchical reference `%s' is not joined yet. @module %s", t.name.c_str(), log_id(new_module->name));
+			if (cur.find(reason) == std::string::npos)
+				new_module->attributes[attr] = RTLIL::Const(cur.empty() ? reason : cur + "; " + reason);
+		}
 	// an upward-reference port is connected by flatten only
 	// (connect_upward_refs): until then it is a free input, so the module
 	// carries a mark, which flatten does not pass on to the parent

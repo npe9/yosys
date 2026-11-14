@@ -1,0 +1,473 @@
+# fe192b: a hierarchical reference resolved to a one-dimensional wire or
+# struct member not declared [N-1:0] (`logic [0:3] va', `logic [7:4] vo')
+# was declared [N-1:0], so a bit or part select through it read the wrong
+# bits with no degradation (`va[0]' read va[3]; `vo[7]' was out of range).
+# The reference now takes the target's range.  Values are asymmetric
+# (4'b0111), so a mirrored read fails p.
+# downward: bit selects of [0:3]
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVA <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.va[0] && mid_i.wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.vo[7] && mid_i.wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) mid_i.wb_stage_i.vo[6:5] == 2'b11 && mid_i.wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.r.rdata[0] && mid_i.wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); chk2 c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# downward: bit selects of [7:4]
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVO <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.va[0] && mid_i.wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.vo[7] && mid_i.wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) mid_i.wb_stage_i.vo[6:5] == 2'b11 && mid_i.wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.r.rdata[0] && mid_i.wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); chk2 c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# downward: part selects of [7:4] and [0:3]
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVOW <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.va[0] && mid_i.wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.vo[7] && mid_i.wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) mid_i.wb_stage_i.vo[6:5] == 2'b11 && mid_i.wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.r.rdata[0] && mid_i.wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); chk2 c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# downward: bit selects of a [0:3] struct member
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DRA <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.va[0] && mid_i.wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.vo[7] && mid_i.wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) mid_i.wb_stage_i.vo[6:5] == 2'b11 && mid_i.wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !mid_i.wb_stage_i.r.rdata[0] && mid_i.wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) mid_i.wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); chk2 c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# upward, one scope (an input port): bit selects of [0:3]
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVA <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !wb_stage_i.va[0] && wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !wb_stage_i.vo[7] && wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) wb_stage_i.vo[6:5] == 2'b11 && wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !wb_stage_i.r.rdata[0] && wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind mid chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# upward, one scope (an input port): bit selects of [7:4]
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVO <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !wb_stage_i.va[0] && wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !wb_stage_i.vo[7] && wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) wb_stage_i.vo[6:5] == 2'b11 && wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !wb_stage_i.r.rdata[0] && wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind mid chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# upward, one scope (an input port): part selects of [7:4] and [0:3]
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVOW <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !wb_stage_i.va[0] && wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !wb_stage_i.vo[7] && wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) wb_stage_i.vo[6:5] == 2'b11 && wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !wb_stage_i.r.rdata[0] && wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind mid chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# upward, one scope (an input port): bit selects of a [0:3] struct member
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DRA <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !wb_stage_i.va[0] && wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !wb_stage_i.vo[7] && wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) wb_stage_i.vo[6:5] == 2'b11 && wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !wb_stage_i.r.rdata[0] && wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind mid chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# upward, two scopes (forwarded by flatten): bit selects of [0:3]
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVA <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !wb_stage_i.va[0] && wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !wb_stage_i.vo[7] && wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) wb_stage_i.vo[6:5] == 2'b11 && wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !wb_stage_i.r.rdata[0] && wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind sub chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# upward, two scopes (forwarded by flatten): bit selects of [7:4]
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVO <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !wb_stage_i.va[0] && wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !wb_stage_i.vo[7] && wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) wb_stage_i.vo[6:5] == 2'b11 && wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !wb_stage_i.r.rdata[0] && wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind sub chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# upward, two scopes (forwarded by flatten): part selects of [7:4] and [0:3]
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVOW <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !wb_stage_i.va[0] && wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !wb_stage_i.vo[7] && wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) wb_stage_i.vo[6:5] == 2'b11 && wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !wb_stage_i.r.rdata[0] && wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind sub chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# upward, two scopes (forwarded by flatten): bit selects of a [0:3] struct member
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DRA <<EOT
+typedef struct packed { logic [0:3] rdata; logic err; } resp_t;
+module wb(input logic clk);
+  logic [0:3] va; assign va = 4'b0111;
+  logic [7:4] vo; assign vo = 4'b0111;
+  resp_t r; assign r = '{rdata: 4'b0111, err: 1'b0};
+endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef VA
+  p: assert property (@(posedge clk) !wb_stage_i.va[0] && wb_stage_i.va[3]);
+  n: assert property (@(posedge clk) wb_stage_i.va[0]);
+`elsif VO
+  p: assert property (@(posedge clk) !wb_stage_i.vo[7] && wb_stage_i.vo[4]);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7]);
+`elsif VOW
+  p: assert property (@(posedge clk) wb_stage_i.vo[6:5] == 2'b11 && wb_stage_i.va[0:1] == 2'b01);
+  n: assert property (@(posedge clk) wb_stage_i.vo[7:6] == 2'b11);
+`elsif RA
+  p: assert property (@(posedge clk) !wb_stage_i.r.rdata[0] && wb_stage_i.r.rdata[3]);
+  n: assert property (@(posedge clk) wb_stage_i.r.rdata[0]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind sub chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset

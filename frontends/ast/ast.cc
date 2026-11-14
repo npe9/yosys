@@ -1540,6 +1540,12 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 					d.clear();
 				if (d.size() > 1 && m->unpacked_dimensions <= 0)
 					module->packed_dims[mname] = d;
+				// fe192b: a one-dimensional member not declared [N-1:0]
+				// (`logic [0:3] rdata'): its range, for a reference's
+				// declaration (bit selects through it)
+				if (d.size() == 1 && m->type == AST_STRUCT_ITEM && m->unpacked_dimensions <= 0 &&
+						(std::get<0>(d[0]) != 0 || std::get<2>(d[0])))
+					module->packed_dims[mname] = d;
 				if (m->type != AST_STRUCT_ITEM)
 					member_dims(m.get(), mname + ".");
 			}
@@ -2861,14 +2867,23 @@ static std::string hierref_member_base(const std::string &full, const HierrefMem
 // `rf[3]' of a memory kept as registers: the memory's)
 static PackedDims wire_packed_dims(RTLIL::Wire *w)
 {
+	// fe192b: a one-dimensional wire not declared [N-1:0] (`[0:3]',
+	// `[7:4]'): its range; a reference declared [N-1:0] read it
+	// mirrored or shifted through a bit select
+	auto own_range = [w]() {
+		PackedDims d;
+		if (w && (w->start_offset != 0 || w->upto))
+			d.emplace_back(w->start_offset, w->width, w->upto);
+		return d;
+	};
 	auto am = w ? dynamic_cast<AST::AstModule*>(w->module) : nullptr;
 	if (!am)
-		return PackedDims();
+		return own_range();
 	std::string n = w->name.str();
 	auto it = am->packed_dims.find(n);
 	if (it == am->packed_dims.end() && !n.empty() && n.back() == ']' && n.rfind('[') != std::string::npos)
 		it = am->packed_dims.find(n.substr(0, n.rfind('[')));
-	return it == am->packed_dims.end() ? PackedDims() : it->second;
+	return it == am->packed_dims.end() ? own_range() : it->second;
 }
 
 // fe169: `inst...name' naming an enum item or a parameter of the module the
@@ -3616,6 +3631,12 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 						AstNode::mkconst_int(loc, swapped ? lsb : msb, true), AstNode::mkconst_int(loc, swapped ? msb : lsb, true)));
 			}
 			wire = std::make_unique<AstNode>(loc, AST_WIRE, std::move(mr));
+		} else if (t.dims.size() == 1) {
+			// fe192b: the target's own range (`[0:3]', `[7:4]')
+			int lsb = std::get<0>(t.dims[0]), msb = std::get<0>(t.dims[0]) + std::get<1>(t.dims[0]) - 1;
+			bool swapped = std::get<2>(t.dims[0]);
+			wire = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE,
+					AstNode::mkconst_int(loc, swapped ? lsb : msb, true), AstNode::mkconst_int(loc, swapped ? msb : lsb, true)));
 		} else
 			wire = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE,
 					AstNode::mkconst_int(loc, t.width - 1, true), AstNode::mkconst_int(loc, 0, true)));

@@ -3796,6 +3796,25 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		if (t.is_mem) {
 			IdString attr = IdString("\\sv_degraded");
 			std::string cur = new_module->has_attribute(attr) ? new_module->attributes.at(attr).decode_string() : std::string();
+			// fe195a: the reference is declared now; a read-time "implicitly
+			// declared" entry for it can survive the rederivation (seen for
+			// a module derived with parameters and an interface port) and,
+			// the array being joined per element, flatten never dropped it:
+			// the per-element entries below stand for it
+			{
+				std::string drop = stringf("Identifier `%s' is implicitly declared. @", t.name.c_str()), kept;
+				size_t pos = 0;
+				while (pos <= cur.size()) {
+					size_t next = cur.find("; ", pos);
+					std::string en = cur.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+					if (!en.empty() && en.rfind(drop, 0) != 0)
+						kept += (kept.empty() ? "" : "; ") + en;
+					if (next == std::string::npos)
+						break;
+					pos = next + 2;
+				}
+				cur = kept;
+			}
 			for (int k = std::min(t.mem_left, t.mem_right); k <= std::max(t.mem_left, t.mem_right); k++) {
 				std::string reason = stringf("Hierarchical reference `%s[%d]' is not joined yet. @module %s", t.name.c_str(), k, log_id(new_module->name));
 				if (cur.find(reason) == std::string::npos)

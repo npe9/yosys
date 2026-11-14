@@ -1,0 +1,47 @@
+# fe195a: a whole-array hierarchical reference (fe193) in a module derived
+# with parameters and an interface port kept its read-time "implicitly
+# declared" entry after flatten had joined every element (the array is
+# joined per element, the entry named the whole array): the design stayed
+# degraded.  The entry is now dropped when the reference is declared.
+
+logger -expect log "ic3: m.o.a: proved" 1
+read_verilog -sv -formal -DIFC <<EOT
+// fe195a check: downward whole-array reference held by a derived module
+interface xif; logic [3:0] v; endinterface
+module core(input logic clk);
+  logic [4:0] ra [2];
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+endmodule
+module obs(input logic clk, input logic [4:0] p [2]);
+  a: assert property (@(posedge clk) p[0] == 5'd3 && p[1] == 5'd17);
+endmodule
+`ifdef IFC
+module mid #(parameter P = 1) (input logic clk, xif x);
+`elsif PAR
+module mid #(parameter P = 1) (input logic clk);
+`else
+module mid (input logic clk);
+`endif
+  core c(.clk);
+  obs o(.clk, .p(c.ra));
+endmodule
+module top(input logic clk);
+`ifdef IFC
+  xif xi();
+  mid #(.P(2)) m(.clk, .x(xi));
+`elsif PAR
+  mid #(.P(2)) m(.clk);
+`else
+  mid m(.clk);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected

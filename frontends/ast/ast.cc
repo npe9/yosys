@@ -3302,7 +3302,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	struct Target { std::string name; int width; bool is_signed; std::string up_rest; std::string member_base = std::string(); int member_offset = -1;
 		int up_offset = -1, up_base_width = 0; bool is_const = false; RTLIL::Const value = RTLIL::Const(); PackedDims dims = PackedDims(); bool pending_join = false;
 		std::string slice_of = std::string(); int slice_offset = -1, slice_base_width = 0;
-		bool is_mem = false; int mem_left = 0, mem_right = 0; };
+		bool is_mem = false; int mem_left = 0, mem_right = 0; bool down_join = false; };
 	std::vector<Target> targets;
 	bool any_wide = false, any_up = false, any_member = false;
 	auto mark_members = [&](RTLIL::Module *m) {
@@ -3333,6 +3333,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		if (target && !target->get_bool_attribute(ID(sv_hierref))) {
 			targets.push_back({wire->name.str(), target->width, target->is_signed, std::string()});
 			targets.back().dims = wire_packed_dims(target);
+			targets.back().down_join = true;
 			if (target->width != 1 || target->is_signed || !targets.back().dims.empty())
 				any_wide = true;
 			continue;
@@ -3350,6 +3351,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				std::string base = hierref_member_base(path, mr);
 				targets.push_back({wire->name.str(), mr.width, mr.is_signed, std::string(), base, mr.offset});
 				targets.back().dims = mr.dims;
+				targets.back().down_join = true;
 				if (mr.width != 1 || mr.is_signed || !mr.dims.empty())
 					any_wide = true;
 				any_member = true;
@@ -3393,6 +3395,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 					continue;
 				targets.push_back({"\\" + ename, et->width, et->is_signed, std::string()});
 				targets.back().dims = wire_packed_dims(et);
+				targets.back().down_join = true;
 				any_wide = any_elem = true;
 			}
 			if (any_elem)
@@ -3800,8 +3803,10 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 			}
 			new_module->attributes[attr] = RTLIL::Const(cur);
 		}
+	// fe194: so is a downward reference (a wire, a struct member, an
+	// element): flatten joins it by name; without flatten it is a free wire
 	for (auto &t : targets)
-		if (t.pending_join) {
+		if (t.pending_join || t.down_join) {
 			IdString attr = IdString("\\sv_degraded");
 			std::string cur = new_module->has_attribute(attr) ? new_module->attributes.at(attr).decode_string() : std::string();
 			std::string reason = stringf("Hierarchical reference `%s' is not joined yet. @module %s", t.name.c_str(), log_id(new_module->name));

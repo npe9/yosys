@@ -1,0 +1,102 @@
+# fe194: a downward hierarchical reference (a wire, a packed-struct member,
+# an unpacked element read with a constant index) is joined by flatten by
+# name; until then it is a free wire.  The module now carries "not joined
+# yet" for each, which flatten drops on joining (before, a flow without
+# flatten checked the free wire with no degraded mark: p disproved).
+
+# joined by flatten: no reason left, each value as in the instance
+logger -expect log "ic3: p: proved" 1
+logger -expect log "ic3: n: disproved" 1
+read_verilog -sv -formal <<EOT
+// fe194: downward references (wire, packed-struct member, element) carry
+// "not joined yet" until flatten joins them
+typedef struct packed { logic [3:0] hi; logic [3:0] lo; } pr_t;
+module wb(input logic clk);
+  logic [7:0] w;
+  pr_t s;
+  logic [7:0] arr [2];
+  always_comb begin
+    w = 8'd77; s = '{hi: 4'd9, lo: 4'd3}; arr[0] = 8'd5; arr[1] = 8'd6;
+  end
+endmodule
+module top(input logic clk);
+  wb wb_i(.clk);
+`ifdef KEEP
+  (* keep_hierarchy *) wb wb_k(.clk);
+  p: assert property (@(posedge clk) wb_k.w == 77);
+`else
+  p: assert property (@(posedge clk) wb_i.w == 77 && wb_i.s.hi == 9 && wb_i.arr[1] == 6);
+  n: assert property (@(posedge clk) wb_i.w != 77 || wb_i.s.hi != 9 || wb_i.arr[1] != 6);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# no flatten: each kind carries the reason
+read_verilog -sv -formal <<EOT
+// fe194: downward references (wire, packed-struct member, element) carry
+// "not joined yet" until flatten joins them
+typedef struct packed { logic [3:0] hi; logic [3:0] lo; } pr_t;
+module wb(input logic clk);
+  logic [7:0] w;
+  pr_t s;
+  logic [7:0] arr [2];
+  always_comb begin
+    w = 8'd77; s = '{hi: 4'd9, lo: 4'd3}; arr[0] = 8'd5; arr[1] = 8'd6;
+  end
+endmodule
+module top(input logic clk);
+  wb wb_i(.clk);
+`ifdef KEEP
+  (* keep_hierarchy *) wb wb_k(.clk);
+  p: assert property (@(posedge clk) wb_k.w == 77);
+`else
+  p: assert property (@(posedge clk) wb_i.w == 77 && wb_i.s.hi == 9 && wb_i.arr[1] == 6);
+  n: assert property (@(posedge clk) wb_i.w != 77 || wb_i.s.hi != 9 || wb_i.arr[1] != 6);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-any A:sv_degraded=*wb_i.w'?is?not?joined?yet*
+select -assert-any A:sv_degraded=*wb_i.s.hi'?is?not?joined?yet*
+select -assert-any A:sv_degraded=*wb_i.arr?1?'?is?not?joined?yet*
+design -reset
+
+# an instance flatten keeps (keep_hierarchy): the reason stays
+read_verilog -sv -formal -DKEEP <<EOT
+// fe194: downward references (wire, packed-struct member, element) carry
+// "not joined yet" until flatten joins them
+typedef struct packed { logic [3:0] hi; logic [3:0] lo; } pr_t;
+module wb(input logic clk);
+  logic [7:0] w;
+  pr_t s;
+  logic [7:0] arr [2];
+  always_comb begin
+    w = 8'd77; s = '{hi: 4'd9, lo: 4'd3}; arr[0] = 8'd5; arr[1] = 8'd6;
+  end
+endmodule
+module top(input logic clk);
+  wb wb_i(.clk);
+`ifdef KEEP
+  (* keep_hierarchy *) wb wb_k(.clk);
+  p: assert property (@(posedge clk) wb_k.w == 77);
+`else
+  p: assert property (@(posedge clk) wb_i.w == 77 && wb_i.s.hi == 9 && wb_i.arr[1] == 6);
+  n: assert property (@(posedge clk) wb_i.w != 77 || wb_i.s.hi != 9 || wb_i.arr[1] != 6);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*wb_k.w'?is?not?joined?yet*
+design -reset

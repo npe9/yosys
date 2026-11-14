@@ -514,6 +514,58 @@ struct FlattenWorker
 			}
 		}
 
+		// fe196: a whole-array reference to a memory of this instance (one
+		// the instance keeps as a memory: read with a dynamic index, or
+		// never written), declared by resolve_hierrefs as element wires
+		// `<cell>.<memory>[k]': each reads the memory through a read port
+		// at its constant address, as a read `memory[k]' there does
+		if (!tpl->memories.empty()) {
+			std::string cprefix = concat_name(cell, ID(x), separator).str();
+			cprefix.pop_back();
+			std::vector<RTLIL::Wire*> refs;
+			for (auto w : module->wires())
+				if (w->get_bool_attribute(ID(sv_hierref)) && w->get_bool_attribute(ID::hierconn) && !w->port_input && !w->port_output &&
+						w->name.begins_with(cprefix) && w->name.str().back() == ']')
+					refs.push_back(w);
+			for (auto w : refs) {
+				std::string n = w->name.str();
+				size_t lb = n.rfind('[');
+				if (lb == std::string::npos || lb + 2 > n.size() - 1)
+					continue;
+				std::string idx = n.substr(lb + 1, n.size() - lb - 2);
+				if (idx.find_first_not_of("0123456789") != std::string::npos || idx.size() > 9)
+					continue;
+				int k = std::stoi(idx);
+				IdString mname = "\\" + n.substr(cprefix.size(), lb - cprefix.size());
+				auto mit = tpl->memories.find(mname);
+				if (mit == tpl->memories.end())
+					continue;
+				RTLIL::Memory *tm = mit->second;
+				if (k < tm->start_offset || k >= tm->start_offset + tm->size)
+					continue;
+				w->attributes.erase(ID::hierconn);
+				if (GetSize(w) != tm->width) {
+					log_warning("Hierarchical reference %s.%s is not joined to memory %s.%s (width %d, not %d); it stays a free wire.\n",
+						module, w, tpl, tm->name, tm->width, GetSize(w));
+					continue;
+				}
+				RTLIL::Cell *rd = module->addCell(NEW_ID, ID($memrd));
+				rd->setPort(ID::CLK, RTLIL::SigSpec(RTLIL::State::Sx, 1));
+				rd->setPort(ID::EN, RTLIL::SigSpec(RTLIL::State::Sx, 1));
+				rd->setPort(ID::ADDR, RTLIL::Const(k, 32));
+				rd->setPort(ID::DATA, w);
+				rd->parameters[ID::MEMID] = RTLIL::Const(memory_map.at(mname).str());
+				rd->parameters[ID::ABITS] = RTLIL::Const(32);
+				rd->parameters[ID::WIDTH] = RTLIL::Const(tm->width);
+				rd->parameters[ID::CLK_ENABLE] = RTLIL::Const(0);
+				rd->parameters[ID::CLK_POLARITY] = RTLIL::Const(0);
+				rd->parameters[ID::TRANSPARENT] = RTLIL::Const(0);
+				log("Joining hierarchical reference %s.%s to memory %s at address %d.\n", log_id(module), log_id(w), log_id(memory_map.at(mname)), k);
+				w->attributes.erase(ID(sv_hierref));
+				drop_hierref_degradation(module, w->name);
+			}
+		}
+
 		// the pending mark of expand_interfaces holds until every member
 		// is joined
 		if (intf_instance && intf_all_joined)

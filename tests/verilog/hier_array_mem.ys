@@ -1,0 +1,661 @@
+# fe196: a hierarchical reference to a whole 1-D unpacked array that the
+# instance keeps as a memory (read there with a dynamic index, or never
+# written: cv32e40s_wrapper's .csr_pmpncfg_q_i(core_i.cs_registers_i.pmpncfg_q)
+# with PMP_NUM_REGIONS = 0) was an implicit 1-bit wire.  It is now declared
+# with the memory's declared range; flatten reads each element through a
+# read port at its constant address, so the reference and the instance's
+# own reads see one memory.
+
+# joined: written with a dynamic index, read there with one
+logger -expect log "ic3: k.p: proved" 1
+logger -expect log "ic3: k.w: proved" 1
+logger -expect log "ic3: k.n: disproved" 1
+read_verilog -sv -formal <<EOT
+// fe196 edge cases: a whole-array reference to a memory the instance keeps
+module csr #(parameter int N = 4) (input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa,
+                                    input logic [7:0] wd, output logic [7:0] rd);
+`ifdef GEN
+  if (1) begin : g
+    logic [7:0] q [N];
+    always_ff @(posedge clk) if (we) q[wa] <= wd;
+    assign rd = q[ra];
+  end
+`else
+  logic [7:0] q [N];
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           input logic [7:0] rd, input logic [7:0] c [4]);
+  p: assert property (@(posedge clk) rd == c[ra]);
+  w: assert property (@(posedge clk) we && wa == 2'd2 |=> c[2] == $past(wd));
+  n: assert property (@(posedge clk) rd == c[0]);
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+`ifdef PAR
+  csr #(.N(4)) cs_i(.*);
+`else
+  csr cs_i(.*);
+`endif
+endmodule
+`ifdef GEN
+ `define REF core_i.cs_i.g.q
+`else
+ `define REF core_i.cs_i.q
+`endif
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+`ifdef BIND
+  // evaluated in csr's scope: core_i is an instance two scopes up (fe195)
+  bind csr: core_i.cs_i chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(core_i.cs_i.q));
+`else
+  chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(`REF));
+`endif
+`ifdef MIXED
+  // also read with a constant index through the same name: stays degraded
+  m: assert property (@(posedge clk) core_i.cs_i.q[1] == core_i.cs_i.q[1]);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+memory
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: declared [4:1] (c[0] is q[4])
+logger -expect log "ic3: k.p: proved" 1
+logger -expect log "ic3: k.n: disproved" 1
+read_verilog -sv -formal -DDESC -DMEMW <<EOT
+// fe196: whole-array reference to a memory the instance keeps (pmpncfg_q in
+// cv32e40s_cs_registers with PMP_NUM_REGIONS = 0: never written, read with a
+// dynamic index).  MEMW: written in always_ff with a dynamic index.
+module csr(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           output logic [7:0] rd);
+`ifdef DESC
+  logic [7:0] q [4:1];
+`elsif SIGNED
+  logic signed [7:0] q [4];
+`elsif PK2
+  logic [1:0][3:0] q [4];
+`else
+  logic [7:0] q [4];
+`endif
+`ifdef MEMW
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+`endif
+`ifdef DESC
+  assign rd = q[ra + 1];
+`else
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic [7:0] rd, input logic [7:0] c [4]);
+  // the reference and the instance's own read see one memory
+`ifdef DESC
+  // c[0] is q[4] ... c[3] is q[1]; rd is q[ra+1]
+  p: assert property (@(posedge clk) ra == 2'd3 |-> rd == c[0]);
+  n: assert property (@(posedge clk) ra == 2'd3 |-> rd == c[3]);
+`else
+  p: assert property (@(posedge clk) rd == c[ra]);
+  n: assert property (@(posedge clk) rd == c[0]);
+`endif
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  csr cs_i(.*);
+endmodule
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+  chk k(.clk, .ra, .rd, .c(core_i.cs_i.q));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+memory
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: signed elements
+logger -expect log "ic3: k.p: proved" 1
+logger -expect log "ic3: k.n: disproved" 1
+read_verilog -sv -formal -DSIGNED -DMEMW <<EOT
+// fe196: whole-array reference to a memory the instance keeps (pmpncfg_q in
+// cv32e40s_cs_registers with PMP_NUM_REGIONS = 0: never written, read with a
+// dynamic index).  MEMW: written in always_ff with a dynamic index.
+module csr(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           output logic [7:0] rd);
+`ifdef DESC
+  logic [7:0] q [4:1];
+`elsif SIGNED
+  logic signed [7:0] q [4];
+`elsif PK2
+  logic [1:0][3:0] q [4];
+`else
+  logic [7:0] q [4];
+`endif
+`ifdef MEMW
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+`endif
+`ifdef DESC
+  assign rd = q[ra + 1];
+`else
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic [7:0] rd, input logic [7:0] c [4]);
+  // the reference and the instance's own read see one memory
+`ifdef DESC
+  // c[0] is q[4] ... c[3] is q[1]; rd is q[ra+1]
+  p: assert property (@(posedge clk) ra == 2'd3 |-> rd == c[0]);
+  n: assert property (@(posedge clk) ra == 2'd3 |-> rd == c[3]);
+`else
+  p: assert property (@(posedge clk) rd == c[ra]);
+  n: assert property (@(posedge clk) rd == c[0]);
+`endif
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  csr cs_i(.*);
+endmodule
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+  chk k(.clk, .ra, .rd, .c(core_i.cs_i.q));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+memory
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: a memory in a generate scope
+logger -expect log "ic3: k.p: proved" 1
+logger -expect log "ic3: k.w: proved" 1
+logger -expect log "ic3: k.n: disproved" 1
+read_verilog -sv -formal -DGEN <<EOT
+// fe196 edge cases: a whole-array reference to a memory the instance keeps
+module csr #(parameter int N = 4) (input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa,
+                                    input logic [7:0] wd, output logic [7:0] rd);
+`ifdef GEN
+  if (1) begin : g
+    logic [7:0] q [N];
+    always_ff @(posedge clk) if (we) q[wa] <= wd;
+    assign rd = q[ra];
+  end
+`else
+  logic [7:0] q [N];
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           input logic [7:0] rd, input logic [7:0] c [4]);
+  p: assert property (@(posedge clk) rd == c[ra]);
+  w: assert property (@(posedge clk) we && wa == 2'd2 |=> c[2] == $past(wd));
+  n: assert property (@(posedge clk) rd == c[0]);
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+`ifdef PAR
+  csr #(.N(4)) cs_i(.*);
+`else
+  csr cs_i(.*);
+`endif
+endmodule
+`ifdef GEN
+ `define REF core_i.cs_i.g.q
+`else
+ `define REF core_i.cs_i.q
+`endif
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+`ifdef BIND
+  // evaluated in csr's scope: core_i is an instance two scopes up (fe195)
+  bind csr: core_i.cs_i chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(core_i.cs_i.q));
+`else
+  chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(`REF));
+`endif
+`ifdef MIXED
+  // also read with a constant index through the same name: stays degraded
+  m: assert property (@(posedge clk) core_i.cs_i.q[1] == core_i.cs_i.q[1]);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+memory
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: a module derived with parameters
+logger -expect log "ic3: k.p: proved" 1
+logger -expect log "ic3: k.w: proved" 1
+logger -expect log "ic3: k.n: disproved" 1
+read_verilog -sv -formal -DPAR <<EOT
+// fe196 edge cases: a whole-array reference to a memory the instance keeps
+module csr #(parameter int N = 4) (input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa,
+                                    input logic [7:0] wd, output logic [7:0] rd);
+`ifdef GEN
+  if (1) begin : g
+    logic [7:0] q [N];
+    always_ff @(posedge clk) if (we) q[wa] <= wd;
+    assign rd = q[ra];
+  end
+`else
+  logic [7:0] q [N];
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           input logic [7:0] rd, input logic [7:0] c [4]);
+  p: assert property (@(posedge clk) rd == c[ra]);
+  w: assert property (@(posedge clk) we && wa == 2'd2 |=> c[2] == $past(wd));
+  n: assert property (@(posedge clk) rd == c[0]);
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+`ifdef PAR
+  csr #(.N(4)) cs_i(.*);
+`else
+  csr cs_i(.*);
+`endif
+endmodule
+`ifdef GEN
+ `define REF core_i.cs_i.g.q
+`else
+ `define REF core_i.cs_i.q
+`endif
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+`ifdef BIND
+  // evaluated in csr's scope: core_i is an instance two scopes up (fe195)
+  bind csr: core_i.cs_i chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(core_i.cs_i.q));
+`else
+  chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(`REF));
+`endif
+`ifdef MIXED
+  // also read with a constant index through the same name: stays degraded
+  m: assert property (@(posedge clk) core_i.cs_i.q[1] == core_i.cs_i.q[1]);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+memory
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: upward (fe195), a bound checker's port
+logger -expect log "ic3: core_i.cs_i.k.p: proved" 1
+logger -expect log "ic3: core_i.cs_i.k.w: proved" 1
+logger -expect log "ic3: core_i.cs_i.k.n: disproved" 1
+read_verilog -sv -formal -DBIND <<EOT
+// fe196 edge cases: a whole-array reference to a memory the instance keeps
+module csr #(parameter int N = 4) (input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa,
+                                    input logic [7:0] wd, output logic [7:0] rd);
+`ifdef GEN
+  if (1) begin : g
+    logic [7:0] q [N];
+    always_ff @(posedge clk) if (we) q[wa] <= wd;
+    assign rd = q[ra];
+  end
+`else
+  logic [7:0] q [N];
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           input logic [7:0] rd, input logic [7:0] c [4]);
+  p: assert property (@(posedge clk) rd == c[ra]);
+  w: assert property (@(posedge clk) we && wa == 2'd2 |=> c[2] == $past(wd));
+  n: assert property (@(posedge clk) rd == c[0]);
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+`ifdef PAR
+  csr #(.N(4)) cs_i(.*);
+`else
+  csr cs_i(.*);
+`endif
+endmodule
+`ifdef GEN
+ `define REF core_i.cs_i.g.q
+`else
+ `define REF core_i.cs_i.q
+`endif
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+`ifdef BIND
+  // evaluated in csr's scope: core_i is an instance two scopes up (fe195)
+  bind csr: core_i.cs_i chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(core_i.cs_i.q));
+`else
+  chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(`REF));
+`endif
+`ifdef MIXED
+  // also read with a constant index through the same name: stays degraded
+  m: assert property (@(posedge clk) core_i.cs_i.q[1] == core_i.cs_i.q[1]);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+memory
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: never written (read there with a dynamic index only; the
+# reference reads the same memory as that read)
+logger -expect log "Joining hierarchical reference top.core_i.cs_i.q.3. to memory" 1
+read_verilog -sv -formal <<EOT
+// fe196: whole-array reference to a memory the instance keeps (pmpncfg_q in
+// cv32e40s_cs_registers with PMP_NUM_REGIONS = 0: never written, read with a
+// dynamic index).  MEMW: written in always_ff with a dynamic index.
+module csr(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           output logic [7:0] rd);
+`ifdef DESC
+  logic [7:0] q [4:1];
+`elsif SIGNED
+  logic signed [7:0] q [4];
+`elsif PK2
+  logic [1:0][3:0] q [4];
+`else
+  logic [7:0] q [4];
+`endif
+`ifdef MEMW
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+`endif
+`ifdef DESC
+  assign rd = q[ra + 1];
+`else
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic [7:0] rd, input logic [7:0] c [4]);
+  // the reference and the instance's own read see one memory
+`ifdef DESC
+  // c[0] is q[4] ... c[3] is q[1]; rd is q[ra+1]
+  p: assert property (@(posedge clk) ra == 2'd3 |-> rd == c[0]);
+  n: assert property (@(posedge clk) ra == 2'd3 |-> rd == c[3]);
+`else
+  p: assert property (@(posedge clk) rd == c[ra]);
+  n: assert property (@(posedge clk) rd == c[0]);
+`endif
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  csr cs_i(.*);
+endmodule
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+  chk k(.clk, .ra, .rd, .c(core_i.cs_i.q));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+logger -check-expected
+design -reset
+
+# degraded without flatten: each element is not joined yet
+read_verilog -sv -formal <<EOT
+// fe196 edge cases: a whole-array reference to a memory the instance keeps
+module csr #(parameter int N = 4) (input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa,
+                                    input logic [7:0] wd, output logic [7:0] rd);
+`ifdef GEN
+  if (1) begin : g
+    logic [7:0] q [N];
+    always_ff @(posedge clk) if (we) q[wa] <= wd;
+    assign rd = q[ra];
+  end
+`else
+  logic [7:0] q [N];
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           input logic [7:0] rd, input logic [7:0] c [4]);
+  p: assert property (@(posedge clk) rd == c[ra]);
+  w: assert property (@(posedge clk) we && wa == 2'd2 |=> c[2] == $past(wd));
+  n: assert property (@(posedge clk) rd == c[0]);
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+`ifdef PAR
+  csr #(.N(4)) cs_i(.*);
+`else
+  csr cs_i(.*);
+`endif
+endmodule
+`ifdef GEN
+ `define REF core_i.cs_i.g.q
+`else
+ `define REF core_i.cs_i.q
+`endif
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+`ifdef BIND
+  // evaluated in csr's scope: core_i is an instance two scopes up (fe195)
+  bind csr: core_i.cs_i chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(core_i.cs_i.q));
+`else
+  chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(`REF));
+`endif
+`ifdef MIXED
+  // also read with a constant index through the same name: stays degraded
+  m: assert property (@(posedge clk) core_i.cs_i.q[1] == core_i.cs_i.q[1]);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-any A:sv_degraded=*q?3???is?not?joined?yet*
+design -reset
+
+# degraded: elements of two packed dimensions
+read_verilog -sv -formal -DPK2 <<EOT
+// fe196: whole-array reference to a memory the instance keeps (pmpncfg_q in
+// cv32e40s_cs_registers with PMP_NUM_REGIONS = 0: never written, read with a
+// dynamic index).  MEMW: written in always_ff with a dynamic index.
+module csr(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           output logic [7:0] rd);
+`ifdef DESC
+  logic [7:0] q [4:1];
+`elsif SIGNED
+  logic signed [7:0] q [4];
+`elsif PK2
+  logic [1:0][3:0] q [4];
+`else
+  logic [7:0] q [4];
+`endif
+`ifdef MEMW
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+`endif
+`ifdef DESC
+  assign rd = q[ra + 1];
+`else
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic [7:0] rd, input logic [7:0] c [4]);
+  // the reference and the instance's own read see one memory
+`ifdef DESC
+  // c[0] is q[4] ... c[3] is q[1]; rd is q[ra+1]
+  p: assert property (@(posedge clk) ra == 2'd3 |-> rd == c[0]);
+  n: assert property (@(posedge clk) ra == 2'd3 |-> rd == c[3]);
+`else
+  p: assert property (@(posedge clk) rd == c[ra]);
+  n: assert property (@(posedge clk) rd == c[0]);
+`endif
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  csr cs_i(.*);
+endmodule
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+  chk k(.clk, .ra, .rd, .c(core_i.cs_i.q));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*implicitly?declared*
+design -reset
+
+# degraded: also read with a constant index through the same name
+read_verilog -sv -formal -DMIXED <<EOT
+// fe196 edge cases: a whole-array reference to a memory the instance keeps
+module csr #(parameter int N = 4) (input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa,
+                                    input logic [7:0] wd, output logic [7:0] rd);
+`ifdef GEN
+  if (1) begin : g
+    logic [7:0] q [N];
+    always_ff @(posedge clk) if (we) q[wa] <= wd;
+    assign rd = q[ra];
+  end
+`else
+  logic [7:0] q [N];
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+  assign rd = q[ra];
+`endif
+endmodule
+module chk(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd,
+           input logic [7:0] rd, input logic [7:0] c [4]);
+  p: assert property (@(posedge clk) rd == c[ra]);
+  w: assert property (@(posedge clk) we && wa == 2'd2 |=> c[2] == $past(wd));
+  n: assert property (@(posedge clk) rd == c[0]);
+endmodule
+module core(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+`ifdef PAR
+  csr #(.N(4)) cs_i(.*);
+`else
+  csr cs_i(.*);
+`endif
+endmodule
+`ifdef GEN
+ `define REF core_i.cs_i.g.q
+`else
+ `define REF core_i.cs_i.q
+`endif
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  core core_i(.*);
+`ifdef BIND
+  // evaluated in csr's scope: core_i is an instance two scopes up (fe195)
+  bind csr: core_i.cs_i chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(core_i.cs_i.q));
+`else
+  chk k(.clk, .ra, .we, .wa, .wd, .rd, .c(`REF));
+`endif
+`ifdef MIXED
+  // also read with a constant index through the same name: stays degraded
+  m: assert property (@(posedge clk) core_i.cs_i.q[1] == core_i.cs_i.q[1]);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*implicitly?declared*
+design -reset
+
+# degraded: a kept 2-D unpacked memory
+read_verilog -sv -formal -DTWOD <<EOT
+// fe196 reject shapes, kept memories: TWOD unpacked [2][3]; ASCE elements [0:7]
+module csr(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+`ifdef TWOD
+  logic [7:0] q [2][3];
+  always_ff @(posedge clk) if (we) q[wa[0]][wa] <= wd;
+  assign rd = q[ra[0]][ra];
+`else
+  logic [0:7] q [4];
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+  assign rd = q[ra];
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  csr cs_i(.*);
+`ifdef TWOD
+  logic [7:0] c [2][3];
+`else
+  logic [0:7] c [4];
+`endif
+  assign c = cs_i.q;
+`ifdef TWOD
+  p: assert property (@(posedge clk) ra[0] == 1'b1 && ra == 2'd1 |-> rd == c[1][1]);
+`else
+  // c[k][0] is the msb of q[k] both ways
+  p: assert property (@(posedge clk) rd == c[ra]);
+  b: assert property (@(posedge clk) rd[0] == c[ra][0]);
+  n: assert property (@(posedge clk) rd == c[0]);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*implicitly?declared*
+design -reset
+
+# degraded: elements declared [0:7]
+read_verilog -sv -formal -DASCE <<EOT
+// fe196 reject shapes, kept memories: TWOD unpacked [2][3]; ASCE elements [0:7]
+module csr(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+`ifdef TWOD
+  logic [7:0] q [2][3];
+  always_ff @(posedge clk) if (we) q[wa[0]][wa] <= wd;
+  assign rd = q[ra[0]][ra];
+`else
+  logic [0:7] q [4];
+  always_ff @(posedge clk) if (we) q[wa] <= wd;
+  assign rd = q[ra];
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] ra, input logic we, input logic [1:0] wa, input logic [7:0] wd, output logic [7:0] rd);
+  csr cs_i(.*);
+`ifdef TWOD
+  logic [7:0] c [2][3];
+`else
+  logic [0:7] c [4];
+`endif
+  assign c = cs_i.q;
+`ifdef TWOD
+  p: assert property (@(posedge clk) ra[0] == 1'b1 && ra == 2'd1 |-> rd == c[1][1]);
+`else
+  // c[k][0] is the msb of q[k] both ways
+  p: assert property (@(posedge clk) rd == c[ra]);
+  b: assert property (@(posedge clk) rd[0] == c[ra][0]);
+  n: assert property (@(posedge clk) rd == c[0]);
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*implicitly?declared*
+design -reset

@@ -1582,6 +1582,19 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 				if (d.size() > 1)
 					module->packed_dims[node->str] = d;
 			}
+		for (const auto &node : ast->children)
+			if (node->type == AST_MEMORY && node->children.size() == 2 && node->children[0] && node->children[1] &&
+					node->children[0]->type == AST_RANGE && node->children[1]->type == AST_RANGE &&
+					node->children[0]->range_valid && node->children[1]->range_valid &&
+					node->children[0]->range_right == 0 && node->children[0]->range_left >= 0 &&
+					!node->children[0]->range_swapped && packed_of(node.get()).size() <= 1 && node->unpacked_dimensions <= 1)
+			{
+				// the declared order, as fe193's sv_mem_left/right
+				int ml = node->children[1]->range_left, mr = node->children[1]->range_right;
+				if (node->children[1]->range_swapped)
+					std::swap(ml, mr);
+				module->mem_shapes[node->str] = {ml, mr, node->is_signed};
+			}
 	}
 	module->ast = std::move(ast_before_simplify);
 	module->nolatches = flag_nolatches;
@@ -3088,8 +3101,22 @@ static bool walk_hierref_array(RTLIL::Design *design, RTLIL::Module *mod, const 
 			e0 = w;
 			break;
 		}
-	if (!e0)
-		return false;
+	if (!e0) {
+		// fe196: a memory of the instance (cv32e40s_cs_registers'
+		// pmpncfg_q, read there with a dynamic index): flatten reads each
+		// element through a read port at its constant address
+		auto am = dynamic_cast<AST::AstModule*>(owner);
+		auto mit = owner->memories.find(RTLIL::escape_id(local));
+		if (!am || mit == owner->memories.end())
+			return false;
+		auto sit = am->mem_shapes.find(mit->first.str());
+		if (sit == am->mem_shapes.end())
+			return false;
+		std::tie(a.left, a.right, a.is_signed) = sit->second;
+		a.width = mit->second->width, a.dims.clear();
+		int lo = std::min(a.left, a.right), hi = std::max(a.left, a.right);
+		return lo >= 0 && hi - lo + 1 <= 4096 && lo == mit->second->start_offset && hi - lo + 1 == mit->second->size && a.width > 0;
+	}
 	a.left = e0->attributes.at(ID(sv_mem_left)).as_int(true);
 	a.right = e0->attributes.at(ID(sv_mem_right)).as_int(true);
 	a.width = e0->width, a.is_signed = e0->is_signed, a.dims = wire_packed_dims(e0);
@@ -4578,6 +4605,7 @@ RTLIL::Module *AstModule::clone() const
 	new_mod->struct_elem_members = struct_elem_members;
 	new_mod->enum_items = enum_items;
 	new_mod->packed_dims = packed_dims;
+	new_mod->mem_shapes = mem_shapes;
 
 	return new_mod;
 }

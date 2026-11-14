@@ -437,6 +437,12 @@ namespace AST
 		// with more than one, so a hierarchical reference to one is
 		// declared alike and `ref[i]' is an element, not a bit
 		std::map<std::string, std::vector<std::tuple<int, int, bool>>> packed_dims;
+		// fe196: the memories (1-D unpacked arrays kept as an RTLIL memory,
+		// e.g. read with a dynamic index, or never written) with elements
+		// of one packed dimension [N-1:0]: their declared unpacked range
+		// (left, right) and the elements' signedness, which the RTLIL
+		// memory does not keep, so a whole-array reference is declared alike
+		std::map<std::string, std::tuple<int, int, bool>> mem_shapes;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, bool mayfail) override;
 		RTLIL::IdString derive(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, const dict<RTLIL::IdString, RTLIL::Module*> &interfaces, const dict<RTLIL::IdString, RTLIL::IdString> &modports, bool mayfail) override;
 		std::string derive_common(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Const> &parameters, std::unique_ptr<AstNode>* new_ast_out, bool quiet = false);

@@ -516,7 +516,7 @@ flatten
 select -assert-any A:sv_degraded
 design -reset
 
-# degraded: a real memory there
+# joined (fe196): a real memory there, read through a read port per element
 read_verilog -sv -formal -DMEM <<EOT
 // fe195 edge cases
 module ids(input logic clk);
@@ -577,7 +577,8 @@ EOT
 hierarchy -top top
 proc
 flatten
-select -assert-any A:sv_degraded
+select -assert-none A:sv_degraded
+select -assert-count 4 t:$memrd
 design -reset
 
 # degraded: the head's arrays differ between the chains

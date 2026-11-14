@@ -227,7 +227,8 @@ flatten
 select -assert-any A:sv_degraded=*implicitly?declared*
 design -reset
 
-# degraded: the instance keeps a real memory (no element wires)
+# joined (fe196): the instance keeps a real memory (no element wires); each
+# element reads it through a read port at its address
 read_verilog -sv -formal -DMEM <<EOT
 typedef struct packed { logic l; logic [6:0] v; } cfg_t;
 module regs(input logic clk, input logic [1:0] wa, input logic [7:0] wd);
@@ -294,7 +295,8 @@ EOT
 hierarchy -top top
 proc
 flatten
-select -assert-any A:sv_degraded=*implicitly?declared*
+select -assert-none A:sv_degraded
+select -assert-count 256 t:$memrd
 design -reset
 
 # degraded: a 2-D unpacked array

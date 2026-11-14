@@ -270,7 +270,11 @@ struct FlattenWorker
 			add(conn.first);
 		for (auto c : m->cells())
 			for (auto &conn : c->connections())
-				if (!yosys_celltypes.cell_known(c->type) || yosys_celltypes.cell_output(c->type, conn.first))
+				// fe192: a `\$sva' cell (before sva2check) drives only its
+				// Y: a reference an assertion reads directly
+				// (`wb_stage_i.vec[3]') is not written
+				if (c->type == "\\$sva" ? conn.first == ID::Y :
+						(!yosys_celltypes.cell_known(c->type) || yosys_celltypes.cell_output(c->type, conn.first)))
 					add(conn.second);
 		std::function<void(RTLIL::CaseRule*)> walk = [&](RTLIL::CaseRule *cr) {
 			for (auto &a : cr->actions)

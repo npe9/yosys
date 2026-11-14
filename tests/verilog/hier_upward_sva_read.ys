@@ -1,0 +1,65 @@
+# fe192a: flatten counted every connection of a `\$sva' cell (an assertion
+# before sva2check) as a driver, so an upward reference an assertion read
+# directly (`wb_stage_i.flag', the head two scopes up, fe190) was never
+# forwarded and stayed a degraded free wire.  A `\$sva' cell drives only Y.
+# a 1-bit reference as the property
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DFLAG <<EOT
+module wb(input logic clk); logic flag; assign flag = 1'b1; logic [3:0] v; assign v = 4'd9; endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef FLAG
+  p: assert property (@(posedge clk) wb_stage_i.flag);
+  n: assert property (@(posedge clk) !wb_stage_i.flag);
+`elsif SEQ
+  p: assert property (@(posedge clk) wb_stage_i.flag ##1 wb_stage_i.flag);
+  n: assert property (@(posedge clk) wb_stage_i.flag ##1 !wb_stage_i.flag);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.v == 4'd9 ##1 wb_stage_i.v[3]);
+  n: assert property (@(posedge clk) wb_stage_i.v[1]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind sub chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# a 1-bit reference in a sequence
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DSEQ <<EOT
+module wb(input logic clk); logic flag; assign flag = 1'b1; logic [3:0] v; assign v = 4'd9; endmodule
+module sub(input logic clk); endmodule
+module chk(input logic clk);
+`ifdef FLAG
+  p: assert property (@(posedge clk) wb_stage_i.flag);
+  n: assert property (@(posedge clk) !wb_stage_i.flag);
+`elsif SEQ
+  p: assert property (@(posedge clk) wb_stage_i.flag ##1 wb_stage_i.flag);
+  n: assert property (@(posedge clk) wb_stage_i.flag ##1 !wb_stage_i.flag);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.v == 4'd9 ##1 wb_stage_i.v[3]);
+  n: assert property (@(posedge clk) wb_stage_i.v[1]);
+`endif
+endmodule
+module mid(input logic clk); wb wb_stage_i(.clk); sub sub_i(.clk); endmodule
+module top(input logic clk); mid mid_i(.clk); bind sub chk c(.clk); endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset

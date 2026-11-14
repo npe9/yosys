@@ -1,0 +1,827 @@
+# fe191: an interface port connected to a hierarchical name of an interface
+# instance (`.m(core_i.i)'; cv32e40s binds load_store_unit_sva with
+# `.m_c_obi_data_if(core_i.m_c_obi_data_if)', core_i two scopes above the
+# bind target) was an implicit 1-bit net: the port was never expanded and
+# every member the sub-module read was a free wire.  hierarchy now finds the
+# instance (downward, else upward by IEEE 1800-2017 23.8: the nearest scope
+# holding the head) and connects each member the sub-module uses to a
+# reference `path.member', which flatten joins (forwarding it upward when
+# the instance is further up).  Until joined the module carries an
+# sv_degraded reason.
+
+# downward, one level: a packed-struct member (m.s.req) and a vector
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DV1 <<EOT
+typedef struct packed { logic req; logic [1:0] k; } req_t;
+interface ifc; req_t s; logic [3:0] a; modport mon(input s, a); modport mst(output s, a); endinterface
+module lsu(input logic clk); endmodule
+module chk(input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.s.req == 1'b1 && m.a == 4'd9);
+  n: assert property (@(posedge clk) m.a != 4'd9);
+endmodule
+module core(input logic clk);
+  ifc i();
+  assign i.s = '{req: 1'b1, k: 2'd2};
+  assign i.a = 4'd9;
+  lsu l(.clk(clk));
+endmodule
+module top(input logic clk);
+  core core_i(.clk(clk));
+  // V selects the variant
+`ifdef V0  // local interface in top, direct instance
+  ifc i0();
+  assign i0.s = '{req: 1'b1, k: 2'd2};
+  assign i0.a = 4'd9;
+  chk c(.clk(clk), .m(i0));
+`elsif V1  // direct instantiation in top, hierarchical interface connection one level down
+  chk c(.clk(clk), .m(core_i.i));
+`elsif V2  // bind into core, local interface instance
+  bind core chk c(.clk(clk), .m(i));
+`elsif V3  // bind into lsu, upward reference to the interface instance (cv32e40s shape)
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# upward, two scopes above the bind target (the cv32e40s shape)
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DV3 <<EOT
+typedef struct packed { logic req; logic [1:0] k; } req_t;
+interface ifc; req_t s; logic [3:0] a; modport mon(input s, a); modport mst(output s, a); endinterface
+module lsu(input logic clk); endmodule
+module chk(input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.s.req == 1'b1 && m.a == 4'd9);
+  n: assert property (@(posedge clk) m.a != 4'd9);
+endmodule
+module core(input logic clk);
+  ifc i();
+  assign i.s = '{req: 1'b1, k: 2'd2};
+  assign i.a = 4'd9;
+  lsu l(.clk(clk));
+endmodule
+module top(input logic clk);
+  core core_i(.clk(clk));
+  // V selects the variant
+`ifdef V0  // local interface in top, direct instance
+  ifc i0();
+  assign i0.s = '{req: 1'b1, k: 2'd2};
+  assign i0.a = 4'd9;
+  chk c(.clk(clk), .m(i0));
+`elsif V1  // direct instantiation in top, hierarchical interface connection one level down
+  chk c(.clk(clk), .m(core_i.i));
+`elsif V2  // bind into core, local interface instance
+  bind core chk c(.clk(clk), .m(i));
+`elsif V3  // bind into lsu, upward reference to the interface instance (cv32e40s shape)
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the nearest scope holding `core_i' wins (mid.core_i.i = 7, not top.core_i.i = 9)
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DA2 <<EOT
+interface ifc #(parameter W = 4); logic [W-1:0] a; logic b; modport mon(input a, b); modport mon2(input a); modport mst(output a, b); endinterface
+module lsu(input logic clk); endmodule
+module chk #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == V);
+  n: assert property (@(posedge clk) m.a != V);
+endmodule
+module chk2(input logic clk, ifc.mon2 m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+endmodule
+module drv(input logic clk, ifc.mst m);
+  assign m.a = 4'd3;
+  p: assert property (@(posedge clk) m.a == 4'd3);
+endmodule
+module core #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk);
+  ifc #(.W(W)) i();
+  assign i.a = V;
+  assign i.b = 1'b0;
+  lsu l(.clk(clk));
+endmodule
+module coreport(input logic clk, ifc.mst i);
+  assign i.a = 4'd9;
+  assign i.b = 1'b1;
+  lsu l(.clk(clk));
+endmodule
+module lsu2(input logic clk); endmodule
+module core2(input logic clk);
+  ifc i();
+  assign i.a = 4'd7;
+  assign i.b = 1'b0;
+  lsu2 l(.clk(clk));
+endmodule
+module mid(input logic clk);
+  core2 core_i(.clk(clk));
+endmodule
+module top(input logic clk);
+`ifdef A1   // not an interface instance: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.l));
+`elsif A2   // nearest scope: mid.core_i.i (7), not top.core_i.i (9)
+  core core_i(.clk(clk));
+  mid m(.clk(clk));
+  bind lsu2 chk #(.V(4'd7)) c(.clk(clk), .m(core_i.i));
+`elsif A3   // parameterized interface, 8 bits
+  core #(.W(8), .V(8'd200)) core_i(.clk(clk));
+  bind lsu chk #(.W(8), .V(8'd200)) c(.clk(clk), .m(core_i.i));
+`elsif A4   // downward miss: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.k));
+`elsif A7   // narrower modport: a only
+  core core_i(.clk(clk));
+  bind lsu chk2 c(.clk(clk), .m(core_i.i));
+`elsif A6   // a driver through the reference: second driver of i.a, upward -> stays degraded
+  core core_i(.clk(clk));
+  bind lsu drv c(.clk(clk), .m(core_i.i));
+`elsif A9   // the instance is an interface port of core_i
+  ifc ti();
+  coreport core_i(.clk(clk), .i(ti));
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# a parameterized interface (8-bit member)
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DA3 <<EOT
+interface ifc #(parameter W = 4); logic [W-1:0] a; logic b; modport mon(input a, b); modport mon2(input a); modport mst(output a, b); endinterface
+module lsu(input logic clk); endmodule
+module chk #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == V);
+  n: assert property (@(posedge clk) m.a != V);
+endmodule
+module chk2(input logic clk, ifc.mon2 m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+endmodule
+module drv(input logic clk, ifc.mst m);
+  assign m.a = 4'd3;
+  p: assert property (@(posedge clk) m.a == 4'd3);
+endmodule
+module core #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk);
+  ifc #(.W(W)) i();
+  assign i.a = V;
+  assign i.b = 1'b0;
+  lsu l(.clk(clk));
+endmodule
+module coreport(input logic clk, ifc.mst i);
+  assign i.a = 4'd9;
+  assign i.b = 1'b1;
+  lsu l(.clk(clk));
+endmodule
+module lsu2(input logic clk); endmodule
+module core2(input logic clk);
+  ifc i();
+  assign i.a = 4'd7;
+  assign i.b = 1'b0;
+  lsu2 l(.clk(clk));
+endmodule
+module mid(input logic clk);
+  core2 core_i(.clk(clk));
+endmodule
+module top(input logic clk);
+`ifdef A1   // not an interface instance: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.l));
+`elsif A2   // nearest scope: mid.core_i.i (7), not top.core_i.i (9)
+  core core_i(.clk(clk));
+  mid m(.clk(clk));
+  bind lsu2 chk #(.V(4'd7)) c(.clk(clk), .m(core_i.i));
+`elsif A3   // parameterized interface, 8 bits
+  core #(.W(8), .V(8'd200)) core_i(.clk(clk));
+  bind lsu chk #(.W(8), .V(8'd200)) c(.clk(clk), .m(core_i.i));
+`elsif A4   // downward miss: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.k));
+`elsif A7   // narrower modport: a only
+  core core_i(.clk(clk));
+  bind lsu chk2 c(.clk(clk), .m(core_i.i));
+`elsif A6   // a driver through the reference: second driver of i.a, upward -> stays degraded
+  core core_i(.clk(clk));
+  bind lsu drv c(.clk(clk), .m(core_i.i));
+`elsif A9   // the instance is an interface port of core_i
+  ifc ti();
+  coreport core_i(.clk(clk), .i(ti));
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the instance is an interface port of core_i
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DA9 <<EOT
+interface ifc #(parameter W = 4); logic [W-1:0] a; logic b; modport mon(input a, b); modport mon2(input a); modport mst(output a, b); endinterface
+module lsu(input logic clk); endmodule
+module chk #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == V);
+  n: assert property (@(posedge clk) m.a != V);
+endmodule
+module chk2(input logic clk, ifc.mon2 m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+endmodule
+module drv(input logic clk, ifc.mst m);
+  assign m.a = 4'd3;
+  p: assert property (@(posedge clk) m.a == 4'd3);
+endmodule
+module core #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk);
+  ifc #(.W(W)) i();
+  assign i.a = V;
+  assign i.b = 1'b0;
+  lsu l(.clk(clk));
+endmodule
+module coreport(input logic clk, ifc.mst i);
+  assign i.a = 4'd9;
+  assign i.b = 1'b1;
+  lsu l(.clk(clk));
+endmodule
+module lsu2(input logic clk); endmodule
+module core2(input logic clk);
+  ifc i();
+  assign i.a = 4'd7;
+  assign i.b = 1'b0;
+  lsu2 l(.clk(clk));
+endmodule
+module mid(input logic clk);
+  core2 core_i(.clk(clk));
+endmodule
+module top(input logic clk);
+`ifdef A1   // not an interface instance: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.l));
+`elsif A2   // nearest scope: mid.core_i.i (7), not top.core_i.i (9)
+  core core_i(.clk(clk));
+  mid m(.clk(clk));
+  bind lsu2 chk #(.V(4'd7)) c(.clk(clk), .m(core_i.i));
+`elsif A3   // parameterized interface, 8 bits
+  core #(.W(8), .V(8'd200)) core_i(.clk(clk));
+  bind lsu chk #(.W(8), .V(8'd200)) c(.clk(clk), .m(core_i.i));
+`elsif A4   // downward miss: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.k));
+`elsif A7   // narrower modport: a only
+  core core_i(.clk(clk));
+  bind lsu chk2 c(.clk(clk), .m(core_i.i));
+`elsif A6   // a driver through the reference: second driver of i.a, upward -> stays degraded
+  core core_i(.clk(clk));
+  bind lsu drv c(.clk(clk), .m(core_i.i));
+`elsif A9   // the instance is an interface port of core_i
+  ifc ti();
+  coreport core_i(.clk(clk), .i(ti));
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# a narrower modport: the unused member is not connected, nothing pending
+logger -expect log "c.p: proved" 1
+read_verilog -sv -formal -DA7 <<EOT
+interface ifc #(parameter W = 4); logic [W-1:0] a; logic b; modport mon(input a, b); modport mon2(input a); modport mst(output a, b); endinterface
+module lsu(input logic clk); endmodule
+module chk #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == V);
+  n: assert property (@(posedge clk) m.a != V);
+endmodule
+module chk2(input logic clk, ifc.mon2 m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+endmodule
+module drv(input logic clk, ifc.mst m);
+  assign m.a = 4'd3;
+  p: assert property (@(posedge clk) m.a == 4'd3);
+endmodule
+module core #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk);
+  ifc #(.W(W)) i();
+  assign i.a = V;
+  assign i.b = 1'b0;
+  lsu l(.clk(clk));
+endmodule
+module coreport(input logic clk, ifc.mst i);
+  assign i.a = 4'd9;
+  assign i.b = 1'b1;
+  lsu l(.clk(clk));
+endmodule
+module lsu2(input logic clk); endmodule
+module core2(input logic clk);
+  ifc i();
+  assign i.a = 4'd7;
+  assign i.b = 1'b0;
+  lsu2 l(.clk(clk));
+endmodule
+module mid(input logic clk);
+  core2 core_i(.clk(clk));
+endmodule
+module top(input logic clk);
+`ifdef A1   // not an interface instance: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.l));
+`elsif A2   // nearest scope: mid.core_i.i (7), not top.core_i.i (9)
+  core core_i(.clk(clk));
+  mid m(.clk(clk));
+  bind lsu2 chk #(.V(4'd7)) c(.clk(clk), .m(core_i.i));
+`elsif A3   // parameterized interface, 8 bits
+  core #(.W(8), .V(8'd200)) core_i(.clk(clk));
+  bind lsu chk #(.W(8), .V(8'd200)) c(.clk(clk), .m(core_i.i));
+`elsif A4   // downward miss: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.k));
+`elsif A7   // narrower modport: a only
+  core core_i(.clk(clk));
+  bind lsu chk2 c(.clk(clk), .m(core_i.i));
+`elsif A6   // a driver through the reference: second driver of i.a, upward -> stays degraded
+  core core_i(.clk(clk));
+  bind lsu drv c(.clk(clk), .m(core_i.i));
+`elsif A9   // the instance is an interface port of core_i
+  ifc ti();
+  coreport core_i(.clk(clk), .i(ti));
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# not flattened: the references are pending
+read_verilog -sv -formal -DV3 <<EOT
+typedef struct packed { logic req; logic [1:0] k; } req_t;
+interface ifc; req_t s; logic [3:0] a; modport mon(input s, a); modport mst(output s, a); endinterface
+module lsu(input logic clk); endmodule
+module chk(input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.s.req == 1'b1 && m.a == 4'd9);
+  n: assert property (@(posedge clk) m.a != 4'd9);
+endmodule
+module core(input logic clk);
+  ifc i();
+  assign i.s = '{req: 1'b1, k: 2'd2};
+  assign i.a = 4'd9;
+  lsu l(.clk(clk));
+endmodule
+module top(input logic clk);
+  core core_i(.clk(clk));
+  // V selects the variant
+`ifdef V0  // local interface in top, direct instance
+  ifc i0();
+  assign i0.s = '{req: 1'b1, k: 2'd2};
+  assign i0.a = 4'd9;
+  chk c(.clk(clk), .m(i0));
+`elsif V1  // direct instantiation in top, hierarchical interface connection one level down
+  chk c(.clk(clk), .m(core_i.i));
+`elsif V2  // bind into core, local interface instance
+  bind core chk c(.clk(clk), .m(i));
+`elsif V3  // bind into lsu, upward reference to the interface instance (cv32e40s shape)
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-any A:sv_degraded=*not?joined?yet*
+design -reset
+
+# not an interface instance: stays the implicit wire
+read_verilog -sv -formal -DA1 <<EOT
+interface ifc #(parameter W = 4); logic [W-1:0] a; logic b; modport mon(input a, b); modport mon2(input a); modport mst(output a, b); endinterface
+module lsu(input logic clk); endmodule
+module chk #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == V);
+  n: assert property (@(posedge clk) m.a != V);
+endmodule
+module chk2(input logic clk, ifc.mon2 m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+endmodule
+module drv(input logic clk, ifc.mst m);
+  assign m.a = 4'd3;
+  p: assert property (@(posedge clk) m.a == 4'd3);
+endmodule
+module core #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk);
+  ifc #(.W(W)) i();
+  assign i.a = V;
+  assign i.b = 1'b0;
+  lsu l(.clk(clk));
+endmodule
+module coreport(input logic clk, ifc.mst i);
+  assign i.a = 4'd9;
+  assign i.b = 1'b1;
+  lsu l(.clk(clk));
+endmodule
+module lsu2(input logic clk); endmodule
+module core2(input logic clk);
+  ifc i();
+  assign i.a = 4'd7;
+  assign i.b = 1'b0;
+  lsu2 l(.clk(clk));
+endmodule
+module mid(input logic clk);
+  core2 core_i(.clk(clk));
+endmodule
+module top(input logic clk);
+`ifdef A1   // not an interface instance: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.l));
+`elsif A2   // nearest scope: mid.core_i.i (7), not top.core_i.i (9)
+  core core_i(.clk(clk));
+  mid m(.clk(clk));
+  bind lsu2 chk #(.V(4'd7)) c(.clk(clk), .m(core_i.i));
+`elsif A3   // parameterized interface, 8 bits
+  core #(.W(8), .V(8'd200)) core_i(.clk(clk));
+  bind lsu chk #(.W(8), .V(8'd200)) c(.clk(clk), .m(core_i.i));
+`elsif A4   // downward miss: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.k));
+`elsif A7   // narrower modport: a only
+  core core_i(.clk(clk));
+  bind lsu chk2 c(.clk(clk), .m(core_i.i));
+`elsif A6   // a driver through the reference: second driver of i.a, upward -> stays degraded
+  core core_i(.clk(clk));
+  bind lsu drv c(.clk(clk), .m(core_i.i));
+`elsif A9   // the instance is an interface port of core_i
+  ifc ti();
+  coreport core_i(.clk(clk), .i(ti));
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*implicitly?declared*
+design -reset
+
+# a downward miss (no core_i.k): stays the implicit wire
+read_verilog -sv -formal -DA4 <<EOT
+interface ifc #(parameter W = 4); logic [W-1:0] a; logic b; modport mon(input a, b); modport mon2(input a); modport mst(output a, b); endinterface
+module lsu(input logic clk); endmodule
+module chk #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == V);
+  n: assert property (@(posedge clk) m.a != V);
+endmodule
+module chk2(input logic clk, ifc.mon2 m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+endmodule
+module drv(input logic clk, ifc.mst m);
+  assign m.a = 4'd3;
+  p: assert property (@(posedge clk) m.a == 4'd3);
+endmodule
+module core #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk);
+  ifc #(.W(W)) i();
+  assign i.a = V;
+  assign i.b = 1'b0;
+  lsu l(.clk(clk));
+endmodule
+module coreport(input logic clk, ifc.mst i);
+  assign i.a = 4'd9;
+  assign i.b = 1'b1;
+  lsu l(.clk(clk));
+endmodule
+module lsu2(input logic clk); endmodule
+module core2(input logic clk);
+  ifc i();
+  assign i.a = 4'd7;
+  assign i.b = 1'b0;
+  lsu2 l(.clk(clk));
+endmodule
+module mid(input logic clk);
+  core2 core_i(.clk(clk));
+endmodule
+module top(input logic clk);
+`ifdef A1   // not an interface instance: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.l));
+`elsif A2   // nearest scope: mid.core_i.i (7), not top.core_i.i (9)
+  core core_i(.clk(clk));
+  mid m(.clk(clk));
+  bind lsu2 chk #(.V(4'd7)) c(.clk(clk), .m(core_i.i));
+`elsif A3   // parameterized interface, 8 bits
+  core #(.W(8), .V(8'd200)) core_i(.clk(clk));
+  bind lsu chk #(.W(8), .V(8'd200)) c(.clk(clk), .m(core_i.i));
+`elsif A4   // downward miss: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.k));
+`elsif A7   // narrower modport: a only
+  core core_i(.clk(clk));
+  bind lsu chk2 c(.clk(clk), .m(core_i.i));
+`elsif A6   // a driver through the reference: second driver of i.a, upward -> stays degraded
+  core core_i(.clk(clk));
+  bind lsu drv c(.clk(clk), .m(core_i.i));
+`elsif A9   // the instance is an interface port of core_i
+  ifc ti();
+  coreport core_i(.clk(clk), .i(ti));
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*implicitly?declared*
+design -reset
+
+# a member driven through the reference, upward: not joined (a second driver)
+read_verilog -sv -formal -DA6 <<EOT
+interface ifc #(parameter W = 4); logic [W-1:0] a; logic b; modport mon(input a, b); modport mon2(input a); modport mst(output a, b); endinterface
+module lsu(input logic clk); endmodule
+module chk #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == V);
+  n: assert property (@(posedge clk) m.a != V);
+endmodule
+module chk2(input logic clk, ifc.mon2 m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+endmodule
+module drv(input logic clk, ifc.mst m);
+  assign m.a = 4'd3;
+  p: assert property (@(posedge clk) m.a == 4'd3);
+endmodule
+module core #(parameter W = 4, parameter [W-1:0] V = 9) (input logic clk);
+  ifc #(.W(W)) i();
+  assign i.a = V;
+  assign i.b = 1'b0;
+  lsu l(.clk(clk));
+endmodule
+module coreport(input logic clk, ifc.mst i);
+  assign i.a = 4'd9;
+  assign i.b = 1'b1;
+  lsu l(.clk(clk));
+endmodule
+module lsu2(input logic clk); endmodule
+module core2(input logic clk);
+  ifc i();
+  assign i.a = 4'd7;
+  assign i.b = 1'b0;
+  lsu2 l(.clk(clk));
+endmodule
+module mid(input logic clk);
+  core2 core_i(.clk(clk));
+endmodule
+module top(input logic clk);
+`ifdef A1   // not an interface instance: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.l));
+`elsif A2   // nearest scope: mid.core_i.i (7), not top.core_i.i (9)
+  core core_i(.clk(clk));
+  mid m(.clk(clk));
+  bind lsu2 chk #(.V(4'd7)) c(.clk(clk), .m(core_i.i));
+`elsif A3   // parameterized interface, 8 bits
+  core #(.W(8), .V(8'd200)) core_i(.clk(clk));
+  bind lsu chk #(.W(8), .V(8'd200)) c(.clk(clk), .m(core_i.i));
+`elsif A4   // downward miss: stays degraded
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.k));
+`elsif A7   // narrower modport: a only
+  core core_i(.clk(clk));
+  bind lsu chk2 c(.clk(clk), .m(core_i.i));
+`elsif A6   // a driver through the reference: second driver of i.a, upward -> stays degraded
+  core core_i(.clk(clk));
+  bind lsu drv c(.clk(clk), .m(core_i.i));
+`elsif A9   // the instance is an interface port of core_i
+  ifc ti();
+  coreport core_i(.clk(clk), .i(ti));
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# the checker passes the interface on to an instance (downward): every member stays connected
+logger -expect log "c.u.p: proved" 1
+logger -expect log "c.u.n: disproved" 1
+read_verilog -sv -formal -DDOWN <<EOT
+interface ifc; logic [3:0] a; modport mon(input a); endinterface
+module lsu(input logic clk); endmodule
+module inner(input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+  n: assert property (@(posedge clk) m.a != 4'd9);
+endmodule
+module chk(input logic clk, ifc.mon m);
+`ifdef WILD
+  inner u(.*);
+`else
+  inner u(.clk(clk), .m(m));
+`endif
+endmodule
+module core(input logic clk);
+  ifc i();
+  assign i.a = 4'd9;
+  lsu l(.clk(clk));
+`ifdef G3
+  if (1) begin : core_i
+    logic [3:0] x;   // a generate scope named core_i, no instance in it
+  end
+`endif
+endmodule
+module top(input logic clk);
+  core core_i(.clk(clk));
+`ifdef DOWN
+  chk c(.clk(clk), .m(core_i.i));
+`elsif G3
+  bind core chk c(.clk(clk), .m(core_i.i));   // core_i is the local generate scope: downward miss
+`else
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the same, upward
+logger -expect log "c.u.p: proved" 1
+logger -expect log "c.u.n: disproved" 1
+read_verilog -sv -formal -DUP <<EOT
+interface ifc; logic [3:0] a; modport mon(input a); endinterface
+module lsu(input logic clk); endmodule
+module inner(input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+  n: assert property (@(posedge clk) m.a != 4'd9);
+endmodule
+module chk(input logic clk, ifc.mon m);
+`ifdef WILD
+  inner u(.*);
+`else
+  inner u(.clk(clk), .m(m));
+`endif
+endmodule
+module core(input logic clk);
+  ifc i();
+  assign i.a = 4'd9;
+  lsu l(.clk(clk));
+`ifdef G3
+  if (1) begin : core_i
+    logic [3:0] x;   // a generate scope named core_i, no instance in it
+  end
+`endif
+endmodule
+module top(input logic clk);
+  core core_i(.clk(clk));
+`ifdef DOWN
+  chk c(.clk(clk), .m(core_i.i));
+`elsif G3
+  bind core chk c(.clk(clk), .m(core_i.i));   // core_i is the local generate scope: downward miss
+`else
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the same, passed on by `.*'
+logger -expect log "c.u.p: proved" 1
+logger -expect log "c.u.n: disproved" 1
+read_verilog -sv -formal -DWILD <<EOT
+interface ifc; logic [3:0] a; modport mon(input a); endinterface
+module lsu(input logic clk); endmodule
+module inner(input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+  n: assert property (@(posedge clk) m.a != 4'd9);
+endmodule
+module chk(input logic clk, ifc.mon m);
+`ifdef WILD
+  inner u(.*);
+`else
+  inner u(.clk(clk), .m(m));
+`endif
+endmodule
+module core(input logic clk);
+  ifc i();
+  assign i.a = 4'd9;
+  lsu l(.clk(clk));
+`ifdef G3
+  if (1) begin : core_i
+    logic [3:0] x;   // a generate scope named core_i, no instance in it
+  end
+`endif
+endmodule
+module top(input logic clk);
+  core core_i(.clk(clk));
+`ifdef DOWN
+  chk c(.clk(clk), .m(core_i.i));
+`elsif G3
+  bind core chk c(.clk(clk), .m(core_i.i));   // core_i is the local generate scope: downward miss
+`else
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# a local generate scope named `core_i' (no instance in it): a downward miss, not searched upward
+read_verilog -sv -formal -DG3 <<EOT
+interface ifc; logic [3:0] a; modport mon(input a); endinterface
+module lsu(input logic clk); endmodule
+module inner(input logic clk, ifc.mon m);
+  p: assert property (@(posedge clk) m.a == 4'd9);
+  n: assert property (@(posedge clk) m.a != 4'd9);
+endmodule
+module chk(input logic clk, ifc.mon m);
+`ifdef WILD
+  inner u(.*);
+`else
+  inner u(.clk(clk), .m(m));
+`endif
+endmodule
+module core(input logic clk);
+  ifc i();
+  assign i.a = 4'd9;
+  lsu l(.clk(clk));
+`ifdef G3
+  if (1) begin : core_i
+    logic [3:0] x;   // a generate scope named core_i, no instance in it
+  end
+`endif
+endmodule
+module top(input logic clk);
+  core core_i(.clk(clk));
+`ifdef DOWN
+  chk c(.clk(clk), .m(core_i.i));
+`elsif G3
+  bind core chk c(.clk(clk), .m(core_i.i));   // core_i is the local generate scope: downward miss
+`else
+  bind lsu chk c(.clk(clk), .m(core_i.i));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*implicitly?declared*
+design -reset

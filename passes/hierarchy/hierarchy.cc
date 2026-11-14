@@ -172,11 +172,201 @@ bool read_id_num(RTLIL::IdString str, int *dst)
 	return true;
 }
 
+// fe191: an interface port connected to a hierarchical name of an
+// interface instance (`.m(core_i.i)', a bound checker's
+// `.m_c_obi_data_if(core_i.m_c_obi_data_if)' in cv32e40s).  The frontend
+// made the name an implicit one-bit wire, so the port was never expanded
+// and every member the sub-module reads was a free wire.  The instance is
+// looked up downward through instance names, else upward (IEEE 1800-2017
+// 23.8): on every chain of instantiating modules, the nearest scope with
+// an instance named like the first component.  1: found, the same
+// interface module on every chain; 0: not; -1: a module on the way is
+// still to be derived.
+// whether any connection, cell port or process of `m' uses `wire'
+// (`skip': a cell not counted)
+static bool module_uses_wire(RTLIL::Module *m, RTLIL::Wire *wire, const RTLIL::Cell *skip = nullptr)
+{
+	bool used = false;
+	auto check = [&](const RTLIL::SigSpec &sig) {
+		for (auto &chunk : sig.chunks())
+			if (chunk.wire == wire)
+				used = true;
+	};
+	for (auto &conn : m->connections())
+		check(conn.first), check(conn.second);
+	for (auto cell : m->cells())
+		if (cell != skip)
+			for (auto &conn : cell->connections())
+				check(conn.second);
+	auto visit = [&](RTLIL::SigSpec &sig) { check(sig); };
+	for (auto &it : m->processes)
+		it.second->rewrite_sigspecs(visit);
+	return used;
+}
+
+// drop the sv_degraded reasons of `m' that start with `prefix'
+static void drop_degraded_prefix(RTLIL::Module &m, const std::string &prefix)
+{
+	std::string cur = m.get_string_attribute(ID(sv_degraded)), kept;
+	if (cur.empty())
+		return;
+	for (size_t pos = 0; pos <= cur.size();) {
+		size_t next = cur.find("; ", pos);
+		std::string entry = cur.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+		if (!entry.empty() && entry.compare(0, prefix.size(), prefix) != 0)
+			kept += (kept.empty() ? "" : "; ") + entry;
+		if (next == std::string::npos)
+			break;
+		pos = next + 2;
+	}
+	if (kept.empty())
+		m.attributes.erase(ID(sv_degraded));
+	else
+		m.set_string_attribute(ID(sv_degraded), kept);
+}
+
+static int walk_interface_down(RTLIL::Design *design, RTLIL::Module *mod, std::string rest, RTLIL::Module *&iface)
+{
+	auto underived = [&](RTLIL::Cell *c, RTLIL::Module *m) {
+		if (!m)
+			return design->module("$abstract" + c->type.str()) != nullptr;
+		return !c->parameters.empty() && !c->type.begins_with("$paramod");
+	};
+	for (int depth = 0; depth < 64 && mod; depth++) {
+		if (RTLIL::Cell *c = mod->cell(RTLIL::escape_id(rest))) {
+			RTLIL::Module *im = design->module(c->type);
+			if (underived(c, im))
+				return -1;
+			if (!im || !im->get_bool_attribute(ID::is_interface))
+				return 0;
+			iface = im;
+			return 1;
+		}
+		// the longest instance-name prefix (generate scopes: `g[0].u_l')
+		RTLIL::Cell *cell = nullptr;
+		size_t cut = std::string::npos;
+		for (size_t dot = rest.find('.'); dot != std::string::npos; dot = rest.find('.', dot + 1))
+			if (RTLIL::Cell *c = mod->cell(RTLIL::escape_id(rest.substr(0, dot))))
+				cell = c, cut = dot;
+		if (!cell)
+			return 0;
+		RTLIL::Module *sub = design->module(cell->type);
+		if (underived(cell, sub))
+			return -1;
+		if (!sub || sub->get_blackbox_attribute())
+			return 0;
+		rest = rest.substr(cut + 1);
+		mod = sub;
+	}
+	return 0;
+}
+
+static std::string hier_module_base_name(RTLIL::Module *m)
+{
+	std::string h = m->get_string_attribute(ID::hdlname);
+	if (!h.empty())
+		return h;
+	std::string n = m->name.str();
+	if (!n.empty() && n[0] == '\\')
+		return n.substr(1);
+	size_t p = n.find('\\');
+	if (p == std::string::npos)
+		return n;
+	std::string r = n.substr(p + 1);
+	return r.substr(0, r.find_first_of("\\$"));
+}
+
+// a local scope named `head' in `m': an instance, or a generate scope
+// (cells or wires named `head.<...>'; references, which are dotted
+// names too, and ports do not count)
+static bool hier_local_head(RTLIL::Module *m, const std::string &head)
+{
+	if (m->cell(RTLIL::escape_id(head)))
+		return true;
+	std::string prefix = "\\" + head + ".";
+	for (auto c : m->cells())
+		if (c->name.begins_with(prefix))
+			return true;
+	for (auto w : m->wires())
+		if (w->name.begins_with(prefix) && !w->port_id && !w->get_bool_attribute(ID(sv_hierref)) &&
+				!w->get_bool_attribute(ID::hierconn) && !w->has_attribute(ID(sv_upward_ref)))
+			return true;
+	return false;
+}
+
+static int resolve_interface_path(RTLIL::Design *design, RTLIL::Module *mod, const std::string &path,
+		const pool<RTLIL::Module*> *used_modules, RTLIL::Module *&iface)
+{
+	iface = nullptr;
+	size_t dot = path.find('.');
+	if (dot == std::string::npos)
+		return 0;
+	std::string head = path.substr(0, dot);
+	// downward first: a head that names a local scope is a downward name,
+	// and a miss there is an error, not an upward search (23.8)
+	if (hier_local_head(mod, head))
+		return walk_interface_down(design, mod, path, iface);
+	RTLIL::Module *found = nullptr;
+	std::function<int(RTLIL::Module*, int)> up = [&](RTLIL::Module *m, int depth) -> int {
+		if (depth > 32)
+			return 0;
+		// a scope whose module name is the head: by module name, not an instance further up
+		if (hier_module_base_name(m) == head)
+			return 0;
+		std::vector<RTLIL::Module*> parents;
+		pool<RTLIL::IdString> parent_names;
+		for (auto pm : design->modules()) {
+			if (pm->get_bool_attribute(ID::to_delete))
+				continue;
+			if (used_modules && !used_modules->count(pm))
+				continue;
+			for (auto c : pm->cells())
+				if (c->type == m->name) {
+					// a parent instantiating it with parameters not yet derived
+					if (!c->parameters.empty() && !c->type.begins_with("$paramod"))
+						return -1;
+					if (parent_names.insert(pm->name).second)
+						parents.push_back(pm);
+				}
+		}
+		if (parents.empty())
+			// a derived module is never a top: one no longer instantiated
+			// waits for its parent's re-derivation
+			return m->name.begins_with("$") && !m->get_bool_attribute(ID::top) && !m->get_bool_attribute(ID::initial_top) ? -1 : 0;
+		for (auto pm : parents) {
+			if (!hier_local_head(pm, head)) {
+				int r = up(pm, depth + 1);
+				if (r <= 0)
+					return r;
+				continue;
+			}
+			RTLIL::Module *im = nullptr;
+			int r = walk_interface_down(design, pm, path, im);
+			if (r <= 0)
+				return r;
+			if (found && found != im)
+				return 0;
+			found = im;
+		}
+		return 1;
+	};
+	int r = up(mod, 0);
+	if (r > 0 && found) {
+		iface = found;
+		return 1;
+	}
+	return r < 0 ? -1 : 0;
+}
+
+// rounds a hierarchical interface connection has waited (bounded: a
+// connection that never resolves is left implicit, i.e. degraded)
+static dict<std::pair<RTLIL::IdString, RTLIL::IdString>, int> hier_interface_rounds;
+
 // A helper struct for expanding a module's interface connections in expand_module
 struct IFExpander
 {
 	IFExpander (RTLIL::Design &design, RTLIL::Module &m)
-		: module(m), has_interfaces_not_found(false)
+		: design(design), module(m), has_interfaces_not_found(false)
 	{
 		// Keep track of all derived interfaces available in the current
 		// module in 'interfaces_in_module':
@@ -188,6 +378,7 @@ struct IFExpander
 		}
 	}
 
+	RTLIL::Design                          &design;
 	RTLIL::Module                          &module;
 	dict<RTLIL::IdString, RTLIL::Module*>   interfaces_in_module;
 
@@ -203,10 +394,18 @@ struct IFExpander
 	// members of an interface that the parent, itself holding a modport view,
 	// does not have: (port member in the sub-module, name in the parent)
 	std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> members_outside_view;
+	// fe191: the modules in use (upward lookups count only their instances)
+	const pool<RTLIL::Module*>             *used_modules = nullptr;
+	// fe191: implicit wires of hierarchical interface connections resolved for this cell
+	std::vector<RTLIL::Wire*>               hier_interface_wires;
+	// fe191: (member port of the sub-module, the reference connected to it)
+	std::vector<std::pair<RTLIL::IdString, RTLIL::Wire*>> hier_interface_refs;
 
 	// Reset the per-cell state
 	void start_cell()
 	{
+		hier_interface_wires.clear();
+		hier_interface_refs.clear();
 		has_interfaces_not_found = false;
 		wildcard_interface = false;
 		connections_to_remove.clear();
@@ -325,12 +524,139 @@ struct IFExpander
 				cell.unsetPort(name);
 	}
 
+	// fe191: an interface port connected to the implicit wire of a
+	// hierarchical name (see resolve_interface_path).  Each member
+	// `port.m' is connected to a reference `path.m' here, declared at the
+	// member's width and marked like a downward reference (sv_hierref,
+	// hierconn): flatten joins it to the instance's member by name, and
+	// forwards it upward (fe190) when the instance is further up.  Left
+	// unresolved, the connection stays the implicit, degraded wire.
+	void on_hier_interface(RTLIL::Module &submodule, RTLIL::IdString port_name, RTLIL::Wire *wire)
+	{
+		std::string path = wire->name.str().substr(1);
+		RTLIL::Module *iface = nullptr;
+		int r = resolve_interface_path(&design, &module, path, used_modules, iface);
+		if (r < 0) {
+			if (++hier_interface_rounds[{module.name, wire->name}] <= 16) {
+				has_interfaces_not_found = true;
+				return;
+			}
+			r = 0;
+		}
+		if (r == 0)
+			return;
+		std::vector<std::pair<RTLIL::IdString, RTLIL::Wire*>> members;
+		for (auto mod_wire : iface->wires()) {
+			if (!mod_wire->name.isPublic())
+				continue;
+			RTLIL::IdString ref_name = "\\" + path + "." + mod_wire->name.unescape();
+			RTLIL::Wire *ref = module.wire(ref_name);
+			// a wire of that name that is not a reference of the same width: leave it all implicit
+			if (ref && (ref->width != mod_wire->width || !ref->get_bool_attribute(ID(sv_hierref)) || ref->port_id))
+				return;
+			members.push_back({mod_wire->name, ref});
+		}
+		for (auto &m : members) {
+			RTLIL::Wire *ref = m.second;
+			if (!ref) {
+				RTLIL::Wire *mod_wire = iface->wire(m.first);
+				ref = module.addWire("\\" + path + "." + m.first.unescape(), mod_wire->width);
+				ref->is_signed = mod_wire->is_signed;
+				ref->set_bool_attribute(ID(sv_hierref));
+				ref->set_bool_attribute(ID::hierconn);
+				if (wire->has_attribute(ID::src))
+					ref->attributes[ID::src] = wire->attributes.at(ID::src);
+			}
+			connections_to_add_name.push_back(RTLIL::IdString(port_name.str() + "." + m.first.unescape()));
+			connections_to_add_signal.push_back(ref);
+			hier_interface_refs.push_back({connections_to_add_name.back(), ref});
+		}
+		log("Connecting interface port %s.%s to the interface instance %s (hierarchical name).\n",
+				log_id(module.name), log_id(port_name), path.c_str());
+		connections_to_remove.push_back(port_name);
+		interfaces_to_add_to_submodule[port_name] = iface;
+		string modport_name = submodule.wire(port_name)->get_string_attribute(ID::interface_modport);
+		if (!modport_name.empty())
+			modports_used_in_submodule[port_name] = "\\" + modport_name;
+		hier_interface_wires.push_back(wire);
+	}
+
+	// fe191: once the cell no longer connects it, a resolved hierarchical
+	// interface name's implicit wire and its degradation go, unless
+	// something else in the module still reads or drives it
+	void drop_hier_interface_wires()
+	{
+		for (auto wire : hier_interface_wires) {
+			if (module.wire(wire->name) != wire)
+				continue;
+			if (module_uses_wire(&module, wire))
+				continue;
+			drop_degraded_prefix(module, "Identifier `" + wire->name.str() + "' is implicitly declared. @");
+			module.remove(pool<RTLIL::Wire*>{wire});
+		}
+	}
+
+	// fe191: with the sub-module derived, each member reference it still
+	// connects is pending until flatten joins it (the reason flatten drops
+	// on the join, as for fe190's references): a flow that does not flatten
+	// keeps the free wires degraded
+	// A member the derived sub-module does not use is not connected: its
+	// reference would never be read, so flatten would never join it.  A
+	// sub-module that passes the interface on (to an instance's interface
+	// port, or by `.*') uses its members only once that instance is
+	// expanded: then every member stays connected.
+	void mark_hier_interface_refs(RTLIL::Cell &cell, RTLIL::Module &derived)
+	{
+		pool<RTLIL::IdString> passed_on;
+		for (auto c : derived.cells()) {
+			if (c->get_bool_attribute(ID::wildcard_port_conns))
+				for (auto &it : hier_interface_refs)
+					passed_on.insert(it.first);
+			for (auto &conn : c->connections())
+				for (auto &chunk : conn.second.chunks())
+					if (chunk.wire && chunk.wire->name.begins_with("$dummywireforinterface"))
+						passed_on.insert(RTLIL::IdString("\\" + chunk.wire->name.str().substr(23)));
+		}
+		for (auto &it : hier_interface_refs) {
+			if (module.wire(it.second->name) != it.second)
+				continue;
+			RTLIL::Wire *mw = derived.wire(it.first);
+			std::string member = it.first.str();
+			bool via_port = passed_on.count(it.first) || passed_on.count(RTLIL::IdString(member.substr(0, member.find('.'))));
+			if (!cell.hasPort(it.first) || !mw || (!via_port && !module_uses_wire(&derived, mw))) {
+				cell.unsetPort(it.first);
+				// (the frontend may have declared it at its width already, fe190, pending)
+				if (!module_uses_wire(&module, it.second)) {
+					drop_degraded_prefix(module, stringf("Hierarchical reference `%s' is not joined yet. @", it.second->name.c_str()));
+					module.remove(pool<RTLIL::Wire*>{it.second});
+				}
+				continue;
+			}
+			std::string entry = stringf("Hierarchical reference `%s' is not joined yet. @module %s", it.second->name.c_str(), log_id(module.name));
+			std::string cur = module.get_string_attribute(ID(sv_degraded));
+			if (("; " + cur + "; ").find("; " + entry + "; ") != std::string::npos)
+				continue;
+			module.set_string_attribute(ID(sv_degraded), cur.empty() ? entry : cur + "; " + entry);
+		}
+	}
+
 	// Handle a single connection from the module, making a note to expand
 	// it if it's an interface connection.
 	void on_connection(RTLIL::Module        &submodule,
 	                   RTLIL::IdString       conn_name,
 	                   const RTLIL::SigSpec &conn_signals)
 	{
+		// fe191: a named interface port connected to a hierarchical name
+		if (!conn_signals.empty() && conn_signals.is_wire() && conn_name.isPublic()) {
+			RTLIL::Wire *cw = conn_signals.as_wire();
+			const RTLIL::Wire *pw = submodule.wire(conn_name);
+			if (pw && pw->port_id && pw->get_bool_attribute(ID::is_interface) && cw->width == 1 &&
+					cw->name.isPublic() && cw->get_bool_attribute(ID(sv_hierref)) && !cw->port_id &&
+					cw->name.str().find('.') != std::string::npos) {
+				on_hier_interface(submodule, conn_name, cw);
+				return;
+			}
+		}
 		int id = 0;
 		bool positional = read_id_num(conn_name, &id);
 		bool looks_like_iface =
@@ -647,6 +973,7 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 	}
 
 	IFExpander if_expander(*design, *module);
+	if_expander.used_modules = used_modules;
 
 	for (auto cell : module->cells())
 	{
@@ -703,6 +1030,7 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 		}
 
 		if_expander.rewrite_interface_connections(*cell);
+		if_expander.drop_hier_interface_wires();
 
 		// If there are no overridden parameters AND not interfaces, then we can use the existing module instance as the type
 		// for the cell:
@@ -722,6 +1050,7 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 					 if_expander.interfaces_to_add_to_submodule,
 					 if_expander.modports_used_in_submodule);
 		if_expander.check_view_members(*cell, *design->module(cell->type));
+		if_expander.mark_hier_interface_refs(*cell, *design->module(cell->type));
 		cell->parameters.clear();
 		did_something = true;
 
@@ -1301,6 +1630,7 @@ struct HierarchyPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		hier_interface_rounds.clear();
 		// a `bind` whose target module was never read: its instances would
 		// silently vanish (frontends/ast/ast.cc apply_binds)
 		{

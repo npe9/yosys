@@ -1,0 +1,611 @@
+# fe195: a hierarchical reference to a whole 1-D unpacked array of an
+# instance further up (IEEE 1800-2017 23.8; cv32e40s_wrapper's
+# `bind cv32e40s_id_stage: core_i.id_stage_i cv32e40s_dbg_helper
+# (.rf_raddr(core_i.rf_raddr_id))') was an implicit 1-bit wire.  It is now
+# declared as a memory with the target's ranges (as fe193 does downward);
+# flatten forwards its element wires up to the scope holding the head and
+# joins them there by name.
+
+# joined: a bound checker's port, the head two scopes up
+logger -expect log "ic3: core_i.id_stage_i.h.p: proved" 1
+logger -expect log "ic3: core_i.id_stage_i.h.n: disproved" 1
+read_verilog -sv -formal -DBIND <<EOT
+// fe195 edge cases
+module ids(input logic clk);
+`ifdef ASG
+  logic [7:0] x [3];
+  assign x = core_i.ao;
+  p: assert property (@(posedge clk) x[0] == 8'd33 && x[2] == 8'd31);
+  n: assert property (@(posedge clk) x[0] != 8'd33);
+`elsif MIXED
+  p: assert property (@(posedge clk) core_i.ra[1] == 5'd17);
+  helper h(.clk, .ra(core_i.ra));
+`elsif DRIVE
+  assign core_i.ra = '{5'd1, 5'd2};
+`elsif MEM
+  logic [7:0] y [4];
+  assign y = core_i.mm;
+  p: assert property (@(posedge clk) y[0] == 8'd0);
+`endif
+endmodule
+module helper(input logic clk, input logic [4:0] ra [2]);
+  p: assert property (@(posedge clk) ra[0] == 5'd3 && ra[1] == 5'd17);
+  n: assert property (@(posedge clk) ra[0] != 5'd3 || ra[1] != 5'd17);
+endmodule
+module ex(input logic clk);
+  ids id_stage_i(.clk);
+endmodule
+module core #(parameter N = 2) (input logic clk, input logic [1:0] a, input logic [7:0] d);
+  logic [4:0] ra [N];
+  logic [7:0] ao [3:1];
+  logic [7:0] mm [4];
+  always_ff @(posedge clk) mm[a] <= d;
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+  if (N > 2) begin : g
+    assign ra[2] = 5'd0;
+  end
+  assign ao[3] = 8'd33; assign ao[2] = 8'd32; assign ao[1] = 8'd31;
+`ifdef DEEP
+  ex ex_i(.clk);
+`else
+  ids id_stage_i(.clk);
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] a, input logic [7:0] d);
+  core core_i(.clk, .a, .d);
+`ifdef DISAGREE
+  core #(.N(3)) core_j(.clk, .a, .d);
+`endif
+`ifdef ONE
+  bind core: core_i helper h1(.clk, .ra(core_i.ra));
+`elsif DEEP
+  bind ids helper h(.clk, .ra(core_i.ra));
+`elsif BIND
+  bind ids helper h(.clk, .ra(core_i.ra));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: the head one scope up
+logger -expect log "ic3: core_i.h1.p: proved" 1
+logger -expect log "ic3: core_i.h1.n: disproved" 1
+read_verilog -sv -formal -DONE <<EOT
+// fe195 edge cases
+module ids(input logic clk);
+`ifdef ASG
+  logic [7:0] x [3];
+  assign x = core_i.ao;
+  p: assert property (@(posedge clk) x[0] == 8'd33 && x[2] == 8'd31);
+  n: assert property (@(posedge clk) x[0] != 8'd33);
+`elsif MIXED
+  p: assert property (@(posedge clk) core_i.ra[1] == 5'd17);
+  helper h(.clk, .ra(core_i.ra));
+`elsif DRIVE
+  assign core_i.ra = '{5'd1, 5'd2};
+`elsif MEM
+  logic [7:0] y [4];
+  assign y = core_i.mm;
+  p: assert property (@(posedge clk) y[0] == 8'd0);
+`endif
+endmodule
+module helper(input logic clk, input logic [4:0] ra [2]);
+  p: assert property (@(posedge clk) ra[0] == 5'd3 && ra[1] == 5'd17);
+  n: assert property (@(posedge clk) ra[0] != 5'd3 || ra[1] != 5'd17);
+endmodule
+module ex(input logic clk);
+  ids id_stage_i(.clk);
+endmodule
+module core #(parameter N = 2) (input logic clk, input logic [1:0] a, input logic [7:0] d);
+  logic [4:0] ra [N];
+  logic [7:0] ao [3:1];
+  logic [7:0] mm [4];
+  always_ff @(posedge clk) mm[a] <= d;
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+  if (N > 2) begin : g
+    assign ra[2] = 5'd0;
+  end
+  assign ao[3] = 8'd33; assign ao[2] = 8'd32; assign ao[1] = 8'd31;
+`ifdef DEEP
+  ex ex_i(.clk);
+`else
+  ids id_stage_i(.clk);
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] a, input logic [7:0] d);
+  core core_i(.clk, .a, .d);
+`ifdef DISAGREE
+  core #(.N(3)) core_j(.clk, .a, .d);
+`endif
+`ifdef ONE
+  bind core: core_i helper h1(.clk, .ra(core_i.ra));
+`elsif DEEP
+  bind ids helper h(.clk, .ra(core_i.ra));
+`elsif BIND
+  bind ids helper h(.clk, .ra(core_i.ra));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: the head three scopes up
+logger -expect log "ic3: core_i.ex_i.id_stage_i.h.p: proved" 1
+logger -expect log "ic3: core_i.ex_i.id_stage_i.h.n: disproved" 1
+read_verilog -sv -formal -DDEEP <<EOT
+// fe195 edge cases
+module ids(input logic clk);
+`ifdef ASG
+  logic [7:0] x [3];
+  assign x = core_i.ao;
+  p: assert property (@(posedge clk) x[0] == 8'd33 && x[2] == 8'd31);
+  n: assert property (@(posedge clk) x[0] != 8'd33);
+`elsif MIXED
+  p: assert property (@(posedge clk) core_i.ra[1] == 5'd17);
+  helper h(.clk, .ra(core_i.ra));
+`elsif DRIVE
+  assign core_i.ra = '{5'd1, 5'd2};
+`elsif MEM
+  logic [7:0] y [4];
+  assign y = core_i.mm;
+  p: assert property (@(posedge clk) y[0] == 8'd0);
+`endif
+endmodule
+module helper(input logic clk, input logic [4:0] ra [2]);
+  p: assert property (@(posedge clk) ra[0] == 5'd3 && ra[1] == 5'd17);
+  n: assert property (@(posedge clk) ra[0] != 5'd3 || ra[1] != 5'd17);
+endmodule
+module ex(input logic clk);
+  ids id_stage_i(.clk);
+endmodule
+module core #(parameter N = 2) (input logic clk, input logic [1:0] a, input logic [7:0] d);
+  logic [4:0] ra [N];
+  logic [7:0] ao [3:1];
+  logic [7:0] mm [4];
+  always_ff @(posedge clk) mm[a] <= d;
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+  if (N > 2) begin : g
+    assign ra[2] = 5'd0;
+  end
+  assign ao[3] = 8'd33; assign ao[2] = 8'd32; assign ao[1] = 8'd31;
+`ifdef DEEP
+  ex ex_i(.clk);
+`else
+  ids id_stage_i(.clk);
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] a, input logic [7:0] d);
+  core core_i(.clk, .a, .d);
+`ifdef DISAGREE
+  core #(.N(3)) core_j(.clk, .a, .d);
+`endif
+`ifdef ONE
+  bind core: core_i helper h1(.clk, .ra(core_i.ra));
+`elsif DEEP
+  bind ids helper h(.clk, .ra(core_i.ra));
+`elsif BIND
+  bind ids helper h(.clk, .ra(core_i.ra));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: a [3:1] array assigned to a [3] one (x[0] is ao[3])
+logger -expect log "ic3: core_i.id_stage_i.p: proved" 1
+logger -expect log "ic3: core_i.id_stage_i.n: disproved" 1
+read_verilog -sv -formal -DASG <<EOT
+// fe195 edge cases
+module ids(input logic clk);
+`ifdef ASG
+  logic [7:0] x [3];
+  assign x = core_i.ao;
+  p: assert property (@(posedge clk) x[0] == 8'd33 && x[2] == 8'd31);
+  n: assert property (@(posedge clk) x[0] != 8'd33);
+`elsif MIXED
+  p: assert property (@(posedge clk) core_i.ra[1] == 5'd17);
+  helper h(.clk, .ra(core_i.ra));
+`elsif DRIVE
+  assign core_i.ra = '{5'd1, 5'd2};
+`elsif MEM
+  logic [7:0] y [4];
+  assign y = core_i.mm;
+  p: assert property (@(posedge clk) y[0] == 8'd0);
+`endif
+endmodule
+module helper(input logic clk, input logic [4:0] ra [2]);
+  p: assert property (@(posedge clk) ra[0] == 5'd3 && ra[1] == 5'd17);
+  n: assert property (@(posedge clk) ra[0] != 5'd3 || ra[1] != 5'd17);
+endmodule
+module ex(input logic clk);
+  ids id_stage_i(.clk);
+endmodule
+module core #(parameter N = 2) (input logic clk, input logic [1:0] a, input logic [7:0] d);
+  logic [4:0] ra [N];
+  logic [7:0] ao [3:1];
+  logic [7:0] mm [4];
+  always_ff @(posedge clk) mm[a] <= d;
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+  if (N > 2) begin : g
+    assign ra[2] = 5'd0;
+  end
+  assign ao[3] = 8'd33; assign ao[2] = 8'd32; assign ao[1] = 8'd31;
+`ifdef DEEP
+  ex ex_i(.clk);
+`else
+  ids id_stage_i(.clk);
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] a, input logic [7:0] d);
+  core core_i(.clk, .a, .d);
+`ifdef DISAGREE
+  core #(.N(3)) core_j(.clk, .a, .d);
+`endif
+`ifdef ONE
+  bind core: core_i helper h1(.clk, .ra(core_i.ra));
+`elsif DEEP
+  bind ids helper h(.clk, .ra(core_i.ra));
+`elsif BIND
+  bind ids helper h(.clk, .ra(core_i.ra));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# joined: a derived module with an interface port, whose AST carried the
+# read-time "implicitly declared" entry over (dropped for the array)
+logger -expect log "ic3: core_i.id_stage_i.h.p: proved" 1
+logger -expect log "ic3: core_i.id_stage_i.h.n: disproved" 1
+read_verilog -sv -formal <<EOT
+// fe195: the bind target has an interface port (cv32e40s_id_stage$interfaces$if_xif)
+interface xif; logic [3:0] v; endinterface
+module ids #(parameter P = 1) (input logic clk, xif x);
+endmodule
+module helper(input logic clk, input logic [4:0] ra [2], input logic r);
+  p: assert property (@(posedge clk) ra[0] == 5'd3 && ra[1] == 5'd17 && r);
+  n: assert property (@(posedge clk) ra[0] != 5'd3 || ra[1] != 5'd17);
+endmodule
+module core(input logic clk);
+  xif xi();
+  logic [4:0] ra [2];
+  logic re;
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+  assign re = 1'b1;
+  assign xi.v = 4'd1;
+  ids #(.P(2)) id_stage_i(.clk, .x(xi));
+endmodule
+module top(input logic clk);
+  core core_i(.clk);
+  bind ids: core_i.id_stage_i helper h(.clk, .ra(core_i.ra), .r(core_i.re));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# no flatten: each element is not joined yet
+read_verilog -sv -formal -DBIND <<EOT
+// fe195 edge cases
+module ids(input logic clk);
+`ifdef ASG
+  logic [7:0] x [3];
+  assign x = core_i.ao;
+  p: assert property (@(posedge clk) x[0] == 8'd33 && x[2] == 8'd31);
+  n: assert property (@(posedge clk) x[0] != 8'd33);
+`elsif MIXED
+  p: assert property (@(posedge clk) core_i.ra[1] == 5'd17);
+  helper h(.clk, .ra(core_i.ra));
+`elsif DRIVE
+  assign core_i.ra = '{5'd1, 5'd2};
+`elsif MEM
+  logic [7:0] y [4];
+  assign y = core_i.mm;
+  p: assert property (@(posedge clk) y[0] == 8'd0);
+`endif
+endmodule
+module helper(input logic clk, input logic [4:0] ra [2]);
+  p: assert property (@(posedge clk) ra[0] == 5'd3 && ra[1] == 5'd17);
+  n: assert property (@(posedge clk) ra[0] != 5'd3 || ra[1] != 5'd17);
+endmodule
+module ex(input logic clk);
+  ids id_stage_i(.clk);
+endmodule
+module core #(parameter N = 2) (input logic clk, input logic [1:0] a, input logic [7:0] d);
+  logic [4:0] ra [N];
+  logic [7:0] ao [3:1];
+  logic [7:0] mm [4];
+  always_ff @(posedge clk) mm[a] <= d;
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+  if (N > 2) begin : g
+    assign ra[2] = 5'd0;
+  end
+  assign ao[3] = 8'd33; assign ao[2] = 8'd32; assign ao[1] = 8'd31;
+`ifdef DEEP
+  ex ex_i(.clk);
+`else
+  ids id_stage_i(.clk);
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] a, input logic [7:0] d);
+  core core_i(.clk, .a, .d);
+`ifdef DISAGREE
+  core #(.N(3)) core_j(.clk, .a, .d);
+`endif
+`ifdef ONE
+  bind core: core_i helper h1(.clk, .ra(core_i.ra));
+`elsif DEEP
+  bind ids helper h(.clk, .ra(core_i.ra));
+`elsif BIND
+  bind ids helper h(.clk, .ra(core_i.ra));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-any A:sv_degraded=*core_i.ra?0???is?not?joined?yet*
+select -assert-any A:sv_degraded=*core_i.ra?1???is?not?joined?yet*
+design -reset
+
+# degraded: also read with a constant index
+read_verilog -sv -formal -DMIXED <<EOT
+// fe195 edge cases
+module ids(input logic clk);
+`ifdef ASG
+  logic [7:0] x [3];
+  assign x = core_i.ao;
+  p: assert property (@(posedge clk) x[0] == 8'd33 && x[2] == 8'd31);
+  n: assert property (@(posedge clk) x[0] != 8'd33);
+`elsif MIXED
+  p: assert property (@(posedge clk) core_i.ra[1] == 5'd17);
+  helper h(.clk, .ra(core_i.ra));
+`elsif DRIVE
+  assign core_i.ra = '{5'd1, 5'd2};
+`elsif MEM
+  logic [7:0] y [4];
+  assign y = core_i.mm;
+  p: assert property (@(posedge clk) y[0] == 8'd0);
+`endif
+endmodule
+module helper(input logic clk, input logic [4:0] ra [2]);
+  p: assert property (@(posedge clk) ra[0] == 5'd3 && ra[1] == 5'd17);
+  n: assert property (@(posedge clk) ra[0] != 5'd3 || ra[1] != 5'd17);
+endmodule
+module ex(input logic clk);
+  ids id_stage_i(.clk);
+endmodule
+module core #(parameter N = 2) (input logic clk, input logic [1:0] a, input logic [7:0] d);
+  logic [4:0] ra [N];
+  logic [7:0] ao [3:1];
+  logic [7:0] mm [4];
+  always_ff @(posedge clk) mm[a] <= d;
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+  if (N > 2) begin : g
+    assign ra[2] = 5'd0;
+  end
+  assign ao[3] = 8'd33; assign ao[2] = 8'd32; assign ao[1] = 8'd31;
+`ifdef DEEP
+  ex ex_i(.clk);
+`else
+  ids id_stage_i(.clk);
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] a, input logic [7:0] d);
+  core core_i(.clk, .a, .d);
+`ifdef DISAGREE
+  core #(.N(3)) core_j(.clk, .a, .d);
+`endif
+`ifdef ONE
+  bind core: core_i helper h1(.clk, .ra(core_i.ra));
+`elsif DEEP
+  bind ids helper h(.clk, .ra(core_i.ra));
+`elsif BIND
+  bind ids helper h(.clk, .ra(core_i.ra));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# degraded: written through the reference
+read_verilog -sv -formal -DDRIVE <<EOT
+// fe195 edge cases
+module ids(input logic clk);
+`ifdef ASG
+  logic [7:0] x [3];
+  assign x = core_i.ao;
+  p: assert property (@(posedge clk) x[0] == 8'd33 && x[2] == 8'd31);
+  n: assert property (@(posedge clk) x[0] != 8'd33);
+`elsif MIXED
+  p: assert property (@(posedge clk) core_i.ra[1] == 5'd17);
+  helper h(.clk, .ra(core_i.ra));
+`elsif DRIVE
+  assign core_i.ra = '{5'd1, 5'd2};
+`elsif MEM
+  logic [7:0] y [4];
+  assign y = core_i.mm;
+  p: assert property (@(posedge clk) y[0] == 8'd0);
+`endif
+endmodule
+module helper(input logic clk, input logic [4:0] ra [2]);
+  p: assert property (@(posedge clk) ra[0] == 5'd3 && ra[1] == 5'd17);
+  n: assert property (@(posedge clk) ra[0] != 5'd3 || ra[1] != 5'd17);
+endmodule
+module ex(input logic clk);
+  ids id_stage_i(.clk);
+endmodule
+module core #(parameter N = 2) (input logic clk, input logic [1:0] a, input logic [7:0] d);
+  logic [4:0] ra [N];
+  logic [7:0] ao [3:1];
+  logic [7:0] mm [4];
+  always_ff @(posedge clk) mm[a] <= d;
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+  if (N > 2) begin : g
+    assign ra[2] = 5'd0;
+  end
+  assign ao[3] = 8'd33; assign ao[2] = 8'd32; assign ao[1] = 8'd31;
+`ifdef DEEP
+  ex ex_i(.clk);
+`else
+  ids id_stage_i(.clk);
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] a, input logic [7:0] d);
+  core core_i(.clk, .a, .d);
+`ifdef DISAGREE
+  core #(.N(3)) core_j(.clk, .a, .d);
+`endif
+`ifdef ONE
+  bind core: core_i helper h1(.clk, .ra(core_i.ra));
+`elsif DEEP
+  bind ids helper h(.clk, .ra(core_i.ra));
+`elsif BIND
+  bind ids helper h(.clk, .ra(core_i.ra));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# degraded: a real memory there
+read_verilog -sv -formal -DMEM <<EOT
+// fe195 edge cases
+module ids(input logic clk);
+`ifdef ASG
+  logic [7:0] x [3];
+  assign x = core_i.ao;
+  p: assert property (@(posedge clk) x[0] == 8'd33 && x[2] == 8'd31);
+  n: assert property (@(posedge clk) x[0] != 8'd33);
+`elsif MIXED
+  p: assert property (@(posedge clk) core_i.ra[1] == 5'd17);
+  helper h(.clk, .ra(core_i.ra));
+`elsif DRIVE
+  assign core_i.ra = '{5'd1, 5'd2};
+`elsif MEM
+  logic [7:0] y [4];
+  assign y = core_i.mm;
+  p: assert property (@(posedge clk) y[0] == 8'd0);
+`endif
+endmodule
+module helper(input logic clk, input logic [4:0] ra [2]);
+  p: assert property (@(posedge clk) ra[0] == 5'd3 && ra[1] == 5'd17);
+  n: assert property (@(posedge clk) ra[0] != 5'd3 || ra[1] != 5'd17);
+endmodule
+module ex(input logic clk);
+  ids id_stage_i(.clk);
+endmodule
+module core #(parameter N = 2) (input logic clk, input logic [1:0] a, input logic [7:0] d);
+  logic [4:0] ra [N];
+  logic [7:0] ao [3:1];
+  logic [7:0] mm [4];
+  always_ff @(posedge clk) mm[a] <= d;
+  assign ra[0] = 5'd3;
+  assign ra[1] = 5'd17;
+  if (N > 2) begin : g
+    assign ra[2] = 5'd0;
+  end
+  assign ao[3] = 8'd33; assign ao[2] = 8'd32; assign ao[1] = 8'd31;
+`ifdef DEEP
+  ex ex_i(.clk);
+`else
+  ids id_stage_i(.clk);
+`endif
+endmodule
+module top(input logic clk, input logic [1:0] a, input logic [7:0] d);
+  core core_i(.clk, .a, .d);
+`ifdef DISAGREE
+  core #(.N(3)) core_j(.clk, .a, .d);
+`endif
+`ifdef ONE
+  bind core: core_i helper h1(.clk, .ra(core_i.ra));
+`elsif DEEP
+  bind ids helper h(.clk, .ra(core_i.ra));
+`elsif BIND
+  bind ids helper h(.clk, .ra(core_i.ra));
+`endif
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset
+
+# degraded: the head's arrays differ between the chains
+read_verilog -sv -formal <<EOT
+// fe195: chains that disagree (two wrappers, core_i of different N)
+module ids(input logic clk);
+endmodule
+module helper #(parameter N = 2) (input logic clk, input logic [4:0] ra [2]);
+  p: assert property (@(posedge clk) ra[0] == 5'd3);
+endmodule
+module core #(parameter N = 2) (input logic clk);
+  logic [4:0] ra [N];
+  for (genvar k = 0; k < N; k++) begin : g
+    assign ra[k] = 5'd3;
+  end
+  ids id_stage_i(.clk);
+endmodule
+module wrap #(parameter N = 2) (input logic clk);
+  core #(.N(N)) core_i(.clk);
+endmodule
+module top(input logic clk);
+  wrap #(.N(2)) w0(.clk);
+  wrap #(.N(3)) w1(.clk);
+  bind ids helper h(.clk, .ra(core_i.ra));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded
+design -reset

@@ -3207,8 +3207,10 @@ static bool pending_parent_derivation(RTLIL::Design *design, const std::vector<s
 // every chain must give the same wire and member.
 static int resolve_upward_by_instance(RTLIL::Design *design, RTLIL::Module *mod, RTLIL::IdString head, const std::string &path,
 		const pool<RTLIL::Module*> *used_modules, int &width, bool &is_signed, PackedDims &dims,
-		HierrefMember &member, int &base_width)
+		HierrefMember &member, int &base_width, HierrefArray *arr = nullptr)
 {
+	// fe195: with arr, the whole unpacked array `path' (walk_hierref_array)
+	// in each scope holding `head', declared alike on every chain
 	width = -1, is_signed = false;
 	dims.clear();
 	member = HierrefMember(), base_width = 0;
@@ -3268,6 +3270,18 @@ static int resolve_upward_by_instance(RTLIL::Design *design, RTLIL::Module *mod,
 			RTLIL::Wire *t = walk_hierref_down(design, pm, path, &pending);
 			if (pending)
 				return -1;
+			if (arr) {
+				HierrefArray a;
+				if (t || !walk_hierref_array(design, pm, path, a))
+					return 0;
+				if (!first && (a.left != arr->left || a.right != arr->right || a.width != width ||
+						a.is_signed != is_signed || a.dims != dims))
+					return 0;
+				*arr = a;
+				width = a.width, is_signed = a.is_signed, dims = a.dims;
+				first = false;
+				continue;
+			}
 			if (!t) {
 				HierrefMember m;
 				t = walk_hierref_down(design, pm, path, nullptr, &m);
@@ -3583,6 +3597,26 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 				targets.back().pending_join = true;
 				any_wide = true;
 				continue;
+			}
+			// fe195: the whole unpacked array of an instance further up
+			// (cv32e40s_wrapper's `bind cv32e40s_id_stage: ...
+			// .rf_raddr(core_i.rf_raddr_id)'): declared as a memory as in
+			// fe193; flatten forwards its element wires (`core_i.rf_raddr_id[0]')
+			// up to the scope holding the head and joins them there by name
+			if (r2 == 0 && !wire->has_attribute(ID(sv_hierref_idx)) && !wire_is_driven(this, wire, true)) {
+				HierrefArray ha;
+				int r3 = resolve_upward_by_instance(design, this, head, path, used_modules, width, is_signed, ud, um, ubw, &ha);
+				if (r3 < 0)
+					return false;
+				if (r3 > 0) {
+					log("Hierarchical reference %s.%s: `%s' is an instance further up (IEEE 1800-2017 23.8); an unpacked array [%d:%d].\n",
+							log_id(name), log_id(wire->name), log_id(head), ha.left, ha.right);
+					Target t{wire->name.str(), ha.width, ha.is_signed, std::string()};
+					t.is_mem = true, t.mem_left = ha.left, t.mem_right = ha.right, t.dims = ha.dims;
+					targets.push_back(t);
+					any_wide = true;
+					continue;
+				}
 			}
 		}
 		if (res > 0 && up_const) {

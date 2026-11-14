@@ -3137,11 +3137,17 @@ static bool pending_parent_derivation(RTLIL::Design *design, const std::vector<s
 // dims; 0: not (a chain reaches a top without it, or the chains disagree);
 // -1: an instantiating module or an instance on a path is still to be
 // derived (come back next round).
+// fe192: or a member of a packed struct / union wire there
+// (`wb_stage_i.ex_wb_pipe_i.instr.bus_resp.rdata', cv32e40s sleep_unit_sva):
+// `member' says which (path, offset, width), `base_width' the wire's width;
+// every chain must give the same wire and member.
 static int resolve_upward_by_instance(RTLIL::Design *design, RTLIL::Module *mod, RTLIL::IdString head, const std::string &path,
-		const pool<RTLIL::Module*> *used_modules, int &width, bool &is_signed, PackedDims &dims)
+		const pool<RTLIL::Module*> *used_modules, int &width, bool &is_signed, PackedDims &dims,
+		HierrefMember &member, int &base_width)
 {
 	width = -1, is_signed = false;
 	dims.clear();
+	member = HierrefMember(), base_width = 0;
 	bool first = true;
 	auto base_name = [](RTLIL::Module *m) {
 		std::string h = m->get_string_attribute(ID::hdlname);
@@ -3198,10 +3204,23 @@ static int resolve_upward_by_instance(RTLIL::Design *design, RTLIL::Module *mod,
 			RTLIL::Wire *t = walk_hierref_down(design, pm, path, &pending);
 			if (pending)
 				return -1;
-			if (!t || t->get_bool_attribute(ID(sv_hierref)))
+			if (!t) {
+				HierrefMember m;
+				t = walk_hierref_down(design, pm, path, nullptr, &m);
+				if (!t || t->get_bool_attribute(ID(sv_hierref)))
+					return 0;
+				if (!first && (member.width == 0 || m.path != member.path || m.offset != member.offset ||
+						t->width != base_width || m.dims != dims || m.is_signed != is_signed))
+					return 0;
+				member = m, base_width = t->width;
+				width = m.width, is_signed = m.is_signed, dims = m.dims;
+				first = false;
+				continue;
+			}
+			if (t->get_bool_attribute(ID(sv_hierref)))
 				return 0;
 			PackedDims td = wire_packed_dims(t);
-			if (!first && (t->width != width || t->is_signed != is_signed || td != dims))
+			if (!first && (member.width != 0 || t->width != width || t->is_signed != is_signed || td != dims))
 				return 0;
 			width = t->width, is_signed = t->is_signed, dims = td;
 			first = false;
@@ -3217,7 +3236,8 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	if (get_bool_attribute(ID(sv_hierrefs_resolved)))
 		return false;
 	struct Target { std::string name; int width; bool is_signed; std::string up_rest; std::string member_base = std::string(); int member_offset = -1;
-		int up_offset = -1, up_base_width = 0; bool is_const = false; RTLIL::Const value = RTLIL::Const(); PackedDims dims = PackedDims(); bool pending_join = false; };
+		int up_offset = -1, up_base_width = 0; bool is_const = false; RTLIL::Const value = RTLIL::Const(); PackedDims dims = PackedDims(); bool pending_join = false;
+		std::string slice_of = std::string(); int slice_offset = -1, slice_base_width = 0; };
 	std::vector<Target> targets;
 	bool any_wide = false, any_up = false, any_member = false;
 	auto mark_members = [&](RTLIL::Module *m) {
@@ -3443,14 +3463,35 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 					return false;
 			}
 		}
-		if (res == 0 && !wire->has_attribute(ID(sv_hierref_idx))) {
+		if (res == 0) {
 			// fe190: the head is an instance further up (23.8): declared at
 			// the target's width, still a reference (sv_hierref, hierconn)
-			// that flatten forwards up to the scope holding the head
+			// that flatten forwards up to the scope holding the head.
+			// fe192: also when read with constant indices (`trans_o.memtype[0]'):
+			// a wire or member found there is declared whole and the selects
+			// apply to it; else the indices name elements (below)
 			PackedDims ud;
-			int r2 = resolve_upward_by_instance(design, this, head, path, used_modules, width, is_signed, ud);
+			HierrefMember um;
+			int ubw = 0;
+			int r2 = resolve_upward_by_instance(design, this, head, path, used_modules, width, is_signed, ud, um, ubw);
 			if (r2 < 0)
 				return false;
+			if (r2 > 0 && um.width != 0) {
+				// fe192: a member there: the wire `base' is the reference
+				// (forwarded and joined by flatten like any other), and
+				// the member is its slice, assigned here
+				std::string base = hierref_member_base(path, um);
+				if (base.empty() || base.find('.') == std::string::npos || um.offset < 0 || um.offset + width > ubw)
+					continue;
+				log("Hierarchical reference %s.%s: `%s' is an instance further up (IEEE 1800-2017 23.8); bits %d+:%d of `%s'.\n",
+						log_id(name), log_id(wire->name), log_id(head), um.offset, width, base.c_str());
+				Target t{wire->name.str(), width, is_signed, std::string()};
+				t.dims = ud;
+				t.slice_of = "\\" + base, t.slice_offset = um.offset, t.slice_base_width = ubw;
+				targets.push_back(t);
+				any_wide = true;
+				continue;
+			}
 			if (r2 > 0) {
 				log("Hierarchical reference %s.%s: `%s' is an instance further up (IEEE 1800-2017 23.8).\n",
 						log_id(name), log_id(wire->name), log_id(head));
@@ -3514,6 +3555,42 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		} else
 			++it;
 	}
+	// fe192: the base wire of each member slice is a reference of its own
+	// (one per name; one the module also reads directly is already a
+	// target, and must agree in width)
+	{
+		dict<std::string, int> names;
+		for (int i = 0; i < GetSize(targets); i++)
+			names[targets[i].name] = i;
+		for (auto it = targets.begin(); it != targets.end();) {
+			if (it->slice_of.empty()) {
+				++it;
+				continue;
+			}
+			auto nt = names.find(it->slice_of);
+			if (nt != names.end() && (targets[nt->second].width != it->slice_base_width ||
+					!targets[nt->second].pending_join || targets[nt->second].dims.size() > 1)) {
+				log_warning("Hierarchical reference %s.%s: its wire `%s' is referenced here differently; left unresolved.\n",
+						log_id(name), log_id(it->name), it->slice_of.c_str());
+				it = targets.erase(it);
+				names.clear();
+				for (int i = 0; i < GetSize(targets); i++)
+					names[targets[i].name] = i;
+				continue;
+			}
+			++it;
+		}
+		std::vector<Target> bases;
+		for (auto &t : targets)
+			if (!t.slice_of.empty() && !names.count(t.slice_of)) {
+				Target b{t.slice_of, t.slice_base_width, false, std::string()};
+				b.pending_join = true;
+				names[b.name] = -1;
+				bases.push_back(b);
+			}
+		for (auto &b : bases)
+			targets.push_back(b);
+	}
 	if (!any_wide && !any_up) {
 		if (any_member)
 			mark_members(this);
@@ -3550,6 +3627,22 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 			auto asgn = std::make_unique<AstNode>(loc, AST_ASSIGN, std::make_unique<AstNode>(loc, AST_IDENTIFIER),
 					AstNode::mkconst_bits(loc, t.value.to_bits(), t.is_signed));
 			asgn->children[0]->str = t.name;
+			new_ast->children.push_back(std::move(wire));
+			new_ast->children.push_back(std::move(asgn));
+			continue;
+		}
+		if (!t.slice_of.empty()) {
+			// fe192: a plain wire, the slice of the base reference
+			auto sel = std::make_unique<AstNode>(loc, AST_IDENTIFIER, std::make_unique<AstNode>(loc, AST_RANGE,
+					AstNode::mkconst_int(loc, t.slice_offset + t.width - 1, true), AstNode::mkconst_int(loc, t.slice_offset, true)));
+			sel->str = t.slice_of;
+			auto asgn = std::make_unique<AstNode>(loc, AST_ASSIGN, std::make_unique<AstNode>(loc, AST_IDENTIFIER), std::move(sel));
+			asgn->children[0]->str = t.name;
+			// (not a generate scope's wire: its head stays an upward name
+			// for flatten and hierarchy)
+			wire->set_attribute(ID(sv_hierref_slice), AstNode::mkconst_int(loc, 1, false));
+			log("Hierarchical reference %s.%s is bits %d+:%d of the reference %s; rederiving the module.\n",
+					log_id(name), log_id(t.name), t.slice_offset, t.width, log_id(t.slice_of));
 			new_ast->children.push_back(std::move(wire));
 			new_ast->children.push_back(std::move(asgn));
 			continue;

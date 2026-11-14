@@ -1,0 +1,734 @@
+# fe192: a hierarchical reference whose head is an instance two or more
+# scopes up (IEEE 1800-2017 23.8, fe190) and which ends in a member of a
+# packed struct / union there (cv32e40s sleep_unit_sva:
+# `wb_stage_i.ex_wb_pipe_i.instr.bus_resp.rdata'; the mpu_sva bind:
+# `core_i.load_store_unit_i.write_buffer_i.trans_o.memtype[0]') was an
+# implicit 1-bit wire.  The struct wire is now the reference (forwarded and
+# joined by flatten) and the member its slice; constant bit selects of an
+# upward reference no longer skip the upward search.
+# a member two scopes up, one level down
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DPLAIN <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the same, the bound module instantiated before the head instance
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DPLAIN -DSWAP <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# the struct wire and its member read in one module
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DBOTH <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# two members of one wire, and a member of another
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DTWO <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# constant bit selects of a member
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DBIT <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# a member three levels down (the mpu_sva shape), with bit selects
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DDEEP <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# constant bit selects of a packed vector further up
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal -DVEC <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# no flatten: the reference is not joined yet
+read_verilog -sv -formal -DPLAIN <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-any A:sv_degraded=*not?joined?yet*
+design -reset
+
+# a member written through the reference: stays implicit
+read_verilog -sv -formal -DDRIVE <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*implicitly?declared*
+design -reset
+
+# chains that disagree on the member's place: stays implicit
+read_verilog -sv -formal -DDIS <<EOT
+typedef struct packed { logic [3:0] rdata; logic err; } resp_t;
+typedef struct packed { resp_t bus_resp; logic v; } instr_t;
+typedef struct packed { logic v; resp_t bus_resp; } instr2_t;
+typedef struct packed { logic [2:0] prot; logic [1:0] memtype; logic dbg; } req_t;
+module wbuf(input logic clk); req_t trans_o; assign trans_o = '{prot: 3'd5, memtype: 2'b10, dbg: 1'b1}; endmodule
+module wb(input logic clk, input instr_t pi); instr_t q; assign q = pi; logic [3:0] vec; assign vec = 4'b0101; wbuf wbuf_i(.clk); endmodule
+module wb2(input logic clk, input instr2_t pi); endmodule
+module sub(input logic clk); endmodule
+module chk2(input logic clk);
+`ifdef BOTH
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && wb_stage_i.pi == 6'b1001_0_1 && wb_stage_i.pi.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata != 4'h9);
+`elsif TWO
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9 && !wb_stage_i.pi.bus_resp.err && wb_stage_i.q.v);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.err);
+`elsif BIT
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[0] && wb_stage_i.pi.bus_resp.rdata[3] && !wb_stage_i.pi.bus_resp.rdata[1]);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata[2]);
+`elsif DEEP
+  p: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[1] && !wb_stage_i.wbuf_i.trans_o.memtype[0] && wb_stage_i.wbuf_i.trans_o.prot == 3'd5);
+  n: assert property (@(posedge clk) wb_stage_i.wbuf_i.trans_o.memtype[0]);
+`elsif VEC
+  p: assert property (@(posedge clk) wb_stage_i.vec[0] && wb_stage_i.vec[2] && !wb_stage_i.vec[1]);
+  n: assert property (@(posedge clk) wb_stage_i.vec[3]);
+`elsif DRIVE
+  assign wb_stage_i.q.v = 1'b0;
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+`else
+  p: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h9);
+  n: assert property (@(posedge clk) wb_stage_i.pi.bus_resp.rdata == 4'h8);
+`endif
+endmodule
+module mid(input logic clk);
+  instr_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+`ifdef SWAP
+  sub sub_i(.clk);
+  wb wb_stage_i(.clk, .pi(p));
+`else
+  wb wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+`endif
+endmodule
+module mid2(input logic clk);
+  instr2_t p;
+  assign p = '{bus_resp: '{rdata: 4'h9, err: 1'b0}, v: 1'b1};
+  wb2 wb_stage_i(.clk, .pi(p));
+  sub sub_i(.clk);
+endmodule
+module top(input logic clk);
+  mid mid_i(.clk);
+`ifdef DIS
+  mid2 mid2_i(.clk);
+`endif
+  bind sub chk2 c(.clk);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-any A:sv_degraded=*implicitly?declared*
+design -reset
+
+# an interface port connected by a hierarchical name (fe191) next to a
+# member slice with the same head in the bind target: the slice wire is
+# no local generate scope, so the interface is still found upward
+logger -expect log "c.p: proved" 1
+logger -expect log "c.n: disproved" 1
+read_verilog -sv -formal <<EOT
+typedef struct packed { logic req; logic [1:0] k; } req_t;
+interface ifc; req_t s; logic [3:0] a; modport mon(input s, a); endinterface
+module lsu(input logic clk); endmodule
+module chk(input logic clk, ifc.mon m, input logic [1:0] kk);
+  p: assert property (@(posedge clk) m.s.req && m.a == 4'd9 && kk == 2'd2);
+  n: assert property (@(posedge clk) m.a != 4'd9);
+endmodule
+module core(input logic clk);
+  ifc i();
+  req_t st;
+  assign st = '{req: 1'b1, k: 2'd2};
+  assign i.s = st;
+  assign i.a = 4'd9;
+  lsu l(.clk(clk));
+endmodule
+module top(input logic clk);
+  core core_i(.clk(clk));
+  bind lsu chk c(.clk(clk), .m(core_i.i), .kk(core_i.st.k));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset

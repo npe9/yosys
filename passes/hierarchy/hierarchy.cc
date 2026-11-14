@@ -289,7 +289,8 @@ static bool hier_local_head(RTLIL::Module *m, const std::string &head)
 			return true;
 	for (auto w : m->wires())
 		if (w->name.begins_with(prefix) && !w->port_id && !w->get_bool_attribute(ID(sv_hierref)) &&
-				!w->get_bool_attribute(ID::hierconn) && !w->has_attribute(ID(sv_upward_ref)))
+				!w->get_bool_attribute(ID::hierconn) && !w->has_attribute(ID(sv_upward_ref)) &&
+				!w->get_bool_attribute(ID(sv_hierref_slice)))
 			return true;
 	return false;
 }

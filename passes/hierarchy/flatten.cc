@@ -175,6 +175,7 @@ struct FlattenWorker
 					h.insert(head_of(c->name));
 			for (auto w : mod->wires())
 				if (w->name[0] == '\\' && !w->get_bool_attribute(ID(sv_hierref)) && !w->has_attribute(ID(sv_upward_ref)) &&
+						!w->get_bool_attribute(ID(sv_hierref_slice)) &&
 						!w->get_bool_attribute(ID::hierconn) && !w->port_input && !w->port_output &&
 						w->name.str().find('.') != std::string::npos)
 					h.insert(head_of(w->name));

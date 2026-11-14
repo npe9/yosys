@@ -1,0 +1,62 @@
+# fe193a: an element of a signed unpacked-array input port is signed
+# (1800-2017 7.4: its type is `logic signed [7:0]').  The flattened port's
+# element read was an unsigned part-select of the wide wire, so `p[0] < 0'
+# was false for a negative element and the sign was not extended (silently).
+logger -expect log "o.p: proved" 1
+logger -expect log "o.n: disproved" 1
+read_verilog -sv -formal <<EOT
+module leaf(input logic signed [7:0] a, output logic neg);
+  assign neg = a < 0;
+endmodule
+module obs(input logic clk, input logic signed [7:0] ps [2], input logic signed [3:0] pd [2:1]);
+  logic neg0;
+  logic signed [15:0] ext;
+  assign ext = ps[0];
+  leaf l(.a(ps[0]), .neg(neg0));
+  p: assert property (@(posedge clk) ps[0] < 0 && ps[1] > 0 && ps[0] == -8'sd3 && ext == -16'sd3 && neg0
+                       && pd[2] < 0 && pd[1] == 4'sd2 && ps[0][7] && ps[0][3:0] == 4'hd);
+  n: assert property (@(posedge clk) ps[1] < 0);
+endmodule
+module top(input logic clk);
+  logic signed [7:0] sg [2];
+  logic signed [3:0] sd [2:1];
+  assign sg[0] = -8'sd3; assign sg[1] = 8'sd4;
+  assign sd[2] = -4'sd1; assign sd[1] = 4'sd2;
+  obs o(.clk, .ps(sg), .pd(sd));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected
+design -reset
+
+# a non-constant index, an `int' array, a typedef'd signed element
+logger -expect log "o.p: proved" 1
+logger -expect log "o.n: disproved" 1
+read_verilog -sv -formal <<EOT
+typedef logic signed [5:0] s6_t;
+module obs(input logic clk, input logic [0:0] k, input logic signed [7:0] ps [2], input int pi [2], input s6_t pt [2]);
+  p: assert property (@(posedge clk) ps[k] < 0 == (k == 0) && pi[0] < 0 && pi[1] > 0 && pt[1] < 0 && pt[0] > 0);
+  n: assert property (@(posedge clk) ps[k] > 0);
+endmodule
+module top(input logic clk, input logic k);
+  logic signed [7:0] sg [2]; int ii [2]; s6_t tt [2];
+  assign sg[0] = -8'sd3; assign sg[1] = 8'sd4;
+  assign ii[0] = -7; assign ii[1] = 9;
+  assign tt[0] = 6'sd5; assign tt[1] = -6'sd2;
+  obs o(.clk, .k, .ps(sg), .pi(ii), .pt(tt));
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+async2sync
+ic3 -check-cells -init-zero
+logger -check-expected

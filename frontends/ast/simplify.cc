@@ -658,6 +658,7 @@ static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, i
 		}
 		node->children.erase(node->children.begin());
 		std::unique_ptr<AstNode> left, right;
+		bool whole_elem = false;
 		if (!node->children.empty() && node->children[0]->type == AST_RANGE &&
 				(node->children[0]->range_valid || !node->children[0]->children.empty())) {
 			// word select plus packed sub-select [a:b] or bit select [a].
@@ -696,6 +697,7 @@ static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, i
 			left = add(std::move(pa));
 			right = add(std::move(pb));
 		} else {
+			whole_elem = true;
 			if (off->type == AST_CONSTANT) {
 				left = AstNode::mkconst_int(loc, off->integer + w - 1, true);
 				right = std::move(off);
@@ -708,6 +710,23 @@ static void rewrite_unpacked_port_refs(AstNode *node, const std::string &name, i
 				std::make_unique<AstNode>(loc, AST_RANGE, std::move(left), std::move(right)));
 		node->integer = 0;
 		node->basic_prep = false;
+		// fe193a: an element of a signed array is signed (its type is
+		// `logic signed [w-1:0]'), but a part-select of the flat wire is
+		// unsigned, so `p[0] < 0' was false for a negative element
+		// (silently).  Only for an input port, never written here; an
+		// output's element may be an lvalue or an output connection.
+		if (whole_elem && port_node && port_node->is_signed && port_node->is_input && !port_node->is_output) {
+			for (auto &child : node->children)
+				rewrite_unpacked_port_refs(child.get(), name, w, port_node, ulo, uhi, udesc, pl, pr, pasc);
+			auto inner = node->clone();
+			node->type = AST_TO_SIGNED;
+			node->str.clear();
+			node->id2ast = nullptr;
+			node->integer = 0;
+			node->children.clear();
+			node->children.push_back(std::move(inner));
+			return;
+		}
 	}
 	for (auto &child : node->children)
 		rewrite_unpacked_port_refs(child.get(), name, w, port_node, ulo, uhi, udesc, pl, pr, pasc);

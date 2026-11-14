@@ -3028,8 +3028,10 @@ static RTLIL::Wire *find_struct_member(RTLIL::Module *mod, const std::string &re
 }
 
 static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod, std::string rest, bool *pending = nullptr,
-		HierrefMember *member = nullptr)
+		HierrefMember *member = nullptr, RTLIL::Module **owner = nullptr, std::string *local = nullptr)
 {
+	if (owner)
+		*owner = nullptr;
 	for (int depth = 0; depth < 64 && mod; depth++) {
 		// the longest instance-name prefix of the remaining path
 		RTLIL::Cell *cell = nullptr;
@@ -3040,8 +3042,12 @@ static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod,
 		if (!cell && member && depth > 0)
 			if (RTLIL::Wire *w = find_struct_member(mod, rest, member))
 				return w;
-		if (!cell)
+		if (!cell) {
+			// fe193: the module the path ends in, and the name there
+			if (owner && depth > 0)
+				*owner = mod, *local = rest;
 			return nullptr;
+		}
 		RTLIL::Module *sub = design->module(cell->type);
 		if (pending && cell->type.str().rfind("$paramod", 0) != 0 &&
 				((!sub && design->module("$abstract" + cell->type.str())) ||
@@ -3052,11 +3058,54 @@ static RTLIL::Wire *walk_hierref_down(RTLIL::Design *design, RTLIL::Module *mod,
 		rest = rest.substr(cut + 1);
 		if (!sub || sub->get_blackbox_attribute())
 			return nullptr;
-		if (rest.find('.') == std::string::npos || sub->wire(RTLIL::escape_id(rest)))
-			return sub->wire(RTLIL::escape_id(rest));
+		if (rest.find('.') == std::string::npos || sub->wire(RTLIL::escape_id(rest))) {
+			RTLIL::Wire *w = sub->wire(RTLIL::escape_id(rest));
+			if (!w && owner)
+				*owner = sub, *local = rest;
+			return w;
+		}
 		mod = sub;
 	}
 	return nullptr;
+}
+
+// fe193: a whole 1-D unpacked array of an instance, which the instance's
+// mem2reg split into element wires `<name>[k]' tagged with the declared
+// range (sv_mem_left/right).  Every element of the declared range must be
+// there, tagged alike, with the same width, signedness and packed
+// dimensions (at most one), and not an unresolved reference itself.
+struct HierrefArray { int left = 0, right = 0, width = 0; bool is_signed = false; PackedDims dims; };
+static bool walk_hierref_array(RTLIL::Design *design, RTLIL::Module *mod, const std::string &path, HierrefArray &a)
+{
+	RTLIL::Module *owner = nullptr;
+	std::string local;
+	if (walk_hierref_down(design, mod, path, nullptr, nullptr, &owner, &local) || !owner)
+		return false;
+	std::string prefix = "\\" + local + "[";
+	RTLIL::Wire *e0 = nullptr;
+	for (auto w : owner->wires())
+		if (w->name.begins_with(prefix) && w->has_attribute(ID(sv_mem_left)) && w->has_attribute(ID(sv_mem_right))) {
+			e0 = w;
+			break;
+		}
+	if (!e0)
+		return false;
+	a.left = e0->attributes.at(ID(sv_mem_left)).as_int(true);
+	a.right = e0->attributes.at(ID(sv_mem_right)).as_int(true);
+	a.width = e0->width, a.is_signed = e0->is_signed, a.dims = wire_packed_dims(e0);
+	if (a.dims.size() > 1)
+		return false;
+	int lo = std::min(a.left, a.right), hi = std::max(a.left, a.right);
+	if (hi - lo + 1 > 4096)
+		return false;
+	for (int k = lo; k <= hi; k++) {
+		RTLIL::Wire *w = owner->wire(stringf("%s%d]", prefix.c_str(), k));
+		if (!w || w->get_bool_attribute(ID(sv_hierref)) || !w->has_attribute(ID(sv_mem_left)) || !w->has_attribute(ID(sv_mem_right)) ||
+				w->attributes.at(ID(sv_mem_left)).as_int(true) != a.left || w->attributes.at(ID(sv_mem_right)).as_int(true) != a.right ||
+				w->width != a.width || w->is_signed != a.is_signed || wire_packed_dims(w) != a.dims)
+			return false;
+	}
+	return true;
 }
 
 // (ignore_inout: an inout cell port is not counted -- a black box whose
@@ -3252,7 +3301,8 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 		return false;
 	struct Target { std::string name; int width; bool is_signed; std::string up_rest; std::string member_base = std::string(); int member_offset = -1;
 		int up_offset = -1, up_base_width = 0; bool is_const = false; RTLIL::Const value = RTLIL::Const(); PackedDims dims = PackedDims(); bool pending_join = false;
-		std::string slice_of = std::string(); int slice_offset = -1, slice_base_width = 0; };
+		std::string slice_of = std::string(); int slice_offset = -1, slice_base_width = 0;
+		bool is_mem = false; int mem_left = 0, mem_right = 0; };
 	std::vector<Target> targets;
 	bool any_wide = false, any_up = false, any_member = false;
 	auto mark_members = [&](RTLIL::Module *m) {
@@ -3311,6 +3361,21 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 			if (!bw && !wire_is_driven(this, wire, true) && walk_hierref_const(design, this, path, cv, cs, false, &cd)) {
 				Target t{wire->name.str(), GetSize(cv), cs, std::string()};
 				t.is_const = true, t.value = cv, t.dims = cd;
+				targets.push_back(t);
+				any_wide = true;
+				continue;
+			}
+		}
+		// fe193: the whole unpacked array (`.p(core_i.regs_i.cfg_q)'):
+		// declared here as a memory of the same ranges, split by mem2reg,
+		// whose element wires flatten joins by name; a whole-array read or
+		// connection is then laid out as for a local array (fe132).  Read
+		// also with constant indices, or written, it stays implicit.
+		if (!wire->has_attribute(ID(sv_hierref_idx)) && !wire_is_driven(this, wire, true)) {
+			HierrefArray ha;
+			if (walk_hierref_array(design, this, path, ha)) {
+				Target t{wire->name.str(), ha.width, ha.is_signed, std::string()};
+				t.is_mem = true, t.mem_left = ha.left, t.mem_right = ha.right, t.dims = ha.dims;
 				targets.push_back(t);
 				any_wide = true;
 				continue;
@@ -3621,6 +3686,30 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 			max_port_id = child->port_id;
 	for (auto &t : targets) {
 		std::unique_ptr<AstNode> wire;
+		if (t.is_mem) {
+			// fe193: a memory with the target's element and unpacked
+			// ranges; its elements inherit the reference attributes
+			std::unique_ptr<AstNode> data;
+			if (t.dims.size() == 1) {
+				int lsb = std::get<0>(t.dims[0]), msb = std::get<0>(t.dims[0]) + std::get<1>(t.dims[0]) - 1;
+				bool swapped = std::get<2>(t.dims[0]);
+				data = std::make_unique<AstNode>(loc, AST_RANGE,
+						AstNode::mkconst_int(loc, swapped ? lsb : msb, true), AstNode::mkconst_int(loc, swapped ? msb : lsb, true));
+			} else
+				data = std::make_unique<AstNode>(loc, AST_RANGE, AstNode::mkconst_int(loc, t.width - 1, true), AstNode::mkconst_int(loc, 0, true));
+			auto mem = std::make_unique<AstNode>(loc, AST_MEMORY, std::move(data), std::make_unique<AstNode>(loc, AST_RANGE,
+					AstNode::mkconst_int(loc, t.mem_left, true), AstNode::mkconst_int(loc, t.mem_right, true)));
+			mem->str = t.name;
+			mem->is_logic = true;
+			mem->is_signed = t.is_signed;
+			mem->set_attribute(ID::mem2reg, AstNode::mkconst_int(loc, 1, false));
+			mem->set_attribute(ID::hierconn, AstNode::mkconst_int(loc, 1, false));
+			mem->set_attribute(ID(sv_hierref), AstNode::mkconst_int(loc, 1, false));
+			log("Hierarchical reference %s.%s resolved to an unpacked array [%d:%d] of %d%s bits; rederiving the module.\n",
+					log_id(name), log_id(t.name), t.mem_left, t.mem_right, t.width, t.is_signed ? " signed" : "");
+			new_ast->children.push_back(std::move(mem));
+			continue;
+		}
 		if (t.dims.size() > 1) {
 			// declared with the target's packed dimensions
 			auto mr = std::make_unique<AstNode>(loc, AST_MULTIRANGE);
@@ -3698,6 +3787,19 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	// fe190: a reference to an instance further up is joined only by
 	// flatten (forwarded to the scope holding the head): until then it is
 	// a free wire, so the module carries a reason flatten drops on joining
+	// fe193: so is each element of a whole-array reference until flatten
+	// joins it (by the element's name); without flatten it stays degraded
+	for (auto &t : targets)
+		if (t.is_mem) {
+			IdString attr = IdString("\\sv_degraded");
+			std::string cur = new_module->has_attribute(attr) ? new_module->attributes.at(attr).decode_string() : std::string();
+			for (int k = std::min(t.mem_left, t.mem_right); k <= std::max(t.mem_left, t.mem_right); k++) {
+				std::string reason = stringf("Hierarchical reference `%s[%d]' is not joined yet. @module %s", t.name.c_str(), k, log_id(new_module->name));
+				if (cur.find(reason) == std::string::npos)
+					cur += (cur.empty() ? "" : "; ") + reason;
+			}
+			new_module->attributes[attr] = RTLIL::Const(cur);
+		}
 	for (auto &t : targets)
 		if (t.pending_join) {
 			IdString attr = IdString("\\sv_degraded");

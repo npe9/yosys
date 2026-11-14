@@ -4923,6 +4923,17 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					} else if (node->get_bool_attribute(ID(sv_intf_mem))) {
 						reg->is_input = node->is_input;
 						reg->is_output = node->is_output;
+					} else if (node->unpacked_dimensions <= 1) {
+						// fe193: the declared unpacked range of a 1-D
+						// array, in order, so that a hierarchical
+						// reference to the whole array can rebuild it
+						// (the element names alone lose the direction,
+						// and `[3:1]' also gets an element `[0]')
+						int ml = node->children[1]->range_left, mr = node->children[1]->range_right;
+						if (node->children[1]->range_swapped)
+							std::swap(ml, mr);
+						reg->set_attribute(ID(sv_mem_left), mkconst_int(loc, ml, true));
+						reg->set_attribute(ID(sv_mem_right), mkconst_int(loc, mr, true));
 					}
 					reg->location.begin.filename = node->location.begin.filename;
 					reg->location = node->location;

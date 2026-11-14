@@ -2343,6 +2343,13 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 		}
 	}
 
+	// fe191: the caller frees `ast' (the Verilog frontend, right after
+	// this).  A later derive that skips loadconfig() -- no parameters, a
+	// module derived only with its interfaces, from hierarchy -- read the
+	// freed tree through current_ast in simplify (the let-name lookup): a
+	// heap-use-after-free that crashed about one run in three.  Globals
+	// live on in design->verilog_globals.
+	current_ast = nullptr;
 }
 
 // An interface port with modport is specified like this:

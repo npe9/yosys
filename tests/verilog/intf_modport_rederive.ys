@@ -1,0 +1,137 @@
+# fe198: a module whose interface instance is passed down by modport
+# (`.x(xif.cpu)', IEEE 1800-2017 25.5) and which is rederived after its
+# interfaces were expanded (resolve_hierrefs: a checker bound into it from
+# the parent names `core_i.l.g2') lost the modport rewrite: the AST kept for
+# the rederive was taken before rewrite_modport_connections, so `xif.cpu'
+# was an implicit 1-bit wire again (sv_degraded, xu's `r' disproved on the
+# free wire).  cv32e40s_core with core_sva bound from cv32e40s_wrapper.
+
+design -reset
+logger -expect log "ic3: 3 properties: proved=3 disproved=0 undecided=0" 1
+read_verilog -sv -formal <<EOT
+interface xifc;
+  logic v;
+  logic w;
+  modport cpu (output v, input w);
+endinterface
+module xu(input logic clk, xifc.cpu x);
+  assign x.v = 1'b1;
+  r: assert property (@(posedge clk) x.w == 1'b0);
+endmodule
+module lsu(input logic clk);
+  logic g2;
+  assign g2 = 1'b0;
+endmodule
+module core(input logic clk);
+  xifc xif();
+  assign xif.w = 1'b0;
+  xu xu_i(.clk, .x(xif.cpu));
+  lsu l(.clk);
+  v: assert property (@(posedge clk) xif.v);
+endmodule
+module cchk(input logic clk, input logic gg);
+  c: assert property (@(posedge clk) gg == 1'b0);
+endmodule
+module top(input logic clk);
+  core core_i(.clk);
+  bind core: core_i cchk cc(.gg(core_i.l.g2), .*);
+`ifdef NEG
+  n: assert property (@(posedge clk) core_i.xif.v == 1'b0);
+`endif
+endmodule
+EOT
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+opt_clean
+ic3
+logger -check-expected
+
+design -reset
+logger -expect log "ic3: 3 properties: proved=3 disproved=0 undecided=0" 1
+read_verilog -sv -formal -defer <<EOT
+interface xifc;
+  logic v;
+  logic w;
+  modport cpu (output v, input w);
+endinterface
+module xu(input logic clk, xifc.cpu x);
+  assign x.v = 1'b1;
+  r: assert property (@(posedge clk) x.w == 1'b0);
+endmodule
+module lsu(input logic clk);
+  logic g2;
+  assign g2 = 1'b0;
+endmodule
+module core(input logic clk);
+  xifc xif();
+  assign xif.w = 1'b0;
+  xu xu_i(.clk, .x(xif.cpu));
+  lsu l(.clk);
+  v: assert property (@(posedge clk) xif.v);
+endmodule
+module cchk(input logic clk, input logic gg);
+  c: assert property (@(posedge clk) gg == 1'b0);
+endmodule
+module top(input logic clk);
+  core core_i(.clk);
+  bind core: core_i cchk cc(.gg(core_i.l.g2), .*);
+`ifdef NEG
+  n: assert property (@(posedge clk) core_i.xif.v == 1'b0);
+`endif
+endmodule
+EOT
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+opt_clean
+ic3
+logger -check-expected
+
+# a property that must fail (the member is driven to 1 through the modport)
+design -reset
+logger -expect log "ic3: 4 properties: proved=3 disproved=1 undecided=0" 1
+read_verilog -sv -formal -DNEG <<EOT
+interface xifc;
+  logic v;
+  logic w;
+  modport cpu (output v, input w);
+endinterface
+module xu(input logic clk, xifc.cpu x);
+  assign x.v = 1'b1;
+  r: assert property (@(posedge clk) x.w == 1'b0);
+endmodule
+module lsu(input logic clk);
+  logic g2;
+  assign g2 = 1'b0;
+endmodule
+module core(input logic clk);
+  xifc xif();
+  assign xif.w = 1'b0;
+  xu xu_i(.clk, .x(xif.cpu));
+  lsu l(.clk);
+  v: assert property (@(posedge clk) xif.v);
+endmodule
+module cchk(input logic clk, input logic gg);
+  c: assert property (@(posedge clk) gg == 1'b0);
+endmodule
+module top(input logic clk);
+  core core_i(.clk);
+  bind core: core_i cchk cc(.gg(core_i.l.g2), .*);
+`ifdef NEG
+  n: assert property (@(posedge clk) core_i.xif.v == 1'b0);
+`endif
+endmodule
+EOT
+hierarchy -check -top top
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+opt_clean
+ic3
+logger -check-expected

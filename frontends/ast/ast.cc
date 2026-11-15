@@ -4061,6 +4061,11 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 	}
 
 	rewrite_modport_connections(design, new_ast.get(), local_interfaces);
+	// fe198: and in the AST kept for a later rederive (resolve_hierrefs, a
+	// reprocess): taken before this rewrite, a rederive made `xif.cpu' an
+	// implicit wire again (cv32e40s_core with core_sva bound into it from
+	// cv32e40s_wrapper, its ports naming `core_i.cs_registers_i.mie_q')
+	rewrite_modport_connections(design, ast_before_replacing_interface_ports.get(), local_interfaces);
 
 	// Generate RTLIL from AST for the new module and add to the design,
 	// renaming this module to move it out of the way.

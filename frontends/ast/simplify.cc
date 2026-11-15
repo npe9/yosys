@@ -5844,13 +5844,22 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		}
 		// `.*' may match an unpacked array of this scope, which is an RTLIL
 		// memory and not a wire hierarchy could connect
+		// (fe197: the module's own items, not current_scope: while a module
+		// is derived from inside another's elaboration (an instance's port
+		// lookup), current_scope still holds the other module's entries, and
+		// some name nodes of an AST since freed -- cv32e40s_core's
+		// `ex_wb_pipe' when cv32e40s_cs_registers was derived for the bound
+		// cs_registers_sva (.*), read with -defer: a use after free)
 		bool wildcard_conns = get_bool_attribute(ID::wildcard_port_conns);
-		if (wildcard_conns && !lookup_suggested)
-			for (auto &it : current_scope)
-				if (it.second && it.second->type == AST_MEMORY) {
-					lookup_suggested = true;
-					break;
-				}
+		if (wildcard_conns && !lookup_suggested && current_ast_mod) {
+			std::function<bool(const AstNode *)> has_mem = [&](const AstNode *n) {
+				for (auto &c : n->children)
+					if (c->type == AST_MEMORY || (c->type == AST_GENBLOCK && has_mem(c.get())))
+						return true;
+				return false;
+			};
+			lookup_suggested = has_mem(current_ast_mod);
+		}
 
 		const RTLIL::Module *module = nullptr;
 		if (lookup_suggested)

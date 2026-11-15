@@ -144,6 +144,11 @@ static int frontend_verilog_class_tok = -1;
 // must not be claimed by the typedef lookahead (e.g. `new a[i]` would read
 // as a declaration `a[i] ...`)
 static int frontend_verilog_new_tok = -1;
+// fe204: sig_tok of a dropped `virtual' (or the `interface' after it) that
+// starts a virtual interface declaration `virtual [interface] IF[.MP] v'
+// (IEEE 1800-2017 25.9): the declaration reads as `IF v', the modport, which
+// only restricts access through the handle, is dropped.
+static int frontend_verilog_vif_tok = -1;
 static int frontend_verilog_paren_depth = 0;
 // paren depth of the innermost @(...) event list, -1 when not inside one
 static int frontend_verilog_event_depth = -1;
@@ -460,7 +465,13 @@ ASSOC_DIM "["[ \t\r\n]*([a-zA-Z_$][a-zA-Z0-9_$]*|"\*")([ \t\r\n]|"/*"([^*]|\*+[^
 "package"      { SV_KEYWORD(parser::make_TOK_PACKAGE(out_loc)); }
 "endpackage"   { SV_KEYWORD(parser::make_TOK_ENDPACKAGE(out_loc)); }
 "import"       { SV_KEYWORD(parser::make_TOK_IMPORT(out_loc)); }
-"interface"    { SV_KEYWORD(parser::make_TOK_INTERFACE(out_loc)); }
+"interface"    {
+	if (frontend_verilog_vif_tok == frontend_verilog_sig_tok - 1) {
+		frontend_verilog_vif_tok = frontend_verilog_sig_tok;
+	} else {
+		SV_KEYWORD(parser::make_TOK_INTERFACE(out_loc));
+	}
+}
 "endinterface" { SV_KEYWORD(parser::make_TOK_ENDINTERFACE(out_loc)); }
 "modport"      { SV_KEYWORD(parser::make_TOK_MODPORT(out_loc)); }
 "parameter"    { return parser::make_TOK_PARAMETER(out_loc); }
@@ -690,7 +701,13 @@ pullup|pulldown {
 "endclass"       { SV_KEYWORD(parser::make_TOK_ENDCLASS(out_loc)); }
 "extends"        { SV_KEYWORD(parser::make_TOK_EXTENDS(out_loc)); }
 "implements"     { SV_KEYWORD(parser::make_TOK_IMPLEMENTS(out_loc)); }
-"virtual"        { SV_KEYWORD(parser::make_TOK_VIRTUAL(out_loc)); }
+"virtual"        {
+	if ((mode->sv || mode->formal) && lookahead_virtual_if()) {
+		frontend_verilog_vif_tok = frontend_verilog_sig_tok;
+	} else {
+		SV_KEYWORD(parser::make_TOK_VIRTUAL(out_loc));
+	}
+}
 "pure"           { SV_KEYWORD(parser::make_TOK_PURE(out_loc)); }
 "local"          { SV_KEYWORD(parser::make_TOK_LOCAL(out_loc)); }
 "protected"      { SV_KEYWORD(parser::make_TOK_PROTECTED(out_loc)); }
@@ -992,6 +1009,12 @@ supply1 { return parser::make_TOK_SUPPLY1(out_loc); }
 }
 
 [a-zA-Z_$][a-zA-Z0-9_$]*(\.[a-zA-Z_$][a-zA-Z0-9_$]*)* {
+	if (frontend_verilog_vif_tok == frontend_verilog_sig_tok - 1) {
+		// `virtual IF.MP v': the interface type, without the modport
+		std::string t = YYText();
+		auto val = std::make_unique<std::string>("\\" + t.substr(0, t.find('.')));
+		return parser::make_TOK_USER_TYPE(std::move(val), out_loc);
+	}
 	auto val = std::make_unique<std::string>(std::string("\\") + YYText());
 	return parser::make_TOK_ID(std::move(val), out_loc);
 }
@@ -1361,6 +1384,88 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_func_rettype()
 				while (is_cont(k))
 					k = getc();
 				yes = skip_from(k) == '(';
+			}
+		}
+	}
+	for (int i = (int)saved.size() - 1; i >= 0; --i)
+		unput(saved[i]);
+	yylineno = line;
+	return yes;
+}
+
+// fe204: whether the text after `virtual' is a virtual interface
+// declaration `[interface] IF[.MP] name' (IEEE 1800-2017 25.9): a word that
+// is not a keyword, optionally `.word', then a variable name.  A method
+// (`virtual function'), class (`virtual class'), parameterized form
+// (`virtual IF #(...)') or a type argument (`#(virtual IF)') does not match
+// and keeps TOK_VIRTUAL.
+bool VERILOG_FRONTEND::VerilogLexer::lookahead_virtual_if()
+{
+	std::string saved;
+	int line = yylineno;
+	auto getc = [&]() -> int {
+		int c = yyinput();
+		if (c > 0)
+			saved.push_back((char)c);
+		return c;
+	};
+	auto skip_ws = [&](int c) -> int {
+		while (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f')
+			c = getc();
+		return c;
+	};
+	auto is_start = [](int c) { return std::isalpha(c) || c == '_'; };
+	auto is_cont = [](int c) { return std::isalnum(c) || c == '_' || c == '$'; };
+	int trail = 0;
+	auto read_word = [&](int first) -> std::string {
+		std::string word(1, (char)first);
+		int n = getc();
+		while (is_cont(n)) {
+			word.push_back((char)n);
+			n = getc();
+		}
+		trail = n;
+		return word;
+	};
+	bool yes = false;
+	int c = skip_ws(getc());
+	if (is_start(c)) {
+		std::string w = read_word(c);
+		if (w == "interface") {
+			c = skip_ws(trail);
+			w = is_start(c) ? read_word(c) : std::string();
+		}
+		if (!w.empty() && !is_reserved_word(w)) {
+			c = trail;
+			bool ok = true;
+			// `virtual IF #(...) v': a parameterized interface type
+			int h = skip_ws(c);
+			if (h == '#') {
+				c = skip_ws(getc());
+				if (c == '(') {
+					int depth = 1;
+					while (depth > 0 && (c = getc()) > 0) {
+						if (c == '(') depth++;
+						else if (c == ')') depth--;
+					}
+					c = depth == 0 ? getc() : 0;
+				} else
+					ok = false;
+			} else
+				c = h;
+			if (ok && c == '.') {
+				c = getc();
+				if (is_start(c)) {
+					std::string mp = read_word(c);
+					ok = !is_reserved_word(mp);
+					c = trail;
+				} else
+					ok = false;
+			}
+			c = skip_ws(c);
+			if (ok && is_start(c)) {
+				std::string name = read_word(c);
+				yes = !is_reserved_word(name);
 			}
 		}
 	}

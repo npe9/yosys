@@ -1,0 +1,49 @@
+# fe204: virtual interface declarations `virtual [interface] IF[.MP] v'
+# (IEEE 1800-2017 25.9) as class members, typedefs, task arguments and
+# locals and return types (uvma_obi_memory_drv `virtual uvma_obi_memory_if.active_mstr_mp
+# mstr_mp;').  The modport only restricts access through the handle; it is
+# dropped.  `virtual' methods and classes are unaffected.  (At package
+# scope a virtual interface typedef or variable is still refused as an
+# unknown type, as before.)
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+interface i_if;
+	logic a;
+	modport mp(input a);
+endinterface
+interface gi_if #(type T = int);
+endinterface
+package p;
+	virtual class base_c;
+		pure virtual function void g();
+	endclass
+	class c extends base_c;
+		typedef virtual i_if.mp vt1;
+		typedef virtual interface i_if vt2;
+		virtual i_if vif0;
+		virtual i_if.mp vif1;
+		virtual interface i_if.mp vif2;
+		local virtual i_if vif3;
+		task t(virtual i_if.mp v);
+		endtask
+		virtual gi_if #(int) gv;
+		function void s(virtual gi_if #(int) I);
+		endfunction
+		function void f();
+			virtual i_if.mp v;
+		endfunction
+		function virtual i_if get();
+		endfunction
+		extern function virtual i_if.mp get2();
+		virtual function void g();
+		endfunction
+		virtual protected task h();
+		endtask
+	endclass
+endpackage
+module top(output logic o);
+	assign o = 1'b1;
+endmodule
+EOT
+logger -check-expected
+hierarchy -top top

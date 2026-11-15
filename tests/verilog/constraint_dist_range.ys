@@ -1,0 +1,20 @@
+# fe204: value ranges in a dist constraint (`repeat_count dist { 1 :/ 9,
+# [2:3] :/ 1 }', IEEE 1800-2017 18.5.4), in a class constraint block and an
+# inline `randomize() with'.  Constraints are class code: discarded.
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+package p;
+	class c;
+		rand int x;
+		constraint k { x dist { 1 := 9, [2:3] := 1, [4:$] :/ 1 }; }
+		function void f();
+			assert(randomize() with { x dist { 1 :/ 9, [2:3] :/ 1 }; });
+		endfunction
+	endclass
+endpackage
+module top(output logic o);
+	assign o = 1'b1;
+endmodule
+EOT
+logger -check-expected
+hierarchy -top top

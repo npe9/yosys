@@ -6826,6 +6826,11 @@ dist_item_list:
 dist_item:
 	expr opt_dist_weight {
 		(void)$1;
+	} |
+	TOK_LBRA expr TOK_COL expr TOK_RBRA opt_dist_weight {
+		// a value range, `x dist { [2:3] :/ 1 }' (IEEE 1800-2017 18.5.4);
+		// constraints are simulation-only and discarded
+		(void)$2; (void)$4;
 	};
 
 opt_dist_weight:

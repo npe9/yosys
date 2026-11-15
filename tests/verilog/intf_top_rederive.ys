@@ -1,0 +1,104 @@
+# fe200: a top module with an interface port, rederived when a hierarchical
+# reference into its instance resolves (`core_i.cnt'): the rederived top
+# gets its interface ports exploded again, so the instance is still derived
+# with the interface.  Before: with `.*', "Width mismatch between wire
+# (1 bits) and port (4 bits) for implicit port connection `xp.v'"; with
+# explicit connections the top stayed sv_degraded (the instance used the
+# variant without the interface).
+read_verilog -sv -formal <<EOT
+interface ifc;
+  logic [3:0] v;
+  logic       r;
+  modport cpu (output v, input r);
+endinterface
+
+module core (input logic clk, ifc.cpu xp);
+  logic [3:0] cnt;
+  always_ff @(posedge clk) cnt <= cnt + 1;
+  assign xp.v = cnt;
+endmodule
+
+module top (input logic clk, ifc.cpu xp);
+  core core_i (.xp(xp), .*);
+  logic [3:0] probe;
+  assign probe = core_i.cnt;
+  p: assert property (@(posedge clk) probe == xp.v);
+  n: assert property (@(posedge clk) probe != 4'd3);
+endmodule
+EOT
+hierarchy -check -top top
+sva2check
+proc
+flatten
+async2sync
+select -assert-none A:sv_degraded
+logger -expect log "ic3: 2 properties: proved=1 disproved=1 undecided=0" 1
+ic3 -init-zero -bmc 6 -max 0 -kind 2
+logger -check-expected
+design -reset
+
+# -defer
+read_verilog -sv -formal -defer <<EOT
+interface ifc;
+  logic [3:0] v;
+  logic       r;
+  modport cpu (output v, input r);
+endinterface
+
+module core (input logic clk, ifc.cpu xp);
+  logic [3:0] cnt;
+  always_ff @(posedge clk) cnt <= cnt + 1;
+  assign xp.v = cnt;
+endmodule
+
+module top (input logic clk, ifc.cpu xp);
+  core core_i (.xp(xp), .*);
+  logic [3:0] probe;
+  assign probe = core_i.cnt;
+  p: assert property (@(posedge clk) probe == xp.v);
+  n: assert property (@(posedge clk) probe != 4'd3);
+endmodule
+EOT
+hierarchy -check -top top
+sva2check
+proc
+flatten
+async2sync
+select -assert-none A:sv_degraded
+logger -expect log "ic3: 2 properties: proved=1 disproved=1 undecided=0" 1
+ic3 -init-zero -bmc 6 -max 0 -kind 2
+logger -check-expected
+design -reset
+
+# explicit connections
+read_verilog -sv -formal <<EOT
+interface ifc;
+  logic [3:0] v;
+  logic       r;
+  modport cpu (output v, input r);
+endinterface
+
+module core (input logic clk, ifc.cpu xp);
+  logic [3:0] cnt;
+  always_ff @(posedge clk) cnt <= cnt + 1;
+  assign xp.v = cnt;
+endmodule
+
+module top (input logic clk, ifc.cpu xp);
+  core core_i (.xp(xp), .clk(clk));
+  logic [3:0] probe;
+  assign probe = core_i.cnt;
+  p: assert property (@(posedge clk) probe == xp.v);
+  n: assert property (@(posedge clk) probe != 4'd3);
+endmodule
+EOT
+hierarchy -check -top top
+sva2check
+proc
+flatten
+async2sync
+select -assert-none A:sv_degraded
+logger -expect log "ic3: 2 properties: proved=1 disproved=1 undecided=0" 1
+ic3 -init-zero -bmc 6 -max 0 -kind 2
+logger -check-expected
+design -reset

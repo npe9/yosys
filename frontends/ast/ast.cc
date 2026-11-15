@@ -2798,6 +2798,9 @@ static std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> interface_cells_
 	return intf_cells;
 }
 
+static void explode_top_interface_ports(RTLIL::Design *design, AstNode *new_ast);
+static bool has_top_interface_dummies(RTLIL::Module *module);
+
 static void redo_interface_ports(RTLIL::Module *old_module, RTLIL::Module *new_module,
 		const std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> &intf_cells)
 {
@@ -2839,7 +2842,14 @@ bool AstModule::reprocess_if_necessary(RTLIL::Design *design)
 			// to be done again, or hierarchy explodes the ports a second time.
 			auto intf_cells = interface_cells_of(this);
 			RTLIL::Module *old_module = this;
-			RTLIL::Module *new_module = process_and_replace_module(design, this, ast.get(), NULL);
+			// fe200: a top's interface ports again (explode_top_interface_ports)
+			std::unique_ptr<AstNode> kept_ast, top_ast;
+			if (has_top_interface_dummies(this)) {
+				kept_ast = ast->clone();
+				top_ast = ast->clone();
+				explode_top_interface_ports(design, top_ast.get());
+			}
+			RTLIL::Module *new_module = process_and_replace_module(design, this, top_ast ? top_ast.get() : ast.get(), std::move(kept_ast));
 			redo_interface_ports(old_module, new_module, intf_cells);
 			return true;
 		}
@@ -3849,7 +3859,14 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	bool intf_done = get_bool_attribute(ID::interfaces_replaced_in_module);
 	auto intf_cells = interface_cells_of(this);
 	RTLIL::Module *old_module = this;
-	RTLIL::Module *new_module = process_and_replace_module(design, this, new_ast.get(), NULL);
+	// fe200: a top's interface ports again (explode_top_interface_ports);
+	// the AST kept for a later rederive stays without them
+	std::unique_ptr<AstNode> kept_ast;
+	if (has_top_interface_dummies(this)) {
+		kept_ast = new_ast->clone();
+		explode_top_interface_ports(design, new_ast.get());
+	}
+	RTLIL::Module *new_module = process_and_replace_module(design, this, new_ast.get(), std::move(kept_ast));
 	redo_interface_ports(old_module, new_module, intf_cells);
 	new_module->set_bool_attribute(ID(sv_hierrefs_resolved));
 	if (any_member)
@@ -3981,41 +3998,18 @@ static void rewrite_modport_connections(RTLIL::Design *design, AstNode *mod_ast,
 	}
 }
 
-void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Module*> &local_interfaces)
+// A top module's interface ports (nothing instantiates the interface): a
+// dummy instance `<port>_inst_from_top_dummy' per port, which hierarchy
+// propagates down, and the port's members as wires.
+// fe200: also applied when a top is rederived (resolve_hierrefs, a
+// reprocess) from its kept AST, which is taken before this step: without it
+// the rederived top had its interface ports with no dummy and no members,
+// hierarchy no longer found the interface for the sub-module's port, and
+// the sub-module stayed the variant without the interface (`.*' then named
+// its exploded ports: cv32e40x_wrapper, core_i(.xif_result_if(..), .*))
+static void explode_top_interface_ports(RTLIL::Design *design, AstNode *new_ast)
 {
-	loadconfig();
-
-	auto new_ast = ast->clone();
-	auto loc = ast->location;
-	for (auto &intf : local_interfaces) {
-		std::string intfname = intf.first.str();
-		RTLIL::Module *intfmodule = intf.second;
-		pool<std::string> mems_done;
-		for (auto w : intfmodule->wires()){
-			if (is_intf_mem_element(w)) {
-				std::string origname;
-				if (auto mem = intf_member_memory(new_ast.get(), w, intfname, mems_done, origname))
-					new_ast->children.push_back(std::move(mem));
-				continue;
-			}
-			auto wire = intf_member_wire(new_ast.get(), intfmodule, w, intfname);
-			std::string newname = w->name.unescape();
-			newname = intfname + "." + newname;
-			wire->str = newname;
-			// fe174: driven by the instance's alias; the event is named
-			// through the instance
-			if (w->has_attribute(ID(sv_clockvar)))
-				wire->set_attribute(ID(sv_clockvar), AstNode::mkconst_str(wire->location,
-						clockvar_event_through(w->get_string_attribute(ID(sv_clockvar)), intfname)));
-			new_ast->children.push_back(std::move(wire));
-		}
-	}
-
-	auto ast_before_replacing_interface_ports = new_ast->clone();
-
-	// Explode all interface ports. Note this will only have an effect on 'top
-	// level' modules. Other sub-modules will have their interface ports
-	// exploded via the derive(..) function
+	auto loc = new_ast->location;
 	for (size_t i =0; i<new_ast->children.size(); i++)
 	{
 		const auto& ch2 = new_ast->children[i];
@@ -4051,7 +4045,7 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 							std::string interface_modport_compare_str = "\\" + interface_modport;
 							AstNode *modport = find_modport(ast_module_of_interface->ast.get(), interface_modport_compare_str); // modport == NULL if no modport
 							// Iterate over all wires in the interface and add them to the module:
-							explode_interface_port(new_ast.get(), intfmodule, name_port, modport);
+							explode_interface_port(new_ast, intfmodule, name_port, modport);
 						}
 						break;
 					}
@@ -4059,6 +4053,55 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 			}
 		}
 	}
+}
+
+// whether a module was expanded as a top (has the dummy instances above)
+static bool has_top_interface_dummies(RTLIL::Module *module)
+{
+	for (auto c : module->cells()) {
+		const std::string &n = c->name.str();
+		if (n.size() > 20 && n.compare(n.size() - 20, 20, "_inst_from_top_dummy") == 0)
+			return true;
+	}
+	return false;
+}
+
+void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Module*> &local_interfaces)
+{
+	loadconfig();
+
+	auto new_ast = ast->clone();
+	auto loc = ast->location;
+	for (auto &intf : local_interfaces) {
+		std::string intfname = intf.first.str();
+		RTLIL::Module *intfmodule = intf.second;
+		pool<std::string> mems_done;
+		for (auto w : intfmodule->wires()){
+			if (is_intf_mem_element(w)) {
+				std::string origname;
+				if (auto mem = intf_member_memory(new_ast.get(), w, intfname, mems_done, origname))
+					new_ast->children.push_back(std::move(mem));
+				continue;
+			}
+			auto wire = intf_member_wire(new_ast.get(), intfmodule, w, intfname);
+			std::string newname = w->name.unescape();
+			newname = intfname + "." + newname;
+			wire->str = newname;
+			// fe174: driven by the instance's alias; the event is named
+			// through the instance
+			if (w->has_attribute(ID(sv_clockvar)))
+				wire->set_attribute(ID(sv_clockvar), AstNode::mkconst_str(wire->location,
+						clockvar_event_through(w->get_string_attribute(ID(sv_clockvar)), intfname)));
+			new_ast->children.push_back(std::move(wire));
+		}
+	}
+
+	auto ast_before_replacing_interface_ports = new_ast->clone();
+
+	// Explode all interface ports. Note this will only have an effect on 'top
+	// level' modules. Other sub-modules will have their interface ports
+	// exploded via the derive(..) function
+	explode_top_interface_ports(design, new_ast.get());
 
 	rewrite_modport_connections(design, new_ast.get(), local_interfaces);
 	// fe198: and in the AST kept for a later rederive (resolve_hierrefs, a

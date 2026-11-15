@@ -1,0 +1,65 @@
+# fe204: `real' as a class type argument (uvm_field_real's `uvm_resource
+# #(real)') and as an unpacked struct member (uvml_hrtbt_tdefs `realtime
+# timestamp;', IEEE 1800-2017 7.2).  A typedef alone reads clean; a variable
+# of the struct type is degraded (the member is a 32-bit integer, as a real
+# variable is); a packed struct may not have one (7.2.1).
+logger -expect warning "Unpacked struct or union is treated as packed" 1
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+package p;
+	class r #(type T = int);
+		T v;
+	endclass
+	class c;
+		function void f();
+			r #(real) h;
+			r #(realtime) g;
+		endfunction
+	endclass
+	typedef struct { int id; realtime ts; } s_t;
+endpackage
+EOT
+logger -check-expected
+design -reset
+
+logger -expect warning "Real member `ts' of struct variable `.s' is modeled as a 32-bit integer" 1
+logger -expect warning "Unpacked struct or union is treated as packed" 1
+read_verilog -sv -permissive <<EOT
+module top(input logic [7:0] a, output logic [7:0] o);
+	typedef struct { logic [7:0] id; real ts; } s_t;
+	s_t s;
+	assign s.id = a;
+	assign s.ts = 0;
+	assign o = s.id;
+endmodule
+EOT
+logger -check-expected
+hierarchy -top top
+proc
+# the member is 32 bits: the struct is 8 + 32 bits wide (it was 8 + 1)
+select -assert-count 1 top/s top/s:40 %i
+sat -verify -prove o a
+design -reset
+
+# an unpacked array of the struct (a memory) too
+logger -expect warning "Real member `ts' of struct variable `.arr' is modeled as a 32-bit integer" 1
+logger -expect warning "Unpacked struct or union is treated as packed" 1
+read_verilog -sv -permissive <<EOT
+module top3(input logic [7:0] a, output logic [7:0] o);
+	typedef struct { logic [7:0] id; real ts; } s_t;
+	s_t arr [2];
+	assign arr[0].id = a;
+	assign o = arr[0].id;
+endmodule
+EOT
+logger -check-expected
+design -reset
+
+logger -expect error "A member of a packed struct or union must be of an integral type, not real" 1
+read_verilog -sv <<EOT
+module top2(output logic [7:0] o);
+	typedef struct packed { logic [7:0] id; real ts; } s_t;
+	s_t s;
+	assign o = s.id;
+endmodule
+EOT

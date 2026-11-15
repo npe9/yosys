@@ -1846,8 +1846,30 @@ static bool struct_is_2state(AstNode *n)
 	return false;
 }
 
+// fe204: a real member (unpacked struct, IEEE 1800-2017 7.2) is laid out as
+// a 32-bit integer, as a real variable is (genrtlil.cc).  A variable of the
+// type (a wire, port, parameter, function result or an array of the struct)
+// is degraded; a typedef alone is not.
+static void degrade_real_members(const AstNode *template_node, const std::string &name)
+{
+	std::function<const AstNode *(const AstNode *)> real_member = [&](const AstNode *n) -> const AstNode * {
+		for (auto &c : n->children) {
+			if (c->attributes.count(ID(sv_real_member)))
+				return c.get();
+			if (c->type == AST_STRUCT || c->type == AST_UNION)
+				if (auto r = real_member(c.get()))
+					return r;
+		}
+		return nullptr;
+	};
+	if (auto r = real_member(template_node))
+		degrade(template_node->location.to_loc(), "Real member `%s' of struct variable `%s' is modeled as a 32-bit integer; real values and arithmetic are not synthesized.\n",
+				r->str.c_str(), name.empty() ? "(a nested struct member)" : name.c_str());
+}
+
 std::unique_ptr<AstNode> make_packed_struct(AstNode *template_node, std::string &name, decltype(AstNode::attributes) &attributes, AstNode *packed_dims = nullptr)
 {
+	degrade_real_members(template_node, name);
 	// create a wire for the packed struct
 	auto loc = template_node->location;
 	auto wnode = std::make_unique<AstNode>(loc, AST_WIRE, make_range(loc, template_node->range_left, 0));
@@ -6991,6 +7013,7 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 					} else if (GetSize(children) > 2 && children[1] && children[1]->type == AST_MULTIRANGE) {
 						input_error("Multiple packed dimensions on struct/union type `%s' in unpacked array declaration are not supported.\n", type_name.c_str());
 					}
+					degrade_real_members(template_node.get(), str);
 					int elem_w = std::abs(template_node->range_left - template_node->range_right) + 1;
 					newNode = std::make_unique<AstNode>(location, AST_MEMORY);
 					newNode->str = str;

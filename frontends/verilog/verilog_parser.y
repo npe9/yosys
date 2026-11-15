@@ -4094,6 +4094,21 @@ member_type:
 	} |
 	type_atom type_signing
 	| type_vec type_signing
+	| TOK_REAL {
+		// IEEE 1800-2017 7.2: an unpacked struct member may be any data
+		// type (uvml_hrtbt_tdefs `realtime timestamp;'); a packed one must
+		// be integral (7.2.1).  The member is laid out as a 32-bit integer,
+		// as a real variable is, and marked: a variable of the struct
+		// type is degraded (simplify.cc), a typedef alone is not.
+		if (extra->astbuf1) {
+			if (extra->astbuf2 && !extra->astbuf2->attributes.count(ID(sv_unpacked)))
+				err_at_loc(@$, "A member of a packed struct or union must be of an integral type, not real (IEEE 1800-2017 7.2.1).");
+			extra->astbuf1->set_attribute(ID(sv_real_member), AstNode::mkconst_int(@$, 1, false));
+			extra->astbuf1->is_reg = true;
+			extra->astbuf1->is_signed = true;
+			addRange(extra->astbuf1.get(), 31, 0);
+		}
+	}
 	| hierarchical_type_id { extra->addWiretypeNode($1.get(), extra->astbuf1.get()); }
 	| TOK_SCOPED_ID { extra->addWiretypeNode($1.get(), extra->astbuf1.get()); }
 	;
@@ -6593,6 +6608,10 @@ class_spec_param:
 	} |
 	integer_atom_type TOK_UNSIGNED {
 		// e.g. `uvm_resource #(int unsigned)`; discarded
+	} |
+	TOK_REAL {
+		// e.g. `uvm_resource #(real)` (uvm_field_real's resource read);
+		// discarded.  `real'(...)' is a cast and still parses as expr.
 	} |
 	TOK_USER_TYPE {
 		// a registered type used as a parameter, e.g. `uvm_resource #(uvm_integral_t)`;

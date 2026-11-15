@@ -6555,6 +6555,19 @@ static_method_name:
 class_type_arg:
 	class_type_core class_type_params |
 	class_type_core non_opt_range |
+	TOK_CONSTVAL {
+		// a numeric parameter value in a class scope, e.g.
+		// `uvml_mem_c#(32)::type_id::create(...)'; discarded like the rest
+	} |
+	TOK_CONSTVAL TOK_BASE TOK_BASED_CONSTVAL {
+		// a sized literal, `cls#(8'h4)::'; discarded
+	} |
+	TOK_BASE TOK_BASED_CONSTVAL {
+		// an unsized based literal, `cls#('h4)::'; discarded
+	} |
+	TOK_STRING {
+		// a string parameter value, e.g. `cls#("name")::get()'; discarded
+	} |
 	TOK_DOT TOK_ID TOK_LPAREN expr TOK_RPAREN {
 		// named parameter assignment in a parameterized class scope,
 		// e.g. `test_cls#(.t(23))::new(...)`; parameter values are

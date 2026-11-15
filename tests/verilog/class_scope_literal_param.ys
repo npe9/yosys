@@ -1,0 +1,26 @@
+# fe204: literal parameter values in a class scope (`uvml_mem_c#(32)::
+# type_id::create("mem")', `cls#(8'h4)::', `cls#("s")::'), class code:
+# discarded.
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+package p;
+	class r #(int T = 1);
+		static function r create(string s);
+		endfunction
+	endclass
+	class c;
+		r m;
+		function void f();
+			m = r#(32)::create("a");
+			m = r#(8'h4)::create("b");
+			m = r#('h4)::create("c");
+			m = r#("s")::create("d");
+		endfunction
+	endclass
+endpackage
+module top(output logic o);
+	assign o = 1'b1;
+endmodule
+EOT
+logger -check-expected
+hierarchy -top top

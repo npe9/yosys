@@ -931,6 +931,26 @@ void check_cell_connections(const RTLIL::Module &module, RTLIL::Cell &cell, RTLI
 	}
 }
 
+// fe199: whether a module still has local interface instances it has not
+// expanded (`ifc mi()': read with -defer, waiting for `$abstract\ifc'; or a
+// template that is never expanded itself).  A module derived for its
+// interface ports is cloned from this module's AST, so deriving it before
+// then leaves those instances' members implicit nets (`mi.s_req.req');
+// cv32e40x_core under cv32e40x_wrapper's interface ports.
+static bool local_interfaces_pending(RTLIL::Design *design, RTLIL::Module *mod)
+{
+	if (mod->get_bool_attribute(ID::interfaces_replaced_in_module))
+		return false;
+	for (auto c : mod->cells()) {
+		RTLIL::Module *m = design->module(c->type);
+		if (m == nullptr && c->type.begins_with("\\"))
+			m = design->module("$abstract" + c->type.str());
+		if (m != nullptr && m->get_bool_attribute(ID::is_interface))
+			return true;
+	}
+	return false;
+}
+
 bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check, bool flag_simcheck, bool flag_smtcheck,
 		   std::vector<std::string> &libdirs, const pool<RTLIL::Module*> *used_modules = nullptr)
 {
@@ -1034,6 +1054,19 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 		// If interface instances not yet found, skip cell for now, and say we did something, so that we will return back here:
 		if(if_expander.has_interfaces_not_found) {
 			did_something = true; // waiting for interfaces to be handled
+			continue;
+		}
+
+		// fe199: the module this cell's interface variant is cloned from
+		// expands its own interface instances first: without parameter
+		// overrides that is the cell's module (wait for it), with them the
+		// derived module, which the cell uses until then
+		if (if_expander.interfaces_to_add_to_submodule.size() > 0 && local_interfaces_pending(design, mod)) {
+			if (cell->parameters.size() > 0) {
+				cell->type = mod->derive(design, cell->parameters);
+				cell->parameters.clear();
+			}
+			did_something = true;
 			continue;
 		}
 

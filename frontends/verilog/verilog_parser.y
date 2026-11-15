@@ -1199,7 +1199,7 @@
 %token TOK_BIT_OR_ASSIGN TOK_BIT_AND_ASSIGN TOK_BIT_XOR_ASSIGN TOK_ADD_ASSIGN
 %token TOK_SUB_ASSIGN TOK_DIV_ASSIGN TOK_MOD_ASSIGN TOK_MUL_ASSIGN
 %token TOK_SHL_ASSIGN TOK_SHR_ASSIGN TOK_SSHL_ASSIGN TOK_SSHR_ASSIGN
-%token TOK_TIME_SCALE
+%token TOK_TIME_SCALE TOK_1STEP
 %token TOK_IMPORT
 
 %token TOK_EXCL "'!'"
@@ -8641,6 +8641,10 @@ clocking_delay_opt:
 	TOK_HASH TOK_CONSTVAL { extra->cb_skew = true; } |
 	TOK_HASH TOK_REALVAL { extra->cb_skew = true; } |
 	TOK_HASH TOK_TIME_SCALE { extra->cb_skew = true; } |
+	TOK_HASH TOK_1STEP {
+		// `#1step' is the default input skew (IEEE 1800-2017 14.3: the
+		// value sampled in the Preponed region), so no explicit skew
+	} |
 	%empty;
 
 sva_inside_items:

@@ -1232,6 +1232,11 @@ import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+(context[ \t\r\n]+)?(extern[ \t\r\n]+)?
 	return parser::make_TOK_SPECIFY_AND(out_loc);
 }
 
+"1step" {
+	/* fe204: the `1step' time literal (IEEE 1800-2017 14.4: a clocking
+	   skew of one time step); `1' then the identifier `step' was read */
+	return parser::make_TOK_1STEP(out_loc);
+}
 {UNSIGNED_NUMBER}{TIME_SCALE_SUFFIX} { return parser::make_TOK_TIME_SCALE(out_loc); }
 {FIXED_POINT_NUMBER_DEC}{TIME_SCALE_SUFFIX} { return parser::make_TOK_TIME_SCALE(out_loc); }
 {FIXED_POINT_NUMBER_NO_DEC}{TIME_SCALE_SUFFIX} { return parser::make_TOK_TIME_SCALE(out_loc); }

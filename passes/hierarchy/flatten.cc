@@ -410,7 +410,23 @@ struct FlattenWorker
 						drop_hierref_degradation(module, hier_wire->name);
 					}
 				}
-				if (intf_instance && hier_wire != nullptr && !hier_wire->get_bool_attribute(ID::hierconn) &&
+				// fe202: an upward reference of the interface (hierarchy made
+				// it an input port, sv_upward_ref) is connected through the
+				// cell (connect_upward_refs), not as a member: the parent's
+				// wire of that name is what expand_interfaces made of the
+				// implicit wire the interface had before (one bit), and it
+				// is not one of the interface's members.  Read in the parent
+				// anyway, it stays a free wire, and the mark holds.
+				bool upward_port = tpl_wire->port_input && tpl_wire->attributes.count(ID(sv_upward_ref));
+				if (upward_port && intf_instance && hier_wire != nullptr) {
+					read_cache.erase(module);
+					if (read_wires(module).count(hier_wire)) {
+						log_warning("Interface member %s.%s is read, but %s.%s is an upward reference of the interface; it stays a free wire.\n",
+							module, hier_wire, tpl, tpl_wire);
+						intf_all_joined = false;
+					}
+				}
+				if (intf_instance && hier_wire != nullptr && !upward_port && !hier_wire->get_bool_attribute(ID::hierconn) &&
 						!hier_wire->port_input && !hier_wire->port_output) {
 					if (GetSize(hier_wire) == GetSize(tpl_wire)) {
 						drop_hierref_degradation(module, hier_wire->name);

@@ -1,0 +1,74 @@
+# fe202: an interface bound into a module (`bind dut cov_if u_bind (.*)'),
+# read with -defer, whose logic names an instance further up (`sub_i.q',
+# 23.8): hierarchy rederives the interface with an upward-reference input
+# port, which flatten connects through the cell.  The parent's 1-bit wire
+# `u_bind.sub_i.q' (expand_interfaces made it of the interface's earlier
+# implicit wire) is not a member to join, so the pending mark "Interface
+# `u_bind' (cov_if) has logic that is connected only by flatten" is dropped.
+# Before: "Interface member dut.u_bind.sub_i.q is not joined to
+# cov_if.sub_i.q (width 1, not 4)" and the design stayed sv_degraded
+# (ibex core_ibex_fcov_if bound into ibex_core).
+read_verilog -sv -formal -defer <<EOT
+interface cov_if (input logic clk_i, input logic [3:0] cnt);
+  logic big;
+  assign big = cnt > 4'd7;
+  logic [3:0] sub_q;
+  assign sub_q = sub_i.q;
+  p: assert property (@(posedge clk_i) big == (cnt[3]));
+  q: assert property (@(posedge clk_i) sub_q == cnt);
+  n: assert property (@(posedge clk_i) !big);
+endinterface
+module sub (input logic clk_i, input logic [3:0] d, output logic [3:0] q);
+  assign q = d;
+endmodule
+module dut (input logic clk_i);
+  logic [3:0] cnt;
+  always_ff @(posedge clk_i) cnt <= cnt + 1;
+  logic [3:0] o;
+  sub sub_i (.clk_i, .d(cnt), .q(o));
+endmodule
+bind dut cov_if u_bind (.*);
+EOT
+hierarchy -check -top dut
+sva2check
+proc
+flatten
+async2sync
+select -assert-none A:sv_degraded
+logger -expect log "ic3: 3 properties: proved=2 disproved=1 undecided=0" 1
+ic3 -init-zero -bmc 10 -max 0 -kind 2
+logger -check-expected
+design -reset
+
+# the parent reads that wire itself: it stays a free wire, and the mark holds
+read_verilog -sv -formal -defer <<EOT
+interface cov_if (input logic clk_i, input logic [3:0] cnt);
+  logic big;
+  assign big = cnt > 4'd7;
+  logic [3:0] sub_q;
+  assign sub_q = sub_i.q;
+  p: assert property (@(posedge clk_i) big == (cnt[3]));
+  q: assert property (@(posedge clk_i) sub_q == cnt);
+  n: assert property (@(posedge clk_i) !big);
+endinterface
+module sub (input logic clk_i, input logic [3:0] d, output logic [3:0] q);
+  assign q = d;
+endmodule
+module dut (input logic clk_i);
+  logic [3:0] cnt;
+  always_ff @(posedge clk_i) cnt <= cnt + 1;
+  logic [3:0] o;
+  sub sub_i (.clk_i, .d(cnt), .q(o));
+  logic [3:0] rd; assign rd = u_bind.sub_i.q;
+  r: assert property (@(posedge clk_i) rd == cnt);
+endmodule
+bind dut cov_if u_bind (.*);
+EOT
+hierarchy -check -top dut
+sva2check
+proc
+logger -expect warning "is read, but cov_if.sub_i.q is an upward reference of the interface" 1
+flatten
+async2sync
+select -assert-any A:sv_degraded
+logger -check-expected

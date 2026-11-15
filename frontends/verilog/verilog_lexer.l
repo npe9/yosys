@@ -848,6 +848,9 @@ pullup|pulldown {
 "edge" { if (frontend_verilog_event_depth >= 0 && frontend_verilog_paren_depth == frontend_verilog_event_depth) return parser::make_TOK_EDGE(out_loc); NON_KEYWORD(); }
 "genvar"  { return parser::make_TOK_GENVAR(out_loc); }
 "real"    { return parser::make_TOK_REAL(out_loc); }
+	/* IEEE 1364-2005 4.8.3 / 1800-2017 6.12: "realtime declarations shall
+	   be treated synonymously with real declarations". */
+"realtime" { return parser::make_TOK_REAL(out_loc); }
 
 "enum"    { frontend_verilog_enum_tok = frontend_verilog_sig_tok; SV_KEYWORD(parser::make_TOK_ENUM(out_loc)); }
 "typedef" { SV_KEYWORD(parser::make_TOK_TYPEDEF(out_loc)); }

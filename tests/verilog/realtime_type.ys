@@ -1,0 +1,29 @@
+# IEEE 1800-2017 6.12: realtime is a synonym of real (variable, parameter,
+# typedef, function return).  Both read the same way (the existing real
+# model, with its degradation mark on variables).
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+module top(output logic [31:0] o, output logic [31:0] q);
+	parameter realtime P = 2.5;
+	parameter real R = 2.5;
+	typedef realtime rt_t;
+	localparam rt_t L = 1.5;
+	assign o = $rtoi(P * 2.0);
+	assign q = $rtoi(L * 4.0) + $rtoi(R);
+endmodule
+EOT
+logger -check-expected
+hierarchy -top top
+proc
+sat -verify -prove o 5 -prove q 8
+design -reset
+
+# a realtime variable degrades exactly as a real one does
+logger -expect warning "Real variable `.a' is modeled as a 32-bit integer" 1
+read_verilog -sv -permissive <<EOT
+module top2(output logic o);
+	realtime a;
+	assign o = 1'b0;
+endmodule
+EOT
+logger -check-expected

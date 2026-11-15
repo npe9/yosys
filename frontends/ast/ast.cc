@@ -3869,6 +3869,43 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	RTLIL::Module *new_module = process_and_replace_module(design, this, new_ast.get(), std::move(kept_ast));
 	redo_interface_ports(old_module, new_module, intf_cells);
 	new_module->set_bool_attribute(ID(sv_hierrefs_resolved));
+	// fe201: a reference declared now (a wire, an upward-reference input
+	// port, a member's slice) is no longer implicitly declared.  The
+	// read-time entry for it came over from the module before (carry_degraded
+	// for a module with interface ports: a checker bound into
+	// cv32e40x_controller_fsm, `.xif_commit_kill(core_i.xif_commit_if.commit.commit_kill)')
+	// and, the reference being joined under its new name, flatten never
+	// dropped it.  What still needs joining keeps its own reasons (below).
+	{
+		IdString attr = IdString("\\sv_degraded");
+		if (new_module->has_attribute(attr)) {
+			std::string cur = new_module->attributes.at(attr).decode_string(), kept;
+			std::vector<std::string> drops;
+			for (auto &t : targets)
+				if (!t.is_mem && new_module->wire(RTLIL::escape_id(t.name)) != nullptr)
+					drops.push_back(stringf("Identifier `%s' is implicitly declared. @", t.name.c_str()));
+			size_t pos = 0;
+			while (pos <= cur.size()) {
+				size_t next = cur.find("; ", pos);
+				std::string en = cur.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+				bool drop = false;
+				for (auto &d : drops)
+					if (en.rfind(d, 0) == 0)
+						drop = true;
+				if (!en.empty() && !drop)
+					kept += (kept.empty() ? "" : "; ") + en;
+				if (next == std::string::npos)
+					break;
+				pos = next + 2;
+			}
+			if (kept != cur) {
+				if (kept.empty())
+					new_module->attributes.erase(attr);
+				else
+					new_module->attributes[attr] = RTLIL::Const(kept);
+			}
+		}
+	}
 	if (any_member)
 		mark_members(new_module);
 	// fe190: a reference to an instance further up is joined only by

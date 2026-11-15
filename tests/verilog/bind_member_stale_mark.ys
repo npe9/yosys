@@ -1,0 +1,94 @@
+# fe201: a checker bound into a module with an interface port and a
+# parameter override (read with -defer), its port naming a struct member of
+# an interface instance further up (`core_i.xp.commit.kill', 23.8): the
+# rederived module declares the reference, and the read-time entry
+# "Identifier ... is implicitly declared" carried over from the module
+# before is dropped.  Before: the design stayed sv_degraded with the right
+# verdicts (cv32e40x controller_fsm_sva's `.xif_commit_kill(...)').
+read_verilog -sv -formal -defer <<EOT
+typedef struct packed { logic [1:0] id; logic kill; } c_t;
+interface ifc;
+  c_t commit;
+  logic v;
+  modport cpu (output commit, output v);
+endinterface
+interface oifc;
+  logic g;
+  modport m (input g);
+endinterface
+module fsm #(parameter X = 0) (input logic clk, oifc.m o, output logic t);
+  always_ff @(posedge clk) t <= ~t ^ o.g;
+endmodule
+module core (input logic clk, ifc.cpu xp);
+  logic t;
+  oifc oi();
+  assign oi.g = 1'b0;
+  fsm #(.X(1)) fsm_i (.clk(clk), .o(oi), .t(t));
+  assign xp.commit = '{id: 2'b10, kill: t};
+  assign xp.v = t;
+endmodule
+module chk (input logic clk, input logic k, input logic t);
+  p: assert property (@(posedge clk) k == t);
+  n: assert property (@(posedge clk) !k);
+endmodule
+module top (input logic clk);
+  ifc xp();
+  core core_i (.xp(xp), .clk(clk));
+  bind fsm: core_i.fsm_i chk chk_i (.k(core_i.xp.commit.kill), .*);
+endmodule
+EOT
+hierarchy -check -top top
+sva2check
+proc
+flatten
+async2sync
+select -assert-none A:sv_degraded
+logger -expect log "ic3: 2 properties: proved=1 disproved=1 undecided=0" 1
+ic3 -init-zero -bmc 6 -max 0 -kind 2
+logger -check-expected
+design -reset
+
+
+# a reference that is never joined (no `core_q') stays degraded
+read_verilog -sv -formal -defer <<EOT
+typedef struct packed { logic [1:0] id; logic kill; } c_t;
+interface ifc;
+  c_t commit;
+  logic v;
+  modport cpu (output commit, output v);
+endinterface
+interface oifc;
+  logic g;
+  modport m (input g);
+endinterface
+module fsm #(parameter X = 0) (input logic clk, oifc.m o, output logic t);
+  always_ff @(posedge clk) t <= ~t ^ o.g;
+endmodule
+module core (input logic clk, ifc.cpu xp);
+  logic t;
+  oifc oi();
+  assign oi.g = 1'b0;
+  fsm #(.X(1)) fsm_i (.clk(clk), .o(oi), .t(t));
+  assign xp.commit = '{id: 2'b10, kill: t};
+  assign xp.v = t;
+endmodule
+module chk (input logic clk, input logic k, input logic t);
+  p: assert property (@(posedge clk) k == t);
+  n: assert property (@(posedge clk) !k);
+endmodule
+module top (input logic clk);
+  ifc xp();
+  core core_i (.xp(xp), .clk(clk));
+  bind fsm: core_i.fsm_i chk chk_i (.k(core_q.xp.commit.kill), .*);
+endmodule
+EOT
+hierarchy -check -top top
+sva2check
+proc
+flatten
+async2sync
+select -assert-any A:sv_degraded
+logger -expect log "core_q.xp.commit.kill. is not joined .a free wire." 1
+ic3 -init-zero -allow-degraded -bmc 2 -max 0 -kind 0
+logger -check-expected
+

@@ -1532,7 +1532,8 @@ RTLIL::Module *check_if_top_has_changed(Design *design, Module *top_mod)
 		return top_mod;
 	else {
 		for (auto mod : design->modules()) {
-			if (mod->get_bool_attribute(ID::top)) {
+			// (fe197: never a module about to be deleted)
+			if (mod->get_bool_attribute(ID::top) && !mod->get_bool_attribute(ID::to_delete)) {
 				return mod;
 			}
 		}

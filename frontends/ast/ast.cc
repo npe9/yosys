@@ -1724,9 +1724,15 @@ AST_INTERNAL::process_and_replace_module(RTLIL::Design *design,
 
 	// Check if the module was the top module. If it was, we need to remove
 	// the top attribute and put it on the new module.
+	// fe197: or `top', which a replacement earlier in the same hierarchy
+	// iteration put on it (resolve_hierrefs rederives the top with an input
+	// port, then expand_interfaces replaces that module again): left there,
+	// hierarchy took the module being deleted for the top and used it after
+	// it was freed
 	bool is_top = false;
-	if (old_module->get_bool_attribute(ID::initial_top)) {
+	if (old_module->get_bool_attribute(ID::initial_top) || old_module->get_bool_attribute(ID::top)) {
 		old_module->attributes.erase(ID::initial_top);
+		old_module->attributes.erase(ID::top);
 		is_top = true;
 	}
 

@@ -975,6 +975,7 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 
 	IFExpander if_expander(*design, *module);
 	if_expander.used_modules = used_modules;
+	bool intf_pending = false;
 
 	for (auto cell : module->cells())
 	{
@@ -1004,6 +1005,12 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 			// the thing we just loaded).
 			if (mod)
 				did_something = true;
+			// fe197: an interface instance whose module only now became
+			// available (read with -defer, `if_c_obi #(...)' was still
+			// `$abstract'): the module's interfaces are expanded once, so
+			// not before this one is collected too
+			if (mod && mod->get_bool_attribute(ID::is_interface))
+				intf_pending = true;
 
 			continue;
 		}
@@ -1073,6 +1080,18 @@ bool expand_module(RTLIL::Design *design, RTLIL::Module *module, bool flag_check
 	// to flag an error because of interface instances not found:
 	module->attributes.erase(ID::cells_not_processed);
 
+
+	// fe197: an interface instance still pending: the instances collected
+	// this round are collected again in the next one (expand_interfaces
+	// replaces the module once; cv32e40s_core with `xif' found and its two
+	// `if_c_obi #(...)' not yet derived was expanded with `xif' only, and
+	// the OBI members never became wires)
+	if (intf_pending && !module->get_bool_attribute(ID::interfaces_replaced_in_module)) {
+		for (auto &it : if_expander.interfaces_in_module)
+			if (RTLIL::Cell *c = module->cell(it.first))
+				c->set_bool_attribute(ID::module_not_derived);
+		return true;
+	}
 
 	// If any interface instances or interface ports were found in the module, we need to rederive it completely:
 	if ((if_expander.interfaces_in_module.size() > 0 || has_interface_ports) && !module->get_bool_attribute(ID::interfaces_replaced_in_module)) {

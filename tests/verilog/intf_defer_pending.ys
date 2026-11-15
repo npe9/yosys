@@ -1,0 +1,255 @@
+# fe197: under read_verilog -defer, a module whose interface instances are
+# derived in its first hierarchy round (a plain interface beside two
+# instances of a type-parameterized one) and which is then reprocessed
+# (a cell whose parameterized module only now became available) kept its
+# interface cells' types; the next round expanded only the interface found
+# first, and the others' members (`mi_data.resp_payload') were left as
+# undeclared names ("Could not find signal").  cv32e40s_core (xif + two
+# if_c_obi #(...), and the register file wrapper) read with -defer.
+# The module's interfaces are now expanded once every instance is collected.
+
+# the cv32e40s shape: plain + typed interfaces, a reprocessed cell, -defer
+design -reset
+logger -expect log "ic3: 3 properties: proved=2 disproved=1 undecided=0" 1
+read_verilog -sv -formal -defer -DPLAIN -DRF <<EOT
+package pk;
+  typedef struct packed { logic req; } oreq_t;
+  typedef struct packed { logic gnt; } ognt_t;
+  typedef struct packed { logic [3:0] addr; } ireq_t;
+  typedef struct packed { logic [7:0] rdata; logic err; } iresp_t;
+  typedef struct packed { logic we; logic [3:0] addr; } dreq_t;
+  typedef struct packed { logic [7:0] rdata; logic err; logic x; } dresp_t;
+endpackage
+interface ifc import pk::*; #(parameter type REQ_TYPE = ireq_t, parameter type RESP_TYPE = iresp_t);
+  oreq_t s_req;
+  ognt_t s_gnt;
+  REQ_TYPE req_payload;
+  RESP_TYPE resp_payload;
+  modport master (output s_req, req_payload, input s_gnt, resp_payload);
+  modport monitor (input s_req, req_payload, s_gnt, resp_payload);
+endinterface
+interface xifc;
+  logic v;
+endinterface
+module fsm(input logic clk, ifc.monitor m);
+  p: assert property (@(posedge clk) m.resp_payload.err == m.s_gnt.gnt);
+  q: assert property (@(posedge clk) m.req_payload.addr == 4'd1 && m.s_req.req);
+  n: assert property (@(posedge clk) m.req_payload.addr == 4'd2);
+endmodule
+module ctrl(input logic clk, ifc.monitor m);
+  fsm f(.clk, .m(m));
+endmodule
+module lsu(input logic clk, ifc.master m);
+  assign m.s_req.req = 1'b1;
+  assign m.req_payload.we = 1'b0;
+  assign m.req_payload.addr = 4'd1;
+endmodule
+module rf #(parameter int N = 1) (input logic clk, input logic [3:0] ra [N], output logic [7:0] rd [N]);
+  for (genvar i = 0; i < N; i++) begin : g
+    assign rd[i] = {4'd0, ra[i]};
+  end
+endmodule
+module core import pk::*; (input logic clk, input logic g, input logic [7:0] rd, output logic we_o, output logic [3:0] a_o, output logic rq_o);
+`ifdef PLAIN
+  xifc xif();
+  assign xif.v = 1'b0;
+`endif
+  ifc #(.REQ_TYPE(ireq_t), .RESP_TYPE(iresp_t)) mi_instr();
+  ifc #(.REQ_TYPE(dreq_t), .RESP_TYPE(dresp_t)) mi_data();
+  assign mi_data.s_gnt.gnt = g;
+  assign mi_data.resp_payload.rdata = rd;
+  assign mi_data.resp_payload.err = g;
+  assign mi_data.resp_payload.x = 1'b0;
+  assign mi_instr.s_gnt.gnt = g;
+  assign mi_instr.resp_payload.rdata = rd;
+  assign mi_instr.resp_payload.err = g;
+  assign we_o = mi_data.req_payload.we;
+  assign a_o = mi_data.req_payload.addr;
+  assign rq_o = mi_data.s_req.req;
+`ifdef RF
+  logic [3:0] ra [2];
+  logic [7:0] rdo [2];
+  assign ra[0] = 4'd1;
+  assign ra[1] = 4'd2;
+  rf #(.N(2)) r(.clk, .ra(ra), .rd(rdo));
+`endif
+  lsu l(.clk, .m(mi_data));
+  ctrl c(.clk, .m(mi_data));
+endmodule
+module top(input logic clk, input logic g, input logic [7:0] rd, output logic we_o, output logic [3:0] a_o, output logic rq_o);
+  core core_i(.*);
+endmodule
+EOT
+hierarchy -check -top core
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+opt_clean
+ic3
+logger -check-expected
+
+# the same design read without -defer
+design -reset
+logger -expect log "ic3: 3 properties: proved=2 disproved=1 undecided=0" 1
+read_verilog -sv -formal -DPLAIN -DRF <<EOT
+package pk;
+  typedef struct packed { logic req; } oreq_t;
+  typedef struct packed { logic gnt; } ognt_t;
+  typedef struct packed { logic [3:0] addr; } ireq_t;
+  typedef struct packed { logic [7:0] rdata; logic err; } iresp_t;
+  typedef struct packed { logic we; logic [3:0] addr; } dreq_t;
+  typedef struct packed { logic [7:0] rdata; logic err; logic x; } dresp_t;
+endpackage
+interface ifc import pk::*; #(parameter type REQ_TYPE = ireq_t, parameter type RESP_TYPE = iresp_t);
+  oreq_t s_req;
+  ognt_t s_gnt;
+  REQ_TYPE req_payload;
+  RESP_TYPE resp_payload;
+  modport master (output s_req, req_payload, input s_gnt, resp_payload);
+  modport monitor (input s_req, req_payload, s_gnt, resp_payload);
+endinterface
+interface xifc;
+  logic v;
+endinterface
+module fsm(input logic clk, ifc.monitor m);
+  p: assert property (@(posedge clk) m.resp_payload.err == m.s_gnt.gnt);
+  q: assert property (@(posedge clk) m.req_payload.addr == 4'd1 && m.s_req.req);
+  n: assert property (@(posedge clk) m.req_payload.addr == 4'd2);
+endmodule
+module ctrl(input logic clk, ifc.monitor m);
+  fsm f(.clk, .m(m));
+endmodule
+module lsu(input logic clk, ifc.master m);
+  assign m.s_req.req = 1'b1;
+  assign m.req_payload.we = 1'b0;
+  assign m.req_payload.addr = 4'd1;
+endmodule
+module rf #(parameter int N = 1) (input logic clk, input logic [3:0] ra [N], output logic [7:0] rd [N]);
+  for (genvar i = 0; i < N; i++) begin : g
+    assign rd[i] = {4'd0, ra[i]};
+  end
+endmodule
+module core import pk::*; (input logic clk, input logic g, input logic [7:0] rd, output logic we_o, output logic [3:0] a_o, output logic rq_o);
+`ifdef PLAIN
+  xifc xif();
+  assign xif.v = 1'b0;
+`endif
+  ifc #(.REQ_TYPE(ireq_t), .RESP_TYPE(iresp_t)) mi_instr();
+  ifc #(.REQ_TYPE(dreq_t), .RESP_TYPE(dresp_t)) mi_data();
+  assign mi_data.s_gnt.gnt = g;
+  assign mi_data.resp_payload.rdata = rd;
+  assign mi_data.resp_payload.err = g;
+  assign mi_data.resp_payload.x = 1'b0;
+  assign mi_instr.s_gnt.gnt = g;
+  assign mi_instr.resp_payload.rdata = rd;
+  assign mi_instr.resp_payload.err = g;
+  assign we_o = mi_data.req_payload.we;
+  assign a_o = mi_data.req_payload.addr;
+  assign rq_o = mi_data.s_req.req;
+`ifdef RF
+  logic [3:0] ra [2];
+  logic [7:0] rdo [2];
+  assign ra[0] = 4'd1;
+  assign ra[1] = 4'd2;
+  rf #(.N(2)) r(.clk, .ra(ra), .rd(rdo));
+`endif
+  lsu l(.clk, .m(mi_data));
+  ctrl c(.clk, .m(mi_data));
+endmodule
+module top(input logic clk, input logic g, input logic [7:0] rd, output logic we_o, output logic [3:0] a_o, output logic rq_o);
+  core core_i(.*);
+endmodule
+EOT
+hierarchy -check -top core
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+opt_clean
+ic3
+logger -check-expected
+
+# fe197: the top is replaced twice (reprocessed in the first round, its
+# interfaces expanded in the next); `top' moves to the new module each time
+# (left on the replaced one, hierarchy could take the module being deleted
+# for the top: a use after free on cv32e40s_core, depending on module order)
+design -reset
+logger -expect log "ic3: 3 properties: proved=2 disproved=1 undecided=0" 1
+read_verilog -sv -formal -defer -DRF <<EOT
+package pk;
+  typedef struct packed { logic req; } oreq_t;
+  typedef struct packed { logic gnt; } ognt_t;
+  typedef struct packed { logic [3:0] addr; } ireq_t;
+  typedef struct packed { logic [7:0] rdata; logic err; } iresp_t;
+  typedef struct packed { logic we; logic [3:0] addr; } dreq_t;
+  typedef struct packed { logic [7:0] rdata; logic err; logic x; } dresp_t;
+endpackage
+interface ifc import pk::*; #(parameter type REQ_TYPE = ireq_t, parameter type RESP_TYPE = iresp_t);
+  oreq_t s_req;
+  ognt_t s_gnt;
+  REQ_TYPE req_payload;
+  RESP_TYPE resp_payload;
+  modport master (output s_req, req_payload, input s_gnt, resp_payload);
+  modport monitor (input s_req, req_payload, s_gnt, resp_payload);
+endinterface
+interface xifc;
+  logic v;
+endinterface
+module fsm(input logic clk, ifc.monitor m);
+  p: assert property (@(posedge clk) m.resp_payload.err == m.s_gnt.gnt);
+  q: assert property (@(posedge clk) m.req_payload.addr == 4'd1 && m.s_req.req);
+  n: assert property (@(posedge clk) m.req_payload.addr == 4'd2);
+endmodule
+module ctrl(input logic clk, ifc.monitor m);
+  fsm f(.clk, .m(m));
+endmodule
+module lsu(input logic clk, ifc.master m);
+  assign m.s_req.req = 1'b1;
+  assign m.req_payload.we = 1'b0;
+  assign m.req_payload.addr = 4'd1;
+endmodule
+module rf #(parameter int N = 1) (input logic clk, input logic [3:0] ra [N], output logic [7:0] rd [N]);
+  for (genvar i = 0; i < N; i++) begin : g
+    assign rd[i] = {4'd0, ra[i]};
+  end
+endmodule
+module core import pk::*; (input logic clk, input logic g, input logic [7:0] rd, output logic we_o, output logic [3:0] a_o, output logic rq_o);
+`ifdef PLAIN
+  xifc xif();
+  assign xif.v = 1'b0;
+`endif
+  ifc #(.REQ_TYPE(ireq_t), .RESP_TYPE(iresp_t)) mi_instr();
+  ifc #(.REQ_TYPE(dreq_t), .RESP_TYPE(dresp_t)) mi_data();
+  assign mi_data.s_gnt.gnt = g;
+  assign mi_data.resp_payload.rdata = rd;
+  assign mi_data.resp_payload.err = g;
+  assign mi_data.resp_payload.x = 1'b0;
+  assign mi_instr.s_gnt.gnt = g;
+  assign mi_instr.resp_payload.rdata = rd;
+  assign mi_instr.resp_payload.err = g;
+  assign we_o = mi_data.req_payload.we;
+  assign a_o = mi_data.req_payload.addr;
+  assign rq_o = mi_data.s_req.req;
+`ifdef RF
+  logic [3:0] ra [2];
+  logic [7:0] rdo [2];
+  assign ra[0] = 4'd1;
+  assign ra[1] = 4'd2;
+  rf #(.N(2)) r(.clk, .ra(ra), .rd(rdo));
+`endif
+  lsu l(.clk, .m(mi_data));
+  ctrl c(.clk, .m(mi_data));
+endmodule
+module top(input logic clk, input logic g, input logic [7:0] rd, output logic we_o, output logic [3:0] a_o, output logic rq_o);
+  core core_i(.*);
+endmodule
+EOT
+hierarchy -check -top core
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+opt_clean
+ic3
+logger -check-expected

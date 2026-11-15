@@ -1,0 +1,35 @@
+# fe204: a package-scope class handle with a declaration assignment
+# (uvml_hrtbt_pkg `uvml_hrtbt_mon_c uvml_default_hrtbt = new("...");') is
+# simulation-only storage; its initializer goes with it, so the package reads
+# clean.  A hardware read of the handle is still refused.
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+package p;
+	class m_c;
+		function new(string n);
+		endfunction
+	endclass
+	m_c dflt = new("dflt");
+	m_c other;
+endpackage
+module top(output logic o);
+	assign o = 1'b1;
+endmodule
+EOT
+logger -check-expected
+hierarchy -top top
+design -reset
+
+logger -expect error "Identifier `.p::dflt' is simulation-only package storage" 1
+read_verilog -sv <<EOT
+package p;
+	class m_c;
+		function new(string n);
+		endfunction
+	endclass
+	m_c dflt = new("dflt");
+endpackage
+module top2(output logic o);
+	assign o = (p::dflt != null);
+endmodule
+EOT

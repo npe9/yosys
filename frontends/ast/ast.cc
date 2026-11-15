@@ -2191,6 +2191,7 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 					return false;
 				};
 				auto &pc = child->children;
+				std::set<std::string> dropped;
 				for (auto it = pc.begin(); it != pc.end(); ) {
 					AstNode *n = it->get();
 					const char *what = nullptr;
@@ -2219,7 +2220,35 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 						auto ph = std::make_unique<AstNode>(n->location, AST_WIRE);
 						ph->str = n->str;
 						ph->set_attribute(ID(sv_sim_only_storage), AstNode::mkconst_int(n->location, 1, false));
+						dropped.insert(n->str);
 						*it = std::move(ph);
+					}
+					++it;
+				}
+				// fe204: the declaration assignment of a dropped variable
+				// (`uvml_hrtbt_mon_c uvml_default_hrtbt = new("...");') goes
+				// with it: it only initializes the simulation-only handle.
+				// The parser makes it a continuous assign, or for a variable
+				// an initial block holding the one assignment.
+				auto drops_init = [&](const AstNode *n) {
+					auto lhs_dropped = [&](const AstNode *a) {
+						return a && (a->type == AST_ASSIGN || a->type == AST_ASSIGN_LE || a->type == AST_ASSIGN_EQ) &&
+								!a->children.empty() && a->children[0] && a->children[0]->type == AST_IDENTIFIER &&
+								dropped.count(a->children[0]->str);
+					};
+					if (!n)
+						return false;
+					if (n->type == AST_ASSIGN)
+						return lhs_dropped(n);
+					if (n->type == AST_INITIAL && n->children.size() == 1 && n->children[0] &&
+							n->children[0]->type == AST_BLOCK && n->children[0]->children.size() == 1)
+						return lhs_dropped(n->children[0]->children[0].get());
+					return false;
+				};
+				for (auto it = pc.begin(); it != pc.end(); ) {
+					if (drops_init(it->get())) {
+						it = pc.erase(it);
+						continue;
 					}
 					++it;
 				}

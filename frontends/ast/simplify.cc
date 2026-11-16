@@ -5110,6 +5110,38 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 						if (pkg_child)
 							importer.import(current_scope, pkg_child.get(), &wildcard_scope_names);
 					}
+					// fe205: and the names of the packages it re-exports
+					// (`export p::*;', IEEE 1800-2017 26.6), transitively.
+					// Its own names were imported first, so they win.
+					{
+						auto find_pkg = [&](const std::string &name) -> AstNode * {
+							if (current_ast != nullptr)
+								for (auto &dc : current_ast->children)
+									if (dc->type == AST_PACKAGE && dc->str == name)
+										return dc.get();
+							if (simplify_design_context != nullptr)
+								for (auto &dp : simplify_design_context->verilog_packages)
+									if (dp->str == name)
+										return dp.get();
+							return nullptr;
+						};
+						std::set<const AstNode *> done{package_node};
+						std::vector<const AstNode *> todo{package_node};
+						while (!todo.empty()) {
+							const AstNode *pn = todo.back();
+							todo.pop_back();
+							for (auto &ename : wildcard_exports(pn)) {
+								AstNode *ep = find_pkg(ename);
+								if (!ep || done.count(ep))
+									continue;
+								done.insert(ep);
+								todo.push_back(ep);
+								for (auto &ec : ep->children)
+									if (ec)
+										importer.import(current_scope, ec.get(), &wildcard_scope_names);
+							}
+						}
+					}
 					// Keep the import node: the scope is cleared and rebuilt
 					// on every simplify pass of this module, and later
 					// passes (cell parameter overrides, generate bodies)

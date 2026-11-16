@@ -275,6 +275,20 @@
 			parent->children.push_back(std::move(range));
 		}
 
+		// fe205: a wildcard package export, recorded on the package as a
+		// comma-separated list of package names (`*' for every import)
+		static void add_wildcard_export(ParseState *extra, const std::string &pkg_name)
+		{
+			AstNode *pkg = extra->current_ast_mod;
+			if (!pkg || pkg->type != AST_PACKAGE)
+				return;
+			std::string list;
+			if (pkg->attributes.count(ID(sv_export_pkgs)))
+				list = pkg->attributes.at(ID(sv_export_pkgs))->str + ",";
+			list += pkg_name;
+			pkg->set_attribute(ID(sv_export_pkgs), AstNode::mkconst_str(pkg->location, list));
+		}
+
 		static std::unique_ptr<AstNode> checkRange(AstNode *type_node, std::unique_ptr<AstNode> range_node)
 		{
 			if (type_node->range_left >= 0 && type_node->range_right >= 0) {
@@ -2731,6 +2745,17 @@ checker_decl:
 	};
 
 dpi_export_decl:
+	TOK_EXPORT TOK_ID TOK_PACKAGESEP TOK_ASTER TOK_SEMICOL {
+		// IEEE 1800-2017 26.6: `export p::*;' in package A makes the
+		// names A imports from p visible to A's importers (caliptra uvmf
+		// `export SHA512_in_pkg_hdl::*;').  Recorded on the package; an
+		// import of A follows it (simplify.cc, ast.cc).
+		add_wildcard_export(extra, *$2);
+	} |
+	TOK_EXPORT TOK_ASTER TOK_PACKAGESEP TOK_ASTER TOK_SEMICOL {
+		// `export *::*;': every package A imports
+		add_wildcard_export(extra, "*");
+	} |
 	TOK_EXPORT TOK_STRING TOK_TASK TOK_ID TOK_SEMICOL |
 	TOK_EXPORT TOK_STRING TOK_FUNCTION TOK_ID TOK_SEMICOL |
 	TOK_EXPORT TOK_STRING TOK_EXTERN TOK_TASK TOK_ID TOK_SEMICOL |

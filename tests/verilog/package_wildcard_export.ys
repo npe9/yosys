@@ -1,0 +1,64 @@
+# fe205: wildcard package exports (IEEE 1800-2017 26.6; caliptra uvmf
+# `export SHA512_in_pkg_hdl::*;').  `export p::*;' and `export *::*;' make the
+# names a package imports from p visible to its importers: in modules, in
+# package bodies, through a chain of exports and for a single-name import.
+# The package's own declaration wins over an exported one.
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+package a;
+	localparam int W = 5;
+	function automatic int f(int x);
+		return x + 1;
+	endfunction
+	typedef logic [W-1:0] w_t;
+endpackage
+package b;
+	import a::*;
+	export a::*;
+	localparam int V = 2;
+endpackage
+package b2;
+	import a::*;
+	export *::*;
+	localparam int W = 9;
+endpackage
+package c;
+	import b::*;
+	export b::*;
+endpackage
+package d;
+	import b::*;
+	localparam int Z = f(W) * 2;
+endpackage
+module top(output logic [7:0] o2, output logic [7:0] o3,
+		output logic [7:0] o4, output logic [7:0] o5, output logic [7:0] o6);
+	assign o4 = d::Z;
+	m2 u2(.o(o2));
+	m3 u3(.o(o3));
+	m5 u5(.o(o5));
+	m6 u6(.o(o6));
+endmodule
+module m2(output logic [7:0] o);
+	import b2::*;
+	assign o = f(1) + W;
+endmodule
+module m3(output logic [7:0] o);
+	import c::*;
+	w_t x;
+	assign x = '1;
+	assign o = x;
+endmodule
+module m5(output logic [7:0] o);
+	import b::W;
+	assign o = W;
+endmodule
+module m6(output logic [7:0] o);
+	import b::*;
+	assign o = W + V;
+endmodule
+EOT
+logger -check-expected
+hierarchy -top top
+proc
+flatten
+sat -verify -prove o2 11 -prove o3 31 -prove o4 12 -prove o5 5 -prove o6 7 top

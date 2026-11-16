@@ -2088,6 +2088,39 @@ static void apply_binds(RTLIL::Design *design, AstNode *ast)
 }
 
 // create AstModule instances for all modules in the AST tree and add them to 'design'
+std::vector<std::string> AST::wildcard_exports(const AstNode *pkg)
+{
+	std::vector<std::string> out;
+	if (!pkg || !pkg->attributes.count(ID(sv_export_pkgs)))
+		return out;
+	auto add = [&](std::string n) {
+		size_t sep = n.rfind("::");
+		if (sep != std::string::npos)
+			n = "\\" + n.substr(sep + 2);
+		if (!n.empty() && n[0] != '\\')
+			n = "\\" + n;
+		if (std::find(out.begin(), out.end(), n) == out.end())
+			out.push_back(n);
+	};
+	std::string list = pkg->attributes.at(ID(sv_export_pkgs))->str;
+	size_t pos = 0;
+	while (pos <= list.size()) {
+		size_t comma = list.find(',', pos);
+		std::string item = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+		if (item == "*") {
+			// every package this package imports
+			for (auto &c : pkg->children)
+				if (c && c->type == AST_IMPORT)
+					add(c->str);
+		} else if (!item.empty())
+			add(item);
+		if (comma == std::string::npos)
+			break;
+		pos = comma + 1;
+	}
+	return out;
+}
+
 void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump_ast1, bool dump_ast2, bool no_dump_ptr, bool dump_vlog1, bool dump_vlog2, bool dump_rtlil,
 		bool nolatches, bool nomeminit, bool nomem2reg, bool mem2reg, bool noblackbox, bool lib, bool nowb, bool noopt, bool icells, bool pwires, bool nooverwrite, bool overwrite, bool defer, bool autowire)
 {
@@ -2292,8 +2325,23 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 				for (auto& it : imp->children)
 					if (it)
 						items.insert(it->str);
+				// fe205: the imported package and those it re-exports
+				// (`export p::*;', 26.6), transitively
+				std::set<std::string> from{imp->str};
+				{
+					std::vector<std::string> todo{imp->str};
+					while (!todo.empty()) {
+						std::string pn = todo.back();
+						todo.pop_back();
+						for (auto &n : design->verilog_packages)
+							if (n->str == pn)
+								for (auto &e : wildcard_exports(n.get()))
+									if (from.insert(e).second)
+										todo.push_back(e);
+					}
+				}
 				for (auto& n : design->verilog_packages) {
-					if (n->str != imp->str)
+					if (!from.count(n->str))
 						continue;
 					for (auto &o : n->children) {
 						if (!o || o->str.empty())

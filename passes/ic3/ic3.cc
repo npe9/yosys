@@ -1312,6 +1312,50 @@ struct Ic3Solver
 			wio.inwidth.push_back(GetSize(wio.inlit.back()));
 			wio.total_bits += wio.inwidth.back();
 		}
+		// fe208: a $anyseq / $anyconst output is a free input of the model
+		// too; without it the witness left it out and `sim -r' replayed it
+		// as x (an x-valued check, not the counterexample).  Recorded under
+		// a wire that carries exactly the cell's output.
+		for (auto cell : module->cells()) {
+			if (!cell->type.in(ID($anyseq), ID($anyconst)))
+				continue;
+			SigSpec y = sigmap(cell->getPort(ID::Y));
+			Wire *best = nullptr;
+			for (auto w : module->wires()) {
+				if (w->port_input || GetSize(w) != GetSize(y) || sigmap(SigSpec(w)) != y)
+					continue;
+				if (best == nullptr || (w->name.isPublic() && !best->name.isPublic()))
+					best = w;
+			}
+			if (best == nullptr) {
+				log_warning("ic3: %s %s has no wire of its own; the witness leaves it out.\n", log_id(cell->type), log_id(cell));
+				continue;
+			}
+			wio.inports.push_back(best);
+			wio.inlit.push_back(satgen.importSigSpec(best, 1));
+			wio.inwidth.push_back(GetSize(wio.inlit.back()));
+			wio.total_bits += wio.inwidth.back();
+		}
+	}
+
+	// a witness path: a flattened wire's hierarchical name (hdlname), else
+	// its own name; each element JSON-escaped
+	static std::string yw_path(Wire *w)
+	{
+		std::vector<std::string> parts;
+		if (w->name.isPublic() && w->has_attribute(ID::hdlname))
+			for (auto &h : w->get_hdlname_attribute())
+				parts.push_back("\\" + h);
+		else
+			parts.push_back(w->name.str());
+		std::string r;
+		for (auto &p : parts) {
+			std::string esc;
+			for (char ch : p)
+				esc += ch == '\\' ? std::string("\\\\") : std::string(1, ch);
+			r += (r.empty() ? "\"" : ", \"") + esc + "\"";
+		}
+		return r;
 	}
 
 	// pack the input section of a model vector into a yw step bit string;
@@ -1364,11 +1408,8 @@ struct Ic3Solver
 		}
 		fprintf(f, "  \"signals\": [\n");
 		for (size_t p = 0; p < wio.inports.size(); p++) {
-			std::string esc;
-			for (char ch : wio.inports[p]->name.str())
-				esc += ch == '\\' ? "\\\\" : std::string(1, ch);
-			fprintf(f, "    {\"path\": [\"%s\"], \"width\": %d, \"offset\": 0, \"init_only\": false}%s\n",
-					esc.c_str(), wio.inwidth[p], p + 1 == wio.inports.size() ? "" : ",");
+			fprintf(f, "    {\"path\": [%s], \"width\": %d, \"offset\": 0, \"init_only\": false}%s\n",
+					yw_path(wio.inports[p]).c_str(), wio.inwidth[p], p + 1 == wio.inports.size() ? "" : ",");
 		}
 		fprintf(f, "  ],\n  \"steps\": [\n");
 		for (size_t i = 0; i < steps.size(); i++)

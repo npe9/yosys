@@ -1,0 +1,28 @@
+# fe208: ic3 -cex records $anyseq / $anyconst outputs in the witness.  They
+# are free inputs of the model, but the witness left them out, and
+# `sim -r' replayed them as x: an x-valued check instead of the
+# counterexample.  A flattened wire is written under its hierarchical path.
+read_verilog -sv -formal <<EOT
+module sub(input clk, input a, output reg seen);
+  wire pick = $anyseq;
+  wire [1:0] k = $anyconst;
+  initial seen = 0;
+  always @(posedge clk) if (pick && a && k == 2'd2) seen <= 1;
+  ap: assert property (@(posedge clk) !seen);
+endmodule
+module top(input clk, input a);
+  sub u(.clk(clk), .a(a), .seen());
+endmodule
+EOT
+hierarchy -top top
+sva2check
+proc
+async2sync
+flatten
+design -save prepped
+logger -expect log "u.ap: disproved \(depth 1\)" 1
+ic3 -init-zero -cex ic3_cex_anyseq_
+logger -check-expected
+design -load prepped
+logger -expect error "Assertion top\.u\.ap .* failed" 1
+sim -r ic3_cex_anyseq_u_ap.yw -assert

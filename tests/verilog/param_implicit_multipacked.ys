@@ -1,0 +1,27 @@
+# fe205: an implicit-type parameter with several packed dimensions
+# (`parameter [4:0][31:0] X', caliptra soc_ifc_pkg; IEEE 1800-2017 6.20.2)
+# reads as `parameter logic [4:0][31:0] X': element selects, the whole
+# value, $bits, signedness and overrides.
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+module sub #(parameter [1:0][3:0] X = 8'h12) (output logic [3:0] o);
+	assign o = X[1];
+endmodule
+module top(output logic [31:0] a, output logic [7:0] b, output logic [7:0] c,
+		output logic [3:0] d, output logic [3:0] e, output logic [3:0] f);
+	parameter [4:0][31:0] P = {32'h44444444, 32'h33333333, 32'h22222222, 32'h11111111, 32'h0};
+	localparam [1:0][3:0] X = 8'h12;
+	localparam signed [1:0][3:0] S = 8'hF2;
+	assign a = P[3];
+	assign b = X;
+	assign c = $bits(P);
+	assign d = X[0];
+	assign e = S[1];
+	sub #(.X(8'h5A)) u(.o(f));
+endmodule
+EOT
+logger -check-expected
+hierarchy -top top
+proc
+flatten
+sat -verify -prove a 32'h33333333 -prove b 8'h12 -prove c 160 -prove d 2 -prove e 15 -prove f 5 top

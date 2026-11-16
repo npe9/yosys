@@ -1235,7 +1235,7 @@
 %token TOK_z "'z'"
 
 %type <string_t> module_name_id
-%type <ast_t> range range_or_multirange non_opt_range non_opt_multirange param_unpacked param_packed wire_name_dims timing_event timing_events
+%type <ast_t> range range_or_multirange non_opt_range non_opt_multirange param_unpacked param_packed wire_name_dims timing_event timing_events param_packed_multi
 %type <ast_t> wire_type expr basic_expr concat_list assignment_pattern_list member_pattern_list rvalue lvalue lvalue_concat_list non_io_wire_type io_wire_type alias_lvalues match_filter type_operand opt_type_cast
 %type <string_t> sva_seq_method opt_label opt_sva_label tok_prim_wrapper hierarchical_id hierarchical_type_id integral_number
 %type <string_t> bind_instance_list
@@ -3597,7 +3597,22 @@ param_range_type:
 	type_vec param_signed param_packed {
 		extra->astbuf1->children.push_back(std::move($3));
 	};
-param_implicit_type: param_signed param_range;
+param_implicit_type: param_signed param_range |
+	param_signed param_packed_multi {
+		// `parameter [4:0][31:0] X' (IEEE 1800-2017 6.20.2: an implicit
+		// type with packed dimensions, read as `parameter logic [4:0][31:0]
+		// X'; caliptra soc_ifc_pkg)
+		extra->astbuf1->children.push_back(std::move($2));
+	};
+
+param_packed_multi:
+	non_opt_range non_opt_range {
+		$$ = std::make_unique<AstNode>(@$, AST_MULTIRANGE, std::move($1), std::move($2));
+	} |
+	param_packed_multi non_opt_range {
+		$$ = std::move($1);
+		$$->children.push_back(std::move($2));
+	};
 
 param_type:
 	param_integer_type | param_real | param_range_type | param_implicit_type |

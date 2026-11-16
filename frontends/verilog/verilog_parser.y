@@ -383,10 +383,27 @@
 			AST_INTERNAL::current_module = nullptr;
 			// a leniency stock yosys has too (statement delays) warns and tags
 			// but is never an error, like implicit nets (AST::degrade_warn)
-			if (upstream_leniency)
+			if (upstream_leniency) {
 				AST::degrade_warn(loc.to_loc(), "%s (simulation-only; not modeled).", what);
-			else
-				AST::degrade(loc.to_loc(), "%s (simulation-only; not modeled).", what);
+				return;
+			}
+			// fe206: a strict refusal inside a module or interface is
+			// raised when that module is elaborated, not at the parse: a
+			// unit no design elaborates (an unrelated interface in a file
+			// read for another one, `read_verilog -defer') models nothing.
+			// A read without -defer elaborates every module, so it refuses
+			// as before; -permissive marks at once, as before
+			AstNode *m = extra->current_ast_mod;
+			if (!AST::flag_permissive && m && (m->type == AST_MODULE || m->type == AST_INTERFACE)) {
+				auto l = loc.to_loc();
+				std::string e = stringf("%s\x1f%d\x1f%s (simulation-only; not modeled).", l.filename.c_str(), l.start_line, what);
+				IdString key = ID(sv_pending_refusal);
+				auto it = m->attributes.find(key);
+				std::string cur = it != m->attributes.end() && it->second ? it->second->str : std::string();
+				m->attributes[key] = AstNode::mkconst_str(m->location, cur.empty() ? e : cur + "\x1e" + e);
+				return;
+			}
+			AST::degrade(loc.to_loc(), "%s (simulation-only; not modeled).", what);
 		}
 
 		AstNode* ParseState::saveChild(std::unique_ptr<AstNode> child) {

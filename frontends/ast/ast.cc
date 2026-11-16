@@ -1224,6 +1224,22 @@ static RTLIL::Module *process_module(RTLIL::Design *design, AstNode *ast, bool d
 	log_assert(current_scope.empty());
 	log_assert(ast->type == AST_MODULE || ast->type == AST_INTERFACE);
 
+	// fe206: a strict parse-time refusal recorded in the module (see
+	// parse_degrade) is raised now that the module is elaborated
+	if (!defer) {
+		auto it = ast->attributes.find(ID(sv_pending_refusal));
+		if (it != ast->attributes.end() && it->second) {
+			std::string first = it->second->str;
+			size_t rs = first.find('\x1e');
+			if (rs != std::string::npos)
+				first = first.substr(0, rs);
+			size_t a = first.find('\x1f'), b = a == std::string::npos ? a : first.find('\x1f', a + 1);
+			if (b != std::string::npos)
+				degrade_impl(LogSourceLocation(first.substr(0, a), atoi(first.substr(a + 1, b - a - 1).c_str())), first.substr(b + 1));
+			ast->attributes.erase(it);
+		}
+	}
+
 	if (defer)
 		log("Storing AST representation for module `%s'.\n", ast->str);
 	else if (!quiet) {

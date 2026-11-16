@@ -1,0 +1,57 @@
+# fe206: a strict parse-time refusal (a simulation-only `wait', `@(...)')
+# inside a module or interface is raised when that unit is elaborated.  A
+# deferred read refuses only the units the design elaborates: core-v-verif
+# uvmt_cv32e40p_tb_ifs.sv holds the interface a checker needs next to an
+# unrelated clk_gen_if with `wait (...)' in an initial block, and the whole
+# file was refused at the parse.  A read without -defer elaborates every
+# unit, so it refuses as before; -permissive marks the unit as before.
+logger -expect-no-warnings
+read_verilog -sv -defer <<EOT
+interface clk_gen_if (output logic clk);
+  logic go;
+  initial begin
+    wait (go);
+    clk = 0;
+  end
+endinterface
+module top (input logic [3:0] a, output logic [3:0] o);
+  assign o = a + 4'd1;
+endmodule
+module bad_top (output logic clk);
+  clk_gen_if g (.clk(clk));
+endmodule
+EOT
+hierarchy -top top
+logger -check-expected
+select -assert-none A:sv_degraded
+sat -verify -prove o 4'd6 -set a 4'd5 top
+design -reset
+
+logger -expect warning "\[sv_degraded\] `wait \(...\)' is dropped" 1
+read_verilog -sv -permissive <<EOT
+interface clk_gen_if (output logic clk);
+  logic go;
+  initial begin
+    wait (go);
+    clk = 0;
+  end
+endinterface
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+read_verilog -sv -defer <<EOT
+interface clk_gen_if (output logic clk);
+  logic go;
+  initial begin
+    wait (go);
+    clk = 0;
+  end
+endinterface
+module bad_top (output logic clk);
+  clk_gen_if g (.clk(clk));
+endmodule
+EOT
+logger -expect error "`wait \(...\)' is dropped: the statements after it run without waiting" 1
+hierarchy -top bad_top

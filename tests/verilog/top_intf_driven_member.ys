@@ -1,0 +1,68 @@
+# fe207: a top module's interface-port member (no modport) that the module
+# drives is an output port, not a free input: as an inout it was a free input
+# and a driven net at once, and ic3 left every property reading it unchecked
+# ("multiply-driven net"; core-v-verif uvmt_cv32e40p_debug_assert, whose
+# checker assigns `cov_assert_if.is_wfi').  Undriven members stay free inputs.
+read_verilog -sv -formal <<EOT
+interface ifc(input logic clk);
+  logic a, b;
+  logic w;
+  logic r;
+  logic [1:0] p;
+  logic f;
+endinterface
+module chk(ifc c);
+  assign c.w = c.a & c.b;
+  always_ff @(posedge c.clk) c.r <= c.a;
+  assign c.p[0] = c.b;
+  ap_w: assert property (@(posedge c.clk) c.w == (c.a & c.b));
+  ap_r: assert property (@(posedge c.clk) ##1 c.r == $past(c.a));
+  ap_f: assert property (@(posedge c.clk) c.f);
+endmodule
+EOT
+logger -expect log "Interface port member c\.w of top module chk is driven by the module" 1
+logger -expect log "Interface port member c\.r of top module chk is driven by the module" 1
+hierarchy -top chk
+logger -check-expected
+select -assert-count 1 chk/i:c.a
+select -assert-count 1 chk/i:c.f
+select -assert-count 0 chk/i:c.w
+select -assert-count 0 chk/i:c.r
+select -assert-count 1 chk/o:c.w
+select -assert-count 1 chk/o:c.r
+# partly driven: left as it was (an inout)
+select -assert-count 1 chk/i:c.p
+select -assert-count 1 chk/o:c.p
+sva2check
+proc
+flatten
+logger -expect log "ap_w: proved" 1
+logger -expect log "ap_r: proved" 1
+logger -expect log "ap_f: disproved \(depth 0\)" 1
+ic3 -init-zero
+logger -check-expected
+
+# the same under -defer (the ladder's deferred interface reads, h33)
+design -reset
+read_verilog -sv -formal -defer <<EOT
+interface ifc(input logic clk);
+  logic a, b;
+  logic w;
+  logic r;
+  logic [1:0] p;
+  logic f;
+endinterface
+module chk(ifc c);
+  assign c.w = c.a & c.b;
+  always_ff @(posedge c.clk) c.r <= c.a;
+  assign c.p[0] = c.b;
+  ap_w: assert property (@(posedge c.clk) c.w == (c.a & c.b));
+  ap_r: assert property (@(posedge c.clk) ##1 c.r == $past(c.a));
+  ap_f: assert property (@(posedge c.clk) c.f);
+endmodule
+EOT
+hierarchy -top chk
+select -assert-count 0 chk/i:c.w
+select -assert-count 1 chk/o:c.w
+select -assert-count 1 chk/o:c.r
+select -assert-count 1 chk/i:c.f

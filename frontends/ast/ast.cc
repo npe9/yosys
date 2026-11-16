@@ -2893,6 +2893,7 @@ static std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> interface_cells_
 
 static void explode_top_interface_ports(RTLIL::Design *design, AstNode *new_ast);
 static bool has_top_interface_dummies(RTLIL::Module *module);
+static void top_intf_driven_members_as_outputs(RTLIL::Design *design, RTLIL::Module *module);
 
 static void redo_interface_ports(RTLIL::Module *old_module, RTLIL::Module *new_module,
 		const std::vector<std::pair<RTLIL::IdString, RTLIL::IdString>> &intf_cells)
@@ -2944,6 +2945,7 @@ bool AstModule::reprocess_if_necessary(RTLIL::Design *design)
 			}
 			RTLIL::Module *new_module = process_and_replace_module(design, this, top_ast ? top_ast.get() : ast.get(), std::move(kept_ast));
 			redo_interface_ports(old_module, new_module, intf_cells);
+			top_intf_driven_members_as_outputs(design, new_module);
 			return true;
 		}
 	}
@@ -3961,6 +3963,7 @@ bool AstModule::resolve_hierrefs(RTLIL::Design *design, const pool<RTLIL::Module
 	}
 	RTLIL::Module *new_module = process_and_replace_module(design, this, new_ast.get(), std::move(kept_ast));
 	redo_interface_ports(old_module, new_module, intf_cells);
+	top_intf_driven_members_as_outputs(design, new_module);
 	new_module->set_bool_attribute(ID(sv_hierrefs_resolved));
 	// fe201: a reference declared now (a wire, an upward-reference input
 	// port, a member's slice) is no longer implicitly declared.  The
@@ -4196,6 +4199,87 @@ static bool has_top_interface_dummies(RTLIL::Module *module)
 	return false;
 }
 
+// fe207: a top's interface-port member without a modport is exploded as an
+// inout.  What nothing in the module drives is a free input (the user's
+// decision 2026-11-15), but a member the module itself drives (`assign
+// c.w = ..', a process, a submodule's output) is an output: as an inout it
+// was a free input and a driven net at once (ic3: "multiply-driven net ..
+// not checked"; core-v-verif uvmt_cv32e40p_debug_assert's
+// `cov_assert_if.is_wfi').  Only a member driven on every bit is changed;
+// a partly driven one stays as it was.
+static void top_intf_driven_members_as_outputs(RTLIL::Design *design, RTLIL::Module *module)
+{
+	if (!has_top_interface_dummies(module))
+		return;
+	std::vector<std::string> prefixes;
+	for (auto c : module->cells()) {
+		const std::string &n = c->name.str();
+		if (n.size() > 20 && n.compare(n.size() - 20, 20, "_inst_from_top_dummy") == 0)
+			prefixes.push_back(n.substr(0, n.size() - 20) + ".");
+	}
+	pool<RTLIL::SigBit> driven;
+	auto mark = [&](const RTLIL::SigSpec &s) {
+		for (auto b : s)
+			if (b.wire)
+				driven.insert(b);
+	};
+	for (auto &conn : module->connections())
+		mark(conn.first);
+	std::function<void(const RTLIL::CaseRule*)> walk = [&](const RTLIL::CaseRule *cs) {
+		for (auto &a : cs->actions)
+			mark(a.first);
+		for (auto sw : cs->switches)
+			for (auto c : sw->cases)
+				walk(c);
+	};
+	for (auto &it : module->processes) {
+		walk(&it.second->root_case);
+		for (auto sy : it.second->syncs)
+			for (auto &a : sy->actions)
+				mark(a.first);
+	}
+	for (auto c : module->cells()) {
+		if (c->type.begins_with("$")) {
+			for (auto &p : c->connections())
+				if (c->output(p.first))
+					mark(p.second);
+			continue;
+		}
+		RTLIL::Module *sub = design->module(c->type);
+		if (sub == nullptr)
+			continue;
+		for (auto &p : c->connections()) {
+			RTLIL::Wire *pw = sub->wire(p.first);
+			if (pw && pw->port_output && !pw->port_input)
+				mark(p.second);
+		}
+	}
+	bool changed = false;
+	for (auto w : module->wires()) {
+		if (!w->port_input || !w->port_output)
+			continue;
+		const std::string &n = w->name.str();
+		bool member = false;
+		for (auto &pfx : prefixes)
+			if (n.compare(0, pfx.size(), pfx) == 0)
+				member = true;
+		if (!member)
+			continue;
+		bool all = true;
+		for (int i = 0; i < w->width && all; i++)
+			if (!driven.count(RTLIL::SigBit(w, i)))
+				all = false;
+		if (!all)
+			continue;
+		w->port_input = false;
+		changed = true;
+		log("Interface port member %s of top module %s is driven by the module: an output port, not a free input.\n",
+				log_id(w), log_id(module));
+	}
+	if (changed)
+		module->fixup_ports();
+}
+
 void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdString, RTLIL::Module*> &local_interfaces)
 {
 	loadconfig();
@@ -4261,6 +4345,7 @@ void AstModule::expand_interfaces(RTLIL::Design *design, const dict<RTLIL::IdStr
 					RTLIL::unescape_id(ch->str)));
 	RTLIL::Module* new_module =
 		process_and_replace_module(design, this, new_ast.get(), std::move(ast_before_replacing_interface_ports));
+	top_intf_driven_members_as_outputs(design, new_module);
 	if (!intf_marks.empty()) {
 		IdString attr = IdString("\\sv_degraded");
 		std::string cur = new_module->attributes.count(attr) ? new_module->attributes.at(attr).decode_string() : std::string();

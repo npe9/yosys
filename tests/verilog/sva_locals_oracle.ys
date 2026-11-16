@@ -1,0 +1,41 @@
+# fe208: local variables over an unbounded sequence (assert only): one
+# attempt is tracked, chosen by a free oracle input ($anyseq) once per run;
+# some attempt fails iff some choice tracks a failing one.  The shapes of
+# core-v-verif uvmt_cv32e40s/x_debug_assert's p_dmode_dret_pc and
+# p_debug_regs_mmode.  Checked against per-attempt references
+# (work/fe208/ref.sv, both directions, BMC 8).
+read_verilog -sv -formal <<EOT
+module l(input clk, input a, input v, input c, input [3:0] d, input [3:0] w);
+  reg [3:0] h = 0;
+  always @(posedge clk) if (a) h <= d;
+  // two overlapping attempts with different captures: a at t0, a at t1
+  // with another d, v and c at t2
+  property p_dret; logic [3:0] x; (1, x = d) ##0 a ##1 v[->1] ##0 c |-> h == x; endproperty
+  property p_dret_ok; logic [3:0] x; (1, x = d) ##0 a ##0 (d == 4'd3) ##1 v[->1] ##0 c |-> x == 4'd3; endproperty
+  // the consequent's goto boolean reads the local
+  property p_cons; logic [3:0] u; a ##0 (1, u = d) |=> (w == u)[->1] ##0 c; endproperty
+  property p_cons_ok; logic [3:0] u; a ##0 (1, u = d) |=> (h == u)[->1] ##0 (h == u); endproperty
+  ap_dret: assert property (@(posedge clk) p_dret);
+  ap_dret_ok: assert property (@(posedge clk) p_dret_ok);
+  ap_cons: assert property (@(posedge clk) p_cons);
+  ap_cons_ok: assert property (@(posedge clk) p_cons_ok);
+endmodule
+EOT
+hierarchy -top l
+logger -expect log "local variables over an unbounded sequence: one attempt tracked" 4
+sva2check
+logger -check-expected
+proc
+async2sync
+flatten
+design -save prepped
+logger -expect log "ap_dret: disproved \(depth 2\) \[lowering=exact:oracle\]" 1
+logger -expect log "ap_dret_ok: proved \[lowering=exact:oracle\]" 1
+logger -expect log "ap_cons: disproved \(depth 1\) \[lowering=exact:oracle\]" 1
+logger -expect log "ap_cons_ok: proved \[lowering=exact:oracle\]" 1
+ic3 -init-zero -kind 20 -cex sva_locals_oracle_
+logger -check-expected
+# the witness carries the oracle's pick: the replay fails the check
+design -load prepped
+logger -expect error "Assertion l\.ap_dret .* failed" 1
+sim -r sva_locals_oracle_ap_dret.yw -assert

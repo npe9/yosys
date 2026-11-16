@@ -59,7 +59,9 @@ ic3 -init-zero -kind 40
 design -reset
 logger -check-expected
 
-# a sequence with a local variable is still refused
+# a sequence with a local variable (fe208: lowered by a tracked attempt,
+# the oracle lowering, with the generic weak monitor; it was refused): b at
+# t0 without c, b at t1 with d moved
 read_verilog -sv -formal <<EOT
 module top (input logic clk, input logic a, b, c, input logic [3:0] d);
   property p_l;
@@ -70,5 +72,9 @@ module top (input logic clk, input logic a, b, c, input logic [3:0] d);
 endmodule
 EOT
 hierarchy -top top
-logger -expect error "local variables over an unbounded sequence" 1
 sva2check
+proc
+async2sync
+logger -expect log "a_l: disproved \(depth 1\) \[lowering=exact:oracle\]" 1
+ic3 -init-zero -kind 20
+logger -check-expected

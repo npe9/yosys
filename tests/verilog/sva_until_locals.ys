@@ -111,13 +111,22 @@ ic3 -init-zero
 design -reset
 logger -check-expected
 
-# other shapes stay refused
-logger -expect error "local variables over an unbounded sequence" 1
+# other shapes (fe208: lowered by a tracked attempt, the oracle lowering;
+# they were refused).  |-> : a holds at the start, so the until is met at
+# once; |=> : d back at v before a fails
 read_verilog -sv -formal <<EOT
 module top (input logic clk, input logic a, input logic [3:0] d);
   property p; logic [3:0] v; (a, v = d) |-> (d != v) until a; endproperty
+  property pn; logic [3:0] v; (a, v = d) |=> (d != v) until a; endproperty
   a_r: assert property (@(posedge clk) p);
+  a_rn: assert property (@(posedge clk) pn);
 endmodule
 EOT
 hierarchy -top top
 sva2check
+proc
+async2sync
+logger -expect log "a_r: proved \[lowering=exact:oracle\]" 1
+logger -expect log "a_rn: disproved \(depth 1\) \[lowering=exact:oracle\]" 1
+ic3 -init-zero -kind 20
+logger -check-expected

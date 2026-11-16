@@ -132,8 +132,8 @@ ic3 -init-zero
 design -reset
 logger -check-expected
 
-# a goto condition reading the local stays refused
-logger -expect error "local variables over an unbounded sequence" 1
+# a goto condition reading the local (fe208: lowered by a tracked attempt,
+# the oracle lowering; it was refused): a at t0, d back at v at t1 with !a
 read_verilog -sv -formal <<EOT
 module top (input logic clk, input logic a, input logic [3:0] d);
   property p; logic [3:0] v; a ##0 (1'b1, v = d) ##1 (d == v)[->1] |-> a; endproperty
@@ -142,3 +142,8 @@ endmodule
 EOT
 hierarchy -top top
 sva2check
+proc
+async2sync
+logger -expect log "a_r: disproved \(depth 1\) \[lowering=exact:oracle\]" 1
+ic3 -init-zero -kind 20
+logger -check-expected

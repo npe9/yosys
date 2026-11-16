@@ -1,0 +1,13 @@
+# fe208: the oracle lowering of local variables over an unbounded sequence
+# needs every assignment in the antecedent's start tick, through
+# conjunctive operators: a later assignment (or one under `or') is refused
+# with the reason
+read_verilog -sv -formal <<EOT
+module r(input clk, input a, input b, input v, input [3:0] d, input [3:0] h);
+  property p; logic [3:0] x; a ##1 (b, x = d) ##1 v[->1] |-> h == x; endproperty
+  ap: assert property (@(posedge clk) p);
+endmodule
+EOT
+hierarchy -top r
+logger -expect error "local variables over an unbounded sequence in .* \(a local variable assigned after the antecedent's first tick, or under a branching operator\)" 1
+sva2check

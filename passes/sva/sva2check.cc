@@ -271,10 +271,21 @@ struct SvaCompiler {
 		log_warning("sva2check: %s: lowered with approximation '%s' (%s).\n",
 				check_name.c_str(), kind.c_str(), where.c_str());
 	}
+	// fe208: local variables over an unbounded sequence, assert only: one
+	// attempt is tracked, chosen by a free oracle input ($anyseq) at most
+	// once per run.  Some attempt fails iff some choice of the oracle
+	// tracks a failing one, so the verdict is exact; in simulation the
+	// oracle never picks (tagged "exact:oracle" for such consumers).
+	bool oracle_mode = false;
+	bool oracle_used = false;
+	pool<Wire *> oracle_driven;
+	pool<Wire *> oracle_reads;
+	bool oracle_allowed = false;   // the check is an assert
+	SigSpec top_root, oracle_pick;
 	std::string lowering_tag() const
 	{
 		if (approx_kinds.empty())
-			return "exact";
+			return oracle_used ? "exact:oracle" : "exact";
 		std::string t = "approx:";
 		for (size_t i = 0; i < approx_kinds.size(); i++)
 			t += (i ? "," : "") + approx_kinds[i];
@@ -1814,6 +1825,86 @@ struct SvaCompiler {
 					l, log_id(n), LOCALS_WINDOW);
 	}
 
+	// fe208: whether the oracle lowering of local variables applies: an
+	// implication whose locals are all assigned in the antecedent's start
+	// tick, through conjunctive operators only (each attempt then samples
+	// each local once, with one value), and whose consequent only reads
+	// them.  `why' names the first shape outside it.
+	bool oracle_locals_ok(Cell *body, std::string &why)
+	{
+		Cell *n = unwrap_spec(body);
+		std::string op = n ? sva_op(n) : "";
+		auto ps = n ? ports_of(n) : std::vector<IdString>();
+		if ((op != "|->" && op != "|=>") || GetSize(ps) != 2) {
+			why = "local variables outside an implication's antecedent";
+			return false;
+		}
+		auto has = [&](Cell *c) { pool<Cell *> seen; return c && tree_has_locals(c, seen); };
+		if (has(child_cell(n->getPort(ps[1])))) {
+			why = "a local variable assigned in a consequent";
+			return false;
+		}
+		// assignments only under conjunctive single-tick operators
+		std::function<bool(Cell *)> conj = [&](Cell *c) -> bool {
+			if (!has(c))
+				return true;
+			std::string o = sva_op(c);
+			if (o == "assign")
+				return true;
+			if (o != "seq_match" && o != "matches" && o != "##")
+				return false;
+			for (auto p : ports_of(c))
+				if (!conj(child_cell(c->getPort(p))))
+					return false;
+			return true;
+		};
+		std::function<bool(Cell *)> start_only = [&](Cell *c) -> bool {
+			if (!has(c))
+				return true;
+			if (seq_min_len(c) == 1 && seq_max_len(c) == 1)
+				return conj(c);
+			// `L ##d R': the locals in L, which samples them at its start
+			if (sva_op(c) == "##") {
+				auto cp = ports_of(c);
+				if (GetSize(cp) != 3)
+					return false;
+				for (int i = 1; i < 3; i++)
+					if (has(child_cell(c->getPort(cp[i]))))
+						return false;
+				return start_only(child_cell(c->getPort(cp[0])));
+			}
+			return false;
+		};
+		if (!start_only(child_cell(n->getPort(ps[0])))) {
+			why = "a local variable assigned after the antecedent's first tick, or under a branching operator";
+			return false;
+		}
+		return true;
+	}
+
+	// the oracle's pick: high in the one tick (at most) whose attempt is
+	// tracked
+	SigSpec oracle_root(SigSpec root)
+	{
+		oracle_mode = true;
+		oracle_used = true;
+		SigSpec free;
+		if (const char *fp = getenv("SVA_ORACLE_PICK")) {
+			// test hook: a deterministic pick at tick j (the oracle's
+			// choices one by one, against a per-slot reference)
+			Wire *cnt = wn("oracle_tick", 8);
+			SigSpec sat = mod->Eq(NEW_ID, SigSpec(cnt), Const(255, 8));
+			ffd(mod->Mux(NEW_ID, mod->Add(NEW_ID, SigSpec(cnt), Const(1, 8)), SigSpec(cnt), sat), cnt, true);
+			free = mod->Eq(NEW_ID, SigSpec(cnt), Const(atoi(fp), 8));
+		} else
+			free = mod->Anyseq(NEW_ID, 1);
+		Wire *picked = wn("oracle_picked", 1);
+		SigSpec pick = andN({root, free, mod->Not(NEW_ID, SigSpec(picked))});
+		ffd(mod->Or(NEW_ID, SigSpec(picked), pick), picked, true);
+		oracle_pick = pick;
+		return pick;
+	}
+
 	// enable per-attempt slot mode with an l-slot ring
 	void init_slots(int l)
 	{
@@ -1862,6 +1953,11 @@ struct SvaCompiler {
 	// same-tick pending writes (lowest hot age wins; see slots_mode note)
 	SigSpec local_read(Wire *xw)
 	{
+		if (oracle_mode) {
+			// the local's own wire, driven by its capture (capture_local)
+			oracle_reads.insert(xw);
+			return SigSpec(xw);
+		}
 		if (read_cache.count(xw) && read_cache[xw].first == slot_epoch)
 			return read_cache[xw].second;
 		if (island_mode) {
@@ -1951,6 +2047,24 @@ struct SvaCompiler {
 		if (xs.empty() || !xs[0].is_wire())
 			return;
 		Wire *xw = xs[0].wire;
+		if (oracle_mode) {
+			// the tracked attempt's value: sampled when the assignment
+			// fires (its start tick, oracle_locals_ok), held after; same-
+			// tick reads see the new value.  The local's own wire carries
+			// it, so every lowering that reads the wire sees it.
+			if (!oracle_driven.insert(xw).second || xw->get_bool_attribute(ID(sva_oracle_driven)))
+				log_error("sva2check: local variable %s is assigned twice (or shared by two checks) under the oracle lowering in %s.\n",
+						log_id(xw), log_id(a));
+			if (e.size() < xw->width)
+				e.extend_u0(xw->width, false);
+			e = e.extract(0, xw->width);
+			Wire *q = wn("oracle_local", xw->width);
+			SigSpec cur = mod->Mux(NEW_ID, SigSpec(q), e, reduce1(fire));
+			ffd(cur, q, true, true);
+			mod->connect(SigSpec(xw), cur);
+			xw->set_bool_attribute(ID(sva_oracle_driven));
+			return;
+		}
 		if (!slots_mode)
 			log_error("sva2check: internal: local variable capture outside slots mode in %s.\n", log_id(a));
 		// the sampled expression may read other locals (chained assigns):
@@ -2228,8 +2342,22 @@ struct SvaCompiler {
 			pool<Cell *> seen;
 			if (tree_has_locals(dbody, seen)) {
 				int l = seq_max_len(dbody);
-				check_locals_window(l, dbody);
-				init_slots(l);
+				std::string why;
+				if (oracle_mode) {
+					if (start != oracle_pick)
+						log_error("sva2check: local variables of %s outside the tracked attempt of the oracle lowering in %s.\n",
+								dop.c_str(), check_name.c_str());
+				} else if (l < 0 && oracle_allowed && in_prop && gate == Const(1, 1) && start == top_root &&
+						oracle_locals_ok(dbody, why)) {
+					log("sva2check: %s: local variables over an unbounded sequence: one attempt tracked, chosen by a free oracle input.\n",
+							check_name.c_str());
+					start = oracle_root(start);
+				} else {
+					if (l < 0 && !why.empty())
+						log_error("sva2check: local variables over an unbounded sequence in %s (%s).\n", log_id(dbody), why.c_str());
+					check_locals_window(l, dbody);
+					init_slots(l);
+				}
 			}
 		}
 		Cell *saved_scope = clone_scope;
@@ -3879,6 +4007,9 @@ struct SvaCompiler {
 
 	bool goto_locals_match(Cell *body, GotoLocals &m)
 	{
+		// test hook: route these shapes to the oracle lowering instead
+		if (getenv("SVA_ORACLE_FORCE"))
+			return false;
 		if (!allow_until_locals || !body || multiclock || island_mode)
 			return false;
 		std::string iop = sva_op(body);
@@ -8240,12 +8371,25 @@ struct Sva2CheckPass : public Pass {
 					} else if (body) {
 						pool<Cell *> seen;
 						bool had_slots = comp.slots_mode;
+						SigSpec aroot = root;
+						comp.top_root = root;
+						comp.oracle_allowed = flavor == "assert";
 						if (comp.tree_has_locals(body, seen)) {
 							int l = comp.seq_max_len(body);
-							comp.check_locals_window(l, body);
-							comp.init_slots(l);
+							std::string why;
+							if (l < 0 && flavor == "assert" && comp.oracle_locals_ok(body, why)) {
+								log("sva2check: %s: local variables over an unbounded sequence: one attempt tracked, chosen by a free oracle input.\n",
+										log_id(cell));
+								aroot = comp.oracle_root(root);
+							} else {
+								if (l < 0 && !why.empty())
+									log_error("sva2check: local variables over an unbounded sequence in %s (%s).\n", log_id(body), why.c_str());
+								comp.check_locals_window(l, body);
+								comp.init_slots(l);
+							}
 						}
-						fail = comp.prop_dispatch(SigSpec(), body, root);
+						fail = comp.prop_dispatch(SigSpec(), body, aroot);
+						comp.oracle_mode = false;
 						if (!had_slots && comp.slots_mode) {
 							// slot state is per-property: do not leak it into
 							// the next $check of this module
@@ -8271,13 +8415,26 @@ struct Sva2CheckPass : public Pass {
 						pool<Cell *> seen;
 						SvaCompiler::UntilLocals ul;
 						SvaCompiler::GotoLocals gl;
+						SigSpec droot = root;
+						comp.top_root = root;
+						comp.oracle_allowed = flavor == "assert";
 						if (dbody && !comp.until_locals_match(dbody, ul) && !comp.goto_locals_match(dbody, gl) &&
 								comp.tree_has_locals(dbody, seen) && !comp.weak_true_impl(comp.unwrap_spec(dbody))) {
 							int l = comp.seq_max_len(dbody);
-							comp.check_locals_window(l, dbody);
-							comp.init_slots(l);
+							std::string why;
+							if (l < 0 && flavor == "assert" && comp.oracle_locals_ok(dbody, why)) {
+								log("sva2check: %s: local variables over an unbounded sequence: one attempt tracked, chosen by a free oracle input.\n",
+										log_id(cell));
+								droot = comp.oracle_root(root);
+							} else {
+								if (l < 0 && !why.empty())
+									log_error("sva2check: local variables over an unbounded sequence in %s (%s).\n", log_id(dbody), why.c_str());
+								comp.check_locals_window(l, dbody);
+								comp.init_slots(l);
+							}
 						}
-						fail = comp.prop_dispatch(body_sig, nullptr, root);
+						fail = comp.prop_dispatch(body_sig, nullptr, droot);
+						comp.oracle_mode = false;
 						if (!had_slots && comp.slots_mode) {
 							comp.slots_mode = false;
 							comp.nslots = 0;
@@ -8394,6 +8551,10 @@ struct Sva2CheckPass : public Pass {
 					// under two-state semantics, `r || !r`, a body the frontend
 					// folded) proves nothing about the circuit: say so in the
 					// provenance, where every verdict printer shows it
+					for (auto w : comp.oracle_reads)
+						if (!comp.oracle_driven.count(w))
+							log_error("sva2check: local variable %s is read but never assigned in the tracked attempt of %s (oracle lowering).\n",
+									log_id(w), log_id(cell));
 					std::string tag = comp.lowering_tag();
 					if (const_cone(mod, cell->getPort(ID::A)))
 						tag += ":const";

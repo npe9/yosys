@@ -1,0 +1,65 @@
+# fe209: cover of followed-by `R #-# P` / `R #=# P` (16.12.9).  It has no
+# vacuous success, and 16.14.8 makes it non-vacuous exactly when
+# `R |-> P` / `R |=> P` is, so it covers through the implication's hits.
+# Each case is paired with its sequence twin; c_nv's inner implication is
+# always vacuous, so it must stay unreachable.  The shape of core-v-verif
+# uvmt_cv32e40s/x_debug_assert's cov_havereset_to_running/halted.
+read_verilog -sv -formal <<EOT
+module c1(input clk, input rst, input go);
+  reg [2:0] st;
+  always @(posedge clk) if (rst) st <= 0; else if (st == 0) st <= go ? 1 : 0; else if (st == 1) st <= 2; else if (st == 2) st <= 0;
+  // reachable: 0 then 1
+  c_fn : cover property (@(posedge clk) disable iff (rst) st == 0 #=# st == 1);
+  s_fn : cover property (@(posedge clk) disable iff (rst) st == 0 ##1 st == 1);
+  // reachable: same tick
+  c_fo : cover property (@(posedge clk) st == 1 #-# go);
+  s_fo : cover property (@(posedge clk) st == 1 ##0 go);
+  // unreachable: 1 is always followed by 2
+  c_un : cover property (@(posedge clk) disable iff (rst) st == 1 #=# st == 0);
+  s_un : cover property (@(posedge clk) disable iff (rst) st == 1 ##1 st == 0);
+  // nested: followed-by with an implication consequent (non-vacuous only)
+  c_ne : cover property (@(posedge clk) disable iff (rst) st == 1 #=# (st == 2 |=> st == 0));
+  s_ne : cover property (@(posedge clk) disable iff (rst) st == 1 ##1 st == 2 ##1 st == 0);
+  // nested: vacuous inner implication must not count
+  c_nv : cover property (@(posedge clk) disable iff (rst) st == 1 #=# (st == 1 |-> go));
+endmodule
+EOT
+prep -top c1
+sva2check
+logger -expect log "c_fn: cover reached \(depth 1\)" 1
+logger -expect log "s_fn: cover reached \(depth 1\)" 1
+logger -expect log "c_fo: cover reached \(depth 1\)" 1
+logger -expect log "s_fo: cover reached \(depth 1\)" 1
+logger -expect log "c_un: cover unreachable" 1
+logger -expect log "s_un: cover unreachable" 1
+logger -expect log "c_ne: cover reached \(depth 3\)" 1
+logger -expect log "s_ne: cover reached \(depth 3\)" 1
+logger -expect log "c_nv: cover unreachable" 1
+ic3 -init-zero -kind 20
+logger -check-expected
+
+# a local variable through fuse_impl, beside its `##1' twin
+design -reset
+read_verilog -sv -formal <<EOT
+module c2(input clk, input a, input b, input c, input [3:0] d);
+  reg [3:0] h = 0;
+  always @(posedge clk) h <= d;
+  property p_l; logic [3:0] x; (a, x = d) #=# (h == x && c); endproperty
+  property s_l; logic [3:0] x; (a, x = d) ##1 (h == x && c); endproperty
+  // h is always the previous d, so h != x at the next tick is impossible
+  property p_lu; logic [3:0] x; (a, x = d) #=# (h != x); endproperty
+  property s_lu; logic [3:0] x; (a, x = d) ##1 (h != x); endproperty
+  c_l: cover property (@(posedge clk) p_l);
+  t_l: cover property (@(posedge clk) s_l);
+  c_lu: cover property (@(posedge clk) p_lu);
+  t_lu: cover property (@(posedge clk) s_lu);
+endmodule
+EOT
+prep -top c2
+sva2check
+logger -expect log "c_l: cover reached \(depth 1\)" 1
+logger -expect log "t_l: cover reached \(depth 1\)" 1
+logger -expect log "c_lu: cover unreachable" 1
+logger -expect log "t_lu: cover unreachable" 1
+ic3 -init-zero -kind 20
+logger -check-expected

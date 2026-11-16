@@ -5652,7 +5652,7 @@ struct SvaCompiler {
 	{
 		std::string op = sva_op(c);
 		auto ps = ports_of(c);
-		if ((op != "|->" && op != "|=>") || GetSize(ps) != 2)
+		if (!impl_like(op) || GetSize(ps) != 2)
 			return nullptr;
 		Cell *a = child_cell(c->getPort(ps[0]));
 		if (a && (!seq_shaped(a) || can_empty(a)))
@@ -5665,7 +5665,7 @@ struct SvaCompiler {
 		}
 		if (q && !seq_shaped(q))
 			return nullptr;
-		return new_sva("##", {c->getPort(ps[0]), Const(op == "|=>" ? 1 : 0, 32), qport}, c);
+		return new_sva("##", {c->getPort(ps[0]), Const(op == "|=>" || op == "#=#" ? 1 : 0, 32), qport}, c);
 	}
 
 	// `R |-> ##[m:$] Q` / `R |=> ##[m:$] Q` under weak semantics (an
@@ -5708,12 +5708,18 @@ struct SvaCompiler {
 	// `R |-> P` non-vacuous when R matches and P succeeds non-vacuously.
 	// So the hits of `R |-> P` are P's hits started at R's end (one tick
 	// later for |=>): a sequence P hits at its match end, a Boolean at its
-	// tick, a nested implication recursively.  Anything else: why is set
-	// and the result is empty.
+	// tick, a nested implication recursively.  Followed-by `R #-# P` /
+	// `R #=# P` (16.12.9) has no vacuous success, and 16.14.8 makes it
+	// non-vacuous exactly when `R |-> P` / `R |=> P` is, so its hits are
+	// the same.  Anything else: why is set and the result is empty.
+	static bool impl_like(const std::string &op)
+	{
+		return op == "|->" || op == "|=>" || op == "#-#" || op == "#=#";
+	}
 	SigSpec cover_hit(Cell *c, SigSpec start, std::string &why)
 	{
 		std::string op = sva_op(c);
-		if (op != "|->" && op != "|=>") {
+		if (!impl_like(op)) {
 			why = "cover of a property operator (" + op + ")";
 			return SigSpec();
 		}
@@ -5728,7 +5734,7 @@ struct SvaCompiler {
 			return SigSpec();
 		}
 		SigSpec e = seq_dispatch(c->getPort(ps[0]), a, start, Const(1, 1));
-		if (op == "|=>") {
+		if (op == "|=>" || op == "#=#") {
 			e = delay(e, 1, "cov");
 			if (a && can_empty(a))
 				e = orN({e, start});
@@ -8189,7 +8195,7 @@ struct Sva2CheckPass : public Pass {
 						}
 					}
 					// an implication body covers its non-vacuous successes
-					bool impl_cover = sbody && (sva_op(sbody) == "|->" || sva_op(sbody) == "|=>");
+					bool impl_cover = sbody && SvaCompiler::impl_like(sva_op(sbody));
 					// a sequence with local variables (2026-10-29, OpenTitan
 					// tlul_assert): the goto shape through the goto CAM
 					// (goto_cover_match), a bounded one through the

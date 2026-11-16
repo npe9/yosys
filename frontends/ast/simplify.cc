@@ -7848,6 +7848,71 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				did_something = true;
 			}
 		}
+		// fe205: an index-keyed or `default:' pattern for an array parameter
+		// (`localparam logic [3:0] A [4] = '{2: 4'h9, default: 4'h3}', IEEE
+		// 1800-2017 10.9.1) follows the declared index, not source order.
+		// The item order was taken as positional (A[0] read 9), as was a
+		// packed one's (`[1:0][3:0] '{0: a, 1: b}' read {a, b}).  Put the
+		// items in position order of the outermost dimension, as the
+		// variable assignment path does (AST_ASSIGN below).
+		if ((type == AST_PARAMETER || type == AST_LOCALPARAM) && !children.empty() && children[0] &&
+				children[0]->type == AST_ASSIGN_PATTERN && !dimensions.empty() &&
+				(unpacked_dimensions > 0 || GetSize(dimensions) >= 2) &&
+				!(attributes.count(ID::wiretype) && (attributes.at(ID::wiretype)->type == AST_STRUCT ||
+						attributes.at(ID::wiretype)->type == AST_UNION))) {
+			// levels that hold elements: the unpacked dimensions, or for a
+			// packed array every dimension but the innermost (bits)
+			int levels = unpacked_dimensions > 0 ? unpacked_dimensions : GetSize(dimensions) - 1;
+			std::function<void(AstNode *, int)> position = [&](AstNode *pat, int d) {
+				if (!pat || pat->type != AST_ASSIGN_PATTERN || d >= levels)
+					return;
+				bool keyed = false, positional = false, member = false;
+				for (auto &ch : pat->children) {
+					if (!ch)
+						continue;
+					if (ch->attributes.count(ID(sv_index)))
+						keyed = true;
+					else if (ch->attributes.count(ID(sv_member)))
+						(ch->attributes.at(ID(sv_member))->str == "default" ? keyed : member) = true;
+					else if (!ch->attributes.count(ID(sv_typekey)))
+						positional = true;
+				}
+				if (member)
+					return;   // a struct's pattern: folded member by member elsewhere
+				if (keyed && positional)
+					input_error("Assignment pattern for array parameter `%s' mixes index keys and positional items.\n", str.c_str());
+				if (keyed) {
+					dict<int, AstNode *> by_idx;
+					AstNode *fallback = nullptr;
+					for (auto &ch : pat->children) {
+						if (!ch)
+							continue;
+						if (ch->attributes.count(ID(sv_index)))
+							by_idx[ch->attributes.at(ID(sv_index))->asInt(true)] = ch.get();
+						else if (ch->attributes.count(ID(sv_member)))
+							fallback = ch.get();
+					}
+					const dimension_t &dd = dimensions[d];
+					std::vector<std::unique_ptr<AstNode>> positioned;
+					for (int p = 0; p < dd.range_width; p++) {
+						int low = dd.range_right, high = low + dd.range_width - 1;
+						int idx = dd.range_swapped ? (low + p) : (high - p);
+						AstNode *src = by_idx.count(idx) ? by_idx.at(idx) : fallback;
+						if (!src)
+							input_error("Index assignment pattern for parameter `%s' does not assign index %d.\n", str.c_str(), idx);
+						auto val = src->clone();
+						val->attributes.erase(ID(sv_index));
+						val->attributes.erase(ID(sv_member));
+						positioned.push_back(std::move(val));
+					}
+					pat->children.swap(positioned);
+					did_something = true;
+				}
+				for (auto &ch : pat->children)
+					position(ch.get(), d + 1);
+			};
+			position(children[0].get(), 0);
+		}
 		// unpacked-array parameter values that are not a literal pattern:
 		//  - a default naming another array parameter (`= ibex_pkg::PmpCfgRst`)
 		//    takes that parameter's pattern, so element reads fold;

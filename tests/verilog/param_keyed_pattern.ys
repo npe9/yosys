@@ -1,0 +1,55 @@
+# fe205: index-keyed and `default:' assignment patterns for array parameters
+# follow the declared index (IEEE 1800-2017 10.9.1), not source order: the
+# items were taken as positional, a silent wrong value (A[0] of
+# `'{2: 4'h9, default: 4'h3}' read 9, `[1:0][3:0] '{0: a, 1: b}' read {a, b}).
+# Unpacked (ascending and descending), packed multi-dimensional, nested,
+# struct-element, typedef'd, package and instance-default parameters.
+logger -expect-no-warnings
+read_verilog -sv <<EOT
+package p;
+	localparam logic [3:0] PA [4] = '{3: 4'hc, default: 4'h5};
+endpackage
+module sub #(parameter logic [3:0] A [2] = '{1: 4'h6, 0: 4'h2}) (output logic [3:0] o);
+	assign o = A[0];
+endmodule
+module top(output logic [3:0] o1, output logic [3:0] o2, output logic [7:0] o3,
+		output logic [3:0] o4, output logic [3:0] o5, output logic [3:0] o6,
+		output logic [3:0] o7, output logic [3:0] o8, output logic [3:0] o9,
+		output logic [3:0] o10, output logic [3:0] o11);
+	localparam logic [3:0] A1 [2] = '{1: 4'h2, 0: 4'h1};
+	localparam logic [3:0] A2 [4] = '{2: 4'h9, default: 4'h3};
+	localparam logic [1:0][3:0] A3 = '{0: 4'h1, 1: 4'h2};
+	localparam logic [3:0] A4 [3:0] = '{0: 4'h1, 3: 4'h8, default: 4'h0};
+	localparam logic [3:0] A5 [2][2] = '{1: '{1: 4'h4, 0: 4'h3}, 0: '{4'h1, 4'h2}};
+	typedef struct packed { logic [1:0] a; logic [1:0] b; } s_t;
+	localparam s_t A6 [2] = '{1: '{a: 2'd1, b: 2'd2}, 0: '{a: 2'd3, b: 2'd0}};
+	typedef logic [3:0] a_t [2];
+	localparam a_t A7 = '{1: 4'h2, 0: 4'h1};
+	localparam logic [1:0][1:0][3:0] A8 = '{1: '{1: 4'h4, 0: 4'h3}, 0: '{4'h1, 4'h2}};
+	assign o1 = A1[0];
+	assign o2 = A2[0] + A2[2];
+	assign o3 = A3;
+	assign o4 = A4[3];
+	assign o5 = A5[1][0];
+	assign o6 = A5[0][1];
+	assign o7 = A6[0];
+	assign o8 = A7[0];
+	assign o9 = A8[1][0];
+	assign o10 = p::PA[3] + p::PA[0];
+	sub u(.o(o11));
+endmodule
+EOT
+logger -check-expected
+hierarchy -top top
+proc
+flatten
+sat -verify -prove o1 1 -prove o2 12 -prove o3 8'h21 -prove o4 8 -prove o5 3 -prove o6 2 -prove o7 12 -prove o8 1 -prove o9 3 -prove o10 1 -prove o11 2 top
+design -reset
+
+logger -expect error "Index assignment pattern for parameter `.A' does not assign index 1" 1
+read_verilog -sv <<EOT
+module top2(output logic [3:0] o);
+	localparam logic [3:0] A [3] = '{0: 4'h1, 2: 4'h2};
+	assign o = A[0];
+endmodule
+EOT

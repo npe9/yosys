@@ -31,12 +31,26 @@ ic3 -init-zero
 design -reset
 logger -check-expected
 
-# a constant-false S1 stays refused (an expected error ends the script)
+# a constant-false S1 (refused before fe206): Annex F weak semantics
+# continues a prefix with the letter T, which satisfies every Boolean, 1'b0
+# included, so here too only P can fail.  The generic weak monitor
+# (determinized, live states by T-continuation) lowers it; a_rp's P fails
 read_verilog -sv -formal <<EOT
-module top (input logic clk, input logic a, b, x);
-  a_r: assert property (@(posedge clk) a |-> ((##[0:$] 1'b0) within (a ##[0:$] b)));
+module top (input logic clk);
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) if (t != 4'd15) t <= t + 4'd1;
+  wire a = t == 4'd2, b = t == 4'd6;
+  a_r:  assert property (@(posedge clk) a |-> ((##[0:$] 1'b0) within (a ##[0:$] b)));
+  a_rp: assert property (@(posedge clk) a |-> ((##[0:$] 1'b0) within (t == 4'd3 ##[0:$] b)));
 endmodule
 EOT
 hierarchy -top top
-logger -expect error "no finite bound" 1
+logger -expect log "compiled with weak semantics \(determinized monitor" 2
 sva2check
+proc
+async2sync
+logger -expect log "a_r: proved" 1
+logger -expect log "a_rp: disproved \(depth 2\)" 1
+ic3 -init-zero -kind 30
+design -reset
+logger -check-expected

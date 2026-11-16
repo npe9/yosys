@@ -40,12 +40,29 @@ ic3 -init-zero
 design -reset
 logger -check-expected
 
-# a bounded sequence after the gated goto stays refused
+# a bounded sequence after the gated goto (no shape monitor: refused
+# before fe206) is lowered by the generic weak monitor (determinized)
 read_verilog -sv -formal <<EOT
-module top (input logic clk, input logic a, g, x, y);
-  a_r: assert property (@(posedge clk) a |-> x throughout (g[->1] ##1 (y ##1 y)[*2]));
+module top (input logic clk);
+  logic [3:0] t = 4'd0;
+  always_ff @(posedge clk) if (t != 4'd15) t <= t + 4'd1;
+  wire a = t == 4'd1, g = t == 4'd3;
+  wire y = t >= 4'd4 && t <= 4'd7, y2 = t == 4'd4 || t == 4'd5 || t == 4'd7;
+  a_r:  assert property (@(posedge clk) a |-> 1'b1 throughout (g[->1] ##1 (y ##1 y)[*2]));
+  a_ry: assert property (@(posedge clk) a |-> 1'b1 throughout (g[->1] ##1 (y2 ##1 y2)[*2]));
+  a_rx: assert property (@(posedge clk) a |-> t != 4'd5 throughout (g[->1] ##1 (y ##1 y)[*2]));
+  a_rn: assert property (@(posedge clk) a |-> 1'b1 throughout (1'b0[->1] ##1 (y ##1 y)[*2]));
 endmodule
 EOT
 hierarchy -top top
-logger -expect error "no finite bound" 1
+logger -expect log "compiled with weak semantics \(determinized monitor" 4
 sva2check
+proc
+async2sync
+logger -expect log "a_r: proved" 1
+logger -expect log "a_ry: disproved \(depth 6\)" 1
+logger -expect log "a_rx: disproved \(depth 5\)" 1
+logger -expect log "a_rn: proved" 1
+ic3 -init-zero -kind 30
+design -reset
+logger -check-expected

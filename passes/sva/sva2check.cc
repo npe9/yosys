@@ -5134,7 +5134,14 @@ struct SvaCompiler {
 			// x[*0:$] ##k y after rewrite_empty_delays is an `or` node
 			if (sva_op(c) == "or" && !strong_ctx && seq_max_len(c) < 0) {
 				SigSpec wf;
+				if (getenv("SVA_WEAK_GENERIC") && weak_generic_fail(c, start, wf))
+					return wf;
 				if (weak_unbounded_fail(c, start, wf))
+					return wf;
+				// an `or' of sequences: weak(s1 or s2) == weak(s1) or
+				// weak(s2) (a prefix is dead for the union iff for both),
+				// so the sequence monitor serves the property `or' too
+				if (weak_generic_fail(c, start, wf))
 					return wf;
 			}
 			if (!is_seq_op(sva_op(c))) {
@@ -6165,6 +6172,430 @@ struct SvaCompiler {
 		return true;
 	}
 
+	// fe206: generic weak monitor for an unbounded sequence in property
+	// position (IEEE 1800-2017 16.12.2: `weak(s)' fails at the first tick
+	// at which no extension of the prefix can still match s), tried after
+	// the shapes (a)-(e).  Those track the latest attempt only; this one is
+	// exact for any number of overlapping attempts.  The sequence, over
+	// Boolean atoms only (no local variables, instances or clocks), is a
+	// regular expression over atom valuations; its derivatives (Brzozowski;
+	// `##0' as fusion, `and' / `throughout' / `within' through intersect)
+	// are built at compile time into a DFA, and the monitor keeps one bit
+	// per DFA state, "some pending attempt is in this state".  Attempts in
+	// one state have one future, so the merge loses nothing.  An attempt
+	// starts at its start tick in the initial state, ends at a match (a
+	// nullable derivative) and fails on entering a state from which no
+	// match is reachable.
+	struct Rx { int op, a, b, atom; bool neg; };
+	enum { RX_NONE, RX_EPS, RX_ATOM, RX_CAT, RX_FUSE, RX_OR, RX_AND, RX_STAR };
+	struct RxPool {
+		std::vector<Rx> nodes;
+		std::map<std::tuple<int, int, int, int, bool>, int> memo;
+		int budget = 20000;
+		bool over = false;
+		RxPool() { mk(RX_NONE); mk(RX_EPS); }
+		int mk(int op, int a = -1, int b = -1, int atom = -1, bool neg = false)
+		{
+			auto key = std::make_tuple(op, a, b, atom, neg);
+			auto it = memo.find(key);
+			if (it != memo.end())
+				return it->second;
+			if (GetSize(nodes) >= budget) {
+				over = true;
+				return 0;
+			}
+			nodes.push_back({op, a, b, atom, neg});
+			memo[key] = GetSize(nodes) - 1;
+			return GetSize(nodes) - 1;
+		}
+		bool nullable(int r)
+		{
+			const Rx &x = nodes[r];
+			switch (x.op) {
+			case RX_EPS: case RX_STAR: return true;
+			case RX_CAT: case RX_AND: return nullable(x.a) && nullable(x.b);
+			case RX_OR: return nullable(x.a) || nullable(x.b);
+			default: return false;
+			}
+		}
+		// smart constructors: identities, right-nested `cat', and the
+		// alternatives / conjuncts of `or' / `and' flattened, sorted and
+		// deduplicated (the ACI normal form that keeps the derivatives
+		// finite)
+		int cat(int r, int s)
+		{
+			if (r == 0 || s == 0) return 0;
+			if (r == 1) return s;
+			if (s == 1) return r;
+			if (nodes[r].op == RX_CAT)
+				return cat(nodes[r].a, cat(nodes[r].b, s));
+			return mk(RX_CAT, r, s);
+		}
+		int fuse(int r, int s)
+		{
+			if (r <= 1 || s <= 1) return 0;   // an empty operand of ##0 never matches
+			return mk(RX_FUSE, r, s);
+		}
+		void flat(int r, int op, std::vector<int> &out)
+		{
+			if (nodes[r].op == op) {
+				flat(nodes[r].a, op, out);
+				flat(nodes[r].b, op, out);
+			} else
+				out.push_back(r);
+		}
+		int alt(int r, int s)
+		{
+			std::vector<int> v;
+			flat(r, RX_OR, v);
+			flat(s, RX_OR, v);
+			std::sort(v.begin(), v.end());
+			v.erase(std::unique(v.begin(), v.end()), v.end());
+			v.erase(std::remove(v.begin(), v.end(), 0), v.end());
+			if (v.empty()) return 0;
+			int acc = v.back();
+			for (int i = GetSize(v) - 2; i >= 0; i--)
+				acc = mk(RX_OR, v[i], acc);
+			return acc;
+		}
+		int isect(int r, int s)
+		{
+			std::vector<int> v;
+			flat(r, RX_AND, v);
+			flat(s, RX_AND, v);
+			std::sort(v.begin(), v.end());
+			v.erase(std::unique(v.begin(), v.end()), v.end());
+			if (v.empty() || v.front() == 0) return 0;
+			int acc = v.back();
+			for (int i = GetSize(v) - 2; i >= 0; i--)
+				acc = mk(RX_AND, v[i], acc);
+			return acc;
+		}
+		int star(int r)
+		{
+			if (r <= 1) return 1;
+			if (nodes[r].op == RX_STAR) return r;
+			return mk(RX_STAR, r);
+		}
+		int opt(int r) { return alt(1, r); }
+		// r[*lo:hi], hi < 0 for $
+		int rep(int r, int lo, int hi)
+		{
+			int acc = 1;
+			for (int i = 0; i < lo; i++)
+				acc = cat(acc, r);
+			if (hi < 0)
+				return cat(acc, star(r));
+			int tail = 1;
+			for (int i = lo; i < hi; i++)
+				tail = opt(cat(r, tail));
+			return cat(acc, tail);
+		}
+		// the derivative by a letter: a valuation v of the atoms, or (top)
+		// Annex F's letter T, which satisfies every Boolean -- 1'b0 and a
+		// negated atom included.  Atom -1 is the constant 1, -2 the
+		// constant 0 (constants are not valuation bits)
+		int deriv(int r, uint32_t v, bool top = false)
+		{
+			const Rx x = nodes[r];
+			switch (x.op) {
+			case RX_ATOM: {
+				if (top)
+					return 1;
+				bool val = x.atom == -1 ? true : x.atom == -2 ? false : ((v >> x.atom) & 1) != 0;
+				return (val != x.neg) ? 1 : 0;
+			}
+			case RX_CAT: {
+				int d = cat(deriv(x.a, v, top), x.b);
+				return nullable(x.a) ? alt(d, deriv(x.b, v, top)) : d;
+			}
+			case RX_FUSE: {
+				int da = deriv(x.a, v, top);
+				int d = fuse(da, x.b);
+				return nullable(da) ? alt(d, deriv(x.b, v, top)) : d;
+			}
+			case RX_OR: return alt(deriv(x.a, v, top), deriv(x.b, v, top));
+			case RX_AND: return isect(deriv(x.a, v, top), deriv(x.b, v, top));
+			case RX_STAR: return cat(deriv(x.a, v, top), r);
+			default: return 0;
+			}
+		}
+		// Annex F (F.5.2): w satisfies weak(R) iff every finite prefix,
+		// continued by T forever, satisfies strong(R).  A residual is live
+		// iff some chain of T derivatives reaches a match
+		bool live_top(int r)
+		{
+			std::set<int> seen;
+			while (r != 0 && !over && seen.insert(r).second) {
+				if (nullable(r))
+					return true;
+				r = deriv(r, 0, true);
+			}
+			return false;
+		}
+	};
+
+	bool weak_generic_fail(Cell *n, SigSpec start, SigSpec &fail)
+	{
+		if (slots_mode || in_island || !dyn_gate.empty())
+			return false;
+		RxPool P;
+		std::vector<SigSpec> atoms;
+		auto atom_of = [&](SigSpec s, bool neg) -> int {
+			if (s.is_fully_const())
+				return P.mk(RX_ATOM, -1, -1, s.as_bool() ? -1 : -2, neg);
+			for (int i = 0; i < GetSize(atoms); i++)
+				if (atoms[i] == s)
+					return P.mk(RX_ATOM, -1, -1, i, neg);
+			atoms.push_back(s);
+			return P.mk(RX_ATOM, -1, -1, GetSize(atoms) - 1, neg);
+		};
+		auto rd = [&](Cell *c, int i) -> SigSpec {
+			auto ps = ports_of(c);
+			if (clone_scope && !clone_cmap.count(c))
+				ensure_stub(c);
+			Cell *src = clone_scope ? clone_cmap[c] : nullptr;
+			return cport(c, src, ps[i]);
+		};
+		auto bounds = [&](Cell *b, int &lo, int &hi) -> bool {
+			if (!b || sva_op(b) != "bounds")
+				return false;
+			auto bp = ports_of(b);
+			if (bp.empty() || !const_int(b->getPort(bp[0]), lo) || lo < 0 || lo > 64)
+				return false;
+			hi = lo;
+			if (GetSize(bp) >= 2 && !const_int(b->getPort(bp[1]), hi))
+				return false;
+			if (hi > 64 || (hi >= 0 && hi < lo))
+				return false;
+			return true;
+		};
+		bool ok = true;
+		int decl_depth = 0;
+		std::function<int(Cell *, int)> port;
+		std::function<int(Cell *)> conv;
+		auto decl_body = [&](Cell *decl) -> int {
+			auto dp = ports_of(decl);
+			// argument-free: its body names module-scope signals only (not
+			// an enclosing instance's formals), so it reads the same inside
+			// an instance body's clone scope (cport stubs it lazily)
+			if (GetSize(dp) != 1 || decl_depth >= 16) {
+				if (getenv("SVA_DEBUG_OPS"))
+					log("sva2check: generic weak monitor: declaration %s not inlined.\n", log_id(decl));
+				ok = false;
+				return 0;
+			}
+			Cell *body = child_cell(decl->getPort(dp[0]));
+			body = body ? unwrap_spec(body) : nullptr;
+			if (!body) { ok = false; return 0; }
+			decl_depth++;
+			int r = conv(body);
+			decl_depth--;
+			return r;
+		};
+		// a Boolean operand: a sequence declaration referenced by its bare
+		// name reads as a wire of that name, never an atom (an undriven
+		// wire: the free-wire class)
+		auto boolean = [&](SigSpec raw) -> SigSpec {
+			SigSpec v = resolve(raw);
+			if (decl_for_wire(v)) { ok = false; return Const(0, 1); }
+			return reduce1(v);
+		};
+		conv = [&](Cell *c) -> int {
+			std::string op = sva_op(c);
+			auto ps = ports_of(c);
+			auto kid = [&](int i) -> Cell * { return i < GetSize(ps) ? child_cell(c->getPort(ps[i])) : nullptr; };
+			if (op == "true")
+				return P.mk(RX_ATOM, -1, -1, -1, false);
+			// Boolean-valued operator cells: their value at this tick
+			if (op == "inside" || op == "weq" || op == "wne")
+				return atom_of(reduce1(seq_end(c, Const(1, 1), Const(1, 1))), false);
+			// a named sequence without arguments (cv32e40s
+			// s_conse_next_retire): its body.  One with formals is left to
+			// the other paths (formals bind through subst, which reaches
+			// bare formal leaves only)
+			if (Cell *decl = decl_by_name(op))
+				return decl_body(decl);
+			if (op == "##") {
+				bool lead2 = GetSize(ps) == 2;
+				int lhs = lead2 ? P.mk(RX_ATOM, -1, -1, -1, false) : port(c, 0);
+				int rhs = port(c, lead2 ? 1 : 2);
+				SigSpec cyc = c->getPort(ps[lead2 ? 0 : 1]);
+				Cell *cc = child_cell(cyc);
+				int lo, hi;
+				if (!cc) {
+					if (!const_int(cyc, lo) || lo < 0 || lo > 64) { ok = false; return 0; }
+					hi = lo;
+				} else if (sva_op(cc) == "##[*]" || sva_op(cc) == "##[+]") {
+					lo = sva_op(cc) == "##[+]" ? 1 : 0;
+					hi = -1;
+				} else if (!bounds(cc, lo, hi)) {
+					ok = false;
+					return 0;
+				}
+				int T = P.mk(RX_ATOM, -1, -1, -1, false);
+				int r = 0;
+				if (lo == 0)
+					r = P.fuse(lhs, rhs);
+				int l1 = std::max(lo, 1);
+				// lhs ##k rhs for k in [l1:hi] = lhs ; T[*l1-1:hi-1] ; rhs
+				int mid = P.rep(T, l1 - 1, hi < 0 ? -1 : hi - 1);
+				if (hi < 0 || hi >= l1)
+					r = P.alt(r, P.cat(lhs, P.cat(mid, rhs)));
+				return r;
+			}
+			if (op == "[*]" || op == "[+]") {
+				int lo = 1, hi = -1;
+				if (op == "[*]" && !bounds(kid(1), lo, hi)) { ok = false; return 0; }
+				if (op == "[+]" && kid(1)) { ok = false; return 0; }
+				return P.rep(port(c, 0), lo, hi);
+			}
+			if (op == "[->]" || op == "[=]") {
+				int lo, hi;
+				if (kid(0) || !bounds(kid(1), lo, hi)) { ok = false; return 0; }
+				SigSpec b = boolean(rd(c, 0));
+				int g = P.cat(P.star(atom_of(b, true)), atom_of(b, false));
+				int r = P.rep(g, lo, hi);
+				if (op == "[=]")
+					r = P.cat(r, P.star(atom_of(b, true)));
+				return r;
+			}
+			if (op == "or")
+				return P.alt(port(c, 0), port(c, 1));
+			if (op == "intersect")
+				return P.isect(port(c, 0), port(c, 1));
+			if (op == "and") {
+				int any = P.star(P.mk(RX_ATOM, -1, -1, -1, false));
+				int r = port(c, 0), s = port(c, 1);
+				return P.alt(P.isect(P.cat(r, any), s), P.isect(r, P.cat(s, any)));
+			}
+			if (op == "throughout") {
+				if (kid(0)) { ok = false; return 0; }
+				int cb = atom_of(boolean(rd(c, 0)), false);
+				return P.isect(P.star(cb), port(c, 1));
+			}
+			if (op == "within") {
+				int any = P.star(P.mk(RX_ATOM, -1, -1, -1, false));
+				return P.isect(P.cat(any, P.cat(port(c, 0), any)), port(c, 1));
+			}
+			if (getenv("SVA_DEBUG_OPS"))
+				log("sva2check: generic weak monitor: no rule for `%s'.\n", op.c_str());
+			ok = false;
+			return 0;
+		};
+		port = [&](Cell *c, int i) -> int {
+			auto ps = ports_of(c);
+			if (i >= GetSize(ps)) { ok = false; return 0; }
+			Cell *k = child_cell(c->getPort(ps[i]));
+			if (k)
+				return conv(k);
+			SigSpec raw = rd(c, i);
+			if (Cell *decl = decl_for_wire(resolve(raw)))
+				return decl_body(decl);
+			return atom_of(boolean(raw), false);
+		};
+		Cell *top = n;
+		// weak(first_match(s)) == weak(s): a match exists or it does not
+		if (sva_op(top) == "first_match") {
+			auto ps = ports_of(top);
+			top = ps.empty() ? nullptr : child_cell(top->getPort(ps[0]));
+			if (!top)
+				return false;
+		}
+		int r0 = conv(top);
+		const int max_atoms = 10, max_states = 128;
+		if (!ok || P.over || r0 == 0 || GetSize(atoms) > max_atoms || P.nullable(r0)) {
+			if (getenv("SVA_DEBUG_OPS"))
+				log("sva2check: generic weak monitor: not used (ok %d, over %d, empty %d, %d atoms, nullable %d).\n",
+						ok, P.over, r0 == 0, GetSize(atoms), r0 != 0 && P.nullable(r0));
+			return false;
+		}
+		// the DFA: states are non-nullable derivatives, reached by any
+		// valuation; a nullable target is a match (-1), a dead one -2
+		int nv = 1 << GetSize(atoms);
+		std::vector<int> states = {r0};
+		dict<int, int> sid;
+		sid[r0] = 0;
+		std::vector<std::vector<int>> next;
+		for (int q = 0; q < GetSize(states); q++) {
+			std::vector<int> row(nv);
+			for (int v = 0; v < nv; v++) {
+				int d = P.deriv(states[q], v);
+				if (P.over)
+					return false;
+				if (P.nullable(d))
+					row[v] = -1;
+				else if (d == 0)
+					row[v] = -2;
+				else {
+					if (!sid.count(d)) {
+						if (GetSize(states) >= max_states)
+							return false;
+						sid[d] = GetSize(states);
+						states.push_back(d);
+					}
+					row[v] = sid[d];
+				}
+			}
+			next.push_back(row);
+		}
+		// dead (-2): a residual no T-continuation can match (Annex F weak
+		// semantics; a state can be non-empty in form but dead, e.g. under
+		// an intersect whose operands cannot end together)
+		int ns = GetSize(states);
+		std::vector<bool> live(ns);
+		for (int q = 0; q < ns; q++)
+			live[q] = P.live_top(states[q]);
+		if (P.over)
+			return false;
+		for (int q = 0; q < ns; q++)
+			for (int v = 0; v < nv; v++)
+				if (next[q][v] >= 0 && !live[next[q][v]])
+					next[q][v] = -2;
+		// indicator of {v : row[v] == t} as a mux tree over the atoms
+		std::function<SigSpec(const std::vector<int> &, int, int, int)> ind =
+				[&](const std::vector<int> &row, int t, int base, int bit) -> SigSpec {
+			if (bit < 0)
+				return Const(row[base] == t ? 1 : 0, 1);
+			int span = 1 << bit;
+			bool all1 = true, all0 = true;
+			for (int v = base; v < base + 2 * span; v++) {
+				if (row[v] == t) all0 = false; else all1 = false;
+			}
+			if (all1) return Const(1, 1);
+			if (all0) return Const(0, 1);
+			SigSpec lo = ind(row, t, base, bit - 1), hi = ind(row, t, base + span, bit - 1);
+			return mod->Mux(NEW_ID, lo, hi, atoms[bit]);
+		};
+		std::vector<Wire *> bits;
+		for (int q = 0; q < ns; q++)
+			bits.push_back(wn("wgen", 1));
+		std::vector<SigSpec> nxt(ns);
+		SigSpec f = Const(0, 1);
+		int top_bit = GetSize(atoms) - 1;
+		for (int q = 0; q < ns; q++) {
+			SigSpec act = SigSpec(bits[q]);
+			if (q == 0)
+				act = orN({act, start});
+			std::set<int> ts(next[q].begin(), next[q].end());
+			for (int t : ts) {
+				if (t == -1)
+					continue;
+				SigSpec c = andN({act, ind(next[q], t, 0, top_bit)});
+				if (t == -2)
+					f = orN({f, c});
+				else
+					nxt[t] = nxt[t].empty() ? c : orN({nxt[t], c});
+			}
+		}
+		for (int q = 0; q < ns; q++)
+			ffd(dis_gate(nxt[q].empty() ? SigSpec(Const(0, 1)) : nxt[q]), bits[q], true);
+		fail = f;
+		log("sva2check: %s: unbounded sequence in property position compiled with weak semantics (determinized monitor, %d states over %d atoms).\n",
+				check_name.c_str(), ns, GetSize(atoms));
+		return true;
+	}
+
 	SigSpec strong_seq_fail(Cell *n, SigSpec start)
 	{
 		refuse_empty_prop(n);
@@ -6178,7 +6609,13 @@ struct SvaCompiler {
 			log_error("sva2check: strong unbounded sequence in %s needs a liveness obligation (not supported).\n", log_id(n));
 		if (len < 0) {
 			SigSpec wf;
+			// SVA_WEAK_GENERIC: the generic monitor first (a miter against
+			// the shape monitors (a)-(e))
+			if (getenv("SVA_WEAK_GENERIC") && weak_generic_fail(n, start, wf))
+				return wf;
 			if (weak_unbounded_fail(n, start, wf))
+				return wf;
+			if (weak_generic_fail(n, start, wf))
 				return wf;
 		}
 		int minl = seq_min_len(n);

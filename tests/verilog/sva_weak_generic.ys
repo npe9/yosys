@@ -1,0 +1,74 @@
+# fe206: the generic weak monitor for an unbounded sequence in property
+# position (IEEE 1800-2017 16.12.2), after the shape monitors.  The
+# cv32e40p/s/x debug and fencei checkers' `b[->1:2] ##0 c',
+# `x throughout (b1[->1] ##1 b2[->1])', `x throughout (b1[->1] or b2[->1])'
+# and the `or' of goto chains in s_conse_next_retire were refused ("no
+# finite bound").  The monitor is a DFA over the sequence's Boolean atoms
+# with one bit per state, so overlapping attempts are exact: in a_ovl the
+# attempt at t == 1 fails at t == 5 while the one at t == 4 is alive and
+# later matches.
+read_verilog -sv -formal <<EOT
+module top (input logic clk);
+  logic [4:0] t = 5'd0;
+  always_ff @(posedge clk) if (t != 5'd31) t <= t + 5'd1;
+  wire w = t == 5'd2 || t == 5'd6 || t == 5'd12 || t == 5'd14;
+  sequence s_n;
+    ((t == 5'd2)[->1] ##0 w[->1]) or ((t == 5'd9)[->1] ##0 w[->2]) or ((t == 5'd6 || t == 5'd8)[->1] ##0 (t inside {5'd6, 5'd7}));
+  endsequence
+  sequence s_in;
+    (t == 5'd3 || t == 5'd5)[->1:2] ##0 t == 5'd5;
+  endsequence
+  sequence s_out;
+    s_in ##0 t[0];
+  endsequence
+  sequence s_bad;
+    s_in ##0 t == 5'd6;
+  endsequence
+  a_sok:  assert property (@(posedge clk) t == 5'd1 |-> s_out);
+  a_sbad: assert property (@(posedge clk) t == 5'd1 |-> s_bad);
+  a_rok:  assert property (@(posedge clk) t == 5'd1 |-> (t == 5'd3 || t == 5'd5)[->1:2] ##0 t == 5'd5);
+  a_rfl:  assert property (@(posedge clk) t == 5'd1 |-> (t == 5'd3 || t == 5'd5)[->1:2] ##0 t == 5'd6);
+  a_ovl:  assert property (@(posedge clk) (t == 5'd1 || t == 5'd4) |-> (t == 5'd3 || t == 5'd5 || t == 5'd7)[->1:2] ##0 t == 5'd7);
+  a_tok:  assert property (@(posedge clk) t == 5'd1 |-> t != 5'd4 throughout ((t == 5'd2 || t == 5'd6)[->1] ##1 (t == 5'd3 || t == 5'd8)[->1]));
+  a_tfl:  assert property (@(posedge clk) t == 5'd1 |-> t != 5'd3 throughout ((t == 5'd2 || t == 5'd6)[->1] ##1 (t == 5'd3 || t == 5'd8)[->1]));
+  a_tor:  assert property (@(posedge clk) t == 5'd1 |-> t != 5'd4 throughout ((t == 5'd4)[->1] or (t == 5'd6)[->1]));
+  a_nok:  assert property (@(posedge clk) t == 5'd1 |-> s_n ##0 t == 5'd6);
+  a_nfl:  assert property (@(posedge clk) t == 5'd1 |-> s_n ##0 t == 5'd8);
+  a_dis:  assert property (@(posedge clk) disable iff (t == 5'd4) t == 5'd1 |-> (t == 5'd3 || t == 5'd5)[->1:2] ##0 t == 5'd6);
+  a_nev:  assert property (@(posedge clk) t == 5'd1 |-> 1'b0[->1:2] ##0 t == 5'd6);
+endmodule
+EOT
+hierarchy -top top
+logger -expect log "compiled with weak semantics \(determinized monitor" 12
+sva2check
+proc
+async2sync
+logger -expect log "a_rok: proved" 1
+logger -expect log "a_rfl: disproved \(depth 5\)" 1
+logger -expect log "a_ovl: disproved \(depth 5\)" 1
+logger -expect log "a_tok: proved" 1
+logger -expect log "a_tfl: disproved \(depth 3\)" 1
+logger -expect log "a_tor: disproved \(depth 4\)" 1
+logger -expect log "a_nok: proved" 1
+logger -expect log "a_nfl: disproved \(depth 14\)" 1
+logger -expect log "a_dis: proved" 1
+logger -expect log "a_nev: proved" 1
+logger -expect log "a_sok: proved" 1
+logger -expect log "a_sbad: disproved \(depth 5\)" 1
+ic3 -init-zero -kind 40
+design -reset
+logger -check-expected
+
+# a sequence with a local variable is still refused
+read_verilog -sv -formal <<EOT
+module top (input logic clk, input logic a, b, c, input logic [3:0] d);
+  property p_l;
+    logic [3:0] v;
+    (a, v = d) |-> b[->1:2] ##0 (d == v) && c;
+  endproperty
+  a_l: assert property (@(posedge clk) p_l);
+endmodule
+EOT
+hierarchy -top top
+logger -expect error "local variables over an unbounded sequence" 1
+sva2check

@@ -2129,6 +2129,22 @@ struct SvaCompiler {
 			return false;
 		std::string op = sva_op(c);
 		auto p = ports_of(c);
+		if (decls && decl_by_name(op)) {
+			// fe214: an instance can match empty iff its body can
+			if (!sa_busy.insert(c).second)
+				return false;
+			bool r = false;
+			Cell *dbody = nullptr;
+			std::vector<Wire *> dformals;
+			SigSpec draw;
+			if (lookup_decl(c, dbody, dformals, nullptr, &draw) && dbody && sva_op(dbody) != "spec") {
+				SubstGuard guard(this);
+				bind_len_actuals(guard, c, dformals);
+				r = can_empty(dbody);
+			}
+			sa_busy.erase(c);
+			return r;
+		}
 		if (op == "[*]" || op == "[->]" || op == "[=]") {
 			int m = op == "[*]" ? 0 : 1;
 			Cell *b = p.size() >= 2 ? child_cell(c->getPort(p[1])) : nullptr;
@@ -2140,9 +2156,9 @@ struct SvaCompiler {
 			return m == 0;
 		}
 		if (op == "or" && p.size() >= 2)
-			return can_empty(child_cell(c->getPort(p[0]))) || can_empty(child_cell(c->getPort(p[1])));
+			return can_empty(len_child(c->getPort(p[0]))) || can_empty(len_child(c->getPort(p[1])));
 		if (op == "throughout" && p.size() >= 2)
-			return can_empty(child_cell(c->getPort(p[1])));
+			return can_empty(len_child(c->getPort(p[1])));
 		return false;
 	}
 
@@ -2222,6 +2238,58 @@ struct SvaCompiler {
 			return sva_ref(new_sva("throughout", {c->getPort(p[0]), b}, c));
 		}
 		return s;
+	}
+
+	// fe214: a named sequence or property used without actuals is a plain
+	// wire in the RTLIL (`not s', `s #-# p', `x |-> s', `p or q'), not an
+	// $sva cell, and the operators that took a missing operand cell for a
+	// Boolean leaf read the declaration's name wire: an undriven wire, at
+	// the attempt's own tick (`not s' failed at depth 0, `x |-> s' was
+	// covered at depth 0; the inline twins at 1).  Each such operand
+	// becomes an instance without actuals, which every operator handles as
+	// `s()'.  A check root (`spec') keeps its bare-name handling.
+	void rewrite_bare_decls(const dict<std::string, dict<std::string, Cell *>> &scoped)
+	{
+		std::vector<Cell *> work;
+		for (auto c : mod->cells())
+			if (c->type == "\\$sva")
+				work.push_back(c);
+		for (auto n : work) {
+			std::string op = sva_op(n);
+			if (op == "sequence_decl" || op == "property_decl" || op == "let_decl" || op == "spec")
+				continue;
+			auto sit = scoped.find(flat_scope(n));
+			if (sit == scoped.end())
+				continue;
+			for (auto pr : ports_of(n)) {
+				SigSpec s = n->getPort(pr);
+				if (child_cell(s))
+					continue;
+				Wire *rep = nullptr;
+				bool one = true;
+				for (int i = 0; i < s.size() && one; i++)
+					if (s[i].is_wire()) {
+						if (!rep)
+							rep = s[i].wire;
+						else if (s[i].wire != rep)
+							one = false;
+					} else if (s[i].data != State::S0)
+						one = false;
+				if (!one || !rep)
+					continue;
+				std::string nm = flat_local_name(rep);
+				if (!nm.empty() && nm[0] == '\\')
+					nm = nm.substr(1);
+				auto dit = sit->second.find(nm);
+				if (dit == sit->second.end())
+					continue;
+				std::string dop = sva_op(dit->second);
+				if (dop != "sequence_decl" && dop != "property_decl")
+					continue;
+				Cell *inst = new_sva("\\" + nm, {}, n);
+				n->setPort(pr, sva_ref(inst));
+			}
+		}
 	}
 
 	void rewrite_empty_delays()
@@ -4376,13 +4444,19 @@ struct SvaCompiler {
 	// The fixed failure offset of a property (register v3 F10): ticks from
 	// an attempt's start to the tick its failure is reported, when that is
 	// the same for every attempt; -1 when it varies.  Mirrors prop_fail.
+	pool<Cell *> sa_busy;   // fe214: instances under a static analysis (recursion)
 	int fail_off(Cell *c)
 	{
 		if (!c)
 			return 0;   // Boolean leaf: fails at its own tick
 		std::string op = sva_op(c);
 		auto p = ports_of(c);
-		auto ch = [&](int i) -> Cell * { return i < GetSize(p) ? child_cell(c->getPort(p[i])) : nullptr; };
+		// fe214: a bare operand naming a declaration (no actuals: a plain
+		// wire) stands for the declaration's body, as for the lengths
+		// (len_child); it was a Boolean leaf at offset 0, and `p or !a'
+		// with `property p; !a |=> 0; endproperty' paired p's failure at
+		// t+1 with !a's at t+1 instead of t: a false disproof [exact]
+		auto ch = [&](int i) -> Cell * { return i < GetSize(p) ? len_child(c->getPort(p[i])) : nullptr; };
 		auto fixed_len = [&](Cell *q) -> int {
 			if (!q) return 1;
 			int lo = seq_min_len(q), hi = seq_max_len(q);
@@ -4399,8 +4473,25 @@ struct SvaCompiler {
 			if (early_fail && len > 1) return -1;
 			return len - 1;
 		}
-		if (decl_by_name(op))
-			return -1;
+		if (decl_by_name(op)) {
+			// fe214: an instance reports where its body does, under its
+			// actuals (as the lengths: seq_min_len_raw); it was -1, and the
+			// unaligned pairing disproved `p() or !a' (tagged approx)
+			if (!sa_busy.insert(c).second)
+				return -1;
+			int r = -1;
+			Cell *dbody = nullptr;
+			std::vector<Wire *> dformals;
+			SigSpec draw, bare;
+			if (lookup_decl(c, dbody, dformals, nullptr, &draw)) {
+				dbody = dbody ? unwrap_spec(dbody, &bare) : nullptr;
+				SubstGuard guard(this);
+				bind_len_actuals(guard, c, dformals);
+				r = dbody ? fail_off(dbody) : 0;
+			}
+			sa_busy.erase(c);
+			return r;
+		}
 		if (op == "|->" || op == "|=>") {
 			int la = fixed_len(ch(0)), d = fail_off(ch(1));
 			if (la < 0 || d < 0 || (ch(1) && sva_op(ch(1)) == "clocked")) return -1;
@@ -4486,6 +4577,10 @@ struct SvaCompiler {
 		};
 		auto sub = [&](int i) -> SigSpec {
 			return prop_dispatch(port(i), child(i), start);
+		};
+		// fe214: an operand's failure offset sees through a bare declaration
+		auto lchild = [&](int i) -> Cell * {
+			return i < GetSize(ports) ? len_child(n->getPort(ports[i])) : nullptr;
 		};
 
 		if (op == "#-#" || op == "#=#") {
@@ -4943,7 +5038,7 @@ struct SvaCompiler {
 			bool saved_early = early_fail;
 			early_fail = false;
 			SigSpec f1 = sub(0), f2 = prop_dispatch(port(1), child(1), start);
-			int d1 = fail_off(child(0)), d2 = fail_off(child(1));
+			int d1 = fail_off(lchild(0)), d2 = fail_off(lchild(1));
 			early_fail = saved_early;
 			if (saved_early && (d1 > 0 || d2 > 0))
 				approx("late-failure-tick", op + " operands at " + std::string(log_id(n)));
@@ -5136,7 +5231,7 @@ struct SvaCompiler {
 			// the failing tick was not seen (`reject_on(1) 1' was proved),
 			// and an abort of one attempt was lost when the next attempt
 			// restarted the flag.
-			int dp = fail_off(child(1));
+			int dp = fail_off(lchild(1));
 			if (dp >= 0) {
 				SigSpec win_b = b, win_start = start;
 				for (int j = 1; j <= dp; j++) {
@@ -5201,7 +5296,7 @@ struct SvaCompiler {
 			// per-tick evaluation start is reintroduced by the delays.
 			// (dp was taken as 0: a temporal p's failure for one tick was
 			// paired with another tick's -- PBT class F6.)
-			int dp = fail_off(child(1));
+			int dp = fail_off(lchild(1));
 			early_fail = saved_early;
 			if (saved_early && dp > 0)
 				approx("late-failure-tick", op + " operand at " + std::string(log_id(n)));
@@ -7221,6 +7316,7 @@ struct Sva2CheckPass : public Pass {
 
 			// E1: ## next to an empty-capable operand, once per module and
 			// before the declaration-body scan so new cells are protected
+			SvaCompiler(mod, SigSpec(), true, "$probe", nullptr).rewrite_bare_decls(scoped_decls);
 			SvaCompiler(mod, SigSpec(), true, "$probe", nullptr).rewrite_empty_delays();
 
 			// bodies of declarations are shared between instances: never

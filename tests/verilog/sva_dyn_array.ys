@@ -1,0 +1,61 @@
+# fe210: an associative or dynamic unpacked dimension is a one-element
+# placeholder ([0:0]): a constant-key read elsewhere folded to 0 and a write
+# there was dropped, so `m[1] <= 5' then `m[1] == 0' was PROVED.  Every use
+# is refused (-permissive: a warning and sv_degraded); an unused
+# declaration (UVM / package data) stays clean, its initializer dropped.  A
+# dynamic array declared with a constant list is that fixed array, until a
+# resize, which is refused.
+read_verilog -sv -formal <<EOT
+package p;
+  bit [11:0] m1[int] = '{ 1 : 12'h5, default : 12'h0 };
+  int unused_q[*];
+endpackage
+module t(input clk, input [7:0] be);
+  import p::*;
+  reg [7:0] cb[] = { 8'b00000001, 8'b00000011, 8'b00000111 };
+  bit ins;
+  always_comb ins = be inside {cb};
+  a_in3: assert property (@(posedge clk) be == 8'd3 |-> ins);
+  a_out5: assert property (@(posedge clk) be == 8'd5 |-> !ins);
+endmodule
+EOT
+prep -top t
+sva2check
+logger -expect log "a_in3: proved" 1
+logger -expect log "a_out5: proved" 1
+ic3 -init-zero -kind 4
+logger -check-expected
+
+design -reset
+logger -expect warning "Identifier `\\m' is an associative array; its elements are not modeled" 2
+logger -expect warning "Identifier `\\d' is a dynamic array; its elements are not modeled" 1
+logger -expect warning "Identifier `\\t' is an associative array" 1
+read_verilog -sv -formal -permissive <<EOT
+typedef bit [7:0] map_t[int];
+module a(input clk);
+  bit [7:0] m[int];
+  always @(posedge clk) m[1] <= 8'd5;
+  a_false: assert property (@(posedge clk) ##1 m[1] == 8'd0);
+endmodule
+module b(input clk);
+  bit [7:0] d[];
+  a_d: assert property (@(posedge clk) d[1] == 8'd0);
+endmodule
+module c(input clk);
+  map_t t;
+  always @(posedge clk) t[1] <= 8'd5;
+endmodule
+EOT
+logger -check-expected
+select -assert-mod-count 3 A:sv_degraded
+
+design -reset
+logger -expect error "resizes it; not modeled" 1
+read_verilog -sv -formal <<EOT
+module r(output [7:0] o);
+  reg [7:0] cb[] = {8'd1, 8'd2};
+  reg [7:0] cc[0:2];
+  initial cb = cc;
+  assign o = cb[1];
+endmodule
+EOT

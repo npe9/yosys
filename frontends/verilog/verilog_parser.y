@@ -2576,6 +2576,7 @@ non_opt_range:
 	} |
 	TOK_LBRA TOK_RBRA {
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "dynamic"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
@@ -2583,16 +2584,19 @@ non_opt_range:
 		// associative-array style dimension, e.g. `uvm_resource_base rsrc[int]`:
 		// approximated as a single unconstrained dimension
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
 	TOK_LBRA integer_atom_type TOK_SIGNED TOK_RBRA {
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
 	TOK_LBRA integer_atom_type TOK_UNSIGNED TOK_RBRA {
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
@@ -2600,32 +2604,38 @@ non_opt_range:
 		// associative-array style dimension with packed index type,
 		// e.g. `mem[int [15:0]]`
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
 	TOK_LBRA TOK_LOGIC TOK_LBRA expr TOK_COL expr TOK_RBRA TOK_RBRA {
 		// e.g. `mem[bit [31:0]]` / `arr[logic [P.XLEN-1:0]]`
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
 	TOK_LBRA TOK_LOGIC TOK_SIGNED TOK_LBRA expr TOK_COL expr TOK_RBRA TOK_RBRA {
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
 	TOK_LBRA TOK_LOGIC TOK_UNSIGNED TOK_LBRA expr TOK_COL expr TOK_RBRA TOK_RBRA {
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
 	TOK_LBRA TOK_REG TOK_LBRA expr TOK_COL expr TOK_RBRA TOK_RBRA {
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
 	TOK_LBRA TOK_TIME TOK_RBRA {
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
@@ -2633,12 +2643,14 @@ non_opt_range:
 		// associative-array style dimension with a bare vector index type,
 		// e.g. `arr[bit]` / `arr[logic]`
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	} |
 	TOK_LBRA TOK_LOGIC TOK_LBRA expr TOK_COL expr TOK_RBRA TOK_LBRA expr TOK_COL expr TOK_RBRA TOK_RBRA {
 		// e.g. `arr[bit[31:0][k:0]]`
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	};
@@ -4346,8 +4358,41 @@ wire_name_and_opt_assign:
 	} |
 	wire_name TOK_EQ expr {
 		auto wire = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
-		wire->str = extra->ast_stack.back()->children.back()->str;
-		if (extra->astbuf1->is_input) {
+		AstNode *decl = extra->ast_stack.back()->children.back().get();
+		wire->str = decl->str;
+		// fe210: an associative / dynamic unpacked dimension is modeled as
+		// one element and every use of the array is refused (simplify), so
+		// an associative array's initializer models nothing and is dropped.
+		// A dynamic array `T a[] = {e0, .., eN-1}' (or '{..}) has N
+		// elements until it is resized, and a resize is refused: it is
+		// the fixed array [0:N-1].
+		AstNode *dyn = decl->type == AST_MEMORY && !decl->children.empty() ? decl->children.back().get() : nullptr;
+		std::string dyn_kind;
+		if (dyn && dyn->type == AST_RANGE && dyn->attributes.count(ID(sv_dyn_dim)))
+			dyn_kind = dyn->attributes.at(ID(sv_dyn_dim))->str;
+		bool dyn_any = dyn_kind == "associative";
+		if (dyn && dyn->type == AST_MULTIRANGE)
+			for (auto &r : dyn->children)
+				if (r && r->attributes.count(ID(sv_dyn_dim)))
+					dyn_any = true;
+		if (dyn_kind == "dynamic" && ($3->type == AST_CONCAT || $3->type == AST_ASSIGN_PATTERN) && !$3->children.empty()) {
+			bool plain = true;
+			for (auto &e : $3->children)
+				if (!e || e->type == AST_REPLICATE || e->type == AST_ASSIGN_PATTERN ||
+						e->attributes.count(ID(sv_member)) || e->attributes.count(ID(sv_index)) ||
+						e->attributes.count(ID(sv_typekey)))
+					plain = false;
+			if (plain) {
+				dyn->children.clear();
+				dyn->children.push_back(AstNode::mkconst_int(@$, 0, true));
+				dyn->children.push_back(AstNode::mkconst_int(@$, GetSize($3->children) - 1, true));
+				dyn->attributes.erase(ID(sv_dyn_dim));
+				decl->set_attribute(ID(sv_dyn_sized), AstNode::mkconst_int(@$, 1, false));
+			}
+		}
+		if (dyn_any) {
+			// dropped: see above
+		} else if (extra->astbuf1->is_input) {
 			extra->astbuf1->attributes[ID::defaultvalue] = std::move($3);
 		}
 		else if (extra->astbuf1->is_reg || extra->astbuf1->is_logic){
@@ -4376,6 +4421,7 @@ wire_name_dims:
 		// struct members (member_name) and for type-indexed dimensions,
 		// which the lexer rewrites to this token pair.
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
+		$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 		$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
 	};

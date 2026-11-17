@@ -8383,6 +8383,24 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			// (AstNode::process); reading it would read a free 1-bit wire
 			if (id2ast && id2ast->attributes.count(ID(sv_sim_only_storage)))
 				degrade(location.to_loc(), "Identifier `%s' is simulation-only package storage (a queue or class handle); it is not modeled.\n", str.c_str());
+			// fe210: an associative or dynamic unpacked dimension is a
+			// one-element placeholder (the parser's [0:0]): a read at any
+			// other key folded to 0 or x, and a write there was dropped
+			if (id2ast && id2ast->type == AST_MEMORY) {
+				std::string kind;
+				for (auto &ch : id2ast->children) {
+					if (!ch || (ch->type != AST_RANGE && ch->type != AST_MULTIRANGE))
+						continue;
+					if (ch->attributes.count(ID(sv_dyn_dim)))
+						kind = ch->attributes.at(ID(sv_dyn_dim))->str;
+					for (auto &r : ch->children)
+						if (r && r->type == AST_RANGE && r->attributes.count(ID(sv_dyn_dim)))
+							kind = r->attributes.at(ID(sv_dyn_dim))->str;
+				}
+				if (!kind.empty())
+					degrade(location.to_loc(), "Identifier `%s' is %s array; its elements are not modeled (one placeholder element).\n",
+							str.c_str(), kind == "dynamic" ? "a dynamic" : "an associative");
+			}
 		}
 	}
 
@@ -10447,6 +10465,11 @@ skip_memory_read:;
 				// elaborated right, so the metadata cannot be trusted to
 				// refuse on (OpenTitan i3c_target `assign targ_dev_o =
 				// targ_dev')
+				// fe210: a dynamic array sized by its initializer list is
+				// resized by such an assignment, which is not modeled
+				if (!same_unpacked && lhs_mem->attributes.count(ID(sv_dyn_sized)))
+					degrade(location.to_loc(), "Assignment of a different-size array to the dynamic array `%s' resizes it; not modeled.\n",
+							lhs_mem->str.c_str());
 				if (!same_unpacked) {
 					log_file_warning(location.to_loc(), "Array dimension mismatch in assignment; leaving it unexpanded.\n");
 					goto skip_array_expand;

@@ -5876,7 +5876,8 @@ struct SvaCompiler {
 			return true;
 		std::string op = sva_op(n);
 		auto ps = ports_of(n);
-		auto ch = [&](int i) -> Cell * { return i < GetSize(ps) ? child_cell(n->getPort(ps[i])) : nullptr; };
+		// fe214: through a bare declaration (len_child)
+		auto ch = [&](int i) -> Cell * { return i < GetSize(ps) ? len_child(n->getPort(ps[i])) : nullptr; };
 		auto fixed_bounds = [&](Cell *b, int &k) -> bool {
 			if (!b || sva_op(b) != "bounds")
 				return false;
@@ -5909,6 +5910,23 @@ struct SvaCompiler {
 			return GetSize(ps) >= 2 && single_match(ch(1));
 		if (op == "first_match")
 			return true;
+		if (decl_by_name(op)) {
+			// fe214: an instance matches as its body does
+			if (!sa_busy.insert(n).second)
+				return false;
+			bool r = false;
+			Cell *dbody = nullptr;
+			std::vector<Wire *> dformals;
+			SigSpec draw, bare;
+			if (lookup_decl(n, dbody, dformals, nullptr, &draw)) {
+				dbody = dbody ? unwrap_spec(dbody, &bare) : nullptr;
+				SubstGuard guard(this);
+				bind_len_actuals(guard, n, dformals);
+				r = single_match(dbody);
+			}
+			sa_busy.erase(n);
+			return r;
+		}
 		return false;
 	}
 	bool cover_multimatch(Cell *c)
@@ -5917,12 +5935,13 @@ struct SvaCompiler {
 		auto ps = ports_of(c);
 		if (!impl_like(op) || GetSize(ps) < 2)
 			return false;
-		Cell *a = child_cell(c->getPort(ps[0]));
+		// fe214: a named sequence antecedent (`s_ab |-> c') is its body
+		Cell *a = len_child(c->getPort(ps[0]));
 		if (a && (op == "|->" || op == "|=>") && (can_empty(a) || !single_match(a)))
 			return true;
-		Cell *q = child_cell(c->getPort(ps[1]));
+		Cell *q = len_child(c->getPort(ps[1]));
 		while (q && (sva_op(q) == "strong" || sva_op(q) == "weak"))
-			q = child_cell(q->getPort(ID(A)));
+			q = len_child(q->getPort(ID(A)));
 		return q && cover_multimatch(q);
 	}
 	// Ticks from an attempt's start to its last possible match or failure
@@ -5935,16 +5954,16 @@ struct SvaCompiler {
 		auto ps = ports_of(c);
 		if (!impl_like(op) || GetSize(ps) < 2)
 			return -1;
-		Cell *a = child_cell(c->getPort(ps[0]));
+		Cell *a = len_child(c->getPort(ps[0]));
 		int ra = a ? seq_max_len(a) : 1;
 		if (ra < 0)
 			return -1;
 		if (a && (op == "#-#" || op == "#=#") && (can_empty(a) || seq_min_len(a) != ra))
 			return -1;
 		int d = op == "|=>" || op == "#=#" ? 1 : 0;
-		Cell *q = child_cell(c->getPort(ps[1]));
+		Cell *q = len_child(c->getPort(ps[1]));
 		while (q && (sva_op(q) == "strong" || sva_op(q) == "weak"))
-			q = child_cell(q->getPort(ID(A)));
+			q = len_child(q->getPort(ID(A)));
 		int sp = 1;
 		if (q && impl_like(sva_op(q)))
 			sp = cover_span(q);

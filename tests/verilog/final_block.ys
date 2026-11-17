@@ -1,0 +1,64 @@
+# A `final' procedure (IEEE 1800-2017 9.2.3) was read as an initial block
+# and was a degradation, so a testbench with an end-of-test summary (the
+# core-v-verif tb's `final begin: end_of_test ... $display ... end') could
+# not be read.  It runs once the simulation has ended, so nothing evaluated
+# during the run sees it.  fe213: it is dropped with the simulation-only
+# statements in it; an assertion in it (an end-of-simulation check) is
+# refused.
+
+# dropped: its write to x is not a step-0 write, its body is not elaborated
+logger -expect log "p_x: proved" 1
+read_verilog -sv -formal <<EOT
+module t(input logic clk, input logic a);
+  logic x = 0;
+  always @(posedge clk) x <= 0;
+  final begin : end_of_test
+    string s;
+    static bit done = 0;
+    s = $sformatf("%0d", a);
+    if (done == 0) $display("aborted %s", s);
+    x = 1;
+    wait (a);
+    @(posedge clk);
+  end
+  final $display("done");
+  p_x: assert property (@(posedge clk) x == 0);
+endmodule
+EOT
+hierarchy -check -top t
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# an assertion in a final block is refused
+logger -expect error "an assertion in a `final' block is an end-of-simulation check \(simulation-only; not modeled\)" 1
+read_verilog -sv -formal <<EOT
+module f(input logic clk, input logic a);
+  logic [1:0] n = 0;
+  always @(posedge clk) n <= n + 1;
+  final assert (n != 2'd3);
+endmodule
+EOT
+logger -check-expected
+design -reset
+
+# output-formatting system tasks change nothing the design sees
+logger -expect log "p_n: proved" 1
+read_verilog -sv -formal <<EOT
+module s(input logic clk);
+  logic [1:0] n = 0;
+  initial begin $timeformat(-9, 3, " ns", 8); $printtimescale; $dumpflush; $dumplimit(100); end
+  initial begin : entry $timeformat(-9, 3, " ns", 8); $printtimescale; end
+  always @(posedge clk) n <= n + 1;
+  p_n: assert property (@(posedge clk) n == n);
+endmodule
+EOT
+hierarchy -check -top s
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected

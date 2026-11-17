@@ -4994,7 +4994,11 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	// deactivate all calls to non-synthesis system tasks
 	// note that $display, $finish, and $stop are used for synthesis-time DRC so they're not in this list
 	if ((type == AST_FCALL || type == AST_TCALL) && (str == "$strobe" || str == "$monitor" || str == "$time" ||
-			str == "$dumpfile" || str == "$dumpvars" || str == "$dumpon" || str == "$dumpoff" || str == "$dumpall")) {
+			str == "$dumpfile" || str == "$dumpvars" || str == "$dumpon" || str == "$dumpoff" || str == "$dumpall" ||
+			// fe213: output formatting only (20.4.2, 20.4.3, 21.7.3)
+			// (`\$timeformat' inside a named block)
+			(type == AST_TCALL && (str == "$timeformat" || str == "$printtimescale" || str == "$dumpflush" || str == "$dumplimit" ||
+					str == "\\$timeformat" || str == "\\$printtimescale" || str == "\\$dumpflush" || str == "\\$dumplimit")))) {
 		log_file_warning(location.to_loc(), "Ignoring call to system %s %s.\n", type == AST_FCALL ? "function" : "task", str);
 		delete_children();
 		str = std::string();

@@ -372,7 +372,7 @@
 			// a simulation-only statement there drops nothing (UVM's
 			// uvm_sequence_base `wait (...)' refused every file reading uvm_pkg)
 			for (auto *n : extra->ast_stack)
-				if (n->type == AST_CLASS || n->attributes.count(ID(sv_class_method_def)))
+				if (n->type == AST_CLASS || n->attributes.count(ID(sv_class_method_def)) || n->attributes.count(ID(sv_final)))
 					return;
 			struct Restore {
 				AstNode *mod = AST_INTERNAL::current_ast_mod;
@@ -4994,13 +4994,34 @@ always_stmt:
 		extra->ast_stack.pop_back();
 	} |
 	attr TOK_FINAL {
-		parse_degrade(extra, @2, "`final' block runs at step 0, like an initial block");
+		// fe213: a final procedure runs once the simulation has ended
+		// (9.2.3): no time passes in it, and nothing evaluated during the
+		// run (a design value, a concurrent assertion's sample) sees what
+		// it does, so it is dropped, with the simulation-only statements
+		// in it (sv_final: parse_degrade).  An assertion in it is an
+		// end-of-simulation check, which a formal run has no point for:
+		// refused.
 		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_INITIAL));
 		append_attr(node, std::move($1));
+		node->set_attribute(ID(sv_final), AstNode::mkconst_int(@$, 1, false));
 		(void)extra->pushChild(std::make_unique<AstNode>(@$, AST_BLOCK));
 	} behavioral_stmt {
 		extra->ast_stack.pop_back();
 		extra->ast_stack.pop_back();
+		auto &siblings = extra->ast_stack.back()->children;
+		std::unique_ptr<AstNode> fin = std::move(siblings.back());
+		siblings.pop_back();
+		std::function<bool(const AstNode*)> has_check = [&](const AstNode *n) {
+			if (n->type == AST_ASSERT || n->type == AST_ASSUME || n->type == AST_LIVE ||
+					n->type == AST_FAIR || n->type == AST_COVER)
+				return true;
+			for (auto &c : n->children)
+				if (c && has_check(c.get()))
+					return true;
+			return false;
+		};
+		if (has_check(fin.get()))
+			parse_degrade(extra, @2, "an assertion in a `final' block is an end-of-simulation check");
 	};
 
 event_wait_list:

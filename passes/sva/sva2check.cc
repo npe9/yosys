@@ -5767,6 +5767,55 @@ struct SvaCompiler {
 	// Followed-by is existential over its antecedent's matches (fe209),
 	// so only an implication's own antecedent counts; a nested consequent
 	// is checked recursively.
+	// fe211b: every match of one attempt of n ends on one tick.  A fixed
+	// length is one; so is a chain of fixed delays over such operands, a
+	// goto `b[->k]' with a constant k (its k-th occurrence), the right
+	// operand of throughout, first_match, and a fixed `[*k]' of such a
+	// body.  False when unsure.
+	bool single_match(Cell *n)
+	{
+		if (!n)
+			return true;
+		int lmax = seq_max_len(n), lmin = seq_min_len(n);
+		if (lmax >= 0 && lmin == lmax)
+			return true;
+		std::string op = sva_op(n);
+		auto ps = ports_of(n);
+		auto ch = [&](int i) -> Cell * { return i < GetSize(ps) ? child_cell(n->getPort(ps[i])) : nullptr; };
+		auto fixed_bounds = [&](Cell *b, int &k) -> bool {
+			if (!b || sva_op(b) != "bounds")
+				return false;
+			auto bp = ports_of(b);
+			int lo, hi;
+			if (bp.empty() || !const_int(b->getPort(bp[0]), lo))
+				return false;
+			hi = lo;
+			if (GetSize(bp) >= 2 && !const_int(b->getPort(bp[1]), hi))
+				return false;
+			k = lo;
+			return lo == hi && lo >= 0;
+		};
+		int k;
+		if (op == "##") {
+			bool lead2 = GetSize(ps) == 2;
+			if (!lead2 && GetSize(ps) != 3)
+				return false;
+			SigSpec cyc = n->getPort(ps[lead2 ? 0 : 1]);
+			Cell *cc = child_cell(cyc);
+			if (cc ? !fixed_bounds(cc, k) : !const_int(cyc, k))
+				return false;
+			return (lead2 || single_match(ch(0))) && single_match(ch(lead2 ? 1 : 2));
+		}
+		if (op == "[->]")
+			return GetSize(ps) >= 2 && !ch(0) && fixed_bounds(ch(1), k) && k >= 1;
+		if (op == "[*]")
+			return GetSize(ps) >= 2 && fixed_bounds(ch(1), k) && single_match(ch(0)) && !can_empty(n);
+		if (op == "throughout" || op == "clocked")
+			return GetSize(ps) >= 2 && single_match(ch(1));
+		if (op == "first_match")
+			return true;
+		return false;
+	}
 	bool cover_multimatch(Cell *c)
 	{
 		std::string op = sva_op(c);
@@ -5774,11 +5823,8 @@ struct SvaCompiler {
 		if (!impl_like(op) || GetSize(ps) < 2)
 			return false;
 		Cell *a = child_cell(c->getPort(ps[0]));
-		if (a && (op == "|->" || op == "|=>")) {
-			int lmax = seq_max_len(a), lmin = seq_min_len(a);
-			if (can_empty(a) || lmax < 0 || lmin != lmax)
-				return true;
-		}
+		if (a && (op == "|->" || op == "|=>") && (can_empty(a) || !single_match(a)))
+			return true;
 		Cell *q = child_cell(c->getPort(ps[1]));
 		while (q && (sva_op(q) == "strong" || sva_op(q) == "weak"))
 			q = child_cell(q->getPort(ID(A)));

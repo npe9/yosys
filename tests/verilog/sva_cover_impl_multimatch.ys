@@ -62,3 +62,27 @@ logger -expect log "c_dis_ok: cover reached \(depth 3\)" 1
 logger -expect log "c_free: cover reached \(depth 3\)" 1
 ic3
 logger -check-expected
+# fe211b: an antecedent whose matches end on one tick although its length
+# varies (a goto [->k], throughout over one) keeps the exact existential hit
+design -reset
+read_verilog -sv -formal <<EOT
+module c6(input clk, input r);
+  reg [3:0] t = 0;
+  always @(posedge clk) if (t != 15) t <= t + 1;
+  wire g = t == 3 || t == 5;
+  c_g1: cover property (@(posedge clk) t == 1 ##1 g[->1] |-> t == 3);
+  c_g1u: cover property (@(posedge clk) t == 1 ##1 g[->1] |-> t == 5);
+  c_g2: cover property (@(posedge clk) t == 1 ##1 g[->2] |-> t == 5);
+  c_th: cover property (@(posedge clk) t == 1 ##1 (t < 9 throughout g[->1]) ##1 1 |-> t == 4);
+  c_r: cover property (@(posedge clk) t == 1 ##1 r[->1] |-> t == 7);
+endmodule
+EOT
+prep -top c6
+sva2check
+logger -expect log "c_g1: cover reached \(depth 3\) \[lowering=exact\]" 1
+logger -expect log "c_g1u: cover unreachable \[lowering=exact\]" 1
+logger -expect log "c_g2: cover reached \(depth 5\) \[lowering=exact\]" 1
+logger -expect log "c_th: cover reached \(depth 4\) \[lowering=exact\]" 1
+logger -expect log "c_r: cover reached \(depth 7\) \[lowering=exact\]" 1
+ic3
+logger -check-expected

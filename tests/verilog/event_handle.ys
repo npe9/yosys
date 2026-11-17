@@ -1,0 +1,85 @@
+# An `event' variable (IEEE 1800-2017 15.5) was an unknown type name, a
+# one-bit logic marked degraded, and a trigger `-> e;' or `->> e;' was
+# itself a degradation, so the core-v-verif tb (`always @(..) ->
+# isacov_if.retire;') stopped elaborating.  fe212: an event is an opaque
+# handle like a class handle (fe176).  A trigger is dropped: it changes
+# only the event's triggered state, and every observation of an event is
+# refused: a read, an `@(e)' wait (the any-edge list was otherwise taken
+# as a combinational block, so `always @(e) x <= 1;' made x constantly 1),
+# and a hierarchical wait once flatten joins it to an event.
+
+# triggered, never observed: checked exactly
+logger -expect log "p_n: proved" 1
+read_verilog -sv -formal <<EOT
+module t(input logic clk, input logic a);
+  event e, f;
+  logic [1:0] n = 0;
+  always @(posedge clk) begin if (a) -> e; else ->> f; n <= n + 1; end
+  p_n: assert property (@(posedge clk) n == n);
+endmodule
+EOT
+hierarchy -check -top t
+proc
+select -assert-none A:sv_degraded
+select -assert-count 2 t/a:sv_class_handle=event
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# `@(e)' refused on a strict read
+logger -expect error "Event `\\e' read \(simulation-only; not modeled\)" 1
+read_verilog -sv -formal <<EOT
+module w(input logic clk, input logic a);
+  event e;
+  logic x = 0;
+  always @(posedge clk) if (a) -> e;
+  always @(e) x <= 1;
+  a_x: assert property (@(posedge clk) x == 0);
+endmodule
+EOT
+logger -check-expected
+design -reset
+
+# a hierarchical wait on a child's event: degraded once joined
+read_verilog -sv -formal <<EOT
+module child(input logic clk, input logic a);
+  event e;
+  always @(posedge clk) if (a) -> e;
+endmodule
+module h(input logic clk, input logic a);
+  logic x = 0;
+  child c(.clk(clk), .a(a));
+  always @(c.e) x <= 1;
+  a_x: assert property (@(posedge clk) x == 0);
+endmodule
+EOT
+hierarchy -top h
+proc
+flatten
+select -assert-count 1 h/a:sv_class_handle=event
+select -assert-mod-count 1 A:sv_degraded
+logger -expect error "refusing a design that carries sv_degraded" 1
+sva2check
+ic3
+logger -check-expected
+design -reset
+
+# a hierarchical any-edge list on a plain signal stays a combinational block
+logger -expect log "a_x: proved" 1
+read_verilog -sv -formal <<EOT
+module kid(input logic a); logic s; assign s = a; endmodule
+module s(input logic clk, input logic a);
+  logic x;
+  kid c(.a(a));
+  always @(c.s or a) x = a;
+  a_x: assert property (@(posedge clk) x == a);
+endmodule
+EOT
+hierarchy -top s
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+ic3
+logger -check-expected

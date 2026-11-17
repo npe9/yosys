@@ -408,6 +408,9 @@ struct FlattenWorker
 					} else {
 						hier_wire->attributes.erase(ID(sv_hierref));
 						drop_hierref_degradation(module, hier_wire->name);
+						// fe212: joined to a handle or event, the reference is one
+						if (tpl_wire->attributes.count(ID(sv_class_handle)))
+							hier_wire->attributes[ID(sv_class_handle)] = tpl_wire->attributes.at(ID(sv_class_handle));
 					}
 				}
 				// fe202: an upward reference of the interface (hierarchy made
@@ -433,6 +436,8 @@ struct FlattenWorker
 						// the interface's initial value (`logic c = 0;')
 						if (tpl_wire->attributes.count(ID::init) && !hier_wire->attributes.count(ID::init))
 							hier_wire->attributes[ID::init] = tpl_wire->attributes.at(ID::init);
+						if (tpl_wire->attributes.count(ID(sv_class_handle)))
+							hier_wire->attributes[ID(sv_class_handle)] = tpl_wire->attributes.at(ID(sv_class_handle));
 						new_wire = hier_wire;
 					} else {
 						log_warning("Interface member %s.%s is not joined to %s.%s (width %d, not %d).\n",
@@ -825,6 +830,16 @@ struct FlattenWorker
 					w->name.str().find('.') != std::string::npos && read.count(w)) {
 				std::string reason = stringf("Hierarchical reference `%s' is not joined (a free wire). @module %s",
 						log_id(w->name), log_id(module->name));
+				if (cur.find(reason) == std::string::npos && add.find(reason) == std::string::npos)
+					add += (add.empty() && cur.empty() ? "" : "; ") + reason;
+			}
+		// fe212: a class handle or event (sv_class_handle) is not modeled
+		// and every read in its own module is refused by the frontend; a
+		// hierarchical read joined to it here is refused the same way
+		for (auto w : module->wires())
+			if (w->has_attribute(ID(sv_class_handle)) && read.count(w)) {
+				std::string reason = stringf("Handle `%s' (%s) is read (simulation-only; not modeled). @module %s",
+						log_id(w->name), w->get_string_attribute(ID(sv_class_handle)).c_str(), log_id(module->name));
 				if (cur.find(reason) == std::string::npos && add.find(reason) == std::string::npos)
 					add += (add.empty() && cur.empty() ? "" : "; ") + reason;
 			}

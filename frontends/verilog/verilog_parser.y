@@ -5859,15 +5859,16 @@ behavioral_stmt:
 		(void)$3;
 	} |
 	attr TOK_ARROW rvalue TOK_SEMICOL {
-		// event trigger statement, e.g. `->w.trigger;` (simulation-only)
-		parse_degrade(extra, @2, "event trigger `->' is dropped");
+		// event trigger statement, e.g. `->w.trigger;` (simulation-only).
+		// fe212: dropped.  A trigger changes nothing but the event's
+		// triggered state, and every observation of an event (a read, an
+		// `@(e)' wait; a hierarchical one after flatten) is refused.
 		(void)$1;
 		(void)$3;
 	} |
 	attr TOK_NB_ARROW rvalue TOK_SEMICOL {
 		// nonblocking event trigger statement, e.g. `->>top.e;`
-		// (IEEE 15.5.1, simulation-only)
-		parse_degrade(extra, @2, "event trigger `->>' is dropped");
+		// (IEEE 15.5.1, simulation-only): dropped, as `->' (fe212)
 		(void)$1;
 		(void)$3;
 	} |

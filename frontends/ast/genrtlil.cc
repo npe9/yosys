@@ -462,6 +462,24 @@ struct AST_INTERNAL::ProcessGenerator
 			log("Note: Assuming pure combinatorial block at %s in\n", always->loc_string());
 			log("compliance with IEC 62142(E):2005 / IEEE Std. 1364.1(E):2002. Recommending\n");
 			log("use of @* instead of @(...) for better match of synthesis and simulation.\n");
+			// fe212: the list is dropped, which is wrong for an event (15.5):
+			// `@(e)' runs the block only when e is triggered.  Reading each
+			// listed event refuses it (the handle read); a hierarchical name
+			// is kept read by a dead wire, so flatten marks it once joined
+			// to an event.
+			for (auto &child : always->children)
+				if (child->type == AST_EDGE && GetSize(child->children) == 1 && child->children.at(0)->type == AST_IDENTIFIER) {
+					AstNode *id = child->children.at(0).get();
+					bool handle = id->id2ast && id->id2ast->type == AST_WIRE && id->id2ast->attributes.count(ID(sv_class_handle));
+					bool hier = id->str.find('.') != std::string::npos;
+					if (!handle && !hier)
+						continue;
+					RTLIL::SigSpec sig = id->genRTLIL();
+					if (hier && GetSize(sig) > 0) {
+						RTLIL::Wire *w = current_module->addWire(NEW_ID, GetSize(sig));
+						current_module->connect(w, sig);
+					}
+				}
 		}
 
 		// create syncs for the process
@@ -1843,8 +1861,9 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			// fe176: a class or covergroup handle is not modelled; only its
 			// construction (`= new') is, as a constant (simplify)
 			if (id2ast && id2ast->type == AST_WIRE && id2ast->attributes.count(ID(sv_class_handle)) && !in_lvalue)
-				degrade(location.to_loc(), "%s handle `%s' read (simulation-only; not modeled).",
-						id2ast->attributes.at(ID(sv_class_handle))->str == "covergroup" ? "Covergroup" : "Class", str.c_str());
+				degrade(location.to_loc(), "%s `%s' read (simulation-only; not modeled).",
+						id2ast->attributes.at(ID(sv_class_handle))->str == "covergroup" ? "Covergroup handle" :
+						id2ast->attributes.at(ID(sv_class_handle))->str == "event" ? "Event" : "Class handle", str.c_str());
 
 			// fe174: a clocking block variable is the signal itself only as
 			// a sampled operand of a concurrent assertion (sva2check checks

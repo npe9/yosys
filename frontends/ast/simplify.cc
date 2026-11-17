@@ -7006,6 +7006,17 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				if (children.empty() || !children[0] || children[0]->type != AST_RANGE)
 					children.insert(children.begin(), make_range(location, 0, 0));
 				did_something = true;
+			} else if (!known_typedef && type == AST_WIRE && type_name == "\\event") {
+				// fe212: an `event' variable (15.5) is an opaque handle like a
+				// class handle (fe176): one bit, every read refused (genrtlil;
+				// a hierarchical read joined by flatten is marked there)
+				set_attribute(ID(sv_class_handle), AstNode::mkconst_str(location, "event"));
+				is_custom_type = false;
+				is_logic = true;
+				children.erase(children.begin());
+				if (children.empty() || !children[0] || children[0]->type != AST_RANGE)
+					children.insert(children.begin(), make_range(location, 0, 0));
+				did_something = true;
 			} else if (!known_typedef) {
 				// The typedef often lives in a package this file did not elaborate.
 				// Keep any declared range and otherwise use a single logic bit.

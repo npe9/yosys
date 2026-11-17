@@ -1,0 +1,94 @@
+# A named property or sequence used without actuals is a plain wire in
+# the RTLIL (not an $sva cell), so the analyses that took the operand's
+# cell saw a Boolean leaf.  fe214: they take the declaration's body
+# (len_child, as the length helpers already did).
+#  - a property declaration whose body is a sequence was dispatched to
+#    prop_fail: "unsupported property operator '##'" (core-v-verif
+#    fencei_assert p_fencei_quick_retire);
+#  - fail_off took the operand at offset 0, so `p_x or !a' paired p_x's
+#    failure at t+1 with the other operand's at t+1 instead of t: a false
+#    disproof tagged exact;
+#  - fe211's cover_multimatch took a named antecedent as single-match:
+#    `s_ab |-> c' was "cover reached [exact]" where the inline form is
+#    unreachable.
+
+logger -expect log "d_or: proved \[lowering=exact\]" 1
+logger -expect log "d_ctl: disproved \(depth 1\)" 1
+logger -expect log "n_seq: disproved \(depth 1\)" 1
+logger -expect log "p_seqor: proved" 1
+logger -expect log "c_seq: cover reached \(depth 1\)" 1
+read_verilog -sv -formal <<EOT
+module m(input logic clk, input logic a, b);
+  // p_x fails at t+1 iff !a(t); `!a' fails at t iff a(t)
+  property p_x; !a |=> 1'b0; endproperty
+  property p_seq; a ##1 b; endproperty
+  property p_ok; a ##1 (a || !a); endproperty
+  d_or: assert property (@(posedge clk) p_x or !a);
+  d_ctl: assert property (@(posedge clk) p_x or a);
+  n_seq: assert property (@(posedge clk) p_seq);
+  p_seqor: assert property (@(posedge clk) p_ok or !a);
+  c_seq: cover property (@(posedge clk) p_seq);
+endmodule
+EOT
+prep -top m
+sva2check
+ic3
+logger -check-expected
+design -reset
+
+logger -expect log "c_dcl: cover unreachable \[lowering=exact:oracle\]" 1
+logger -expect log "c_inl: cover unreachable \[lowering=exact:oracle\]" 1
+logger -expect log "c_ok: cover reached" 1
+read_verilog -sv -formal <<EOT
+module c(input clk);
+  reg [3:0] t = 0;
+  always @(posedge clk) if (t != 15) t <= t + 1;
+  wire a = t == 1, b = t == 2 || t == 3, c = t == 3, bc = t == 2 || t == 3;
+  sequence s_ab; a ##[1:2] b; endsequence
+  // the only attempt fails at its first match (c low at t == 2)
+  c_inl: cover property (@(posedge clk) a ##[1:2] b |-> c);
+  c_dcl: cover property (@(posedge clk) s_ab |-> c);
+  // every match succeeds: reached
+  c_ok: cover property (@(posedge clk) s_ab |-> bc);
+endmodule
+EOT
+prep -top c
+sva2check
+ic3
+logger -check-expected
+design -reset
+
+# every operator sees a bare named operand as the instance `s()' (it read
+# the declaration's undriven name wire at the attempt's tick: `not s',
+# `s #-# c', `x |-> s' all resolved at depth 0, the inline twins at 1), and
+# an instance's failure offset is its body's (`p() or !a' was unaligned:
+# disproved, tagged approx), also through the declaration's own clock
+logger -expect log "d_not: disproved \(depth 1\)" 1
+logger -expect log "d_xnot: disproved \(depth 1\)" 1
+logger -expect log "d_fb: disproved \(depth 1\)" 1
+logger -expect log "d_fb2: disproved \(depth 1\)" 1
+logger -expect log "d_orc: proved \[lowering=exact\]" 1
+logger -expect log "d_acc: proved \[lowering=exact\]" 1
+logger -expect log "d_al: proved \[lowering=exact\]" 1
+logger -expect log "d_inst: proved \[lowering=exact\]" 1
+logger -expect log "d_c2: cover reached \(depth 1\)" 1
+read_verilog -sv -formal <<EOT
+module t(input logic clk, input logic a, b, c, x);
+  sequence s_ab; a ##1 b; endsequence
+  property p_x; !a |=> 1'b0; endproperty
+  property p_xc; @(posedge clk) !a |=> 1'b0; endproperty
+  d_not: assert property (@(posedge clk) not s_ab);
+  d_xnot: assert property (@(posedge clk) x |-> not s_ab);
+  d_fb: assert property (@(posedge clk) s_ab #-# c);
+  d_fb2: assert property (@(posedge clk) s_ab #=# c);
+  d_orc: assert property (@(posedge clk) p_xc or !a);
+  d_acc: assert property (@(posedge clk) accept_on (c) p_x or !a);
+  d_al: assert property (@(posedge clk) always [0:1] p_x() or !a);
+  d_inst: assert property (@(posedge clk) p_x() or !a);
+  d_c2: cover property (@(posedge clk) x |-> s_ab);
+endmodule
+EOT
+prep -top t
+sva2check
+ic3
+logger -check-expected

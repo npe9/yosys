@@ -2475,7 +2475,10 @@ struct SvaCompiler {
 			if (dbody && dop == "sequence_decl")
 				r = strong_seq_fail(dbody, start);
 			else if (dbody)
-				r = prop_fail(dbody, start);
+				// fe214: dispatched as an inline body is: a sequence-shaped
+				// property body (`property p; a ##1 b; endproperty') reached
+				// prop_fail, which has no sequence operator
+				r = prop_dispatch(SigSpec(), dbody, start);
 			else if (!bsig.empty())
 				r = andN({start, mod->Not(NEW_ID, reduce1(bsig))});
 			else

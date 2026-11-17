@@ -1,0 +1,64 @@
+# fe211: a cover of `R |-> P` counts the attempts that succeed non-vacuously,
+# and an attempt succeeds only when P succeeds after EVERY match of R
+# (16.12.7, 16.14.8).  With an antecedent whose matches end on different
+# ticks, the merged existential hit over-reported (c_bad: c after the later
+# match, but the attempt failed at the earlier one).  Such a cover now tracks
+# one attempt chosen by a free oracle input.  Followed-by stays existential.
+read_verilog -sv -formal <<EOT
+module c4(input clk);
+  reg [3:0] t = 0;
+  always @(posedge clk) if (t != 15) t <= t + 1;
+  wire a = t == 1, b = t == 2 || t == 3, c = t == 3, d = t == 2 || t == 3;
+  wire b2 = t == 2, c2 = t == 2;
+  wire e = t == 4 || t == 5, f = t == 5, g = t == 5 || t == 6;
+  c_bad: cover property (@(posedge clk) a ##[1:2] b |-> c);
+  c_bad2: cover property (@(posedge clk) a ##[1:2] b |-> c2);
+  c_ok: cover property (@(posedge clk) a ##[1:2] b |-> d);
+  c_one: cover property (@(posedge clk) a ##[1:2] b2 |-> c2);
+  c_nx: cover property (@(posedge clk) a ##[1:2] b |=> d);
+  c_nx_ok: cover property (@(posedge clk) t == 3 ##[1:2] e |=> g);
+  c_nest: cover property (@(posedge clk) t == 3 |-> (e[*1:2] |-> f));
+  c_nest_ok: cover property (@(posedge clk) t == 4 |-> (e[*1:2] |-> e));
+  c_seq: cover property (@(posedge clk) a ##[1:2] b |-> ##1 (t != 4));
+  c_seq_ok: cover property (@(posedge clk) a ##[1:2] b |-> ##1 (t != 9));
+  c_fo: cover property (@(posedge clk) a ##[1:2] b #-# c);
+endmodule
+EOT
+prep -top c4
+sva2check
+logger -expect log "c_bad: cover unreachable \[lowering=exact:oracle\]" 1
+logger -expect log "c_bad2: cover unreachable" 1
+logger -expect log "c_ok: cover reached \(depth 3\)" 1
+logger -expect log "c_one: cover reached \(depth 3\)" 1
+logger -expect log "c_nx: cover unreachable" 1
+logger -expect log "c_nx_ok: cover reached \(depth 6\)" 1
+logger -expect log "c_nest_ok: cover reached \(depth 5\)" 1
+logger -expect log "c_nest: cover unreachable" 1
+logger -expect log "c_seq: cover unreachable" 1
+logger -expect log "c_seq_ok: cover reached \(depth 4\)" 1
+logger -expect log "c_fo: cover reached \(depth 3\) \[lowering=exact\]" 1
+ic3
+logger -check-expected
+design -reset
+read_verilog -sv -formal <<EOT
+module c5(input clk);
+  reg [3:0] t = 0;
+  always @(posedge clk) if (t != 15) t <= t + 1;
+  wire a = t == 1, b = t == 2 || t == 3, d = t == 2 || t == 3;
+  wire e = t == 4 || t == 5, f = t == 5;
+  c_nest2: cover property (@(posedge clk) t == 4 |-> (e[*1:2] |-> f));
+  c_nest2_ok: cover property (@(posedge clk) t == 4 |-> (e[*1:2] |-> e));
+  c_dis: cover property (@(posedge clk) disable iff (t == 3) a ##[1:2] b |-> d);
+  c_dis_ok: cover property (@(posedge clk) disable iff (t == 9) a ##[1:2] b |-> d);
+  c_free: cover property (@(posedge clk) a ##[1:2] (b && t == 2) |-> t == 2);
+endmodule
+EOT
+prep -top c5
+sva2check
+logger -expect log "c_nest2: cover unreachable" 1
+logger -expect log "c_nest2_ok: cover reached \(depth 5\)" 1
+logger -expect log "c_dis: cover unreachable" 1
+logger -expect log "c_dis_ok: cover reached \(depth 3\)" 1
+logger -expect log "c_free: cover reached \(depth 3\)" 1
+ic3
+logger -check-expected

@@ -5758,6 +5758,80 @@ struct SvaCompiler {
 		return cover_hit(q, e, why);
 	}
 
+	// fe211: an attempt of `R |-> P` succeeds when P succeeds after EVERY
+	// match of R (16.12.7), so cover_hit (some match, then a hit of P) is
+	// exact only when the matches of one attempt end on one tick: then
+	// they start one attempt of P.  An antecedent whose matches can end on
+	// different ticks (`a ##[1:2] b |-> c`) over-reported: c after the
+	// later match counted although the attempt failed at the earlier one.
+	// Followed-by is existential over its antecedent's matches (fe209),
+	// so only an implication's own antecedent counts; a nested consequent
+	// is checked recursively.
+	bool cover_multimatch(Cell *c)
+	{
+		std::string op = sva_op(c);
+		auto ps = ports_of(c);
+		if (!impl_like(op) || GetSize(ps) < 2)
+			return false;
+		Cell *a = child_cell(c->getPort(ps[0]));
+		if (a && (op == "|->" || op == "|=>")) {
+			int lmax = seq_max_len(a), lmin = seq_min_len(a);
+			if (can_empty(a) || lmax < 0 || lmin != lmax)
+				return true;
+		}
+		Cell *q = child_cell(c->getPort(ps[1]));
+		while (q && (sva_op(q) == "strong" || sva_op(q) == "weak"))
+			q = child_cell(q->getPort(ID(A)));
+		return q && cover_multimatch(q);
+	}
+	// Ticks from an attempt's start to its last possible match or failure
+	// tick, inclusive: -1 when unbounded or not a chain of implications
+	// over sequences.  A followed-by on the chain must have a fixed-length
+	// antecedent (prop_fail refuses the other ones).
+	int cover_span(Cell *c)
+	{
+		std::string op = sva_op(c);
+		auto ps = ports_of(c);
+		if (!impl_like(op) || GetSize(ps) < 2)
+			return -1;
+		Cell *a = child_cell(c->getPort(ps[0]));
+		int ra = a ? seq_max_len(a) : 1;
+		if (ra < 0)
+			return -1;
+		if (a && (op == "#-#" || op == "#=#") && (can_empty(a) || seq_min_len(a) != ra))
+			return -1;
+		int d = op == "|=>" || op == "#=#" ? 1 : 0;
+		Cell *q = child_cell(c->getPort(ps[1]));
+		while (q && (sva_op(q) == "strong" || sva_op(q) == "weak"))
+			q = child_cell(q->getPort(ID(A)));
+		int sp = 1;
+		if (q && impl_like(sva_op(q)))
+			sp = cover_span(q);
+		else if (q && seq_shaped(q))
+			sp = seq_max_len(q);
+		else if (q)
+			sp = -1;
+		if (sp < 1)
+			return -1;
+		return std::max(ra, 1) - 1 + d + sp;
+	}
+	// The cover hit of such an implication, exactly: one attempt tracked,
+	// started where a free oracle input picks (fe208's oracle_root), and
+	// it hits on its last tick when some match reached a hit of P and no
+	// match failed.  Reachable iff some attempt succeeds non-vacuously.
+	SigSpec cover_hit_tracked(Cell *c, SigSpec root, int span, std::string &why)
+	{
+		SigSpec pick = oracle_root(root);
+		SigSpec h = cover_hit(c, pick, why);
+		SigSpec f = why.empty() ? prop_dispatch(SigSpec(), c, pick) : SigSpec();
+		oracle_mode = false;
+		if (!why.empty())
+			return SigSpec();
+		SigSpec hs = since(h, pick), fs = since(f, pick);
+		SigSpec done = delay(pick, span - 1, "cov");
+		return andN({done, hs, mod->Not(NEW_ID, fs)});
+	}
+
 	// Inside an explicit strong(...): an unbounded sequence there needs a
 	// liveness obligation, not the weak monitor below.
 	bool strong_ctx = false;
@@ -8219,6 +8293,11 @@ struct Sva2CheckPass : public Pass {
 							} else if (impl_cover) {
 								// a bounded implication: its fused sequence
 								Cell *fz = comp.fuse_impl(sbody);
+								if (fz && comp.cover_multimatch(sbody))
+									// fe211: the fused sequence is existential
+									// over the antecedent's matches
+									comp.approx("cover-impl-multimatch", std::string(log_id(cell)) +
+											": an attempt that fails after one antecedent match still counts when P hits after another");
 								if (fz) {
 									sbody = fz;
 									impl_cover = false;
@@ -8246,7 +8325,17 @@ struct Sva2CheckPass : public Pass {
 					}
 					SigSpec impl_hit;
 					if (why.empty() && impl_cover) {
-						impl_hit = comp.cover_hit(sbody, root, why);
+						int span = comp.cover_multimatch(sbody) ? comp.cover_span(sbody) : 0;
+						if (span > 0) {
+							log("sva2check: %s: cover of an implication with a variable-length antecedent: one attempt tracked, chosen by a free oracle input.\n",
+									log_id(cell));
+							impl_hit = comp.cover_hit_tracked(sbody, root, span, why);
+						} else {
+							if (span < 0)
+								comp.approx("cover-impl-multimatch", std::string(log_id(cell)) +
+										": an attempt that fails after one antecedent match still counts when P hits after another");
+							impl_hit = comp.cover_hit(sbody, root, why);
+						}
 						if (why.empty() && disable && sva_op(disable) == "disable_iff")
 							comp.approx("cover-disable-at-match", std::string(log_id(cell)) +
 									": an attempt disabled before its match tick still counts");

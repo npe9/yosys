@@ -1735,8 +1735,11 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 			// 32-bit integer and its initializer as a continuous assignment
 			// (`real r = 1.5; ... r = r + 1.0' read r as the constant 2, and
 			// a REFUTED property was proved; hw-cbmc real_variable2)
+			// fe210b: a package variable's clone in an importing module
+			// (`p::x', fe119) is refused where a read resolves to it
+			// (simplify), so an unused package constant stays clean
 			for (auto &child : children)
-				if (child->type == AST_REALVALUE) {
+				if (child->type == AST_REALVALUE && str.find("::") == std::string::npos) {
 					degrade(location.to_loc(), "Real variable `%s' is modeled as a 32-bit integer; real values and arithmetic are not synthesized.\n", str.c_str());
 					break;
 				}

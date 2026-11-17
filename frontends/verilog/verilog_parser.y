@@ -89,7 +89,7 @@
 			// per module the input clockvars that were modelled
 			struct ClockingItem { std::string name; bool input, skew, expr; };
 			std::vector<ClockingItem> cb_items;
-			bool cb_dir_input = false, cb_skew = false, cb_block_skew = false;
+			bool cb_dir_input = false, cb_skew = false, cb_block_skew = false, cb_skew_in = false;
 			pool<const AstNode*> iff_event_nodes;
 			std::map<std::pair<const AstNode*, std::string>, std::vector<std::string>> clocking_vars;
 			void model_clocking(const std::string &cb, const AstNode *event, const parser::location_type &loc);
@@ -2572,7 +2572,15 @@ non_opt_range:
 	} |
 	TOK_LBRA expr TOK_RBRA {
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
-		$$->children.push_back(std::move($2));
+		if ($2->type == AST_IDENTIFIER && $2->str == "\\string" && $2->children.empty()) {
+			// fe210b: a string-keyed associative dimension `m[string]'
+			// (`string' is not reserved by the lexer): the same
+			// placeholder as the other associative keys, refused on use
+			$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
+			$$->children.push_back(AstNode::mkconst_int(@$, 0, true));
+			$$->set_attribute(ID(sv_dyn_dim), AstNode::mkconst_str(@$, "associative"));
+		} else
+			$$->children.push_back(std::move($2));
 	} |
 	TOK_LBRA TOK_RBRA {
 		$$ = std::make_unique<AstNode>(@$, AST_RANGE);
@@ -5834,7 +5842,10 @@ behavioral_stmt:
 	} opt_rs_production_id rs_productions TOK_ENDSEQUENCE {
 		extra->ast_stack.pop_back();
 	} |
-	attr proc_at TOK_LPAREN event_wait_list TOK_RPAREN TOK_SEMICOL {
+	attr proc_at TOK_LPAREN event_wait_list TOK_RPAREN behavioral_stmt {
+		// fe210b: `@(e) stmt' as well as `@(e);' (IEEE 9.4.2; UVM monitor
+		// loops `@(vif.mon_cb) for (..) ..'): the statement stays in the
+		// flow, the wait is dropped
 		parse_degrade(extra, @2, "procedural event control `@(...);' is dropped: the statements after it run without waiting");
 		(void)$1;
 	} |
@@ -6713,7 +6724,9 @@ class_spec_params:
 
 class_spec_param:
 	expr |
-	TOK_DOT TOK_ID TOK_LPAREN expr TOK_RPAREN |
+	// fe210b: a named actual may be a type as well (`.T_CFG(cfg_c#(X))',
+	// `.T(int)'); class parameter values are discarded
+	TOK_DOT TOK_ID TOK_LPAREN class_spec_param TOK_RPAREN |
 	TOK_DOT TOK_ID TOK_LPAREN TOK_RPAREN |
 	hierarchical_type_id TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN |
 	TOK_ID TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN |
@@ -7745,6 +7758,13 @@ assignment_pattern_list:
 		$3->set_attribute(ID(sv_index), sva_num(@1, *$1, extra->case_type_stack));
 		$$->children.push_back(std::move($3));
 	} |
+	TOK_STRING TOK_COL expr {
+		// fe210b: an associative-array literal item `"key" : value'
+		// (7.9.11); refused wherever it is elaborated (simplify)
+		$$ = std::make_unique<AstNode>(@$, AST_ASSIGN_PATTERN);
+		$3->set_attribute(ID(sv_strkey), AstNode::mkconst_str(@1, *$1));
+		$$->children.push_back(std::move($3));
+	} |
 	integer_atom_type TOK_COL expr {
 		// IEEE 1800-2009 10.9: a simple-type pattern key assigns every
 		// member of that type (elaborated as a fill-all, last wins)
@@ -7769,6 +7789,11 @@ assignment_pattern_list:
 	assignment_pattern_list TOK_COMMA integral_number TOK_COL expr {
 		$$ = std::move($1);
 		$5->set_attribute(ID(sv_index), sva_num(@3, *$3, extra->case_type_stack));
+		$$->children.push_back(std::move($5));
+	} |
+	assignment_pattern_list TOK_COMMA TOK_STRING TOK_COL expr {
+		$$ = std::move($1);
+		$5->set_attribute(ID(sv_strkey), AstNode::mkconst_str(@3, *$3));
 		$$->children.push_back(std::move($5));
 	} |
 	assignment_pattern_list TOK_COMMA integer_atom_type TOK_COL expr {
@@ -8714,6 +8739,18 @@ clocking_item:
 		extra->cb_skew = false;
 	} |
 	clocking_dir clocking_skew clocking_assign_list TOK_SEMICOL {
+		extra->cb_skew = false;
+	} |
+	clocking_dir clocking_skew {
+		extra->cb_skew_in = extra->cb_skew;
+		extra->cb_skew = false;
+	} clocking_dir clocking_skew {
+		// fe210b: `input [skew] output [skew] x' (14.3 clocking_direction):
+		// read as an input clockvar with the input's skew; the output skew
+		// only times the drive
+		extra->cb_dir_input = true;
+		extra->cb_skew = extra->cb_skew_in;
+	} clocking_assign_list TOK_SEMICOL {
 		extra->cb_skew = false;
 	} |
 	TOK_SEMICOL;

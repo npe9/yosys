@@ -360,7 +360,7 @@ void AstNode::cloneInto(AstNode &other, std::unordered_map<const AstNode *, AstN
 	// the value: a value rewritten in place (a struct member access, an
 	// inlined function call) keeps its key unless the source has its own.
 	std::vector<std::pair<RTLIL::IdString, std::unique_ptr<AstNode>>> pattern_keys;
-	for (auto key : {ID(sv_member), ID(sv_typekey), ID(sv_index)})
+	for (auto key : {ID(sv_member), ID(sv_typekey), ID(sv_index), ID(sv_strkey)})
 		if (other.attributes.count(key) && !attributes.count(key))
 			pattern_keys.emplace_back(key, std::move(other.attributes.at(key)));
 

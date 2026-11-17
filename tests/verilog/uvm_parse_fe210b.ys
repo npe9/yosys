@@ -1,0 +1,68 @@
+# fe210b: constructs of the core-v-verif UVM agent files a bind-context read
+# of cv32e40s_wrapper parses (uvma_core_cntrl_tdefs, uvma_rvfi_instr_mon,
+# uvma_rvvi_mon_trn_logger, uvma_fencei_if, uvma_clknrst_constants):
+#  - a string-keyed associative array with an associative-array literal
+#    (a placeholder like the other associative keys, refused on use, its
+#    initializer dropped);
+#  - `@(e) stmt' (the wait dropped, refused when the unit is elaborated);
+#  - a type as a named class parameter actual;
+#  - `input #1step output x' in a clocking block;
+#  - a real package constant, refused only where it is read.
+read_verilog -sv -formal <<EOT
+package p;
+  typedef enum bit [11:0] { A = 'h1, B = 'h2 } e_t;
+  bit [11:0] name2addr[string] = '{ "a" : A, "b" : B };
+  const realtime per = 10ns;
+  const int n = 3;
+  class a_c #(type T = int, type U = int); endclass
+  class b_c #(int I = 1); endclass
+  class c_c extends a_c #(.T(int), .U(b_c #(3)));
+    task run(); forever begin @(this.n) for (int i = 0; i < 2; i++) begin end end endtask
+    int n;
+  endclass
+endpackage
+interface i_if (input clk);
+  logic a, b;
+  clocking cb @(posedge clk);
+    input #1step output a;
+    input b;
+  endclocking
+endinterface
+module t (input clk, output int o);
+  import p::*;
+  i_if u (.clk(clk));
+  assign o = n;
+  a_ok: assert property (@(posedge clk) o == 3);
+endmodule
+EOT
+hierarchy -top t
+select -assert-mod-count 0 A:sv_degraded
+prep -top t
+sva2check
+logger -expect log "a_ok: proved" 1
+ic3 -init-zero -kind 2
+logger -check-expected
+
+design -reset
+logger -expect warning "Real variable `\\p::per' is modeled as a 32-bit integer" 1
+logger -expect warning "the string key a \(an associative-array literal\) is not modeled" 1
+logger -expect warning "Identifier `\\m' is an associative array" 1
+logger -expect warning "procedural event control `@\(...\);' is dropped" 1
+read_verilog -sv -formal -permissive <<EOT
+package p;
+  const realtime per = 10ns;
+endpackage
+module r (output int o); import p::*; assign o = per; endmodule
+module s (output int o);
+  int f [0:1] = '{ "a" : 1, 2 };
+  assign o = f[0];
+endmodule
+module m (output int o);
+  int m [string];
+  assign o = m["k"];
+endmodule
+module w (input clk, output reg o);
+  initial begin @(posedge clk) o = 1; end
+endmodule
+EOT
+logger -check-expected

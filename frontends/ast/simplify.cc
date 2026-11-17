@@ -3750,6 +3750,15 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	}
 	recursion_counter++;
 
+	// fe210b: an associative-array literal item (`"key" : value') is only
+	// legal for an associative array, whose uses are refused; anywhere
+	// else positional placement would be silently wrong
+	if (attributes.count(ID(sv_strkey))) {
+		std::string k = attributes.at(ID(sv_strkey))->str;
+		attributes.erase(ID(sv_strkey));
+		degrade(location.to_loc(), "Assignment pattern item with the string key %s (an associative-array literal) is not modeled.\n", k.c_str());
+	}
+
 	// An unpacked-array parameter whose value is `c ? '{...} : '{...}`: the
 	// pattern handling below only sees a pattern, so take the branch here
 	if ((type == AST_PARAMETER || type == AST_LOCALPARAM) && GetSize(children) >= 1 &&
@@ -8383,6 +8392,14 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			// (AstNode::process); reading it would read a free 1-bit wire
 			if (id2ast && id2ast->attributes.count(ID(sv_sim_only_storage)))
 				degrade(location.to_loc(), "Identifier `%s' is simulation-only package storage (a queue or class handle); it is not modeled.\n", str.c_str());
+			// fe210b: a real package variable's clone (genrtlil keeps it as
+			// a 32-bit integer and refuses it only outside a package)
+			if (id2ast && id2ast->type == AST_WIRE && id2ast->str.find("::") != std::string::npos)
+				for (auto &ch : id2ast->children)
+					if (ch && ch->type == AST_REALVALUE) {
+						degrade(location.to_loc(), "Real variable `%s' is modeled as a 32-bit integer; real values and arithmetic are not synthesized.\n", id2ast->str.c_str());
+						break;
+					}
 			// fe210: an associative or dynamic unpacked dimension is a
 			// one-element placeholder (the parser's [0:0]): a read at any
 			// other key folded to 0 or x, and a write there was dropped
@@ -12199,7 +12216,7 @@ skip_memory_write:;
 			// delete_children() also drops the attributes; a call that is
 			// the value of a named pattern element keeps its member key
 			std::vector<std::pair<RTLIL::IdString, std::unique_ptr<AstNode>>> pattern_keys;
-			for (auto key : {ID(sv_member), ID(sv_typekey), ID(sv_index)})
+			for (auto key : {ID(sv_member), ID(sv_typekey), ID(sv_index), ID(sv_strkey)})
 				if (attributes.count(key))
 					pattern_keys.emplace_back(key, std::move(attributes.at(key)));
 			delete_children();

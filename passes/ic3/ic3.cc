@@ -3859,10 +3859,50 @@ struct Ic3Pass : Pass
 
 		// lowering provenance from sva2check (register v3 A3): printed
 		// next to every verdict so no PROVED hides an approximation
-		auto lowering_tag = [](RTLIL::Cell *c) -> std::string {
+		// fe217: a check whose input cone (through cells and FFs) reaches a
+		// free value standing for class code (attribute sv_class_free, set
+		// by the frontend) gets `,class-free' after its lowering: its
+		// verdict holds for every value the class code could produce, a
+		// sound over-approximation (computed only when such cells exist)
+		pool<RTLIL::Cell*> class_free_checks;
+		{
+			std::vector<RTLIL::Cell*> seeds;
+			for (auto c : module->cells())
+				if (c->get_bool_attribute(ID(sv_class_free)))
+					seeds.push_back(c);
+			if (!seeds.empty()) {
+				SigMap cf_sm(module);
+				dict<RTLIL::SigBit, std::vector<RTLIL::Cell*>> readers;
+				for (auto c : module->cells())
+					for (auto &conn : c->connections())
+						if (c->input(conn.first))
+							for (auto b : cf_sm(conn.second))
+								if (b.wire)
+									readers[b].push_back(c);
+				pool<RTLIL::Cell*> seen(seeds.begin(), seeds.end());
+				std::vector<RTLIL::Cell*> work = seeds;
+				while (!work.empty()) {
+					RTLIL::Cell *c = work.back();
+					work.pop_back();
+					if (c->type.in(ID($check), ID($assert), ID($assume), ID($cover), ID($live), ID($fair)))
+						class_free_checks.insert(c);
+					for (auto &conn : c->connections())
+						if (c->output(conn.first))
+							for (auto b : cf_sm(conn.second)) {
+								auto it = readers.find(b);
+								if (it != readers.end())
+									for (auto r : it->second)
+										if (seen.insert(r).second)
+											work.push_back(r);
+							}
+				}
+			}
+		}
+		auto lowering_tag = [&class_free_checks](RTLIL::Cell *c) -> std::string {
+			std::string cf = class_free_checks.count(c) ? ",class-free" : "";
 			if (!c->attributes.count(ID(sva_lowering)))
-				return std::string(" [lowering=untagged]");
-			return " [lowering=" + c->attributes.at(ID(sva_lowering)).decode_string() + "]";
+				return " [lowering=untagged" + cf + "]";
+			return " [lowering=" + c->attributes.at(ID(sva_lowering)).decode_string() + cf + "]";
 		};
 		NativeCert ncert;
 		bool ncert_on = certify && !engine_ext;

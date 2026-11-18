@@ -80,6 +80,9 @@
 			std::unique_ptr<dict<IdString, std::unique_ptr<AstNode>>> albuf;
 			std::vector<UserTypeMap> user_type_stack;
 			dict<std::string, AstNode*> pkg_user_types;
+			// fe217b: package-qualified class names (`pkg::C'), so a
+			// variable of that type outside the package is a handle
+			pool<std::string> pkg_class_types;
 			std::vector<AstNode*> ast_stack;
 			std::unique_ptr<AstNode> astbuf1, astbuf2, astbuf3;
 			// fe174: the clocking block being parsed (IEEE 1800-2017 14.3):
@@ -496,6 +499,12 @@
 			node->children.back()->str = *name;
 			// fe176: a variable of a class or covergroup type is a handle
 			// (simulation-only; simplify models it, see sv_class_handle)
+			// fe217b: `pkg::C' of a class declared in a package (a forward
+			// `typedef class C;' may also be registered under that name)
+			if (pkg_class_types.count(*name)) {
+				node->children.back()->set_attribute(ID(sv_class_type), AstNode::mkconst_str(node->location, "class"));
+				return;
+			}
 			for (auto it = user_type_stack.rbegin(); it != user_type_stack.rend(); ++it) {
 				auto f = it->find(*name);
 				if (f == it->end())
@@ -1870,6 +1879,8 @@ class_decl:
 		node->str = *$3;
 		append_attr(node.get(), std::move($1));
 		extra->user_type_stack.back()[*$3] = node.get();
+		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
+			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$3).substr(1));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
 		extra->ast_stack.pop_back();
@@ -1879,6 +1890,8 @@ class_decl:
 		node->str = *$4;
 		append_attr(node.get(), std::move($1));
 		extra->user_type_stack.back()[*$4] = node.get();
+		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
+			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$4).substr(1));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
 		extra->ast_stack.pop_back();
@@ -1891,6 +1904,8 @@ class_decl:
 		node->set_attribute(ID(sv_interface_class), AstNode::mkconst_int(@$, 1, false));
 		append_attr(node.get(), std::move($1));
 		extra->user_type_stack.back()[*$4] = node.get();
+		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
+			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$4).substr(1));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
 		extra->ast_stack.pop_back();
@@ -1901,6 +1916,8 @@ nested_class_decl:
 		auto node = std::make_unique<AstNode>(@$, AST_CLASS);
 		node->str = *$2;
 		extra->user_type_stack.back()[*$2] = node.get();
+		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
+			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$2).substr(1));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
 		extra->ast_stack.pop_back();
@@ -1912,6 +1929,8 @@ nested_class_decl:
 		node->str = *$3;
 		node->set_attribute(ID(sv_interface_class), AstNode::mkconst_int(@$, 1, false));
 		extra->user_type_stack.back()[*$3] = node.get();
+		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
+			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$3).substr(1));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
 		extra->ast_stack.pop_back();
@@ -2030,6 +2049,10 @@ class_method_proto:
 	TOK_FUNCTION opt_automatic func_return_type TOK_ID {
 		extra->current_function_or_task = extra->pushChild(std::make_unique<AstNode>(@$, AST_FUNCTION));
 		extra->current_function_or_task->str = *$4;
+		// fe217: the return type, for a free value of a class function's
+		// result (the class body itself stays opaque)
+		if ($3 != nullptr)
+			extra->current_function_or_task->set_attribute(ID(sv_class_return), std::move($3));
 		extra->current_function_or_task_port_id = 1;
 	} task_func_args_opt TOK_SEMICOL {
 		extra->current_function_or_task = nullptr;
@@ -2065,6 +2088,10 @@ class_method_body:
 	TOK_FUNCTION opt_automatic func_return_type TOK_ID {
 		extra->current_function_or_task = extra->pushChild(std::make_unique<AstNode>(@$, AST_FUNCTION));
 		extra->current_function_or_task->str = *$4;
+		// fe217: the return type, for a free value of a class function's
+		// result (the class body itself stays opaque)
+		if ($3 != nullptr)
+			extra->current_function_or_task->set_attribute(ID(sv_class_return), std::move($3));
 		extra->current_function_or_task_port_id = 1;
 	} task_func_args_opt TOK_SEMICOL task_func_body TOK_ENDFUNCTION opt_label {
 		extra->current_function_or_task = nullptr;

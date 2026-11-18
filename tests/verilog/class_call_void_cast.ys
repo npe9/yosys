@@ -2,8 +2,9 @@
 # e.g. the core-v-verif tb's `uvm_config_db#(virtual ..)::set(..)') was an
 # unresolved task, a degradation.  Class code is simulation-only; when every
 # formal of the method's declaration is an input the call writes no design
-# state and is dropped.  A method with an output/inout/ref formal, or one
-# whose declaration is not found, stays a degradation.
+# state and is dropped.  A method whose declaration is not found stays a
+# degradation; one with an output/inout/ref formal gives its actuals free
+# values since fe217 (was a degradation).
 # (2) `void'(f(..));' dropped the whole call, so the writes of $cast, the
 # scanf family and of functions with output formals were lost silently:
 # `x = 5; void'($cast(x, in));' made x constant 5.  The value is discarded,
@@ -44,9 +45,10 @@ design -reset
 # (refusals are read with -permissive: the degradation is a warning and
 # the module is marked sv_degraded)
 
-# a class method with an inout formal writes its actual: refused
-logger -expect warning "Unresolved function `\\p::cdb::get'; the call becomes constant 0" 1
-read_verilog -sv -formal -permissive <<EOT
+# a class method with an inout formal writes its actual: since fe217 (user
+# decision 2026-11-18) the actual gets a free value (class_call_free.ys)
+logger -expect log "class method call `\\p::cdb::get' is simulation-only; dropped; its output actuals get free values" 1
+read_verilog -sv -formal <<EOT
 package p;
   class cdb #(type T=int);
     static function bit get(string a, inout T v); endfunction
@@ -57,13 +59,14 @@ module g(input logic clk);
   initial begin x = 0; void'(p::cdb#(int)::get("v", x)); end
 endmodule
 EOT
-select -assert-any A:sv_degraded
+select -assert-none A:sv_degraded
 logger -check-expected
 design -reset
 
-# a class task with an output formal: refused
-logger -expect warning "Unresolved task `\\p::cdb::tk'; the call is ignored" 1
-read_verilog -sv -formal -permissive <<EOT
+# a class task with an output formal: since fe217 the actual gets a free
+# value
+logger -expect log "class method call `\\p::cdb::tk' is simulation-only; dropped; its output actuals get free values" 1
+read_verilog -sv -formal <<EOT
 package p;
   class cdb #(type T=int);
     static task tk(output int o); endtask
@@ -74,7 +77,7 @@ module k(input logic clk);
   initial p::cdb#(int)::tk(x);
 endmodule
 EOT
-select -assert-any A:sv_degraded
+select -assert-none A:sv_degraded
 logger -check-expected
 design -reset
 

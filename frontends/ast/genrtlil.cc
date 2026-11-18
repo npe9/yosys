@@ -2932,6 +2932,11 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 						input_error("Attribute `reg' with non-constant value!\n");
 					cell->attributes[ID::reg] =  attr->asAttrConst();
 				}
+				// fe217: a free value standing for class code's result or a
+				// class call's output (simulation-only, not modelled); ic3
+				// tags every verdict whose cone reaches it
+				if (attributes.count(ID(sv_class_free)))
+					cell->attributes[ID(sv_class_free)] = RTLIL::Const(1);
 
 				Wire *wire = current_module->addWire(myid + "_wire", width);
 				set_src_attr(wire, this);

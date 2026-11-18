@@ -3731,23 +3731,24 @@ static std::unique_ptr<AstNode> array_param_flat_value(AstNode *src, AstSrcLocTy
 
 // fe215: the declaration of a class method named by a call `C::m' /
 // `pkg::C::m' (class parameters are already dropped from the name).
-// Returns 1 when it is found and every formal is an input (the call writes
-// no design state: class code is simulation-only), 0 when it is found with
-// an output/inout/ref formal, -1 when no declaration is found (inherited
-// method, unknown class, not a class scope).
-static int class_method_input_only(const std::string &str)
+// Returns the method's task/function node, or nullptr when no declaration
+// is found (inherited method, unknown class, not a class scope).
+static AstNode *class_method_decl(const std::string &str)
 {
 	// fe216: a call through a handle (`h.m(..)', `pkg::h.m(..)') whose
 	// head is a package class-handle placeholder (AstNode::process tags it
 	// with its class): the method of that class
-	size_t dot = str.find('.');
-	if (dot != std::string::npos) {
+	size_t dot = str.rfind('.');
+	if (dot != std::string::npos && dot > 0) {
 		std::string head = str.substr(0, dot), meth = str.substr(dot + 1);
-		if (meth.empty() || meth.find('.') != std::string::npos || meth.find("::") != std::string::npos)
-			return -1;
+		if (meth.empty() || meth.find("::") != std::string::npos)
+			return nullptr;
 		AstNode *h = nullptr;
 		if (current_scope.count(head))
 			h = current_scope.at(head);
+		// fe217b: a module or block-local handle that recorded its class
+		if (h && h->type == AST_WIRE && h->attributes.count(ID(sv_handle_class)))
+			return class_method_decl(h->attributes.at(ID(sv_handle_class))->str + "::" + meth);
 		// a bare name through `import p::*' / `import p::h' binds to the
 		// module's qualified clone `p::h' (as fe119 does for a read)
 		if (!h && current_ast_mod && head.find("::") == std::string::npos)
@@ -3771,12 +3772,12 @@ static int class_method_input_only(const std::string &str)
 						if (c && c->type == AST_WIRE && pk->str + "::" + c->str.substr(1) == head)
 							h = c.get();
 		if (!h || !h->attributes.count(ID(sv_sim_only_storage)) || !h->attributes.count(ID(sv_sim_only_class)))
-			return -1;
-		return class_method_input_only(h->attributes.at(ID(sv_sim_only_class))->str + "::" + meth);
+			return nullptr;
+		return class_method_decl(h->attributes.at(ID(sv_sim_only_class))->str + "::" + meth);
 	}
 	size_t sep = str.rfind("::");
 	if (sep == std::string::npos || sep < 2)
-		return -1;
+		return nullptr;
 	std::string cls = str.substr(0, sep), meth = "\\" + str.substr(sep + 2);
 	std::string tail = "::" + cls.substr(1);
 	auto match = [&](AstNode *c) {
@@ -3798,14 +3799,363 @@ static int class_method_input_only(const std::string &str)
 			if (!c || !match(c.get()))
 				continue;
 			for (auto &m : c->children)
-				if (m && (m->type == AST_TASK || m->type == AST_FUNCTION) && m->str == meth) {
-					for (auto &w : m->children)
-						if (w && w->type == AST_WIRE && w->port_id > 0 && (w->is_output || w->attributes.count(ID(sv_ref))))
-							return 0;
-					return 1;
-				}
+				if (m && (m->type == AST_TASK || m->type == AST_FUNCTION) && m->str == meth)
+					return m.get();
 		}
-	return -1;
+	return nullptr;
+}
+
+// a formal the call writes back to its actual (output, inout, ref)
+static bool class_formal_writes(const AstNode *w)
+{
+	return w && w->type == AST_WIRE && w->port_id > 0 && (w->is_output || w->attributes.count(ID(sv_ref)));
+}
+
+// fe215: 1 when the class method's declaration is found and every formal is
+// an input (the call writes no design state: class code is
+// simulation-only), 0 when it is found with an output/inout/ref formal, -1
+// when no declaration is found.
+static int class_method_input_only(const std::string &str)
+{
+	AstNode *m = class_method_decl(str);
+	if (!m)
+		return -1;
+	for (auto &w : m->children)
+		if (class_formal_writes(w.get()))
+			return 0;
+	return 1;
+}
+
+// fe217 (user decision 2026-11-18): a value class code produces is not
+// modelled; it is a free value, a sound over-approximation.  A hidden wire
+// of the given width driven by $anyconst when the use is in an initial
+// block (evaluated once) and by $anyseq elsewhere (the fe102 $urandom
+// idiom); the $anyconst/$anyseq carries sv_class_free, so ic3 tags every
+// verdict whose cone reaches it.  nullptr outside a module.
+static std::unique_ptr<AstNode> class_free_value(const AstNode *at, int width, bool is_signed)
+{
+	if (!current_ast_mod || width <= 0)
+		return nullptr;
+	const auto &loc = at->location;
+	bool once = current_always && current_always->type == AST_INITIAL;
+	std::string wname = stringf("$class_free$%d", autoidx++);
+	auto wire = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE,
+			AstNode::mkconst_int(loc, width - 1, true), AstNode::mkconst_int(loc, 0, true)));
+	wire->str = wname;
+	wire->is_logic = true;
+	wire->is_signed = is_signed;
+	AstNode *wire_p = wire.get();
+	while (wire_p->simplify(true, 1, -1, false)) { }
+	current_scope[wname] = wire_p;
+	current_ast_mod->children.push_back(std::move(wire));
+	auto ref = [&]() {
+		auto id = std::make_unique<AstNode>(loc, AST_IDENTIFIER);
+		id->str = wname;
+		id->id2ast = wire_p;
+		id->was_checked = true;
+		return id;
+	};
+	auto src = std::make_unique<AstNode>(loc, AST_FCALL, AstNode::mkconst_int(loc, width, false));
+	src->str = once ? "\\$anyconst" : "\\$anyseq";
+	src->set_attribute(ID(sv_class_free), AstNode::mkconst_int(loc, 1, false));
+	current_ast_mod->children.push_back(std::make_unique<AstNode>(loc, AST_ASSIGN, ref(), std::move(src)));
+	return ref();
+}
+
+// fe217: the width of a class function's result, from the return type the
+// parser keeps on the method (sv_class_return: a plain packed range); false
+// when the type is not a plain vector (a typedef, class handle, struct,
+// string, real) or the range is not constant
+static bool class_method_result(const AstNode *m, int &width, bool &is_signed)
+{
+	auto it = m->attributes.find(ID(sv_class_return));
+	if (it == m->attributes.end() || !it->second)
+		return false;
+	const AstNode *r = it->second.get();
+	if (r->type != AST_RANGE || GetSize(r->children) != 2 ||
+			r->children[0]->type != AST_CONSTANT || r->children[1]->type != AST_CONSTANT)
+		return false;
+	width = std::abs(int(r->children[0]->integer) - int(r->children[1]->integer)) + 1;
+	is_signed = r->is_signed;
+	return true;
+}
+
+// fe217: a statement call of a class method with output/inout/ref formals:
+// the call is dropped and each such formal's actual gets a free value.
+// Returns the block of assignments, or nullptr when an actual is not a
+// plain variable (a concatenation, select, `null', an expression) or the
+// call is not in a module.
+static std::unique_ptr<AstNode> class_call_free_outputs(const AstNode *call, const AstNode *m)
+{
+	auto blk = std::make_unique<AstNode>(call->location, AST_BLOCK);
+	for (auto &w : m->children) {
+		if (!class_formal_writes(w.get()))
+			continue;
+		int k = w->port_id - 1;
+		if (k < 0 || k >= GetSize(call->children) || !call->children[k])
+			return nullptr;
+		const AstNode *a = call->children[k].get();
+		if (a->type != AST_IDENTIFIER || !a->children.empty())
+			return nullptr;
+		AstNode *d = a->id2ast;
+		if (!d && current_scope.count(a->str))
+			d = current_scope.at(a->str);
+		if (!d || d->type != AST_WIRE)
+			return nullptr;
+		auto probe = a->clone();
+		probe->id2ast = d;
+		int width = -1;
+		bool sg = false;
+		probe->detectSignWidth(width, sg);
+		auto v = class_free_value(call, width, sg);
+		if (!v)
+			return nullptr;
+		auto lhs = a->clone();
+		lhs->id2ast = d;
+		blk->children.push_back(std::make_unique<AstNode>(call->location, AST_ASSIGN_EQ, std::move(lhs), std::move(v)));
+	}
+	return blk;
+}
+
+// fe217b: a type name that names a class (in the module, the design root or
+// a package; matched on its last `::' component)
+static bool class_type_name(const std::string &name)
+{
+	if (name.empty())
+		return false;
+	size_t q = name.rfind("::");
+	std::string tail = q == std::string::npos ? name.substr(1) : name.substr(q + 2);
+	// `pkg::C': a class declared in that package (exact)
+	if (q != std::string::npos && name.find("::") == q) {
+		std::string pkg = name.substr(0, q);
+		// an imported package's classes are cloned into the module under
+		// the qualified name (the package may come from another file)
+		if (current_ast_mod)
+			for (auto &c : current_ast_mod->children)
+				if (c && c->type == AST_CLASS && !c->attributes.count(ID(sv_covergroup)) && c->str == name)
+					return true;
+		if (current_ast)
+			for (auto &n : current_ast->children)
+				if (n && n->type == AST_PACKAGE && n->str == pkg)
+					for (auto &c : n->children)
+						if (c && c->type == AST_CLASS && !c->attributes.count(ID(sv_covergroup)) &&
+								(c->str == "\\" + tail || c->str == name))
+							return true;
+		return false;
+	}
+	std::string suffix = "::" + tail;
+	auto match = [&](const AstNode *c) {
+		if (!c || c->type != AST_CLASS || c->attributes.count(ID(sv_covergroup)))
+			return false;
+		const std::string &n = c->str;
+		return n == name || n == "\\" + tail ||
+				(n.size() > suffix.size() && n.compare(n.size() - suffix.size(), std::string::npos, suffix) == 0);
+	};
+	std::vector<AstNode*> roots;
+	if (current_ast_mod) roots.push_back(current_ast_mod);
+	if (current_ast) {
+		roots.push_back(current_ast);
+		for (auto &n : current_ast->children)
+			if (n && n->type == AST_PACKAGE)
+				roots.push_back(n.get());
+	}
+	for (auto r : roots)
+		for (auto &c : r->children)
+			if (match(c.get()))
+				return true;
+	return false;
+}
+
+// fe217b: a variable of a class type (a handle)
+static bool class_handle_var(const AstNode *w)
+{
+	if (!w || w->type != AST_WIRE)
+		return false;
+	if (w->attributes.count(ID(sv_class_handle)))
+		return true;
+	for (auto &c : w->children)
+		if (c && c->type == AST_WIRETYPE && (c->attributes.count(ID(sv_class_type)) || class_type_name(c->str)))
+			return true;
+	return false;
+}
+
+// fe217b: a function or task (e.g. a UVM package function such as
+// uvm_report_enabled) whose body runs class code and writes no design
+// state.  Class code: a class-handle local or a class method call.  No
+// design write: every formal is an input; every assignment target is a
+// local, a formal or the result (or a member of a local handle: class
+// state); every nested call is a system call that writes no argument, a
+// class call whose plain-variable actuals are locals, or a function/task
+// that passes this test itself.  `cls' is set when class code is seen.
+static bool class_code_body(const AstNode *fn, int depth, bool &cls)
+{
+	if (!fn || (fn->type != AST_FUNCTION && fn->type != AST_TASK) || depth > 8)
+		return false;
+	for (auto &c : fn->children)
+		if (class_formal_writes(c.get()))
+			return false;
+	pool<std::string> locals, handles;
+	locals.insert(fn->str);
+	locals.insert("$result");
+	size_t q = fn->str.rfind("::");
+	if (q != std::string::npos)
+		locals.insert("\\" + fn->str.substr(q + 2));
+	std::function<void(const AstNode*)> collect = [&](const AstNode *n) {
+		for (auto &c : n->children) {
+			if (!c)
+				continue;
+			if (c->type == AST_WIRE || c->type == AST_MEMORY) {
+				locals.insert(c->str);
+				if (class_handle_var(c.get())) {
+					handles.insert(c->str);
+					cls = true;
+				}
+			}
+			collect(c.get());
+		}
+	};
+	collect(fn);
+	auto local_target = [&](const AstNode *t) {
+		if (!t || t->type != AST_IDENTIFIER)
+			return false;
+		if (locals.count(t->str))
+			return true;
+		size_t dot = t->str.find('.');
+		return dot != std::string::npos && handles.count(t->str.substr(0, dot));
+	};
+	auto actuals_local = [&](const AstNode *call) {
+		for (auto &a : call->children)
+			if (a && a->type == AST_IDENTIFIER && a->children.empty() && !local_target(a.get()))
+				return false;
+		return true;
+	};
+	std::function<bool(const AstNode*)> ok = [&](const AstNode *n) -> bool {
+		if (n->type == AST_ASSIGN_EQ || n->type == AST_ASSIGN_LE || n->type == AST_ASSIGN) {
+			const AstNode *t = n->children.empty() ? nullptr : n->children[0].get();
+			if (t && t->type == AST_CONCAT) {
+				for (auto &e : t->children)
+					if (!local_target(e.get()))
+						return false;
+			} else if (!local_target(t))
+				return false;
+		}
+		if (n->type == AST_FCALL || n->type == AST_TCALL) {
+			const std::string &f = n->str;
+			if (f.compare(0, 2, "\\$") == 0 || f.compare(0, 1, "$") == 0) {
+				std::string b = f[0] == '\\' ? f.substr(1) : f;
+				if (b == "$cast" || b == "$sscanf" || b == "$fscanf" || b == "$fgets" || b == "$fread" ||
+						b == "$value$plusargs" || b == "$readmemh" || b == "$readmemb" || b == "$ungetc")
+					return false;
+			} else if (f == fn->str || f == "\\return" || f == "\\break" || f == "\\continue") {
+				// recursion (the body is being checked); control flow
+			} else {
+				size_t dot = f.find('.');
+				bool via_local = dot != std::string::npos && handles.count(f.substr(0, dot));
+				if (via_local || f == "\\new" || class_method_decl(f)) {
+					cls = true;
+					if (!actuals_local(n))
+						return false;
+				} else {
+					auto it = current_scope.find(f);
+					if (it == current_scope.end() || !class_code_body(it->second, depth + 1, cls))
+						return false;
+				}
+			}
+		}
+		for (auto &c : n->children)
+			if (c && !ok(c.get()))
+				return false;
+		return true;
+	};
+	for (auto &c : fn->children)
+		if (c && c->type != AST_WIRE && c->type != AST_MEMORY && !ok(c.get()))
+			return false;
+	return true;
+}
+
+// fe217b: a cheap precheck: the body itself declares a class-handle local
+// or calls a class method (`h.m', `C::m')
+static bool class_code_direct(const AstNode *n)
+{
+	for (auto &c : n->children) {
+		if (!c)
+			continue;
+		if (c->type == AST_WIRE && class_handle_var(c.get()))
+			return true;
+		if ((c->type == AST_FCALL || c->type == AST_TCALL) &&
+				(c->str.find('.') != std::string::npos || c->str.find("::") != std::string::npos) && class_method_decl(c->str))
+			return true;
+		if (class_code_direct(c.get()))
+			return true;
+	}
+	return false;
+}
+
+// fe217b: a right-hand side whose value is a class handle that class code
+// produces without writing design state: `new', `null', `this', another
+// handle, an input-only class method, a chained `f().m()' (no arguments)
+// on such a value, or a call of a function passing class_code_body
+static bool class_handle_source(const AstNode *r)
+{
+	if (!r)
+		return false;
+	if (r->type == AST_IDENTIFIER) {
+		if (r->str == "\\new" || r->str == "\\null" || r->str == "\\this")
+			return true;
+		auto it = current_scope.find(r->str);
+		return r->children.empty() && it != current_scope.end() && class_handle_var(it->second);
+	}
+	if (r->type != AST_FCALL)
+		return false;
+	if (r->str == "\\new")
+		return true;
+	if (!r->str.empty() && r->str[0] == '.')
+		return GetSize(r->children) == 1 && class_handle_source(r->children[0].get());
+	if (class_method_input_only(r->str) == 1)
+		return true;
+	auto it = current_scope.find(r->str);
+	bool cls = false;
+	return it != current_scope.end() && class_code_direct(it->second) && class_code_body(it->second, 0, cls) && cls;
+}
+
+// fe217b: the result width of a function whose result variable is a plain
+// vector (no range: one bit; one constant packed range); false for a
+// typedef, class handle, struct, real or string
+static bool plain_function_result(const AstNode *fn, int &width, bool &is_signed)
+{
+	if (!fn || fn->type != AST_FUNCTION)
+		return false;
+	// the result variable keeps the package-qualified name in a clone
+	// registered under the bare name (`\f' holding `\p::f')
+	auto tail = [](const std::string &n) {
+		size_t q = n.rfind("::");
+		return q == std::string::npos ? n.substr(1) : n.substr(q + 2);
+	};
+	const AstNode *r = nullptr;
+	for (auto &c : fn->children)
+		if (c && c->type == AST_WIRE && c->port_id == 0 && (c->str == fn->str || c->str == "$result" || tail(c->str) == tail(fn->str))) {
+			r = c.get();
+			break;
+		}
+	if (!r || r->is_string || r->is_custom_type)
+		return false;
+	is_signed = r->is_signed;
+	const AstNode *range = nullptr;
+	for (auto &c : r->children) {
+		if (!c)
+			continue;
+		if (c->type != AST_RANGE || range)
+			return false;
+		range = c.get();
+	}
+	if (!range) {
+		width = r->range_valid ? std::abs(r->range_left - r->range_right) + 1 : 1;
+		return true;
+	}
+	if (GetSize(range->children) != 2 || range->children[0]->type != AST_CONSTANT || range->children[1]->type != AST_CONSTANT)
+		return false;
+	width = std::abs(int(range->children[0]->integer) - int(range->children[1]->integer)) + 1;
+	return true;
 }
 
 bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hint)
@@ -3891,12 +4241,18 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	if ((type == AST_ASSIGN_EQ || type == AST_ASSIGN_LE || type == AST_ASSIGN) && children.size() == 2 &&
 			children[0] && children[0]->type == AST_IDENTIFIER && children[0]->children.empty() &&
 			children[1] && (children[1]->type == AST_FCALL || children[1]->type == AST_IDENTIFIER) &&
-			children[1]->str == "\\new" && current_scope.count(children[0]->str)) {
+			current_scope.count(children[0]->str)) {
 		AstNode *w = current_scope.at(children[0]->str);
 		bool handle = w && w->type == AST_WIRE && (w->attributes.count(ID(sv_class_handle)) ||
 				(w->is_custom_type && !w->children.empty() && w->children[0] &&
 				 w->children[0]->type == AST_WIRETYPE && w->children[0]->attributes.count(ID(sv_class_type))));
-		if (handle) {
+		// fe217b: likewise any handle value class code produces without
+		// writing design state (`h = C::get();', `h = f().m();')
+		bool is_new = children[1]->str == "\\new";
+		if (handle && (is_new || class_handle_source(children[1].get()))) {
+			if (!is_new)
+				log("%s: class handle `%s' assigned by class code; simulation-only, not modelled.\n",
+						location.to_string().c_str(), children[0]->str.c_str());
 			children[1] = AstNode::mkconst_int(children[1]->location, 0, false, 1);
 		}
 	}
@@ -5102,6 +5458,15 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 			delete_children();
 			type = AST_BLOCK;
 			str.clear();
+		} else if (auto free_blk = class_method_input_only(str) == 0 ?
+				class_call_free_outputs(this, class_method_decl(str)) : nullptr) {
+			// fe217: the value is discarded; the outputs get free values
+			log("%s: class method call `%s' is simulation-only; dropped; its output actuals get free values.\n",
+					location.to_string().c_str(), str.c_str());
+			delete_children();
+			type = AST_BLOCK;
+			str.clear();
+			children = std::move(free_blk->children);
 		} else if (current_ast_mod) {
 			std::string tmpname = stringf("$voidcast$%d", autoidx++);
 			auto tmp_wire = std::make_unique<AstNode>(location, AST_WIRE);
@@ -7140,10 +7505,19 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 				is_logic = true;
 				set_attribute(ID(sv_string), AstNode::mkconst_int(location, 1, false));
 				did_something = true;
-			} else if (!known_typedef && type == AST_WIRE && children[0]->attributes.count(ID(sv_class_type))) {
+			} else if (type == AST_WIRE && ((!known_typedef && children[0]->attributes.count(ID(sv_class_type))) ||
+					// fe217b: `pkg::C' of a class in a package read from
+					// another file (the parser's marks are per file); a
+					// forward `typedef class C;' made it a known typedef
+					(type_name.find("::") != std::string::npos && class_type_name(type_name)))) {
 				// fe176: a class or covergroup handle: one opaque bit, marked
-				std::string kind = children[0]->attributes.at(ID(sv_class_type))->str;
+				std::string kind = children[0]->attributes.count(ID(sv_class_type)) ?
+						children[0]->attributes.at(ID(sv_class_type))->str : std::string("class");
 				set_attribute(ID(sv_class_handle), AstNode::mkconst_str(location, kind));
+				// fe217b: the class, so a method call through the handle
+				// resolves (class_method_decl)
+				if (kind == "class")
+					set_attribute(ID(sv_handle_class), AstNode::mkconst_str(location, children[0]->str));
 				is_custom_type = false;
 				is_logic = true;
 				children.erase(children.begin());
@@ -11795,6 +12169,30 @@ skip_memory_write:;
 			if (current_scope.count(str) == 0)
 				str = try_pop_module_prefix();
 			if (current_scope.count(str) == 0 || current_scope[str]->type != AST_FUNCTION) {
+				// fe217b: while probing (eval_known_int), an unresolved call
+				// is left as is: not a constant, and no degradation from a
+				// throwaway copy (a block-local handle is not in scope yet)
+				if (probe_eval_depth > 0) {
+					recursion_counter--;
+					return did_something;
+				}
+				// fe217 (user decision 2026-11-18): the value of a class
+				// function whose formals are all inputs is a free value of
+				// its result type (a plain vector); with an output formal a
+				// value use stays a degradation (the write-back is a
+				// statement)
+				if (class_method_input_only(str) == 1) {
+					AstNode *m = class_method_decl(str);
+					int fw = -1;
+					bool fs = false;
+					if (m->type == AST_FUNCTION && class_method_result(m, fw, fs))
+						if (auto v = class_free_value(this, fw, fs)) {
+							log("%s: class function call `%s' is simulation-only; its value is free.\n",
+									location.to_string().c_str(), str.c_str());
+							newNode = std::move(v);
+							goto apply_newNode;
+						}
+				}
 				degrade(location.to_loc(), "Unresolved function `%s'; the call becomes constant 0.\n", str.c_str());
 				newNode = mkconst_int(location, 0, false);
 				goto apply_newNode;
@@ -11884,16 +12282,60 @@ skip_memory_write:;
 				// with an output/inout/ref formal, or one whose declaration is
 				// not found (inherited, unknown class), stays a degradation.
 				bool class_call_dropped = !severity_task && class_method_input_only(str) == 1;
+				// fe217 (user decision 2026-11-18): with output/inout/ref
+				// formals the call is dropped and each such actual (a plain
+				// variable) gets a free value
+				std::unique_ptr<AstNode> free_blk;
+				if (!severity_task && !class_call_dropped && class_method_input_only(str) == 0)
+					free_blk = class_call_free_outputs(this, class_method_decl(str));
 				if (class_call_dropped)
 					log("%s: class method call `%s' is simulation-only; dropped (every formal is an input).\n",
 							location.to_string().c_str(), str.c_str());
-				else if (!severity_task)
+				else if (free_blk) {
+					log("%s: class method call `%s' is simulation-only; dropped; its output actuals get free values.\n",
+							location.to_string().c_str(), str.c_str());
+					newNode = std::move(free_blk);
+					goto apply_newNode;
+				} else if (!severity_task)
 					degrade(location.to_loc(), "Unresolved task `%s'; the call is ignored.\n", str.c_str());
 				newNode = std::make_unique<AstNode>(location, AST_BLOCK);
 				goto apply_newNode;
 			}
 		}
 
+
+		// fe217b (user decision 2026-11-18, free values): a call of a
+		// function/task whose body runs class code and writes no design
+		// state (class_code_body; e.g. UVM's uvm_report_enabled behind
+		// `uvm_info) is simulation-only: a statement call is dropped, a
+		// value use of a plain-vector result is a free value.  Not in a
+		// constant context (a parameter or range takes no free value).
+		if ((type == AST_FCALL || type == AST_TCALL) && !in_param && current_ast_mod && current_scope.count(str)) {
+			bool cls = false;
+			AstNode *d = current_scope.at(str);
+			if (class_code_direct(d) && class_code_body(d, 0, cls) && cls) {
+				// class code is never a constant: a probe leaves the call
+				if (probe_eval_depth > 0) {
+					recursion_counter--;
+					return did_something;
+				}
+				if (type == AST_TCALL) {
+					log("%s: call of `%s' runs only class code; it is simulation-only and dropped.\n",
+							location.to_string().c_str(), str.c_str());
+					newNode = std::make_unique<AstNode>(location, AST_BLOCK);
+					goto apply_newNode;
+				}
+				int fw = -1;
+				bool fs = false;
+				if (plain_function_result(d, fw, fs))
+					if (auto v = class_free_value(this, fw, fs)) {
+						log("%s: call of `%s' runs only class code; its value is free.\n",
+								location.to_string().c_str(), str.c_str());
+						newNode = std::move(v);
+						goto apply_newNode;
+					}
+			}
+		}
 
 		std::stringstream sstr;
 		sstr << str << "$func$" << RTLIL::encode_filename(*location.begin.filename) << ":" << location.begin.line << "$" << (autoidx++) << '.';

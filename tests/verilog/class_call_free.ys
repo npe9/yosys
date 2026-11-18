@@ -1,0 +1,242 @@
+# fe217 (user decision 2026-11-18: free values).  Class code is
+# simulation-only and not modelled.  A class call's output/inout/ref
+# actual (a plain variable) and the value of a class function whose
+# formals are all inputs become free values: a hidden wire driven by
+# $anyconst (initial block) or $anyseq, tagged sv_class_free.  This is a
+# sound over-approximation; ic3 appends `,class-free' to the lowering tag
+# of every verdict whose cone reaches such a value.  A non-variable
+# output actual, and a value use of a function with an output formal, stay
+# degradations.  Refusals are read with -permissive so every block runs.
+
+# outputs of statement and void'-cast calls, a value use; tagged verdicts
+logger -expect log "class method call `\\p::cdb::get' is simulation-only; dropped; its output actuals get free values" 2
+logger -expect log "class method call `\\top_h.tk' is simulation-only; dropped; its output actuals get free values" 1
+logger -expect log "class function call `\\top_h.en' is simulation-only; its value is free" 1
+logger -expect log "p_v: disproved \(depth [0-9]+\) \[lowering=[a-z]+,class-free\]" 1
+logger -expect log "p_w: disproved \(depth [0-9]+\) \[lowering=[a-z]+,class-free\]" 1
+logger -expect log "p_y: disproved \(depth [0-9]+\) \[lowering=[a-z]+,class-free\]" 1
+logger -expect log "p_q: proved \[lowering=[a-z]+,class-free\]" 1
+logger -expect log "p_u: cover reached \(depth [0-9]+\) \[lowering=[a-z]+,class-free\]" 1
+logger -expect log "p_n: proved \[lowering=[a-z]+\]" 1
+read_verilog -sv -formal <<EOT
+package p;
+  class cdb #(type T=int);
+    static function bit get(string a, inout T v); endfunction
+  endclass
+  class root;
+    task tk(input int a, output logic [3:0] o); o = 4'd0; endtask
+    function bit en(int a); return 1'b0; endfunction
+  endclass
+  root top_h;
+endpackage
+import p::*;
+module t(input logic clk);
+  logic [1:0] n = 0;
+  // initial-block outputs: no declaration initializer (fe218: two
+  // time-0 sources would be refused)
+  bit v;
+  int u;
+  logic [3:0] w = 4'd0;
+  logic y = 1'b0;
+  logic [3:0] s1 = 4'd0, s2 = 4'd0;
+  initial begin
+    void'(p::cdb#(bit)::get("v", v));
+    p::cdb#(int)::get("u", u);
+  end
+  always @(posedge clk) begin
+    top_h.tk(1, w);
+    y <= top_h.en(2);
+    n <= n + 1;
+    s1 <= w;
+    s2 <= w;
+  end
+  p_v: assert property (@(posedge clk) v == 1'b0);
+  p_w: assert property (@(posedge clk) w == 4'd0);
+  p_y: assert property (@(posedge clk) y == 1'b0);
+  // reads the free value w through two registers: proved, tagged
+  p_q: assert property (@(posedge clk) s1 == s2);
+  p_u: cover property (@(posedge clk) u == 32'd7);
+  p_n: assert property (@(posedge clk) n == n);
+endmodule
+EOT
+hierarchy -check -top t
+proc
+select -assert-none A:sv_degraded
+select -assert-count 4 t/a:sv_class_free
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# an output actual that is not a plain variable: refused
+logger -expect warning "Unresolved task `\\top_h.tk'; the call is ignored" 1
+read_verilog -sv -formal -permissive <<EOT
+package p;
+  class root; task tk(output logic [3:0] o); o = 4'd0; endtask endclass
+  root top_h;
+endpackage
+import p::*;
+module c(input logic clk);
+  logic [1:0] a, b;
+  always @(posedge clk) top_h.tk({a, b});
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# an initial-block output actual into a variable with a declaration
+# initializer: two time-0 sources, one free (fe218): refused
+logger -expect warning "Initial block drives `i.v' with 2 time-0 sources" 1
+read_verilog -sv -formal <<EOT
+package p;
+  class cdb #(type T=int);
+    static function bit get(string a, inout T v); endfunction
+  endclass
+endpackage
+module i(input logic clk);
+  int v = 0;
+  initial void'(p::cdb#(int)::get("v", v));
+endmodule
+EOT
+hierarchy -top i
+proc
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# a value use of a class function with an output formal: refused
+logger -expect warning "Unresolved function `\\top_h.g'; the call becomes constant 0" 1
+read_verilog -sv -formal -permissive <<EOT
+package p;
+  class root; function bit g(output int o); o = 1; return 1'b1; endfunction endclass
+  root top_h;
+endpackage
+import p::*;
+module f(input logic clk);
+  int x;
+  logic r;
+  always @(posedge clk) r <= top_h.g(x);
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# fe217b.  A package function whose body is class code and writes no design
+# state (UVM's `uvm_info chain: uvm_report_enabled, uvm_get_report_object,
+# uvm_report_info) is class code too: a value use is a free value, a
+# statement call is dropped.  A handle assigned by class code is not
+# modelled; a method through a block-local handle resolves through the
+# handle's recorded class.  The package is read as a separate file, as
+# uvm_pkg is; one call is made from a module task.
+logger -expect log "call of `\\enabled' runs only class code; its value is free" 2
+logger -expect log "call of `\\p::report_info' runs only class code; it is simulation-only and dropped" 1
+logger -expect log "class handle `.*_lro_' assigned by class code" 1
+logger -expect log "class function call `.*_lro_\.lvl' is simulation-only; its value is free" 1
+logger -expect log "p_e: disproved \(depth [0-9]+\) \[lowering=[a-z]+,class-free\]" 1
+logger -expect log "p_k: disproved \(depth [0-9]+\) \[lowering=[a-z]+,class-free\]" 1
+logger -expect log "p_n: proved \[lowering=[a-z]+\]" 1
+read_verilog -sv -formal <<EOT
+package p;
+  class ro;
+    function int lvl(int s); return 0; endfunction
+    function ro get_ro(); return this; endfunction
+  endclass
+  class cs_t;
+    extern static function cs_t get();
+    virtual function ro get_root(); return null; endfunction
+  endclass
+  function cs_t cs_t::get(); return null; endfunction
+  function ro get_obj();
+    ro top;
+    cs_t cs;
+    cs = cs_t::get();
+    top = cs.get_root();
+    return top;
+  endfunction
+  function int enabled(int v);
+    ro r;
+    r = get_obj();
+    return r.lvl(v);
+  endfunction
+  function void report_info(string id, int v);
+    ro r;
+    r = get_obj();
+    void'(r.lvl(v));
+  endfunction
+endpackage
+EOT
+read_verilog -sv -formal <<EOT
+import p::*;
+module t(input logic clk);
+  logic [1:0] n = 0;
+  int e = 0, k = 0;
+  task automatic chk(output int o); o = enabled(4); endtask
+  always @(posedge clk) begin
+    n <= n + 1;
+    e <= enabled(3);
+    chk(k);
+    begin
+      p::ro _lro_;
+      _lro_ = p::get_obj().get_ro();
+      if (_lro_.lvl(1) >= 2)
+        p::report_info("ID", 2);
+    end
+  end
+  p_e: assert property (@(posedge clk) e == 0);
+  p_k: assert property (@(posedge clk) k == 0);
+  p_n: assert property (@(posedge clk) n == n);
+endmodule
+EOT
+hierarchy -check -top t
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# ... a function that also writes a package variable is not taken whole:
+# it is inlined (the write is modelled) and only its class call is free
+logger -expect log "class function call `.*\.r\.en' is simulation-only; its value is free" 1
+logger -expect log "p_c: cover reached" 1
+read_verilog -sv -formal <<EOT
+package q;
+  class root; function int en(int a); return 0; endfunction endclass
+  int cnt;
+  function int bump(int v); root r; cnt = cnt + 1; return r.en(v); endfunction
+endpackage
+module w(input logic clk);
+  int e;
+  always @(posedge clk) e <= q::bump(1);
+  p_c: cover property (@(posedge clk) q::cnt == 32'd2);
+endmodule
+EOT
+hierarchy -check -top w
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# an initial-block output actual into a variable an always block also
+# writes: a non-constant init value (fe218, proc_init): refused
+logger -expect warning "Skipping non-constant init value for \\v" 1
+read_verilog -sv -formal <<EOT
+package p;
+  class cdb #(type T=int);
+    static function bit get(string a, inout T v); endfunction
+  endclass
+endpackage
+module r(input logic clk);
+  int v;
+  initial void'(p::cdb#(int)::get("v", v));
+  always @(posedge clk) v <= v + 1;
+endmodule
+EOT
+hierarchy -top r
+proc
+select -assert-any A:sv_degraded
+logger -check-expected

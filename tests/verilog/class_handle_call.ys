@@ -3,8 +3,9 @@
 # unresolved task.  The handle is a simulation-only placeholder that now
 # records its class; when that class declares the method and every formal
 # is an input, the call is dropped like fe215's static class calls.  A
-# method with an output formal, or one the class does not declare itself
-# (inherited), stays a degradation.  Refusals are read with -permissive so
+# method the class does not declare itself (inherited) stays a
+# degradation; one with an output formal gives its actual a free value
+# since fe217 (was a degradation).  Refusals are read with -permissive so
 # every block runs (an expected error ends the script).
 
 logger -expect log "class method call `\\top_h.run_test' is simulation-only; dropped" 1
@@ -40,9 +41,10 @@ ic3 -init-zero
 logger -check-expected
 design -reset
 
-# a method with an output formal writes its actual: refused
-logger -expect warning "Unresolved task `\\top_h.get'; the call is ignored" 1
-read_verilog -sv -formal -permissive <<EOT
+# a method with an output formal writes its actual: since fe217 (user
+# decision 2026-11-18) the actual gets a free value (class_call_free.ys)
+logger -expect log "class method call `\\top_h.get' is simulation-only; dropped; its output actuals get free values" 1
+read_verilog -sv -formal <<EOT
 package p;
   class root; task get(output int o); o = 1; endtask endclass
   root top_h;
@@ -53,7 +55,7 @@ module g(input logic clk);
   initial top_h.get(x);
 endmodule
 EOT
-select -assert-any A:sv_degraded
+select -assert-none A:sv_degraded
 logger -check-expected
 design -reset
 

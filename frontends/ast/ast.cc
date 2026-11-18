@@ -1805,7 +1805,11 @@ static void rename_in_package_stmts(AstNode *pkg)
 				// name of a typedef cloned in from an imported package)
 				// is not this package's to prefix again (register v3 D13:
 				// `build_config_pkg::config_pkg::cva6_cfg_t`)
-				auto it = child->str.empty() || child->str.find("::") != std::string::npos ? idents.end() : idents.find(child->str);
+				// fe218: an internal name (`$urandom$1', the hidden wire of
+				// a package variable's `= $urandom' initializer) is cloned
+				// with that name; qualifying it as `\pk::urandom$1' bound the
+				// reference to a dummy wire, a 1-bit free value
+				auto it = child->str.empty() || child->str[0] != '\\' || child->str.find("::") != std::string::npos ? idents.end() : idents.find(child->str);
 				if (it != idents.end())
 					child->str = it->second + "::" + child->str.substr(1);
 				rename(child);

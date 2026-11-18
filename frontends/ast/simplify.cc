@@ -3728,6 +3728,49 @@ static std::unique_ptr<AstNode> array_param_flat_value(AstNode *src, AstSrcLocTy
 	return AstNode::mkconst_bits(loc, flat, false);
 }
 
+
+// fe215: the declaration of a class method named by a call `C::m' /
+// `pkg::C::m' (class parameters are already dropped from the name).
+// Returns 1 when it is found and every formal is an input (the call writes
+// no design state: class code is simulation-only), 0 when it is found with
+// an output/inout/ref formal, -1 when no declaration is found (inherited
+// method, unknown class, not a class scope).
+static int class_method_input_only(const std::string &str)
+{
+	size_t sep = str.rfind("::");
+	if (sep == std::string::npos || sep < 2)
+		return -1;
+	std::string cls = str.substr(0, sep), meth = "\\" + str.substr(sep + 2);
+	std::string tail = "::" + cls.substr(1);
+	auto match = [&](AstNode *c) {
+		if (c->type != AST_CLASS || c->attributes.count(ID(sv_covergroup)))
+			return false;
+		const std::string &n = c->str;
+		return n == cls || (n.size() > tail.size() && n.compare(n.size() - tail.size(), std::string::npos, tail) == 0);
+	};
+	std::vector<AstNode*> roots;
+	if (current_ast_mod) roots.push_back(current_ast_mod);
+	if (current_ast) {
+		roots.push_back(current_ast);
+		for (auto &n : current_ast->children)
+			if (n && n->type == AST_PACKAGE)
+				roots.push_back(n.get());
+	}
+	for (auto r : roots)
+		for (auto &c : r->children) {
+			if (!c || !match(c.get()))
+				continue;
+			for (auto &m : c->children)
+				if (m && (m->type == AST_TASK || m->type == AST_FUNCTION) && m->str == meth) {
+					for (auto &w : m->children)
+						if (w && w->type == AST_WIRE && w->port_id > 0 && (w->is_output || w->attributes.count(ID(sv_ref))))
+							return 0;
+					return 1;
+				}
+		}
+	return -1;
+}
+
 bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hint)
 {
 	{
@@ -11736,7 +11779,18 @@ skip_memory_write:;
 				// and their tests expect a warning-free elaboration.
 				bool severity_task = str == "\\$fatal" || str == "\\$error" || str == "\\$warning" || str == "\\$info" ||
 						str == "$fatal" || str == "$error" || str == "$warning" || str == "$info";
-				if (!severity_task)
+				// fe215 (user decision 2026-11-17): a call of a class method
+				// (`C::m(..)', `pkg::C#(..)::m(..)', e.g. uvm_config_db::set)
+				// runs class code, which is simulation-only and not modeled.
+				// It writes no design state when every formal of the method's
+				// declaration is an input, so the call is dropped; a method
+				// with an output/inout/ref formal, or one whose declaration is
+				// not found (inherited, unknown class), stays a degradation.
+				bool class_call_dropped = !severity_task && class_method_input_only(str) == 1;
+				if (class_call_dropped)
+					log("%s: class method call `%s' is simulation-only; dropped (every formal is an input).\n",
+							location.to_string().c_str(), str.c_str());
+				else if (!severity_task)
 					degrade(location.to_loc(), "Unresolved task `%s'; the call is ignored.\n", str.c_str());
 				newNode = std::make_unique<AstNode>(location, AST_BLOCK);
 				goto apply_newNode;

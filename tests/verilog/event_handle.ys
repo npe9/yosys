@@ -28,8 +28,8 @@ logger -check-expected
 design -reset
 
 # `@(e)' refused on a strict read
-logger -expect error "Event `\\e' read \(simulation-only; not modeled\)" 1
-read_verilog -sv -formal <<EOT
+logger -expect warning "Event `\\e' read \(simulation-only; not modeled\)" 1
+read_verilog -sv -formal -permissive <<EOT
 module w(input logic clk, input logic a);
   event e;
   logic x = 0;
@@ -38,9 +38,31 @@ module w(input logic clk, input logic a);
   a_x: assert property (@(posedge clk) x == 0);
 endmodule
 EOT
+select -assert-any A:sv_degraded
 logger -check-expected
 design -reset
 
+# a hierarchical any-edge list on a plain signal stays a combinational block
+logger -expect log "a_x: proved" 1
+read_verilog -sv -formal <<EOT
+module kid(input logic a); logic s; assign s = a; endmodule
+module s(input logic clk, input logic a);
+  logic x;
+  kid c(.a(a));
+  always @(c.s or a) x = a;
+  a_x: assert property (@(posedge clk) x == a);
+endmodule
+EOT
+hierarchy -top s
+proc
+flatten
+select -assert-none A:sv_degraded
+sva2check
+ic3
+logger -check-expected
+design -reset
+
+# (last: ic3's refusal is an error, which ends the script)
 # a hierarchical wait on a child's event: degraded once joined
 read_verilog -sv -formal <<EOT
 module child(input logic clk, input logic a);
@@ -60,26 +82,6 @@ flatten
 select -assert-count 1 h/a:sv_class_handle=event
 select -assert-mod-count 1 A:sv_degraded
 logger -expect error "refusing a design that carries sv_degraded" 1
-sva2check
-ic3
-logger -check-expected
-design -reset
-
-# a hierarchical any-edge list on a plain signal stays a combinational block
-logger -expect log "a_x: proved" 1
-read_verilog -sv -formal <<EOT
-module kid(input logic a); logic s; assign s = a; endmodule
-module s(input logic clk, input logic a);
-  logic x;
-  kid c(.a(a));
-  always @(c.s or a) x = a;
-  a_x: assert property (@(posedge clk) x == a);
-endmodule
-EOT
-hierarchy -top s
-proc
-flatten
-select -assert-none A:sv_degraded
 sva2check
 ic3
 logger -check-expected

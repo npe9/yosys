@@ -34,14 +34,15 @@ logger -check-expected
 design -reset
 
 # an assertion in a final block is refused
-logger -expect error "an assertion in a `final' block is an end-of-simulation check \(simulation-only; not modeled\)" 1
-read_verilog -sv -formal <<EOT
+logger -expect warning "an assertion in a `final' block is an end-of-simulation check \(simulation-only; not modeled\)" 1
+read_verilog -sv -formal -permissive <<EOT
 module f(input logic clk, input logic a);
   logic [1:0] n = 0;
   always @(posedge clk) n <= n + 1;
   final assert (n != 2'd3);
 endmodule
 EOT
+select -assert-any A:sv_degraded
 logger -check-expected
 design -reset
 

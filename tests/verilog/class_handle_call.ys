@@ -1,0 +1,91 @@
+# fe216.  A method call through a package class handle (`h.m(..)',
+# `pkg::h.m(..)', e.g. the core-v-verif tb's `uvm_top.run_test();') was an
+# unresolved task.  The handle is a simulation-only placeholder that now
+# records its class; when that class declares the method and every formal
+# is an input, the call is dropped like fe215's static class calls.  A
+# method with an output formal, or one the class does not declare itself
+# (inherited), stays a degradation.  Refusals are read with -permissive so
+# every block runs (an expected error ends the script).
+
+logger -expect log "class method call `\\top_h.run_test' is simulation-only; dropped" 1
+logger -expect log "class method call `\\p::top_h.run_test' is simulation-only; dropped" 1
+logger -expect log "class method call `\\top_h.f' is simulation-only; dropped" 1
+logger -expect log "p_n: proved" 1
+read_verilog -sv -formal <<EOT
+package p;
+  class root;
+    extern virtual task run_test(string s = "");
+    function int f(int a); return a; endfunction
+  endclass
+  task root::run_test(string s = ""); endtask
+  root top_h;
+endpackage
+import p::*;
+module t(input logic clk);
+  logic [1:0] n = 0;
+  initial begin
+    top_h.run_test();
+    p::top_h.run_test("a");
+    void'(top_h.f(1));
+  end
+  always @(posedge clk) n <= n + 1;
+  p_n: assert property (@(posedge clk) n == n);
+endmodule
+EOT
+hierarchy -check -top t
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# a method with an output formal writes its actual: refused
+logger -expect warning "Unresolved task `\\top_h.get'; the call is ignored" 1
+read_verilog -sv -formal -permissive <<EOT
+package p;
+  class root; task get(output int o); o = 1; endtask endclass
+  root top_h;
+endpackage
+import p::*;
+module g(input logic clk);
+  int x;
+  initial top_h.get(x);
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# an inherited method (not declared in the handle's class): refused
+logger -expect warning "Unresolved task `\\top_h.run_base'; the call is ignored" 1
+read_verilog -sv -formal -permissive <<EOT
+package p;
+  class base; virtual task run_base(string s = ""); endtask endclass
+  class root extends base; endclass
+  root top_h;
+endpackage
+import p::*;
+module h(input logic clk);
+  initial top_h.run_base();
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# a local variable of the same name shadows the package handle: refused
+logger -expect warning "Unresolved task `\\top_h.run_test'; the call is ignored" 1
+read_verilog -sv -formal -permissive <<EOT
+package p;
+  class root; task run_test(); endtask endclass
+  root top_h;
+endpackage
+import p::*;
+module s(input logic clk);
+  logic top_h;
+  initial top_h.run_test();
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected

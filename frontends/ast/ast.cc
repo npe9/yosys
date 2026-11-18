@@ -2244,6 +2244,7 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 				for (auto it = pc.begin(); it != pc.end(); ) {
 					AstNode *n = it->get();
 					const char *what = nullptr;
+					std::string handle_class;
 					// a typedef of a class type (`typedef uvm_object_string_pool
 					// #(uvm_barrier) uvm_barrier_pool;') names a class too
 					const AstNode *decl = n;
@@ -2254,8 +2255,10 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 						for (auto &c : decl->children) {
 							if (c && (c->type == AST_RANGE || c->type == AST_MULTIRANGE) && has_dollar(c.get()))
 								what = n->type == AST_TYPEDEF ? "queue typedef" : "queue";
-							if (c && c->type == AST_WIRETYPE && class_names.count(c->str))
+							if (c && c->type == AST_WIRETYPE && class_names.count(c->str)) {
 								what = n->type == AST_TYPEDEF ? "class typedef" : "variable of simulation-only type";
+								handle_class = c->str;
+							}
 						}
 					if (what && n->type == AST_TYPEDEF)
 						class_names.insert(n->str);
@@ -2269,6 +2272,10 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 						auto ph = std::make_unique<AstNode>(n->location, AST_WIRE);
 						ph->str = n->str;
 						ph->set_attribute(ID(sv_sim_only_storage), AstNode::mkconst_int(n->location, 1, false));
+						// fe216: a handle's class, for its method calls
+						// (simplify's class_method_input_only)
+						if (!handle_class.empty() && decl->type == AST_WIRE)
+							ph->set_attribute(ID(sv_sim_only_class), AstNode::mkconst_str(n->location, handle_class));
 						dropped.insert(n->str);
 						*it = std::move(ph);
 					}

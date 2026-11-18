@@ -3737,6 +3737,43 @@ static std::unique_ptr<AstNode> array_param_flat_value(AstNode *src, AstSrcLocTy
 // method, unknown class, not a class scope).
 static int class_method_input_only(const std::string &str)
 {
+	// fe216: a call through a handle (`h.m(..)', `pkg::h.m(..)') whose
+	// head is a package class-handle placeholder (AstNode::process tags it
+	// with its class): the method of that class
+	size_t dot = str.find('.');
+	if (dot != std::string::npos) {
+		std::string head = str.substr(0, dot), meth = str.substr(dot + 1);
+		if (meth.empty() || meth.find('.') != std::string::npos || meth.find("::") != std::string::npos)
+			return -1;
+		AstNode *h = nullptr;
+		if (current_scope.count(head))
+			h = current_scope.at(head);
+		// a bare name through `import p::*' / `import p::h' binds to the
+		// module's qualified clone `p::h' (as fe119 does for a read)
+		if (!h && current_ast_mod && head.find("::") == std::string::npos)
+			for (auto &imp : current_ast_mod->children) {
+				if (!imp || imp->type != AST_IMPORT)
+					continue;
+				bool named = imp->children.empty();
+				for (auto &it : imp->children)
+					if (it && it->str == head)
+						named = true;
+				auto qi = current_scope.find(imp->str + "::" + head.substr(1));
+				if (named && qi != current_scope.end() && qi->second) {
+					h = qi->second;
+					break;
+				}
+			}
+		if (!h && current_ast)
+			for (auto &pk : current_ast->children)
+				if (pk && pk->type == AST_PACKAGE)
+					for (auto &c : pk->children)
+						if (c && c->type == AST_WIRE && pk->str + "::" + c->str.substr(1) == head)
+							h = c.get();
+		if (!h || !h->attributes.count(ID(sv_sim_only_storage)) || !h->attributes.count(ID(sv_sim_only_class)))
+			return -1;
+		return class_method_input_only(h->attributes.at(ID(sv_sim_only_class))->str + "::" + meth);
+	}
 	size_t sep = str.rfind("::");
 	if (sep == std::string::npos || sep < 2)
 		return -1;

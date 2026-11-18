@@ -1,0 +1,154 @@
+# fe215.  (1) A call of a class method (`C::m(..)', `pkg::C#(..)::m(..)',
+# e.g. the core-v-verif tb's `uvm_config_db#(virtual ..)::set(..)') was an
+# unresolved task, a degradation.  Class code is simulation-only; when every
+# formal of the method's declaration is an input the call writes no design
+# state and is dropped.  A method with an output/inout/ref formal, or one
+# whose declaration is not found, stays a degradation.
+# (2) `void'(f(..));' dropped the whole call, so the writes of $cast, the
+# scanf family and of functions with output formals were lost silently:
+# `x = 5; void'($cast(x, in));' made x constant 5.  The value is discarded,
+# not the call.  $value$plusargs stays dropped: in the fe102 model (a run
+# with no plusargs) it writes nothing.
+
+# input-only class methods (task and void'-cast function) are dropped
+logger -expect log "cdb::set' is simulation-only; dropped" 2
+logger -expect log "class method call `\\p::cdb::f' is simulation-only; dropped" 1
+logger -expect log "p_n: proved" 1
+read_verilog -sv -formal <<EOT
+package p;
+  class cdb #(type T=int);
+    static function void set(string a, T v); endfunction
+    static function int f(int a); return a; endfunction
+  endclass
+endpackage
+import p::*;
+module t(input logic clk);
+  logic [1:0] n = 0;
+  initial begin
+    p::cdb#(int)::set("v", 1);
+    cdb#(int)::set("w", 2);
+    void'(p::cdb#(int)::f(3));
+  end
+  always @(posedge clk) n <= n + 1;
+  p_n: assert property (@(posedge clk) n == n);
+endmodule
+EOT
+hierarchy -check -top t
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# (refusals are read with -permissive: the degradation is a warning and
+# the module is marked sv_degraded)
+
+# a class method with an inout formal writes its actual: refused
+logger -expect warning "Unresolved function `\\p::cdb::get'; the call becomes constant 0" 1
+read_verilog -sv -formal -permissive <<EOT
+package p;
+  class cdb #(type T=int);
+    static function bit get(string a, inout T v); endfunction
+  endclass
+endpackage
+module g(input logic clk);
+  int x;
+  initial begin x = 0; void'(p::cdb#(int)::get("v", x)); end
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# a class task with an output formal: refused
+logger -expect warning "Unresolved task `\\p::cdb::tk'; the call is ignored" 1
+read_verilog -sv -formal -permissive <<EOT
+package p;
+  class cdb #(type T=int);
+    static task tk(output int o); endtask
+  endclass
+endpackage
+module k(input logic clk);
+  int x;
+  initial p::cdb#(int)::tk(x);
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# an inherited method (no declaration in the named class): refused
+logger -expect warning "Unresolved task `\\p::sub::set'; the call is ignored" 1
+read_verilog -sv -formal -permissive <<EOT
+package p;
+  class base; static function void set(string a); endfunction endclass
+  class sub extends base; endclass
+endpackage
+module h(input logic clk);
+  initial p::sub::set("v");
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# void'($cast(..)) writes its first argument: refused
+logger -expect warning "`void'\(\$cast\(\.\.\)\)' writes an argument; the write is not modeled" 1
+read_verilog -sv -formal -permissive <<EOT
+module c(input logic clk, input logic [7:0] in);
+  int x;
+  always_comb begin x = 5; void'($cast(x, in)); end
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# void'($urandom()) and void' of a design function: the value is discarded
+logger -expect log "`void'\(\$urandom\(\.\.\)\)' is dropped" 1
+logger -expect log "p_x: proved" 1
+logger -expect log "p_y: proved" 1
+read_verilog -sv -formal <<EOT
+module d(input logic clk, input logic [7:0] in);
+  function automatic int inc(int a); return a + 1; endfunction
+  int x;
+  logic [7:0] y = 0;
+  always_comb begin x = 5; void'(inc(x)); void'($urandom()); end
+  always_ff @(posedge clk) begin y <= 8'd3; void'(inc(y)); end
+  p_x: assert property (@(posedge clk) x == 5);
+  p_y: assert property (@(posedge clk) y == 0 || y == 3);
+endmodule
+EOT
+hierarchy -check -top d
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# void'($value$plusargs(..)): no plusargs, so the variable is not written
+# (opentitan prim_util_memload's show_mem_paths)
+logger -expect log "`void'\(\$value\$plusargs\(\.\.\)\)' is dropped \(the model is a run with no plusargs\)" 2
+logger -expect log "p_e: proved" 1
+read_verilog -sv -formal <<EOT
+module v(input logic clk);
+  logic e = 1'b0;
+  initial begin
+    logic show_mem_paths;
+    void'($value$plusargs("show_mem_paths=%0b", show_mem_paths));
+    if (show_mem_paths) $display("%m");
+    void'($value$plusargs("e=%d", e));
+  end
+  logic [1:0] n = 0;
+  always @(posedge clk) n <= e ? 2'd1 : 2'd0;
+  p_e: assert property (@(posedge clk) n == 0);
+endmodule
+EOT
+hierarchy -check -top v
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected

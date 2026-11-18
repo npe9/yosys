@@ -5034,6 +5034,66 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		return false;
 	}
 
+	// fe215: `void'(f(..));' (IEEE 1800-2017 13.4.1) discards the value, not
+	// the call: a system function that writes an argument ($cast, the
+	// scanf family) is a degradation ($value$plusargs writes nothing in
+	// the fe102 model of a run with no plusargs), other system
+	// functions are dropped; a class method whose formals are all inputs is
+	// dropped (class code is simulation-only); any other call is evaluated
+	// as an assignment to a fresh unused variable, so a user function's
+	// effects and the unresolved-call degradation stay as for a value use.
+	if (type == AST_TCALL && attributes.count(ID(sv_void_cast))) {
+		attributes.erase(ID(sv_void_cast));
+		std::string b = (!str.empty() && str[0] == '\\' && str.size() > 1 && str[1] == '$') ? str.substr(1) : str;
+		if (!b.empty() && b[0] == '$') {
+			static const pool<std::string> writers = {"$cast", "$sscanf", "$fscanf", "$fgets", "$fread"};
+			if (writers.count(b))
+				degrade(location.to_loc(), "`void'(%s(..))' writes an argument; the write is not modeled.\n", b.c_str());
+			else if (b == "$value$plusargs")
+				// fe102: the model is a run with no plusargs, in which the
+				// call leaves its output argument unwritten
+				log("%s: `void'($value$plusargs(..))' is dropped (the model is a run with no plusargs).\n",
+						location.to_string().c_str());
+			else
+				log("%s: `void'(%s(..))' is dropped (the value is discarded).\n", location.to_string().c_str(), b.c_str());
+			delete_children();
+			type = AST_BLOCK;
+			str.clear();
+		} else if (class_method_input_only(str) == 1) {
+			log("%s: class method call `%s' is simulation-only; dropped (every formal is an input).\n",
+					location.to_string().c_str(), str.c_str());
+			delete_children();
+			type = AST_BLOCK;
+			str.clear();
+		} else if (current_ast_mod) {
+			std::string tmpname = stringf("$voidcast$%d", autoidx++);
+			auto tmp_wire = std::make_unique<AstNode>(location, AST_WIRE);
+			tmp_wire->str = tmpname;
+			tmp_wire->is_logic = true;
+			tmp_wire->is_reg = true;
+			tmp_wire->set_attribute(ID::nosync, AstNode::mkconst_int(location, 1, false));
+			AstNode *tmp_wire_p = tmp_wire.get();
+			while (tmp_wire_p->simplify(true, 1, -1, false)) { }
+			current_scope[tmpname] = tmp_wire_p;
+			current_ast_mod->children.push_back(std::move(tmp_wire));
+			auto call = std::make_unique<AstNode>(location, AST_FCALL);
+			call->str = str;
+			call->children = std::move(children);
+			children.clear();
+			auto lhs = std::make_unique<AstNode>(location, AST_IDENTIFIER);
+			lhs->str = tmpname;
+			type = AST_ASSIGN_EQ;
+			str.clear();
+			children.push_back(std::move(lhs));
+			children.push_back(std::move(call));
+		} else {
+			degrade(location.to_loc(), "`void'(%s(..))' outside a module; the call is ignored.\n", str.c_str());
+			delete_children();
+			type = AST_BLOCK;
+			str.clear();
+		}
+	}
+
 	// deactivate all calls to non-synthesis system tasks
 	// note that $display, $finish, and $stop are used for synthesis-time DRC so they're not in this list
 	if ((type == AST_FCALL || type == AST_TCALL) && (str == "$strobe" || str == "$monitor" || str == "$time" ||

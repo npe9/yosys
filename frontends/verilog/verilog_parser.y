@@ -5967,7 +5967,16 @@ behavioral_stmt:
 		}
 	} |
 	TOK_VOID OP_CAST TOK_LPAREN expr TOK_RPAREN TOK_SEMICOL {
-		(void)$4;
+		// fe215: the call is kept (simplify decides; see sv_void_cast):
+		// dropping it dropped the writes of $cast, $value$plusargs and of
+		// functions with output formals
+		if ($4 && $4->type == AST_FCALL) {
+			auto node = std::make_unique<AstNode>(@$, AST_TCALL);
+			node->str = $4->str;
+			node->children = std::move($4->children);
+			node->set_attribute(ID(sv_void_cast), AstNode::mkconst_int(@$, 1, false));
+			extra->saveChild(std::move(node));
+		}
 	} |
 	attr TOK_MSG_TASKS {
 		AstNode* node = extra->pushChild(std::make_unique<AstNode>(@$, AST_TCALL));

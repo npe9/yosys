@@ -48,6 +48,7 @@ struct ProcPass : public Pass {
 		log("    proc_clean\n");
 		log("    proc_past_init\n");
 		log("    opt_expr -keepdc\n");
+		log("    proc_initcheck (when an initial block drives a wire)\n");
 		log("\n");
 		log("This replaces the processes in the design with multiplexers,\n");
 		log("flip-flops and latches.\n");
@@ -140,6 +141,17 @@ struct ProcPass : public Pass {
 		Pass::call(design, "proc_past_init");
 		if (!noopt)
 			Pass::call(design, "opt_expr -keepdc");
+		// fe218: initial-block drivers, checked after folding (only run
+		// when the frontend marked such a wire)
+		{
+			bool any_init_drv = false;
+			for (auto mod : design->selected_modules())
+				for (auto w : mod->wires())
+					if (w->attributes.count(ID(sv_init_drv)))
+						any_init_drv = true;
+			if (any_init_drv)
+				Pass::call(design, "proc_initcheck");
+		}
 
 		log_pop();
 	}

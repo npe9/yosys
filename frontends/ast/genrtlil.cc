@@ -556,6 +556,30 @@ struct AST_INTERNAL::ProcessGenerator
 		}
 
 		outputSignals = RTLIL::SigSpec(subst_lvalue_from);
+
+		// fe218: an initial block's `always' sync rule is a continuous
+		// driver; that is exact only for a value constant at time 0.  The
+		// wires it drives are marked so proc_initcheck can check that
+		// after folding (the init-rule bits, written by an always block
+		// too, are proc_init's).
+		if (always->type == AST_INITIAL) {
+			pool<RTLIL::SigBit> init_bits;
+			for (auto b : initSyncSignals)
+				init_bits.insert(b);
+			// a per-bit mask: an always block may write the other bits.
+			// A class or covergroup handle is skipped: a design read of
+			// one is already a degradation (fe176), so the value written
+			// (`cg_inst = new' under a condition) cannot reach a check.
+			for (auto b : subst_lvalue_from)
+				if (b.wire && !init_bits.count(b) && !b.wire->attributes.count(ID(sv_class_handle))) {
+					RTLIL::Const mask = b.wire->attributes.count(ID(sv_init_drv)) ?
+							b.wire->attributes.at(ID(sv_init_drv)) : RTLIL::Const(RTLIL::State::S0, b.wire->width);
+					if (GetSize(mask) != b.wire->width)
+						mask = RTLIL::Const(RTLIL::State::S0, b.wire->width);
+					mask.set(b.offset, RTLIL::State::S1);
+					b.wire->attributes[ID(sv_init_drv)] = mask;
+				}
+		}
 	}
 
 	// a constant x or z bit assigned to a 2-state variable is 0 (IEEE

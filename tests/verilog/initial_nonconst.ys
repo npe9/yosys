@@ -1,0 +1,156 @@
+# fe218.  An initial block (and a declaration initializer) is lowered to a
+# process with an `always' sync rule, a continuous driver.  That is exact
+# for a value constant at time 0 only: `int v; initial v = w;' made v
+# follow w forever (`v == w' proved), and two time-0 sources
+# (`int v = 0; initial v = w;', two initial blocks) were two drivers folded
+# to the first (`v == 0' proved).  A variable an always block writes takes
+# the init-rule path, where proc_init skipped a non-constant value with a
+# warning and the variable started from 0 under -init-zero.  Each is now a
+# degradation, found by proc (proc_initcheck, after folding, so a value
+# that folds to a constant is fine).  A single free time-0 constant
+# ($anyconst, $urandom in an initial block) stays exact.
+
+# constants (one or several time-0 sources, the later one wins) and a
+# single free time-0 value are modelled
+logger -expect log "p_c: proved" 1
+logger -expect log "p_d: disproved" 1
+logger -expect log "p_u: disproved" 1
+logger -expect log "p_h: proved" 1
+read_verilog -sv -formal <<EOT
+module t(input logic clk);
+  int c = 0;
+  initial c = 5;
+  int u;
+  initial u = $urandom();
+  int h = 3;
+  p_c: assert property (@(posedge clk) c == 5);
+  p_d: assert property (@(posedge clk) c == 0);
+  p_u: assert property (@(posedge clk) u == 0);
+  p_h: assert property (@(posedge clk) h == 3);
+endmodule
+EOT
+hierarchy -check -top t
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# a non-constant value: refused
+logger -expect warning "Initial block drives `[^ ]*v' with a value that is not constant at time 0" 1
+read_verilog -sv -formal <<EOT
+module a(input logic clk, input logic [31:0] w);
+  int v;
+  initial v = w;
+endmodule
+EOT
+hierarchy -top a
+proc
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# a value under a non-constant condition: refused
+logger -expect warning "Initial block drives `[^ ]*v' with a value that is not constant at time 0" 1
+read_verilog -sv -formal <<EOT
+module b(input logic clk, input logic [31:0] w);
+  int v;
+  initial if (w[0]) v = 1; else v = 2;
+endmodule
+EOT
+hierarchy -top b
+proc
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# a declaration initializer and an initial block, one not constant: refused
+logger -expect warning "Initial block drives `[^ ]*v' with 2 time-0 sources" 1
+logger -expect warning "Initial block drives `[^ ]*x' with 2 time-0 sources" 1
+read_verilog -sv -formal <<EOT
+module c(input logic clk, input logic [31:0] w);
+  int v = 0;
+  initial v = w;
+  int x = 0;
+  initial x = $urandom();
+endmodule
+EOT
+hierarchy -top c
+proc
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# a non-constant init value of a variable an always block writes: refused
+logger -expect warning "\[sv_degraded\] Skipping non-constant init value for \\r" 1
+read_verilog -sv -formal <<EOT
+module d(input logic clk);
+  logic r;
+  initial r = $urandom();
+  always @(posedge clk) r <= r;
+endmodule
+EOT
+hierarchy -top d
+proc
+select -assert-any A:sv_degraded
+logger -check-expected
+design -reset
+
+# a package variable's `= $urandom' initializer, cloned into the importing
+# module: its hidden wire was renamed `\pk::urandom$1' and bound to a
+# 1-bit dummy wire, so the upper bits were 0
+logger -expect log "p_s: disproved" 1
+read_verilog -sv -formal <<EOT
+package pk;
+  int unsigned seed = $urandom;
+endpackage
+module s(input logic clk);
+  import pk::*;
+  p_s: assert property (@(posedge clk) seed[31:1] == 0);
+endmodule
+EOT
+hierarchy -check -top s
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# a covergroup handle constructed under a condition (lowRISC's
+# DV_FCOV_INSTANTIATE_CG): a handle is not modelled and a design read of one
+# is a degradation (fe176), so its initial-block write is not checked
+logger -expect log "p_n: proved" 1
+read_verilog -sv -formal <<EOT
+module h(input logic clk, input logic a);
+  covergroup cg_t @(posedge clk); coverpoint a; endgroup
+  bit en;
+  cg_t cg_inst;
+  initial begin #1; if (en) cg_inst = new; end
+  logic [1:0] n = 0;
+  always @(posedge clk) n <= n;
+  p_n: assert property (@(posedge clk) n == 0);
+endmodule
+EOT
+hierarchy -check -top h
+proc
+select -assert-none A:sv_degraded
+sva2check
+ic3 -init-zero
+logger -check-expected
+design -reset
+
+# ... and reading the handle is still refused
+logger -expect warning "Covergroup handle `\\cg_inst' read \(simulation-only; not modeled\)" 1
+read_verilog -sv -formal -permissive <<EOT
+module r(input logic clk, input logic a, output logic o);
+  covergroup cg_t @(posedge clk); coverpoint a; endgroup
+  bit en;
+  cg_t cg_inst;
+  initial begin #1; if (en) cg_inst = new; end
+  assign o = cg_inst;
+endmodule
+EOT
+select -assert-any A:sv_degraded
+logger -check-expected

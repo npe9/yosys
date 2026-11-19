@@ -3805,6 +3805,84 @@ static AstNode *class_method_decl(const std::string &str)
 	return nullptr;
 }
 
+
+// fe219: the declaration of class `name' (exact in the module, else the
+// one class whose name ends in its tail across the module, the design root
+// and the packages); nullptr when unknown or ambiguous
+static AstNode *class_decl_unique(const std::string &name)
+{
+	if (name.empty())
+		return nullptr;
+	std::string nm = name[0] == '\\' ? name : "\\" + name;
+	if (current_ast_mod)
+		for (auto &c : current_ast_mod->children)
+			if (c && c->type == AST_CLASS && !c->attributes.count(ID(sv_covergroup)) && c->str == nm)
+				return c.get();
+	size_t q = nm.rfind("::");
+	std::string tail = q == std::string::npos ? nm.substr(1) : nm.substr(q + 2);
+	std::string suffix = "::" + tail;
+	std::vector<AstNode*> roots;
+	if (current_ast_mod) roots.push_back(current_ast_mod);
+	if (current_ast) {
+		roots.push_back(current_ast);
+		for (auto &n : current_ast->children)
+			if (n && n->type == AST_PACKAGE)
+				roots.push_back(n.get());
+	}
+	AstNode *found = nullptr;
+	pool<std::string> names;
+	for (auto r : roots)
+		for (auto &c : r->children) {
+			if (!c || c->type != AST_CLASS || c->attributes.count(ID(sv_covergroup)))
+				continue;
+			const std::string &n = c->str;
+			// a package class seen as `\C' in its package and as its
+			// qualified clone `\p::C' in the module is one class
+			std::string key = (r->type == AST_PACKAGE ? r->str + "::" + n.substr(1) : n);
+			if (n == "\\" + tail || (n.size() > suffix.size() && n.compare(n.size() - suffix.size(), std::string::npos, suffix) == 0)) {
+				if (!found)
+					found = c.get();
+				names.insert(key);
+			}
+		}
+	if (GetSize(names) > 1) {
+		// `\p::C' (module clone) and `p::C' (package) name the same class
+		pool<std::string> norm;
+		for (auto &k : names)
+			norm.insert(k[0] == '\\' ? k.substr(1) : k);
+		if (GetSize(norm) > 1)
+			return nullptr;
+	}
+	return found;
+}
+
+// fe219: the class and its base classes in order; `complete' is false when
+// a base class is not found (or the chain loops)
+static std::vector<AstNode*> class_chain(const std::string &name, bool &complete)
+{
+	std::vector<AstNode*> chain;
+	pool<AstNode*> seen;
+	complete = false;
+	AstNode *c = class_decl_unique(name);
+	while (c && !seen.count(c)) {
+		seen.insert(c);
+		chain.push_back(c);
+		if (!c->attributes.count(ID(sv_class_extends))) {
+			complete = true;
+			return chain;
+		}
+		c = class_decl_unique(c->attributes.at(ID(sv_class_extends))->str);
+	}
+	return chain;
+}
+
+static std::string class_tail(const std::string &n)
+{
+	size_t q = n.rfind("::");
+	std::string t = q == std::string::npos ? n : n.substr(q + 2);
+	return !t.empty() && t[0] == '\\' ? t.substr(1) : t;
+}
+
 // a formal the call writes back to its actual (output, inout, ref)
 static bool class_formal_writes(const AstNode *w)
 {
@@ -4234,6 +4312,34 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		return false;
 	}
 
+	// fe219: a member read or call through a class handle from module code
+	// (outside every class) of a `local' or `protected' member of the
+	// handle's class or a base class (IEEE 1800-2017 8.18)
+	if ((type == AST_IDENTIFIER || type == AST_FCALL || type == AST_TCALL) && current_ast_mod) {
+		size_t dot = str.find('.');
+		if (dot != std::string::npos && dot > 1) {
+			std::string head = str.substr(0, dot), mem = "\\" + str.substr(dot + 1);
+			auto hi = current_scope.find(head);
+			if (mem.find('.') == std::string::npos && mem.find("::") == std::string::npos && hi != current_scope.end() &&
+					hi->second && hi->second->type == AST_WIRE && hi->second->attributes.count(ID(sv_handle_class))) {
+				bool complete = false;
+				for (auto c : class_chain(hi->second->attributes.at(ID(sv_handle_class))->str, complete)) {
+					AstNode *m = nullptr;
+					for (auto &ch : c->children)
+						if (ch && ch->str == mem && (ch->type == AST_WIRE || ch->type == AST_MEMORY ||
+								ch->type == AST_FUNCTION || ch->type == AST_TASK))
+							m = ch.get();
+					if (!m)
+						continue;
+					if (m->attributes.count(ID(sv_class_local)) || m->attributes.count(ID(sv_class_protected)))
+						input_error("`%s' is a %s member of class `%s'; it is not visible outside the class (IEEE 1800-2017 8.18).\n",
+								str.c_str() + 1, m->attributes.count(ID(sv_class_local)) ? "local" : "protected", class_tail(c->str).c_str());
+					break;
+				}
+			}
+		}
+	}
+
 	// fe176: a class or covergroup handle (`cg_t cg_inst = new();') is
 	// simulation-only: constructing one (`= new', `= new(args)') models
 	// nothing, so the assignment writes a constant; a design read of the
@@ -4249,6 +4355,28 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 		// fe217b: likewise any handle value class code produces without
 		// writing design state (`h = C::get();', `h = f().m();')
 		bool is_new = children[1]->str == "\\new";
+		// fe219: a handle-to-handle assignment needs the source's class to
+		// be the target's class or derived from it (IEEE 1800-2017 8.15)
+		if (handle && children[1]->type == AST_IDENTIFIER && children[1]->children.empty() &&
+				w->attributes.count(ID(sv_handle_class)) && current_scope.count(children[1]->str)) {
+			AstNode *r = current_scope.at(children[1]->str);
+			if (r && r->type == AST_WIRE && r->attributes.count(ID(sv_handle_class))) {
+				std::string lc = w->attributes.at(ID(sv_handle_class))->str;
+				std::string rc = r->attributes.at(ID(sv_handle_class))->str;
+				AstNode *ld = class_decl_unique(lc);
+				bool complete = false;
+				std::vector<AstNode*> chain = class_chain(rc, complete);
+				if (ld && !ld->attributes.count(ID(sv_interface_class)) && complete) {
+					bool ok = false;
+					for (auto c : chain)
+						if (c == ld || class_tail(c->str) == class_tail(ld->str))
+							ok = true;
+					if (!ok)
+						input_error("Class handle `%s' of class `%s' is assigned to `%s' of class `%s', which is not the same class or a base class of it (IEEE 1800-2017 8.15).\n",
+								children[1]->str.c_str() + 1, class_tail(rc).c_str(), children[0]->str.c_str() + 1, class_tail(lc).c_str());
+				}
+			}
+		}
 		if (handle && (is_new || class_handle_source(children[1].get()))) {
 			if (!is_new)
 				log("%s: class handle `%s' assigned by class code; simulation-only, not modelled.\n",

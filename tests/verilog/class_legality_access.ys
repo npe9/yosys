@@ -1,0 +1,36 @@
+# fe219: a local / protected member (own or inherited) read through a
+# handle from module code (IEEE 1800-2017 8.18)
+read_verilog -sv <<EOF
+module t;
+class a_cls;
+    protected int a_prot = 22;
+endclass
+class b_cls extends a_cls;
+    int b = 33;
+endclass
+b_cls bh;
+int v;
+initial begin
+    bh = new;
+    v = bh.b;
+end
+endmodule
+EOF
+design -reset
+logger -expect error "`bh\.a_prot' is a protected member of class `a_cls'; it is not visible outside the class" 1
+read_verilog -sv <<EOF
+module t;
+class a_cls;
+    protected int a_prot = 22;
+endclass
+class b_cls extends a_cls;
+    int b = 33;
+endclass
+b_cls bh;
+int v;
+initial begin
+    bh = new;
+    v = bh.a_prot;
+end
+endmodule
+EOF

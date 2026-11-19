@@ -1,0 +1,58 @@
+# fe219: class legality the fork checks although class code is
+# simulation-only (IEEE 1800-2017 8.15, 8.18, 6.21). Legal forms: no error.
+read_verilog -sv <<EOF
+module t;
+class a_cls;
+    local int a_loc = 21;
+    protected int a_prot = 22;
+    int a = 23;
+    function void own(); $display(a_loc, a_prot); endfunction
+endclass
+class b_cls extends a_cls;
+    local int b_loc = 31;
+    int b = 33;
+    // a derived class sees the base's protected members, and its own locals
+    function void fun(); $display(a_prot, b_loc, b); endfunction
+    // a method's own declaration of a base local's name
+    function void sh(); int a_loc; a_loc = 1; endfunction
+endclass
+interface class ic; endclass
+class c_cls implements ic; endclass
+a_cls ah;
+b_cls bh;
+ic ih;
+c_cls ch;
+logic [7:0] q;
+initial begin
+    bh = new;
+    ah = bh;          // derived into base
+    ah = ah;
+    ch = new;
+    ih = ch;          // into an interface class
+    $display(bh.b, bh.a);   // public members
+    bh.fun();
+end
+task automatic ta(input int x, output int y);
+    int acc = 1;      // declaration initializer
+    acc = acc + x;
+    y = acc;
+endtask
+task ts(input int x);
+    q <= x;           // a module variable from a static task
+endtask
+endmodule
+EOF
+design -reset
+
+# a base-class local seen from inside the derived class
+logger -expect error "`a_loc' is a local member of a base class of `b_cls'" 1
+read_verilog -sv <<EOF
+module t;
+class a_cls;
+    local int a_loc = 21;
+endclass
+class b_cls extends a_cls;
+    function void fun(); $display(a_loc); endfunction
+endclass
+endmodule
+EOF

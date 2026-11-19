@@ -1,0 +1,16 @@
+# fe219: a handle assigned from a handle of a class that is neither the
+# target's class nor derived from it (IEEE 1800-2017 8.15)
+logger -expect error "Class handle `bh' of class `b_cls' is assigned to `ch' of class `c_cls'" 1
+read_verilog -sv <<EOF
+module t;
+class a_cls; int x; endclass
+class b_cls extends a_cls; int y; endclass
+class c_cls extends a_cls; int z; endclass
+b_cls bh;
+c_cls ch;
+initial begin
+    bh = new;
+    ch = bh;          // siblings
+end
+endmodule
+EOF

@@ -83,6 +83,15 @@
 			// fe217b: package-qualified class names (`pkg::C'), so a
 			// variable of that type outside the package is a handle
 			pool<std::string> pkg_class_types;
+			// fe219: class legality. The class named by `extends' (the
+			// first class_type_ref), the member qualifiers of the class
+			// item being parsed (1 local, 2 protected) and the index of
+			// its first child, and the lifetime of the module task being
+			// parsed
+			std::string last_class_ref, first_class_ref, class_extends_name;
+			int class_quals = 0;
+			size_t class_item_start = 0;
+			bool task_automatic = false, cur_task_automatic = false;
 			std::vector<AstNode*> ast_stack;
 			std::unique_ptr<AstNode> astbuf1, astbuf2, astbuf3;
 			// fe174: the clocking block being parsed (IEEE 1800-2017 14.3):
@@ -354,6 +363,149 @@
 		// flow does not model is a frontend degradation like any other (an
 		// error, or under -permissive a warning plus (* sv_degraded *) on
 		// the module being parsed)
+		// fe219: the members a class item declared get its qualifiers
+		static void mark_class_quals(ParseState *extra)
+		{
+			if (extra->ast_stack.empty() || extra->class_quals == 0)
+				return;
+			AstNode *cls = extra->ast_stack.back();
+			if (cls->type != AST_CLASS)
+				return;
+			for (size_t i = extra->class_item_start; i < cls->children.size(); i++) {
+				AstNode *c = cls->children[i].get();
+				if (!c || (c->type != AST_WIRE && c->type != AST_MEMORY && c->type != AST_FUNCTION && c->type != AST_TASK))
+					continue;
+				if (extra->class_quals & 1)
+					c->set_attribute(ID(sv_class_local), AstNode::mkconst_int(c->location, 1, false));
+				if (extra->class_quals & 2)
+					c->set_attribute(ID(sv_class_protected), AstNode::mkconst_int(c->location, 1, false));
+			}
+		}
+
+		// fe219: the class declaration a name refers to (the innermost
+		// user-type scope that declares it as a class)
+		static AstNode *find_class_decl(ParseState *extra, const std::string &name)
+		{
+			for (auto it = extra->user_type_stack.rbegin(); it != extra->user_type_stack.rend(); ++it) {
+				auto f = it->find(name);
+				if (f != it->end())
+					return f->second && f->second->type == AST_CLASS ? f->second : nullptr;
+			}
+			auto f = extra->pkg_user_types.find(name);
+			if (f != extra->pkg_user_types.end() && f->second && f->second->type == AST_CLASS)
+				return f->second;
+			return nullptr;
+		}
+
+		static void collect_decl_names(AstNode *n, pool<std::string> &names)
+		{
+			if (!n)
+				return;
+			if (n->type == AST_WIRE || n->type == AST_MEMORY || n->type == AST_PARAMETER || n->type == AST_LOCALPARAM ||
+					n->type == AST_FUNCTION || n->type == AST_TASK || n->type == AST_ENUM || n->type == AST_ENUM_ITEM)
+				names.insert(n->str);
+			for (auto &c : n->children)
+				collect_decl_names(c.get(), names);
+		}
+
+		static void find_ident_uses(AstNode *n, const pool<std::string> &want, AstNode *&hit)
+		{
+			if (!n || hit)
+				return;
+			if ((n->type == AST_IDENTIFIER || n->type == AST_FCALL || n->type == AST_TCALL) && want.count(n->str)) {
+				hit = n;
+				return;
+			}
+			for (auto &c : n->children)
+				find_ident_uses(c.get(), want, hit);
+		}
+
+		// fe219: a method of a derived class that names a `local' member of
+		// a base class (IEEE 1800-2017 8.18: a local member is visible only
+		// within its own class). Names the derived class or the method
+		// declares itself, and names the enclosing module/package declares
+		// (the lookup continues outward past an invisible member), are not
+		// errors.
+		static void check_inherited_local(ParseState *extra, AstNode *cls)
+		{
+			if (!cls || !cls->attributes.count(ID(sv_class_extends)))
+				return;
+			pool<std::string> base_local, own, seen;
+			AstNode *b = find_class_decl(extra, cls->attributes.at(ID(sv_class_extends))->str);
+			while (b && !seen.count(b->str)) {
+				seen.insert(b->str);
+				for (auto &c : b->children)
+					if (c && c->attributes.count(ID(sv_class_local)))
+						base_local.insert(c->str);
+				if (!b->attributes.count(ID(sv_class_extends)))
+					break;
+				b = find_class_decl(extra, b->attributes.at(ID(sv_class_extends))->str);
+			}
+			if (base_local.empty())
+				return;
+			for (auto &c : cls->children)
+				if (c && c->type != AST_FUNCTION && c->type != AST_TASK)
+					collect_decl_names(c.get(), own);
+				else if (c)
+					own.insert(c->str);
+			if (extra->current_ast_mod)
+				for (auto &c : extra->current_ast_mod->children)
+					if (c && c.get() != cls)
+						own.insert(c->str);
+			for (auto &c : cls->children) {
+				if (!c || (c->type != AST_FUNCTION && c->type != AST_TASK))
+					continue;
+				pool<std::string> want, mine;
+				collect_decl_names(c.get(), mine);
+				for (auto &n : base_local)
+					if (!own.count(n) && !mine.count(n))
+						want.insert(n);
+				AstNode *hit = nullptr;
+				for (auto &st : c->children)
+					find_ident_uses(st.get(), want, hit);
+				if (hit)
+					err_at_loc(hit->location, "`%s' is a local member of a base class of `%s'; it is not visible in the derived class (IEEE 1800-2017 8.18).",
+							hit->str.c_str() + 1, cls->str.c_str() + 1);
+			}
+		}
+
+		// fe219: a nonblocking assignment to a variable of an automatic
+		// task (IEEE 1800-2017 6.21: automatic variables shall not be
+		// written by nonblocking assignments)
+		static void find_nba_to(AstNode *n, const pool<std::string> &vars, AstNode *&hit)
+		{
+			// a declaration initializer is parsed as an initial block
+			// holding a nonblocking assignment: not a statement
+			if (!n || hit || n->type == AST_INITIAL)
+				return;
+			if (n->type == AST_ASSIGN_LE && !n->children.empty() && n->children[0] &&
+					n->children[0]->type == AST_IDENTIFIER) {
+				std::string h = n->children[0]->str;
+				size_t dot = h.find('.');
+				if (dot != std::string::npos)
+					h = h.substr(0, dot);
+				if (vars.count(h)) {
+					hit = n;
+					return;
+				}
+			}
+			for (auto &c : n->children)
+				find_nba_to(c.get(), vars, hit);
+		}
+
+		static void check_automatic_nba(AstNode *task)
+		{
+			pool<std::string> vars;
+			for (auto &c : task->children)
+				collect_decl_names(c.get(), vars);
+			AstNode *hit = nullptr;
+			for (auto &c : task->children)
+				find_nba_to(c.get(), vars, hit);
+			if (hit)
+				err_at_loc(hit->location, "Nonblocking assignment to `%s', a variable of automatic task `%s' (IEEE 1800-2017 6.21).",
+						hit->children[0]->str.c_str() + 1, task->str.c_str() + 1);
+		}
+
 		static void note_dropped_delay(ParseState *extra, const frontend_verilog_yy::parser::location_type& loc)
 		{
 			AstNode *mod = extra->current_ast_mod;
@@ -1881,8 +2033,11 @@ class_decl:
 		extra->user_type_stack.back()[*$3] = node.get();
 		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
 			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$3).substr(1));
+		if (!extra->class_extends_name.empty())
+			node->set_attribute(ID(sv_class_extends), AstNode::mkconst_str(@$, extra->class_extends_name));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
+		check_inherited_local(extra, extra->ast_stack.back());
 		extra->ast_stack.pop_back();
 	} |
 	attr TOK_VIRTUAL TOK_CLASS class_name class_param_list_opt class_extends_opt class_implements_opt TOK_SEMICOL {
@@ -1892,8 +2047,11 @@ class_decl:
 		extra->user_type_stack.back()[*$4] = node.get();
 		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
 			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$4).substr(1));
+		if (!extra->class_extends_name.empty())
+			node->set_attribute(ID(sv_class_extends), AstNode::mkconst_str(@$, extra->class_extends_name));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
+		check_inherited_local(extra, extra->ast_stack.back());
 		extra->ast_stack.pop_back();
 	} |
 	attr TOK_INTERFACE TOK_CLASS class_name class_param_list_opt class_extends_opt class_implements_opt TOK_SEMICOL {
@@ -1906,8 +2064,11 @@ class_decl:
 		extra->user_type_stack.back()[*$4] = node.get();
 		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
 			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$4).substr(1));
+		if (!extra->class_extends_name.empty())
+			node->set_attribute(ID(sv_class_extends), AstNode::mkconst_str(@$, extra->class_extends_name));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
+		check_inherited_local(extra, extra->ast_stack.back());
 		extra->ast_stack.pop_back();
 	};
 
@@ -1918,8 +2079,11 @@ nested_class_decl:
 		extra->user_type_stack.back()[*$2] = node.get();
 		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
 			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$2).substr(1));
+		if (!extra->class_extends_name.empty())
+			node->set_attribute(ID(sv_class_extends), AstNode::mkconst_str(@$, extra->class_extends_name));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
+		check_inherited_local(extra, extra->ast_stack.back());
 		extra->ast_stack.pop_back();
 	} |
 	TOK_INTERFACE TOK_CLASS class_name class_param_list_opt class_extends_opt class_implements_opt TOK_SEMICOL {
@@ -1931,8 +2095,11 @@ nested_class_decl:
 		extra->user_type_stack.back()[*$3] = node.get();
 		if (extra->current_ast_mod && extra->current_ast_mod->type == AST_PACKAGE)
 			extra->pkg_class_types.insert(extra->current_ast_mod->str + "::" + (*$3).substr(1));
+		if (!extra->class_extends_name.empty())
+			node->set_attribute(ID(sv_class_extends), AstNode::mkconst_str(@$, extra->class_extends_name));
 		extra->pushChild(std::move(node));
 	} class_items TOK_ENDCLASS opt_label {
+		check_inherited_local(extra, extra->ast_stack.back());
 		extra->ast_stack.pop_back();
 	};
 
@@ -1967,8 +2134,8 @@ class_param_default:
 	TOK_EQ TOK_ID TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN;
 
 class_extends_opt:
-	%empty |
-	TOK_EXTENDS class_type_refs class_extends_args;
+	%empty { extra->class_extends_name.clear(); } |
+	TOK_EXTENDS class_type_refs class_extends_args { extra->class_extends_name = extra->first_class_ref; };
 
 class_extends_args:
 	%empty |
@@ -1980,26 +2147,32 @@ class_implements_opt:
 	TOK_IMPLEMENTS class_type_refs;
 
 class_type_refs:
-	class_type_ref |
+	class_type_ref { extra->first_class_ref = extra->last_class_ref; } |
 	class_type_refs TOK_COMMA class_type_ref;
 
 class_type_ref:
-	TOK_ID | TOK_USER_TYPE | TOK_PKG_USER_TYPE | TOK_SCOPED_ID |
-	TOK_ID TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN |
-	TOK_USER_TYPE TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN |
-	TOK_PKG_USER_TYPE TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN |
-	TOK_SCOPED_ID TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN;
+	TOK_ID { extra->last_class_ref = *$1; } |
+	TOK_USER_TYPE { extra->last_class_ref = *$1; } |
+	TOK_PKG_USER_TYPE { extra->last_class_ref = *$1; } |
+	TOK_SCOPED_ID { extra->last_class_ref = *$1; } |
+	TOK_ID TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN { extra->last_class_ref = *$1; } |
+	TOK_USER_TYPE TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN { extra->last_class_ref = *$1; } |
+	TOK_PKG_USER_TYPE TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN { extra->last_class_ref = *$1; } |
+	TOK_SCOPED_ID TOK_HASH TOK_LPAREN class_spec_params TOK_RPAREN { extra->last_class_ref = *$1; };
 
 class_items:
 	%empty |
 	class_items class_item;
 
 class_member_quals:
-	%empty |
+	%empty {
+		extra->class_quals = 0;
+		extra->class_item_start = extra->ast_stack.empty() ? 0 : extra->ast_stack.back()->children.size();
+	} |
 	class_member_quals TOK_STATIC |
 	class_member_quals TOK_VIRTUAL |
-	class_member_quals TOK_LOCAL |
-	class_member_quals TOK_PROTECTED |
+	class_member_quals TOK_LOCAL { extra->class_quals |= 1; } |
+	class_member_quals TOK_PROTECTED { extra->class_quals |= 2; } |
 	class_member_quals TOK_EXTERN |
 	class_member_quals TOK_PURE |
 	class_member_quals TOK_RAND |
@@ -2032,10 +2205,10 @@ proto_quals:
 	TOK_PURE TOK_VIRTUAL class_member_quals;
 
 class_item:
-	class_member_quals task_func_decl |
-	class_member_quals class_method_body |
+	class_member_quals task_func_decl { mark_class_quals(extra); } |
+	class_member_quals class_method_body { mark_class_quals(extra); } |
 	proto_quals class_method_proto |
-	class_member_quals wire_decl |
+	class_member_quals wire_decl { mark_class_quals(extra); } |
 	class_member_quals param_decl |
 	class_member_quals localparam_decl |
 	class_member_quals typedef_decl |
@@ -2885,7 +3058,12 @@ task_func_decl:
 		extra->current_function_or_task->str = *$4;
 		append_attr(extra->current_function_or_task, std::move($1));
 		extra->current_function_or_task_port_id = 1;
+		extra->cur_task_automatic = extra->task_automatic;
+		extra->task_automatic = false;
 	} task_func_args_opt TOK_SEMICOL task_func_body TOK_ENDTASK opt_label {
+		if (extra->cur_task_automatic)
+			check_automatic_nba(extra->current_function_or_task);
+		extra->cur_task_automatic = false;
 		extra->current_function_or_task = nullptr;
 		extra->ast_stack.pop_back();
 	} |
@@ -3104,9 +3282,9 @@ dpi_function_args:
 	%empty;
 
 opt_automatic:
-	TOK_AUTOMATIC |
-	TOK_STATIC |
-	%empty;
+	TOK_AUTOMATIC { extra->task_automatic = true; } |
+	TOK_STATIC { extra->task_automatic = false; } |
+	%empty { extra->task_automatic = false; };
 
 opt_lifetime:
 	TOK_AUTOMATIC { extra->current_wire_automatic = true; } |

@@ -1,0 +1,13 @@
+# fe219: a nonblocking assignment to a variable of an automatic task
+# (IEEE 1800-2017 6.21)
+logger -expect error "Nonblocking assignment to `c1', a variable of automatic task `auto_task'" 1
+read_verilog -sv <<EOF
+module t;
+class C; endclass
+task automatic auto_task;
+    C c1, c2;
+    c1 <= c2;
+endtask
+initial auto_task;
+endmodule
+EOF

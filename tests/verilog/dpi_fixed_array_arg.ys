@@ -1,0 +1,17 @@
+# fe221: a DPI import formal may be a fixed-size unpacked array
+# (`output longint stats[N]', Verilab svlib's svlib_dpi_imports.svh);
+# DPI is not modelled, the declaration parses and is dropped
+read_verilog -sv <<EOF
+package p;
+  localparam int N = 4;
+  import "DPI-C" function int st(input string path, output longint stats[N]);
+  import "DPI-C" function void rg(input bit [7:0] v[0:N-1], input byte o[]);
+endpackage
+module t(input logic a, output logic b);
+  import p::*;
+  assign b = a;
+endmodule
+EOF
+hierarchy -top t
+proc
+sat -prove b a -verify

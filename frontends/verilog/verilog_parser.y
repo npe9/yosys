@@ -3265,10 +3265,14 @@ dpi_function_arg:
 		extra->astbuf3.reset();
 	} dpi_open_array_suffix;
 
-// DPI formals may be open/dynamic arrays: `input bit [7:0] msg[]'.
-// yosys does not implement DPI calls; the suffix is parsed and dropped.
+// DPI formals may be open/dynamic arrays: `input bit [7:0] msg[]', or
+// fixed-size unpacked arrays (`output longint stats[N]', `[0:N-1]'; fe221,
+// Verilab svlib). yosys does not implement DPI calls; the suffix is parsed
+// and dropped.
 dpi_open_array_suffix:
 	dpi_open_array_suffix TOK_LBRA TOK_RBRA |
+	dpi_open_array_suffix TOK_LBRA expr TOK_RBRA |
+	dpi_open_array_suffix TOK_LBRA expr TOK_COL expr TOK_RBRA |
 	%empty;
 
 opt_dpi_function_args:

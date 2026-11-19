@@ -1,0 +1,36 @@
+# fe220: constant-function writes outside a variable's declared range are
+# ignored bit by bit (IEEE 1800-2017 11.5.1); they used to write outside the
+# value buffer (heap corruption; sv-tests ivtest br_gh531 crashed at random)
+read_verilog -sv <<EOF
+module t(output [1:0] a, output [1:0] b, output [1:0] c, output [1:0] d, output [1:0] e);
+  function [2:1] f1(input x);
+    f1 = 2'b11;
+    f1[0] = x;          // below the range: ignored
+  endfunction
+  function [2:1] f2(input x);
+    f2 = 2'b00;
+    f2[3] = x;          // above the range: ignored
+  endfunction
+  function [1:0] f3(input [3:0] v);
+    reg [2:1] tmp;
+    tmp = 2'b00;
+    tmp[3:0] = v;       // partly out of range: bits 2:1 written
+    f3 = tmp;
+  endfunction
+  function [1:0] f4(input [3:0] v);
+    reg [2:1] tmp;
+    tmp = 2'b11;
+    tmp[0:-3] = v;      // wholly out of range: ignored
+    f4 = tmp;
+  endfunction
+  function [1:0] f5(input x);
+    f5 = 2'b10;
+    f5[-1000000000] = x; // far below: ignored (was a wild write)
+  endfunction
+  localparam [1:0] A = f1(1'b0), B = f2(1'b1), C = f3(4'b1010), D = f4(4'b0000), E = f5(1'b1);
+  assign a = A, b = B, c = C, d = D, e = E;
+endmodule
+EOF
+hierarchy -top t
+proc
+sat -prove a 2'b11 -prove b 2'b00 -prove c 2'b01 -prove d 2'b11 -prove e 2'b10 -verify

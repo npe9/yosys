@@ -15029,11 +15029,17 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 				if (AstNode *mn = stmt->children.at(0)->get_struct_member())
 					offset += mn->range_right;
 				varinfo_t &v = variables[stmt->children.at(0)->str];
-				RTLIL::Const r = stmt->children.at(1)->bitsAsConst(v.val.size());
+				// fe220: the value is sized to the select (it may be wider
+				// than the variable), and bits of the select outside the
+				// variable's range are not written (IEEE 1800-2017 11.5.1);
+				// both used to index past the buffers and corrupt the heap
+				RTLIL::Const r = stmt->children.at(1)->bitsAsConst(max(width, GetSize(v.val)));
 				for (int i = 0; i < width; i++) {
 					int index = i + offset - v.offset;
 					if (v.range_swapped)
 						index = -index;
+					if (index < 0 || index >= GetSize(v.val))
+						continue;
 					v.val.set(index, r.at(i));
 				}
 			}

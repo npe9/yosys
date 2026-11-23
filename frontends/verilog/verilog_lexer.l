@@ -411,6 +411,17 @@ ASSOC_DIM "["[ \t\r\n]*([a-zA-Z_$][a-zA-Z0-9_$]*|"\*")([ \t\r\n]|"/*"([^*]|\*+[^
 	if (!mode->sv)
 		non_sv_keyword_regions.emplace_back(out_loc.begin.filename ? *out_loc.begin.filename : std::string(), out_loc.begin.line, INT_MAX);
 }
+"("[ \t\r\n]*(supply0|strong0|pull0|weak0|highz0|supply1|strong1|pull1|weak1|highz1)[ \t\r\n]*","[ \t\r\n]*(supply0|strong0|pull0|weak0|highz0|supply1|strong1|pull1|weak1|highz1)[ \t\r\n]*")" {
+	// fe224: a drive strength `(strength0, strength1)' (IEEE 1800-2017
+	// 10.3.4, 28.11): the strength words are reserved, so the group cannot be
+	// anything else; one token keeps it apart from a port list `(a, b)'
+	std::string t;
+	for (const char *p = YYText(); *p; p++)
+		if (*p != '(' && *p != ')' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+			t += *p;
+	return parser::make_TOK_DRIVE_STRENGTH(std::make_unique<std::string>(t), out_loc);
+}
+
 "`end_keywords"[^\n]* {
 	if (!extra->sv_keyword_stack.empty()) {
 		if (!mode->sv && !non_sv_keyword_regions.empty() && std::get<2>(non_sv_keyword_regions.back()) == INT_MAX)

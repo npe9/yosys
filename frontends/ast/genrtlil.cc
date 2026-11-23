@@ -2677,6 +2677,15 @@ RTLIL::SigSpec AstNode::genRTLIL(int width_hint, bool sign_hint)
 		{
 			if (keep_sva_cells)
 				refuse_sva_operand(this);
+			// fe224: a drive strength does not change the value of a net's
+			// only driver, and a net with several drivers is refused by the
+			// engine (ic3's multi-driver cone check); a highz component turns
+			// the driven value into z, which is not modeled
+			if (attributes.count(ID(sv_strength))) {
+				std::string s = attributes.at(ID(sv_strength))->str;
+				if (s.find("highz") != std::string::npos)
+					degrade(location.to_loc(), "Drive strength (%s) with a highz component is not modeled (the driven value becomes z).\n", s);
+			}
 			// fe174: the clockvar alias `assign cb.x = x' writes the alias
 			sva_clockvar_lhs = get_bool_attribute(ID(sv_clockvar_alias));
 			RTLIL::SigSpec left = children[0]->genRTLIL();

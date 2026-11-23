@@ -1,0 +1,33 @@
+# fe224: drive strengths (IEEE 1800-2017 10.3.4, 28.11) on net declarations
+# and continuous assignments: `wire (supply1, pull0) w = ..' and
+# `assign (supply0, supply1) x = ..' were syntax errors, and
+# `assign (highz1, strong0) x = ..' was accepted with the strength dropped.
+# A single driver's value does not depend on its strength (several drivers
+# are refused by ic3's multi-driver check); a highz component is refused.
+read_verilog -sv <<EOT
+module ok(input a, input b, output good);
+  wire y1, y2, y3, y4, y5;
+  and (strong0, weak1) g1 (y5, a, b);
+  wire (supply1, pull0) w1 = a & b;
+  wire (strong0, weak1) [0:0] w2 = a | b;
+  wire w3, w4;
+  assign (supply0, supply1) w3 = a ^ b;
+  assign ( pull1 ,
+           strong0 ) w4 = ~a;
+  assign y1 = w1;
+  assign y2 = w2;
+  assign y3 = w3;
+  assign y4 = w4;
+  assign good = y1 == (a & b) && y2 == (a | b) && y3 == (a ^ b) && y4 == !a && y5 == (a & b);
+endmodule
+EOT
+hierarchy -top ok
+proc
+sat -verify -prove good 1
+design -reset
+logger -expect error "Drive strength \(highz1,strong0\) with a highz component is not modeled" 1
+read_verilog -sv <<EOT
+module top(input a, output y);
+  assign (highz1, strong0) y = a;
+endmodule
+EOT

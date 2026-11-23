@@ -90,6 +90,9 @@
 			// parsed
 			std::string last_class_ref, first_class_ref, class_extends_name;
 			int class_quals = 0;
+			// fe224: the drive strength of the net declaration or continuous
+			// assignment being parsed ("strong0,weak1"), else empty
+			std::string drive_strength;
 			size_t class_item_start = 0;
 			bool task_automatic = false, cur_task_automatic = false;
 			std::vector<AstNode*> ast_stack;
@@ -1373,6 +1376,7 @@
 %token TOK_GENERATE TOK_ENDGENERATE TOK_GENVAR TOK_REAL
 %token TOK_SYNOPSYS_FULL_CASE TOK_SYNOPSYS_PARALLEL_CASE
 %token TOK_SUPPLY0 TOK_SUPPLY1 TOK_TO_SIGNED TOK_TO_UNSIGNED
+%token <string_t> TOK_DRIVE_STRENGTH
 %token TOK_POS_INDEXED TOK_NEG_INDEXED TOK_PROPERTY TOK_ENUM TOK_TYPEDEF
 %token TOK_RAND TOK_CONST TOK_CHECKER TOK_ENDCHECKER TOK_EVENTUALLY TOK_S_EVENTUALLY
 %token TOK_SEQUENCE TOK_ENDSEQUENCE TOK_ENDPROPERTY TOK_INTERSECT TOK_THROUGHOUT TOK_WITHIN
@@ -4505,6 +4509,18 @@ wire_decl:
 			(void)extra->astbuf2.reset();
 		extra->albuf.reset();
 	} TOK_SEMICOL |
+	attr wire_type TOK_DRIVE_STRENGTH range_or_multirange {
+		extra->albuf = std::move($1);
+		extra->astbuf1 = std::move($2);
+		extra->astbuf2 = checkRange(extra->astbuf1.get(), std::move($4));
+		extra->drive_strength = *$3;
+	} delay wire_name_list {
+		(void)extra->astbuf1.reset();
+		if (extra->astbuf2 != nullptr)
+			(void)extra->astbuf2.reset();
+		extra->albuf.reset();
+		extra->drive_strength.clear();
+	} TOK_SEMICOL |
 	attr TOK_SUPPLY0 TOK_ID {
 		extra->ast_stack.back()->children.push_back(std::make_unique<AstNode>(@$, AST_WIRE));
 		extra->ast_stack.back()->children.back()->str = *$3;
@@ -4625,6 +4641,8 @@ wire_name_and_opt_assign:
 		else {
 			auto assign = std::make_unique<AstNode>(@$, AST_ASSIGN, std::move(wire), std::move($3));
 			SET_AST_NODE_LOC(assign.get(), @1, @3);
+			if (!extra->drive_strength.empty())
+				assign->set_attribute(ID(sv_strength), AstNode::mkconst_str(assign->location, extra->drive_strength));
 			extra->ast_stack.back()->children.push_back(std::move(assign));
 		}
 
@@ -4698,7 +4716,11 @@ wire_name:
 
 assign_stmt:
 	TOK_ASSIGN delay assign_expr_list TOK_SEMICOL |
-	TOK_ASSIGN TOK_LPAREN TOK_ID TOK_COMMA TOK_ID TOK_RPAREN delay assign_expr_list TOK_SEMICOL |
+	TOK_ASSIGN TOK_DRIVE_STRENGTH {
+		extra->drive_strength = *$2;
+	} delay assign_expr_list TOK_SEMICOL {
+		extra->drive_strength.clear();
+	} |
 	TOK_ALIAS alias_lvalues TOK_SEMICOL {
 		if (!mode->sv)
 			err_at_loc(@1, "Alias statements are only supported in SystemVerilog mode.");
@@ -4722,6 +4744,8 @@ assign_expr:
 	lvalue TOK_EQ expr {
 		AstNode* node = extra->saveChild(std::make_unique<AstNode>(@$, AST_ASSIGN, std::move($1), std::move($3)));
 		SET_AST_NODE_LOC(node, @$, @$);
+		if (!extra->drive_strength.empty())
+			node->set_attribute(ID(sv_strength), AstNode::mkconst_str(node->location, extra->drive_strength));
 	};
 
 type_name: TOK_ID { $$ = std::move($1); } // first time seen
@@ -4864,6 +4888,17 @@ cell_stmt:
 		(void)extra->astbuf1.reset();
 	} |
 	attr tok_prim_wrapper delay {
+		extra->astbuf1 = std::make_unique<AstNode>(@$, AST_PRIMITIVE);
+		extra->astbuf1->str = *$2;
+		append_attr(extra->astbuf1.get(), std::move($1));
+	} prim_list TOK_SEMICOL {
+		(void)extra->astbuf1.reset();
+	} |
+	attr tok_prim_wrapper TOK_DRIVE_STRENGTH delay {
+		// fe224: a gate's drive strength does not change its only driver's
+		// value (several drivers: ic3's multi-driver check); highz is z
+		if ($3->find("highz") != std::string::npos)
+			degrade(@3.to_loc(), "Drive strength (%s) with a highz component is not modeled (the driven value becomes z).\n", *$3);
 		extra->astbuf1 = std::make_unique<AstNode>(@$, AST_PRIMITIVE);
 		extra->astbuf1->str = *$2;
 		append_attr(extra->astbuf1.get(), std::move($1));

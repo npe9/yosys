@@ -1,0 +1,51 @@
+# fe223: a SystemVerilog reserved word cannot name a declaration (IEEE
+# 1800-2017 5.6.2, Annex B); yosys lexes many of them as plain identifiers
+# and accepted `bit edge;'. Legal forms first: escaped identifiers spelling a
+# reserved word, a class constructor `new' with `null'/`this', a reserved
+# word read as Verilog-2005 (not checked), a keyword-like non-keyword name.
+read_verilog -sv <<EOT
+module ok(input [3:0] a, output [3:0] y);
+  wire [3:0] \edge ;
+  wire [3:0] \table ;
+  wire [3:0] edges, tables, configs;
+  assign \edge = a;
+  assign \table = \edge ;
+  assign y = \table ;
+  class C;
+    int v;
+    function new();
+      v = 0;
+      if (this == null) v = 1;
+    endfunction
+  endclass
+endmodule
+EOT
+hierarchy -top ok
+proc
+sat -verify -prove y a
+design -reset
+read_verilog <<EOT
+module v2005(input a, output y);
+  wire weak0;
+  assign weak0 = a;
+  assign y = weak0;
+endmodule
+EOT
+design -reset
+# a `begin_keywords "1364-2001" region: `logic' is not a keyword there
+read_verilog -sv <<EOT
+`begin_keywords "1364-2001"
+module kw2001(input a, output y);
+  reg logic;
+  always @* logic = a;
+  assign y = logic;
+endmodule
+`end_keywords
+EOT
+design -reset
+logger -expect error "`edge' is a reserved keyword and cannot be used as an identifier" 1
+read_verilog -sv <<EOT
+module top;
+  bit edge;
+endmodule
+EOT

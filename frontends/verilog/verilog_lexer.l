@@ -60,6 +60,8 @@
 USING_YOSYS_NAMESPACE
 using namespace AST;
 using namespace VERILOG_FRONTEND;
+
+static bool is_reserved_word(const std::string &w);
 using parser = frontend_verilog_yy::parser;
 
 YOSYS_NAMESPACE_BEGIN
@@ -404,9 +406,15 @@ ASSOC_DIM "["[ \t\r\n]*([a-zA-Z_$][a-zA-Z0-9_$]*|"\*")([ \t\r\n]|"/*"([^*]|\*+[^
 	if (q != std::string::npos) v = v.substr(q + 1);
 	extra->sv_keyword_stack.push_back(mode->sv);
 	mode->sv = v.compare(0, 4, "1800") == 0;
+	// fe223: reserved words are names inside a non-1800 region (closed at
+	// `end_keywords, else open to the end of the file)
+	if (!mode->sv)
+		non_sv_keyword_regions.emplace_back(out_loc.begin.filename ? *out_loc.begin.filename : std::string(), out_loc.begin.line, INT_MAX);
 }
 "`end_keywords"[^\n]* {
 	if (!extra->sv_keyword_stack.empty()) {
+		if (!mode->sv && !non_sv_keyword_regions.empty() && std::get<2>(non_sv_keyword_regions.back()) == INT_MAX)
+			std::get<2>(non_sv_keyword_regions.back()) = out_loc.begin.line;
 		mode->sv = extra->sv_keyword_stack.back();
 		extra->sv_keyword_stack.pop_back();
 	}
@@ -1104,6 +1112,9 @@ import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+(context[ \t\r\n]+)?(extern[ \t\r\n]+)?
 
 "\\"[^ \t\r\n]+ {
 	auto val = std::make_unique<std::string>(YYText());
+	// fe223: an escaped identifier may spell a reserved word
+	if (is_reserved_word(std::string(YYText() + 1)))
+		escaped_reserved_ids.insert(std::string(YYText()));
 	return parser::make_TOK_ID(std::move(val), out_loc);
 }
 
@@ -1264,6 +1275,9 @@ static bool is_reserved_word(const std::string &w)
 		"bit", "break", "buf", "bufif0", "bufif1", "byte", "case", "casex", "casez", "cell",
 		"chandle", "checker", "class", "clocking", "cmos", "config", "const", "constraint",
 		"context", "continue", "cover", "covergroup", "coverpoint", "cross", "deassign",
+		// fe223: design, ignore_bins, illegal_bins, implements, strong0/1,
+		// weak0/1 were missing from Annex B's list
+		"design", "ignore_bins", "illegal_bins", "implements", "strong0", "strong1", "weak0", "weak1",
 		"default", "defparam", "disable", "dist", "do", "edge", "else", "end", "endcase",
 		"endchecker", "endclass", "endclocking", "endconfig", "endfunction", "endgenerate",
 		"endgroup", "endinterface", "endmodule", "endpackage", "endprimitive", "endprogram",
@@ -1296,6 +1310,11 @@ static bool is_reserved_word(const std::string &w)
 			set.insert(*p);
 	}
 	return set.count(w) != 0;
+}
+
+bool VERILOG_FRONTEND::is_sv_reserved_word(const std::string &w)
+{
+	return is_reserved_word(w);
 }
 
 bool VERILOG_FRONTEND::VerilogLexer::lookahead_is_cast()

@@ -46,6 +46,46 @@ using namespace VERILOG_FRONTEND;
 static std::vector<std::string> verilog_defaults;
 static std::list<std::vector<std::string>> verilog_defaults_stack;
 
+pool<std::string> VERILOG_FRONTEND::escaped_reserved_ids;
+std::vector<std::tuple<std::string, int, int>> VERILOG_FRONTEND::non_sv_keyword_regions;
+
+static bool in_non_sv_keyword_region(const AST::AstSrcLocType &loc)
+{
+	std::string file = loc.begin.filename ? *loc.begin.filename : std::string();
+	for (auto &r : VERILOG_FRONTEND::non_sv_keyword_regions)
+		if (std::get<0>(r) == file && loc.begin.line >= std::get<1>(r) && loc.begin.line <= std::get<2>(r))
+			return true;
+	return false;
+}
+
+// fe223: a SystemVerilog reserved word (IEEE 1800-2017 5.6.2, Annex B) cannot
+// name a declaration; the lexer passes the ones yosys does not parse as
+// keywords through as plain identifiers (`bit edge;'). Escaped identifiers
+// (`\edge ') are legal, and a class constructor is named `new'.
+static void error_on_reserved_decl_name(AST::AstNode *node)
+{
+	switch (node->type) {
+	case AST::AST_MODULE: case AST::AST_INTERFACE: case AST::AST_PACKAGE: case AST::AST_CLASS:
+	case AST::AST_WIRE: case AST::AST_MEMORY: case AST::AST_PARAMETER: case AST::AST_LOCALPARAM:
+	case AST::AST_TYPEDEF: case AST::AST_ENUM_ITEM: case AST::AST_STRUCT_ITEM:
+	case AST::AST_FUNCTION: case AST::AST_TASK: case AST::AST_DPI_FUNCTION:
+	case AST::AST_CELL: case AST::AST_GENVAR: case AST::AST_BLOCK: case AST::AST_GENBLOCK:
+	case AST::AST_MODPORT: case AST::AST_INTERFACEPORT:
+		if (node->str.size() > 1 && node->str[0] == '\\' &&
+				VERILOG_FRONTEND::is_sv_reserved_word(node->str.substr(1)) &&
+				!VERILOG_FRONTEND::escaped_reserved_ids.count(node->str) &&
+				!in_non_sv_keyword_region(node->location) &&
+				!((node->type == AST::AST_FUNCTION || node->type == AST::AST_TASK) && node->str == "\\new"))
+			err_at_loc(node->location, "`%s' is a reserved keyword and cannot be used as an identifier (IEEE 1800-2017 5.6.2, Annex B).\n",
+					node->str.substr(1));
+		break;
+	default:
+		break;
+	}
+	for (auto &child : node->children)
+		error_on_reserved_decl_name(child.get());
+}
+
 static void error_on_dpi_function(AST::AstNode *node)
 {
     if (node->type == AST::AST_DPI_FUNCTION)
@@ -600,8 +640,13 @@ struct VerilogFrontend : public Frontend {
 			lexer.set_debug(true);
 			parser.set_debug_level(1);
 		}
+		VERILOG_FRONTEND::escaped_reserved_ids.clear();
+		VERILOG_FRONTEND::non_sv_keyword_regions.clear();
 		parser.parse();
 		// frontend_verilog_yyset_lineno(1);
+
+		if (parse_mode.sv)
+			error_on_reserved_decl_name(parse_state.current_ast);
 
 		for (auto &child : parse_state.current_ast->children) {
 			if (child->type == AST::AST_MODULE)

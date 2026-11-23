@@ -39,6 +39,14 @@ YOSYS_NAMESPACE_BEGIN
 
 namespace VERILOG_FRONTEND
 {
+	// fe223: IEEE 1800-2017 Annex B reserved words (verilog_lexer.l), and the
+	// reserved words a file wrote as escaped identifiers (`\edge ', legal)
+	bool is_sv_reserved_word(const std::string &w);
+	extern pool<std::string> escaped_reserved_ids;
+	// lines inside a `begin_keywords region with a non-1800 version (file,
+	// first line, last line): a reserved word there is a legal name
+	extern std::vector<std::tuple<std::string, int, int>> non_sv_keyword_regions;
+
 	/* Ephemeral context class */
 	struct ConstParser {
 		AST::AstSrcLocType loc;

@@ -15,6 +15,8 @@ module dut (input logic [7:0] x, output logic [7:0] y);
   ondemand u(.intf);
 endmodule
 
-module ref (input logic [7:0] x, output logic [7:0] y);
+// fe223: was `module ref', a reserved word in SystemVerilog (IEEE 1800-2017
+// 5.6.2, Annex B), now an error under -sv
+module gold (input logic [7:0] x, output logic [7:0] y);
   assign y = ~x;
 endmodule

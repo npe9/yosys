@@ -1,0 +1,10 @@
+# fe222: a circular typedef recursed in simplify until the stack overflowed
+# (sv-tests ivtest sv_typedef_circular1); now a clean error.
+logger -expect error "Recursion too deep while elaborating" 1
+read_verilog -sv <<EOT
+module top;
+  typedef T2 T1;
+  typedef T1 T2;
+  T1 x;
+endmodule
+EOT

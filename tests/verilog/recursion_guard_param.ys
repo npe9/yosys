@@ -1,0 +1,35 @@
+# fe222: a parameter defined by itself (`parameter P = P + 6', ivtest
+# pr3061015a) recursed until the stack overflowed; legal recursion through an
+# automatic constant function still elaborates, then the self-reference is a
+# clean error.
+read_verilog -sv <<EOT
+module ok(output [31:0] y);
+  function automatic integer fact(input integer n);
+    fact = (n <= 1) ? 1 : n * fact(n - 1);
+  endfunction
+  localparam integer F = fact(10);
+  assign y = F;
+endmodule
+EOT
+hierarchy -top ok
+proc
+sat -verify -prove y 3628800
+design -reset
+# a legal 400-term sum (400 nested AST_ADD levels) still elaborates
+read_verilog -sv <<EOT
+module deep(input [7:0] a, output [15:0] y);
+  assign y = a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a;
+endmodule
+EOT
+hierarchy -top deep
+proc
+sat -verify -prove y 400 -set a 1
+design -reset
+logger -expect error "Recursion too deep while elaborating" 1
+read_verilog -sv <<EOT
+module top(output [31:0] y);
+  parameter P = P + 6;
+  assign y = P;
+endmodule
+EOT
+hierarchy -top top

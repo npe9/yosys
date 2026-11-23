@@ -26,6 +26,9 @@
  *
  */
 
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 #include "kernel/log.h"
 #include "libs/sha1/sha1.h"
 #include "frontends/verilog/verilog_frontend.h"
@@ -4247,8 +4250,57 @@ bool AstNode::simplify(bool const_fold, int stage, int width_hint, bool sign_hin
 	}
 	static int recursion_counter = 0;
 	static bool deep_recursion_warning = false;
-
+	uintptr_t stack_used = 0;
+	{
+		// fe222: unbounded recursion (a circular typedef `typedef T2 T1;
+		// typedef T1 T2;', a parameter defined by itself `parameter P = P
+		// + 6', mutually recursive static functions) overflowed the stack
+		// long before the depth counter below fires (about 12 KB of stack
+		// per level): stop with an error, keeping 1 MB (at most 1/8 of
+		// the limit) of headroom for the callees of the deepest level
+		static uintptr_t stack_top = 0;
+		static uintptr_t stack_budget = 0;
+		char probe;
+		uintptr_t sp = reinterpret_cast<uintptr_t>(&probe);
+		if (stack_budget == 0) {
+			uint64_t lim = 1u << 20;	// Windows main-thread default
+#ifndef _WIN32
+			lim = 8u << 20;
+			struct rlimit rl;
+			if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0)
+				lim = rl.rlim_cur;
+#endif
+			if (lim > (uint64_t(256) << 20))
+				lim = uint64_t(256) << 20;
+			uint64_t headroom = lim / 8;
+			if (headroom > (uint64_t(1) << 20))
+				headroom = uint64_t(1) << 20;
+			stack_budget = uintptr_t(lim - headroom);
+		}
+		// another thread's stack (more than 1 GiB away): measure from here
+		if (stack_top == 0 || sp > stack_top || stack_top - sp > (uintptr_t(1) << 30))
+			stack_top = sp;
+		stack_used = stack_top - sp;
+		if (stack_used > stack_budget) {
+			// the error unwinds past every recursion_counter-- (a
+			// long-running process, e.g. the LSP, reads again)
+			recursion_counter = 0;
+			input_error("Recursion too deep while elaborating `%s' (a circular type or parameter definition, or a recursive non-automatic function?).\n",
+					str.empty() ? type2str(type) : (str[0] == '\\' ? str.substr(1) : str));
+		}
+	}
 	if (recursion_counter >= 1000) {
+		// fe222: with a large stack (Linux raises it to 128 MB; a shell may
+		// allow 64 MB) the guard above fires after this counter, and the
+		// "no change" below made circular definitions spin forever. Legal
+		// designs reach this counter with far less stack (a counted level
+		// is about 12 KB, but many levels are not counted): past 8 MB of
+		// simplify stack it is the guard's error
+		if (stack_used > (uintptr_t(8) << 20)) {
+			recursion_counter = 0;
+			input_error("Recursion too deep while elaborating `%s' (a circular type or parameter definition, or a recursive non-automatic function?).\n",
+					str.empty() ? type2str(type) : (str[0] == '\\' ? str.substr(1) : str));
+		}
 		static bool warned = false;
 		if (!warned) {
 			log_warning("Deep recursion in AST simplifier.\nDoes this design contain overly long or deeply nested expressions, or excessive recursion?\n");

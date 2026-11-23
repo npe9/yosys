@@ -1,0 +1,33 @@
+# fe225: supply0 / supply1 as a net type (IEEE 1800-2017 6.7): ANSI ports
+# (`output supply1 out', yosys tests/hana vlib), vectors and lists were
+# syntax errors; a supply net is driven to all-0 / all-1.
+read_verilog -sv <<EOT
+module VCC (output supply1 out);
+endmodule
+module GND (output supply0 [3:0] out);
+endmodule
+module top(input [3:0] a, output good);
+  supply1 [3:0] vdd;
+  supply0 gnd0, gnd1;
+  supply1 one;
+  wire v; wire [3:0] g;
+  VCC u1 (.out(v));
+  GND u2 (.out(g));
+  assign good = vdd == 4'b1111 && gnd0 == 1'b0 && gnd1 == 1'b0 && one == 1'b1 &&
+                v == 1'b1 && g == 4'b0000 && (a & vdd) == a;
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+sat -verify -prove good 1
+design -reset
+read_verilog <<EOT
+module v2005(output y);
+  supply1 vcc;
+  assign y = vcc;
+endmodule
+EOT
+hierarchy -top v2005
+proc
+sat -verify -prove y 1

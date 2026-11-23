@@ -2704,7 +2704,15 @@ net_type:
 		extra->astbuf3->is_wand = true;
 	} |
 	TOK_TRI | TOK_TRI0 | TOK_TRI1 | TOK_TRIAND | TOK_TRIOR | TOK_TRIREG | TOK_UWIRE |
-	TOK_WIRE;
+	TOK_WIRE |
+	// fe225: a supply net (IEEE 1800-2017 6.7) is driven to all-0 / all-1;
+	// the frontend adds the driver after parsing (any width, ports, lists)
+	TOK_SUPPLY0 {
+		extra->astbuf3->set_attribute(ID(sv_supply), AstNode::mkconst_int(@$, 0, false));
+	} |
+	TOK_SUPPLY1 {
+		extra->astbuf3->set_attribute(ID(sv_supply), AstNode::mkconst_int(@$, 1, false));
+	};
 
 logic_type:
 	TOK_LOGIC {
@@ -4520,32 +4528,7 @@ wire_decl:
 			(void)extra->astbuf2.reset();
 		extra->albuf.reset();
 		extra->drive_strength.clear();
-	} TOK_SEMICOL |
-	attr TOK_SUPPLY0 TOK_ID {
-		extra->ast_stack.back()->children.push_back(std::make_unique<AstNode>(@$, AST_WIRE));
-		extra->ast_stack.back()->children.back()->str = *$3;
-		append_attr(extra->ast_stack.back()->children.back().get(), std::move($1));
-		extra->ast_stack.back()->children.push_back(std::make_unique<AstNode>(@$, AST_ASSIGN, std::make_unique<AstNode>(@$, AST_IDENTIFIER), AstNode::mkconst_int(@$, 0, false, 1)));
-		extra->ast_stack.back()->children.back()->children[0]->str = *$3;
-	} opt_supply_wires TOK_SEMICOL |
-	attr TOK_SUPPLY1 TOK_ID {
-		extra->ast_stack.back()->children.push_back(std::make_unique<AstNode>(@$, AST_WIRE));
-		extra->ast_stack.back()->children.back()->str = *$3;
-		append_attr(extra->ast_stack.back()->children.back().get(), std::move($1));
-		extra->ast_stack.back()->children.push_back(std::make_unique<AstNode>(@$, AST_ASSIGN, std::make_unique<AstNode>(@$, AST_IDENTIFIER), AstNode::mkconst_int(@$, 1, false, 1)));
-		extra->ast_stack.back()->children.back()->children[0]->str = *$3;
-	} opt_supply_wires TOK_SEMICOL;
-
-opt_supply_wires:
-	%empty |
-	opt_supply_wires TOK_COMMA TOK_ID {
-		auto wire_node = extra->ast_stack.back()->children.at(GetSize(extra->ast_stack.back()->children)-2)->clone();
-		auto assign_node = extra->ast_stack.back()->children.at(GetSize(extra->ast_stack.back()->children)-1)->clone();
-		wire_node->str = *$3;
-		assign_node->children[0]->str = *$3;
-		extra->ast_stack.back()->children.push_back(std::move(wire_node));
-		extra->ast_stack.back()->children.push_back(std::move(assign_node));
-	};
+	} TOK_SEMICOL;
 
 wire_name_list:
 	wire_name_and_opt_assign | wire_name_list TOK_COMMA wire_name_and_opt_assign;

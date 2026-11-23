@@ -86,6 +86,28 @@ static void error_on_reserved_decl_name(AST::AstNode *node)
 		error_on_reserved_decl_name(child.get());
 }
 
+// fe225: a wire declared with net type supply0/supply1 (the parser marks it
+// sv_supply) gets its driver, `assign w = '0 / '1', as the next sibling
+static void expand_supply_nets(AST::AstNode *node)
+{
+	for (size_t i = 0; i < node->children.size(); i++) {
+		AST::AstNode *c = node->children[i].get();
+		if (c->type == AST::AST_WIRE && c->attributes.count(ID(sv_supply))) {
+			bool one = c->attributes.at(ID(sv_supply))->asInt(false) != 0;
+			c->attributes.erase(ID(sv_supply));
+			auto loc = c->location;
+			auto id = std::make_unique<AST::AstNode>(loc, AST::AST_IDENTIFIER);
+			id->str = c->str;
+			VERILOG_FRONTEND::ConstParser p{loc};
+			auto val = p.const2ast(one ? "'1" : "'0");
+			node->children.insert(node->children.begin() + i + 1,
+					std::make_unique<AST::AstNode>(loc, AST::AST_ASSIGN, std::move(id), std::move(val)));
+			i++;
+		} else
+			expand_supply_nets(c);
+	}
+}
+
 static void error_on_dpi_function(AST::AstNode *node)
 {
     if (node->type == AST::AST_DPI_FUNCTION)
@@ -647,6 +669,7 @@ struct VerilogFrontend : public Frontend {
 
 		if (parse_mode.sv)
 			error_on_reserved_decl_name(parse_state.current_ast);
+		expand_supply_nets(parse_state.current_ast);
 
 		for (auto &child : parse_state.current_ast->children) {
 			if (child->type == AST::AST_MODULE)

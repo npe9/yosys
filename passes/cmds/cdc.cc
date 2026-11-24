@@ -1544,10 +1544,14 @@ struct CdcAnalyzer
 					q_cone(chain.back().first, chain.back().second,
 							comb_tail[a], tail_sinks);
 				}
-				// a word launched by one source register and captured by
-				// one destination register is one bus even when its bits'
-				// cones never meet inside this module (they meet in the
-				// consumer: CV-2 mb_bus_2ff, 2026-11-23)
+				// a word launched by one source register is one bus even
+				// when its bits' cones never meet inside this module (they
+				// meet in the consumer: CV-2 mb_bus_2ff, 2026-11-23), and
+				// whether its bits land in one destination register or in
+				// per-bit synchronizer instances (a generate loop of sync
+				// cells, separate always blocks: cv2b, 2026-11-24).  Bits of
+				// one source vector that are really independent flags stay
+				// a WARNING: conservative, never a false OK.
 				auto src_ff = [&](int a) -> Cell * {
 					auto dit = drivers.find(crossings[synced[a]].dbit);
 					if (dit == drivers.end() || !dit->second.first->is_builtin_ff())
@@ -1555,8 +1559,7 @@ struct CdcAnalyzer
 					return dit->second.first;
 				};
 				auto share = [&](int a, int b) {
-					if (crossings[synced[a]].ffcell == crossings[synced[b]].ffcell &&
-							src_ff(a) != nullptr && src_ff(a) == src_ff(b))
+					if (src_ff(a) != nullptr && src_ff(a) == src_ff(b))
 						return true;
 					for (Cell *c : comb[a])
 						if (comb[b].count(c))
@@ -1822,9 +1825,9 @@ struct CdcPass : public Pass {
 		log("  - synced-bus         (WARNING) all bits of a multi-bit crossing use 2+\n");
 		log("                                 stage synchronizers; check Gray coding or\n");
 		log("                                 handshake coherence between the domains\n");
-		log("                                 (bits launched by one source register and\n");
-		log("                                 captured by one destination register are\n");
-		log("                                 one bus even if they never reconverge here)\n");
+		log("                                 (bits launched by one source register are\n");
+		log("                                 one bus even if they never reconverge here\n");
+		log("                                 or use separate synchronizer instances)\n");
 		log("\n");
 		log("What the analysis skips is reported as findings too (bit = count or port):\n");
 		log("  - unanalyzed-hierarchy (ERROR)  submodule instances: run flatten first\n");

@@ -34,6 +34,15 @@ module v2_icg_ok(input clk_b, en_in, d_b, output reg q);
   wire gclk = clk_b & en_lat;
   always @(posedge gclk) q <= b_d;
 endmodule
+// one source word synced by per-bit synchronizer instances -> still one bus (cv2b)
+module v1_sync1(input clk, d, output reg q); reg m; always @(posedge clk) begin m <= d; q <= m; end endmodule
+module v1_perbit(input clk_a, clk_b, input [3:0] d_a, output [3:0] q_b);
+  reg [3:0] a_q; always @(posedge clk_a) a_q <= d_a;
+  genvar i;
+  for (i = 0; i < 4; i++) begin : g
+    v1_sync1 u(.clk(clk_b), .d(a_q[i]), .q(q_b[i]));
+  end
+endmodule
 // hierarchy left unflattened -> an ERROR finding, not an empty report
 module v3_reg1(input clk, d, output reg q); always @(posedge clk) q <= d; endmodule
 module v3_hier(input clk_a, clk_b, d, output q);
@@ -50,6 +59,12 @@ logger -check-expected
 logger -expect log "OK: +synchronizer-2ff +clk_a -> clk_b" 2
 cdc v1_flags
 logger -check-expected
+design -save cv2
+flatten v1_perbit
+logger -expect log "WARNING: +synced-bus +clk_a -> clk_b" 4
+cdc v1_perbit
+logger -check-expected
+design -load cv2
 logger -expect log "ERROR: +clock-gating-glitch" 1
 cdc v2_icg_foreign
 logger -check-expected

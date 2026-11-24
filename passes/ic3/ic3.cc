@@ -2643,6 +2643,17 @@ struct NativeCert
 		for (int k = 0; k < GetSize(qbits); k++) {
 			RTLIL::Wire *w = m->addWire(stringf("\\ic3_cert_q%d", k));
 			w->set_bool_attribute(ID::keep);
+			// the alias is public, so SigMap may pick it as the bit's
+			// representative: it must carry the register's init value, or
+			// `setundef -init -zero` below gives it 0 and the original wire's
+			// init 1 then conflicts ("Conflicting init values", 2026-11-24:
+			// every clk2fflogic model, whose sampled-clock flops start at 1)
+			RTLIL::Wire *qw = qbits[k].wire;
+			if (qw->attributes.count(ID::init)) {
+				RTLIL::Const iv = qw->attributes.at(ID::init);
+				if (qbits[k].offset < GetSize(iv))
+					w->attributes[ID::init] = RTLIL::Const(iv[qbits[k].offset], 1);
+			}
 			m->connect(w, qbits[k]);
 		}
 

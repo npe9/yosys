@@ -56,6 +56,7 @@ struct CdcFinding {
 	std::string bit;
 	std::string cell;
 	std::string module;
+	std::string obligation = "";	// qd: name of the $assert a driver must prove
 };
 
 struct Crossing {
@@ -98,6 +99,200 @@ struct CdcAnalyzer
 	int bound_hits = 0;
 
 	CdcAnalyzer(Module *module) : module(module), sigmap(module) { }
+
+	// ---- qualified data (qd, 2026-11-24) ------------------------------
+	bool want_obligations = false;
+	bool want_reset_quiet = false;
+	struct QdObligation {
+		std::string name;
+		SigBit clk;
+		bool pol_clk;
+		SigBit en;
+		bool en_inv;
+		SigSpec src;
+	};
+	std::vector<QdObligation> qd_obligs;
+	std::map<std::tuple<Cell *, SigBit, bool>, int> qd_index;
+	int qd_count = 0;
+
+	// capture flop bit c holds its value unless an enable is set:
+	// $dffe-style CE, or D = $mux with the flop's own Q on one input.
+	// src = the data bit captured; it must be a launch flop's Q in a
+	// foreign domain (logic in front of the capture is not qualified data)
+	bool qd_split(const Crossing &c, SigBit &en, bool &en_inv, SigBit &src)
+	{
+		FfData ff(nullptr, c.ffcell);
+		if (c.qidx < 0 || c.qidx >= GetSize(ff.sig_q))
+			return false;
+		SigBit q = sigmap(ff.sig_q[c.qidx]);
+		SigBit d = c.dbit;
+		if (ff.has_ce) {
+			if (GetSize(ff.sig_ce) != 1)
+				return false;
+			en = sigmap(ff.sig_ce[0]);
+			en_inv = !ff.pol_ce;
+			src = d;
+		} else {
+			auto dit = drivers.find(d);
+			if (dit == drivers.end() || dit->second.first->type != ID($mux))
+				return false;
+			Cell *m = dit->second.first;
+			int k = dit->second.second;
+			SigSpec a = sigmap(m->getPort(ID::A)), b = sigmap(m->getPort(ID::B));
+			SigSpec sel = sigmap(m->getPort(ID::S));
+			if (GetSize(sel) != 1 || k >= GetSize(a))
+				return false;
+			en = sel[0];
+			if (a[k] == q) {
+				en_inv = false;
+				src = b[k];
+			} else if (b[k] == q) {
+				en_inv = true;
+				src = a[k];
+			} else
+				return false;
+		}
+		auto sit = drivers.find(src);
+		if (!src.wire || sit == drivers.end() || !sit->second.first->is_builtin_ff())
+			return false;
+		int sd = ff_domain(sit->second.first);
+		return sd >= 0 && c.srcs.count(sd) && GetSize(c.srcs) == 1;
+	}
+
+	// the enable's backward cone (through comb logic, bounded) may contain
+	// only destination-domain flops and constants, and must contain a
+	// synchronizer output (chain stage >= 2) from the data's source domain;
+	// a port, an undriven net or a foreign flop disqualifies
+	bool qd_enable_ok(SigBit en, int d_ff, const pool<SigBit> &sync_outs)
+	{
+		pool<SigBit> seen;
+		std::vector<SigBit> work;
+		bool found = false;
+		if (!en.wire)
+			return false;
+		work.push_back(en);
+		seen.insert(en);
+		while (!work.empty()) {
+			if (GetSize(seen) > 256) {
+				bound_hits++;
+				return false;
+			}
+			SigBit b = work.back();
+			work.pop_back();
+			if (!b.wire)
+				continue;
+			if (b.wire->port_input)
+				return false;
+			auto dit = drivers.find(b);
+			if (dit == drivers.end())
+				return false;
+			Cell *drv = dit->second.first;
+			if (drv->is_builtin_ff()) {
+				if (drv->type.in(ID($dl), ID($dlatch)) || ff_domain(drv) != d_ff)
+					return false;
+				if (sync_outs.count(b))
+					found = true;
+				continue;
+			}
+			if (drv->is_mem_cell() || (module->design && module->design->module(drv->type) != nullptr))
+				return false;
+			for (auto &conn : drv->connections()) {
+				if (!drv->input(conn.first))
+					continue;
+				for (auto ib : sigmap(conn.second))
+					if (ib.wire && seen.insert(ib).second)
+						work.push_back(ib);
+			}
+		}
+		return found;
+	}
+
+	void qd_emit()
+	{
+		// reset quiescence (2026-11-24, -reset-quiet): every primary input
+		// that drives an async or sync flop reset is cut off and tied to its
+		// inactive level, and the flops it resets start at their reset value
+		// (the design came out of reset and is never reset again).  The driver proves with resets free first; only
+		// when that fails does it prove this variant, so a failure that needs
+		// a reset mid-transfer is reported as its own finding (reset-abort).
+		// A structural tie, not an $assume: ic3 proves the tied model in
+		// seconds where the assumed one timed out.
+		if (want_reset_quiet && !qd_obligs.empty()) {
+			std::map<SigBit, bool> resets;	// bit -> active polarity
+			for (auto cell : module->cells()) {
+				if (!cell->is_builtin_ff())
+					continue;
+				FfData f(nullptr, cell);
+				if (f.has_arst && GetSize(f.sig_arst) == 1)
+					resets.emplace(sigmap(f.sig_arst[0]), f.pol_arst);
+				if (f.has_srst && GetSize(f.sig_srst) == 1)
+					resets.emplace(sigmap(f.sig_srst[0]), f.pol_srst);
+			}
+			dict<SigBit, SigBit> repl;
+			for (auto &r : resets) {
+				if (!r.first.wire || !r.first.wire->port_input)
+					continue;
+				repl[r.first] = r.second ? State::S0 : State::S1;	// inactive level
+				log("  reset %s tied inactive, its flops start at their reset value (-reset-quiet)\n", log_signal(r.first));
+			}
+			// the flops these resets reset start in their reset state
+			if (!repl.empty()) {
+				FfInitVals initvals(&sigmap, module);
+				for (auto cell : module->cells().to_vector()) {
+					if (!cell->is_builtin_ff())
+						continue;
+					FfData f(&initvals, cell);
+					if (f.has_arst && GetSize(f.sig_arst) == 1 && repl.count(sigmap(f.sig_arst[0])))
+						f.val_init = f.val_arst;
+					else if (f.has_srst && GetSize(f.sig_srst) == 1 && repl.count(sigmap(f.sig_srst[0])))
+						f.val_init = f.val_srst;
+					else
+						continue;
+					f.emit();
+				}
+			}
+			if (!repl.empty())
+				for (auto cell : module->cells()) {
+					std::vector<std::pair<IdString, SigSpec>> upd;
+					for (auto &conn : cell->connections()) {
+						if (!cell->input(conn.first))
+							continue;
+						SigSpec sig = conn.second;
+						bool changed = false;
+						for (auto &b : sig) {
+							auto it = repl.find(sigmap(b));
+							if (it != repl.end()) { b = it->second; changed = true; }
+						}
+						if (changed)
+							upd.emplace_back(conn.first, sig);
+					}
+					for (auto &u : upd)
+						cell->setPort(u.first, u.second);
+				}
+		}
+		for (auto &o : qd_obligs) {
+			auto ff = [&](SigSpec d) {
+				Wire *w = module->addWire(NEW_ID, GetSize(d));
+				w->attributes[ID::init] = Const(State::S0, GetSize(d));
+				module->addFf(NEW_ID, d, w);
+				return SigSpec(w);
+			};
+			SigSpec clk_q = ff(o.clk);
+			SigSpec en = o.en_inv ? module->Not(NEW_ID, o.en) : SigSpec(o.en);
+			SigSpec en_q = ff(en);
+			SigSpec d1 = ff(o.src), d2 = ff(d1);
+			SigSpec warm1 = ff(State::S1), warm2 = ff(warm1);
+			SigSpec edge = o.pol_clk ?
+					module->And(NEW_ID, o.clk, module->Not(NEW_ID, clk_q)) :
+					module->And(NEW_ID, module->Not(NEW_ID, o.clk), clk_q);
+			SigSpec ev = module->And(NEW_ID, module->And(NEW_ID, edge, en_q), warm2);
+			SigSpec ok = module->And(NEW_ID, module->Eq(NEW_ID, o.src, d1), module->Eq(NEW_ID, d1, d2));
+			SigSpec a = module->Or(NEW_ID, module->Not(NEW_ID, ev), ok);
+			Cell *as = module->addAssert(RTLIL::escape_id(o.name), a, State::S1);
+			as->set_bool_attribute(ID(cdc_obligation));
+			log("  added obligation %s (%d data bits)\n", o.name.c_str(), GetSize(o.src));
+		}
+	}
 
 	static bool is_formal(Cell *cell)
 	{
@@ -1470,11 +1665,46 @@ struct CdcAnalyzer
 			std::vector<int> unsynced, synced;
 			for (int i : g.second)
 				(crossings[i].synced ? synced : unsynced).push_back(i);
+			// qd: clean synchronizer outputs (stage >= 2) into this
+			// destination domain from exactly this group's source domains
+			pool<SigBit> sync_outs;
+			for (auto &sc : crossings) {
+				if (!sc.synced || sc.fanout || sc.comb || sc.dst != g.first.first || sc.srcs != g.first.second)
+					continue;
+				auto chain = sync_chain(sc.ffcell, sc.qidx, sc.dst);
+				for (int k = 1; k < GetSize(chain); k++) {
+					FfData cf(nullptr, chain[k].first);
+					sync_outs.insert(sigmap(cf.sig_q[chain[k].second]));
+				}
+			}
 			for (int i : unsynced) {
 				Crossing &c = crossings[i];
 				std::string sev = "ERROR";
 				std::string cls = GetSize(unsynced) > 1 ?
 						"unsynchronized-bus" : "unsynchronized-bit";
+				std::string oblig;
+				SigBit qen, qsrc;
+				bool qinv = false;
+				if (!async_declared(c.srcs, c.dst) && qd_split(c, qen, qinv, qsrc) &&
+						qd_enable_ok(qen, c.dst, sync_outs)) {
+					// shape only: stays an ERROR until the obligation is proved
+					cls = "qualified-data-unproved";
+					auto key = std::make_tuple(c.ffcell, qen, qinv);
+					auto it = qd_index.find(key);
+					if (it == qd_index.end()) {
+						FfData cf(nullptr, c.ffcell);
+						QdObligation o;
+						o.name = stringf("cdc_qd_%d", qd_count++);
+						o.clk = sigmap(cf.sig_clk[0]);
+						o.pol_clk = cf.pol_clk;
+						o.en = qen;
+						o.en_inv = qinv;
+						it = qd_index.emplace(key, GetSize(qd_obligs)).first;
+						qd_obligs.push_back(o);
+					}
+					qd_obligs[it->second].src.append(qsrc);
+					oblig = qd_obligs[it->second].name;
+				}
 				// SDC pairing: a crossing the constraints declared
 				// asynchronous is the designer's waiver -- keep it
 				// visible but downgrade to a warning
@@ -1483,7 +1713,7 @@ struct CdcAnalyzer
 					cls = "async-declared";
 				}
 				findings.push_back({sev, cls, join_domains(c.srcs),
-						domain_names[c.dst], c.bit, c.cell});
+						domain_names[c.dst], c.bit, c.cell, "", oblig});
 			}
 			{
 				std::vector<int> keep;
@@ -1653,6 +1883,8 @@ struct CdcAnalyzer
 
 		find_crossings();
 		report_unanalyzed(design);
+		if (want_obligations)
+			qd_emit();
 	}
 
 	// (e) everything the structural analysis skips, said once per module
@@ -1819,6 +2051,12 @@ struct CdcPass : public Pass {
 		log("  - gray-bus-unverified (WARNING) Gray-shaped bus whose one-bit-per-clock\n");
 		log("                                 step could not be proved\n");
 		log("  - unsynchronized-bit (ERROR)   single-bit crossing without a synchronizer\n");
+		log("  - qualified-data-unproved (ERROR) a data crossing whose capture flop holds\n");
+		log("                                 unless an enable built only from destination\n");
+		log("                                 flops, including a synchronizer output from\n");
+		log("                                 the data's source domain, is set (handshake /\n");
+		log("                                 MCP shape).  The shape is not proof: data\n");
+		log("                                 stability is an obligation (-obligations).\n");
 		log("  - async-declared     (WARNING) unsynchronized crossing between clocks\n");
 		log("                                 declared asynchronous or false-pathed via\n");
 		log("                                 read_sdc constraints: waived, kept visible\n");
@@ -1837,8 +2075,6 @@ struct CdcPass : public Pass {
 		log("  - search-bound       (WARNING)  bounded searches that gave up\n");
 		log("  - unanalyzed-input   (UNANALYZED) input port reaching FF data with no\n");
 		log("                                 known launch clock\n");
-		log("  (Handshake / multi-cycle-path data buses qualified by a synchronized\n");
-		log("  enable are not recognized: their data bits report unsynchronized-bus.)\n");
 		log("  - unsynchronized-bus (ERROR)   a multi-bit crossing with unsynchronized bits\n");
 		log("  - reset-cdc          (WARNING) asynchronous reset input driven from another\n");
 		log("                                 clock domain or from an external input port\n");
@@ -1865,6 +2101,21 @@ struct CdcPass : public Pass {
 		log("\n");
 		log("Options:\n");
 		log("\n");
+		log("    -obligations\n");
+		log("        for each qualified-data candidate (see the class list) add to the module a\n");
+		log("        global-clock monitor and an $assert cdc_qd_<n> (attribute\n");
+		log("        cdc_obligation): when the capture clock edges with the enable set,\n");
+		log("        the source word has not changed in the two steps before.  Prove it\n");
+		log("        on the clk2fflogic model; only a proof makes the crossing safe.\n");
+		log("\n");
+		log("    -reset-quiet\n");
+		log("        with -obligations: tie every primary input that drives a flop reset\n");
+		log("        to its inactive level and start the flops it resets at their reset\n");
+		log("        value (out of reset, never reset again).\n");
+		log("        This changes the design (proof use only).  Proving the obligations\n");
+		log("        both without and with it separates a protocol bug from a reset that\n");
+		log("        aborts a transfer (conformance/cdc_prove.py does both).\n");
+		log("\n");
 		log("    -json <file>\n");
 		log("        write all findings to the given file as a JSON array of objects\n");
 		log("        with the fields 'severity', 'class', 'src', 'dst', 'bit',\n");
@@ -1874,11 +2125,20 @@ struct CdcPass : public Pass {
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		std::string json_file;
+		bool obligations = false, reset_quiet = false;
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-json" && argidx + 1 < args.size()) {
 				json_file = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-obligations") {
+				obligations = true;
+				continue;
+			}
+			if (args[argidx] == "-reset-quiet") {
+				reset_quiet = true;
 				continue;
 			}
 			break;
@@ -1896,6 +2156,8 @@ struct CdcPass : public Pass {
 				log_error("Module %s still contains processes. Run 'proc' before 'cdc'.\n", module);
 
 			CdcAnalyzer analyzer(module);
+			analyzer.want_obligations = obligations;
+			analyzer.want_reset_quiet = reset_quiet;
 			analyzer.run(design);
 
 			num_nets += analyzer.num_crossing_nets;
@@ -1911,9 +2173,10 @@ struct CdcPass : public Pass {
 			log("\n");
 
 			for (auto &f : analyzer.findings) {
-				log("  %-9s %-22s %s -> %s, bit %s (ff %s)\n",
+				log("  %-9s %-22s %s -> %s, bit %s (ff %s)%s\n",
 						(f.severity + ":").c_str(), f.cls.c_str(), f.src.c_str(), f.dst.c_str(),
-						f.bit.c_str(), f.cell.c_str());
+						f.bit.c_str(), f.cell.c_str(),
+						f.obligation.empty() ? "" : stringf(" [obligation %s]", f.obligation.c_str()).c_str());
 				f.module = log_id(module);
 				all_findings.push_back(f);
 				total++;
@@ -1934,8 +2197,8 @@ struct CdcPass : public Pass {
 
 		if (!json_file.empty()) {
 			json11::Json::array arr;
-			for (auto &f : all_findings)
-				arr.push_back(json11::Json::object{
+			for (auto &f : all_findings) {
+				json11::Json::object o{
 					{"severity", f.severity},
 					{"class", f.cls},
 					{"src", f.src},
@@ -1943,7 +2206,11 @@ struct CdcPass : public Pass {
 					{"bit", f.bit},
 					{"cell", f.cell},
 					{"module", f.module},
-				});
+				};
+				if (!f.obligation.empty())
+					o["obligation"] = f.obligation;
+				arr.push_back(o);
+			}
 			std::string out = json11::Json(arr).dump();
 			FILE *fp = fopen(json_file.c_str(), "wt");
 			if (fp == nullptr)

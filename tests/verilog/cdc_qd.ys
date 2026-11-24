@@ -1,0 +1,143 @@
+# qd (2026-11-24): a handshake-qualified data capture is a candidate (ERROR qualified-data-unproved), never OK on
+# shape; `cdc -obligations` adds a stability $assert that the clk2fflogic model proves for the safe twin and
+# disproves when the source changes data while req is high.  A capture enabled by the unsynchronized req is no
+# candidate at all.
+read_verilog -sv <<EOT
+module qd_safe(input clk_a, input clk_b, input go, input [7:0] din, output [7:0] q);
+  // source (clk_a)
+  reg req = 0; reg [7:0] data_a = 0; reg ack_m = 0, ack_s = 0;
+  always @(posedge clk_a) begin
+    ack_m <= ack_b; ack_s <= ack_m;
+    if (!req && !ack_s && go) begin data_a <= din; req <= 1; end
+    else if (req && ack_s) req <= 0;
+  end
+  // destination (clk_b)
+  reg req_m = 0, req_s = 0; reg ack_b = 0; reg [7:0] cap = 0;
+  wire cap_en = req_s && !ack_b;
+  always @(posedge clk_b) begin
+    req_m <= req; req_s <= req_m;
+    if (cap_en) begin cap <= data_a; ack_b <= 1; end
+    else if (!req_s) ack_b <= 0;
+  end
+    assign q = cap;
+endmodule
+module qd_unsafe(input clk_a, input clk_b, input go, input [7:0] din, output [7:0] q);
+  // source (clk_a)
+  reg req = 0; reg [7:0] data_a = 0; reg ack_m = 0, ack_s = 0;
+  always @(posedge clk_a) begin
+    ack_m <= ack_b; ack_s <= ack_m;
+    if (req) data_a <= din;
+    if (!req && !ack_s && go) begin data_a <= din; req <= 1; end
+    else if (req && ack_s) req <= 0;
+  end
+  // destination (clk_b)
+  reg req_m = 0, req_s = 0; reg ack_b = 0; reg [7:0] cap = 0;
+  wire cap_en = req_s && !ack_b;
+  always @(posedge clk_b) begin
+    req_m <= req; req_s <= req_m;
+    if (cap_en) begin cap <= data_a; ack_b <= 1; end
+    else if (!req_s) ack_b <= 0;
+  end
+    assign q = cap;
+endmodule
+module qd_rawreq(input clk_a, input clk_b, input go, input [7:0] din, output [7:0] q);
+  // source (clk_a)
+  reg req = 0; reg [7:0] data_a = 0; reg ack_m = 0, ack_s = 0;
+  always @(posedge clk_a) begin
+    ack_m <= ack_b; ack_s <= ack_m;
+    if (!req && !ack_s && go) begin data_a <= din; req <= 1; end
+    else if (req && ack_s) req <= 0;
+  end
+  // destination (clk_b)
+  reg req_m = 0, req_s = 0; reg ack_b = 0; reg [7:0] cap = 0;
+  wire cap_en = req && !ack_b;
+  always @(posedge clk_b) begin
+    req_m <= req; req_s <= req_m;
+    if (cap_en) begin cap <= data_a; ack_b <= 1; end
+    else if (!req_s) ack_b <= 0;
+  end
+    assign q = cap;
+endmodule
+EOT
+proc
+design -save qd
+
+logger -expect log "ERROR: +qualified-data-unproved +clk_a -> clk_b" 8
+cdc -obligations qd_safe
+logger -check-expected
+select -assert-count 1 qd_safe/a:cdc_obligation
+async2sync
+clk2fflogic qd_safe
+opt_clean
+logger -expect log "ic3: cdc_qd_0: proved" 1
+ic3 -check-cells -init-zero qd_safe
+logger -check-expected
+
+design -load qd
+cdc -obligations qd_unsafe
+select -assert-count 1 qd_unsafe/a:cdc_obligation
+async2sync
+clk2fflogic qd_unsafe
+opt_clean
+logger -expect log "ic3: cdc_qd_0: disproved" 1
+ic3 -check-cells -init-zero qd_unsafe
+logger -check-expected
+
+design -load qd
+logger -expect log "ERROR: +unsynchronized-bus +clk_a -> clk_b" 9
+cdc -obligations qd_rawreq
+logger -check-expected
+select -assert-none qd_rawreq/a:cdc_obligation
+
+# reset-abort split (2026-11-24): with independent async resets per domain the obligation is disproved
+# (a reset of one side mid-transfer), and proved under -reset-quiet (resets tied inactive, flops start at
+# their reset value).  conformance/cdc_prove.py reports that combination as WARNING qualified-data-reset-abort.
+design -reset
+read_verilog -sv <<EOT
+module qd_rst(input clk_a, input clk_b, input rst_a_n, input rst_b_n, input go, input [7:0] din, output [7:0] q);
+  // source (clk_a)
+  reg req; reg [7:0] data_a; reg ack_m, ack_s;
+  always @(posedge clk_a or negedge rst_a_n)
+    if (!rst_a_n) begin req <= 0; data_a <= 0; ack_m <= 0; ack_s <= 0; end
+    else begin
+      ack_m <= ack_b; ack_s <= ack_m;
+      if (!req && !ack_s && go) begin data_a <= din; req <= 1; end
+      else if (req && ack_s) req <= 0;
+    end
+  // destination (clk_b)
+  reg req_m, req_s; reg ack_b; reg [7:0] cap;
+  wire cap_en = req_s && !ack_b;
+  always @(posedge clk_b or negedge rst_b_n)
+    if (!rst_b_n) begin req_m <= 0; req_s <= 0; ack_b <= 0; cap <= 0; end
+    else begin
+      req_m <= req; req_s <= req_m;
+      if (cap_en) begin cap <= data_a; ack_b <= 1; end
+      else if (!req_s) ack_b <= 0;
+    end
+  assign q = cap;
+endmodule
+EOT
+proc
+design -save rq
+
+# resets free: a reset of one side mid-transfer lets the next request change data_a while clk_b captures it
+cdc -obligations qd_rst
+async2sync
+clk2fflogic qd_rst
+opt_clean
+logger -expect log "ic3: cdc_qd_0: disproved" 1
+ic3 -check-cells -init-zero qd_rst
+logger -check-expected
+
+# -reset-quiet: both resets tied inactive, flops start at their reset value -> the protocol itself proves
+design -load rq
+logger -expect log "tied inactive, its flops start at their reset value" 2
+cdc -obligations -reset-quiet qd_rst
+logger -check-expected
+select -assert-count 2 qd_rst/w:rst_a_n qd_rst/w:rst_b_n %co
+async2sync
+clk2fflogic qd_rst
+opt_clean
+logger -expect log "ic3: cdc_qd_0: proved" 1
+ic3 -check-cells -init-zero qd_rst
+logger -check-expected

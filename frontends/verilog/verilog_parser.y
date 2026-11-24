@@ -1522,6 +1522,9 @@ input: {
 design:
 	module design |
 	program design |
+	// fe226: `timeunit' / `timeprecision' at compilation-unit scope (IEEE
+	// 1800-2017 3.14.2.2); time units are not modeled (delays are dropped)
+	timeunit_decl design |
 	defattr design |
 	task_func_decl design |
 	TOK_VIRTUAL task_func_decl design {

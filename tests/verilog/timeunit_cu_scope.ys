@@ -1,0 +1,23 @@
+# fe226: timeunit / timeprecision at compilation-unit scope (IEEE 1800-2017 3.14.2.2)
+read_verilog -sv <<EOT
+timeunit 1ns;
+timeprecision 1ps;
+module top(input a, output y);
+  timeunit 1ns / 1ps;
+  assign y = ~a;
+  wire good = (y == ~a);
+endmodule
+timeunit 10ns / 1ns;
+module other(input a, output y);
+  assign y = a;
+endmodule
+EOT
+hierarchy -top top
+proc
+sat -verify -prove good 1 top
+design -reset
+logger -expect error "syntax error" 1
+read_verilog -sv <<EOT
+timeunit;
+module m; endmodule
+EOT

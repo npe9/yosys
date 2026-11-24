@@ -75,8 +75,26 @@ class Trace:
         return self.sigs[name][k]
 
 # ---------------------------------------------------------------- booleans
+class AbortTrace:
+    """CS-1: Annex F letter substitution for accept_on/reject_on.  Steps
+    k >= at are the letter TOP (every boolean expression holds) or BOT
+    (none holds); steps before read the base trace.  The trace is extended
+    by EXT steps so obligations past the base trace's end see the letter
+    instead of the weak end-of-trace rule (Annex F uses TOP^omega/BOT^omega)."""
+    EXT = 16
+    def __init__(self, base, at, letter):
+        self.base, self.at, self.letter = base, at, letter
+        self.sigs = base.sigs
+        self.T = base.T + self.EXT
+    def val(self, name, k):
+        return self.base.val(name, k) if k < self.base.T else 0
+
 def eval_bool(b, tr, k):
     """int (0/1) value of boolean expression b at step k (k < tr.T)."""
+    if isinstance(tr, AbortTrace):
+        if k >= tr.at:
+            return tr.letter
+        return eval_bool(b, tr.base, k)
     kind = b.k
     if kind == "sig":   return tr.val(b.a[0], k) & 1
     if kind == "const": return b.a[0] & 1
@@ -307,7 +325,105 @@ def prop_eval(p, tr, t, L):
             if not bj:
                 return F
         return U if L < tr.T else T    # trace ended: weak -> holds
+    # ---- CS-1 (2026-11-23): Annex F operators beyond v1.  End-of-trace
+    # convention: a finite simulation reports only definite failures, so a
+    # strong obligation still pending at the last step is undetermined (U),
+    # like a weak one; the strong forms differ where a range runs past the
+    # trace (never T there) and in BMC (not compared at the bound).
+    if k == "followed":       # followed(seq, prop, nonoverlap): s #-# p / s #=# p
+        sq, q, nonov = p.a     # = not (s |-> not p) (16.12.9)
+        ends, opn = seq_match(sq, tr, t, L)
+        res = F
+        for e in ends:
+            if e is EMPTY and not nonov:
+                continue
+            base = (t - 1) if e is EMPTY else e
+            st = base + 1 if nonov else e
+            res = k_or(res, prop_eval(q, tr, st, L))
+            if res is T: return T
+        if opn and res is F:
+            return U
+        return res
+    if k == "piff":
+        x = prop_eval(p.a[0], tr, t, L); y = prop_eval(p.a[1], tr, t, L)
+        if x is U or y is U: return U
+        return x == y
+    if k == "s_nexttime":     # strong: the n-th next tick must exist
+        n = p.a[1]
+        if t + n >= tr.T: return U
+        return prop_eval(p.a[0], tr, t + n, L)
+    if k == "s_always":       # s_always[lo:hi] p: every tick in range exists and p holds
+        q, lo, hi = p.a
+        res = T
+        for j in range(t + lo, t + hi + 1):
+            if j >= tr.T:
+                return F if res is F else U
+            res = k_and(res, prop_eval(q, tr, j, L))
+            if res is F: return F
+        return res
+    if k == "eventually":     # weak eventually[lo:hi] p: holds if the trace ends first
+        q, lo, hi = p.a
+        res = F
+        for j in range(t + lo, t + hi + 1):
+            if j >= tr.T:
+                return T
+            if j >= L:
+                return U if res is F else res
+            res = k_or(res, prop_eval(q, tr, j, L))
+            if res is T: return T
+        return res
+    if k == "s_until":        # s_until(b, c, with): until, and c must occur
+        b, c, with_ = p.a
+        for j in range(t, L):
+            cj = eval_bool(c, tr, j); bj = eval_bool(b, tr, j)
+            if cj:
+                return T if (not with_ or bj) else F
+            if not bj:
+                return F
+        return U
+    if k in ("accept_on", "reject_on"):
+        # IEEE 1800-2009/2017 16.12.14 (prose): the abort condition is checked
+        # from the attempt's first tick; at the first tick i where it holds,
+        # a verdict p already reached on the ticks before i stands, otherwise
+        # accept_on is true and reject_on is false -- "when the abort
+        # condition occurs at the same time step where the evaluation of the
+        # property_expr ends, the abort condition takes precedence" (this
+        # includes a vacuous success on tick i).  Nested aborts: the outer
+        # one is checked first (lexical order).  sync_ forms sample b at the
+        # clock tick; on a single-clock sampled trace both coincide (a.2 is
+        # printed, not consulted).
+        # Annex F (F.5.3.1, letter substitution w^{0,i-1} TOP^omega / BOT^omega)
+        # differs on one shape: a property that still holds when every
+        # letter from i on is BOT (e.g. a vacuous implication), so Annex F
+        # passes reject_on(c) (a |-> b) on a tick with c && !a while the
+        # prose fails it.  The fork follows the prose (CS-1 decision
+        # 2026-11-23, work/cs1/notes.md); AbortTrace keeps the Annex F
+        # reading available (annexf_abort below).
+        b, q = p.a[0], p.a[1]
+        acc = k == "accept_on"
+        for i in range(t, min(L, tr.T)):
+            if eval_bool(b, tr, i):
+                v = prop_eval(q, tr, t, i) if i > t else U
+                if v is not U:
+                    return v
+                return T if acc else F
+        return prop_eval(q, tr, t, L)
     raise ValueError("bad prop node %r" % p)
+
+def annexf_abort(p, tr, t, L):
+    """Annex F reading of accept_on/reject_on (kept for triage only):
+    w |= accept_on(b) P iff w |= P or, for some tick i of the attempt with
+    b, w^{0,i-1} TOP^omega |= P; reject_on(b) P = not accept_on(b) not P."""
+    b, q = p.a[0], p.a[1]
+    acc = p.k == "accept_on"
+    res = prop_eval(q, tr, t, L)
+    for i in range(t, min(L, tr.T)):
+        if not eval_bool(b, tr, i):
+            continue
+        sub = AbortTrace(tr, i, 1 if acc else 0)
+        v = prop_eval(q, sub, t, sub.T)
+        res = k_or(res, v) if acc else k_and(res, v)
+    return res
 
 def attempt_fire_step(top, tr, t):
     """Step at which the attempt starting at t fires, or None.

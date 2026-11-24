@@ -130,11 +130,16 @@ def first_error(blob):
             return line.strip()[:200]
     return ""
 
+APPROX = {}   # workdir -> sva2check approximation tags seen (CS-1)
+
 def sim_leg(workdir, tr, idx, timeout):
     yw = "stim%d.yw" % idx; summ = "sum%d.json" % idx
     open(os.path.join(workdir, yw), "w").write(yw_text(tr))
     open(os.path.join(workdir, "sim%d.ys" % idx), "w").write(SIM_SCRIPT.format(yw=yw, summary=summ))
     rc, out = run([YOSYS, "-q", "sim%d.ys" % idx], workdir, timeout)
+    # CS-1: record sva2check's approximation tags so tagged cases (known
+    # residue, e.g. prop-binop-unaligned) split from untagged ones
+    APPROX.setdefault(workdir, set()).update(re.findall(r"lowered with approximation '([^']+)'", out))
     if rc != 0:
         return None, first_error(out) or ("rc=%d" % rc)
     data = json.load(open(os.path.join(workdir, summ)))
@@ -212,6 +217,7 @@ def shrink(top, traces, cls, bound, timeout, limit=60):
             if tried > limit: break
             with tempfile.TemporaryDirectory() as wd:
                 c, _ = check_case(cand, best_traces, wd, bound, timeout, want_bmc=False)
+                APPROX.pop(wd, None)
             if c == cls:
                 best = cand; improved = True; break
         if not improved and best_traces[0].T > 3:
@@ -220,6 +226,7 @@ def shrink(top, traces, cls, bound, timeout, limit=60):
             tr2 = [derive({n: tr.sigs[n][:T2] for n, _ in INPUTS}) for tr in best_traces]
             with tempfile.TemporaryDirectory() as wd:
                 c, _ = check_case(best, tr2, wd, bound, timeout, want_bmc=False)
+                APPROX.pop(wd, None)
             if c == cls:
                 best_traces = tr2; improved = True
     return best, best_traces
@@ -241,6 +248,7 @@ lock = threading.Lock()
 def one_case(seed, index, args):
     rng = random.Random("pbt:%d:%d" % (seed, index))
     g = (pbt_gen.UnbGen if args.unbounded else pbt_gen.Gen)(rng, max_depth=args.depth, budget=args.budget)
+    g.ext = getattr(args, "ext", False)
     top = g.top()
     traces = [random_trace(rng, args.bound) for _ in range(args.traces)]
     wd = tempfile.mkdtemp(prefix="pbt_")
@@ -255,7 +263,8 @@ def one_case(seed, index, args):
             bad_syntax = syntax_leg(top, wd, args.timeout)
         rec = {"seed": seed, "index": index, "class": cls, "detail": detail,
                "prop": pbt_gen.ptop(top), "size": pbt_gen.size(top),
-               "accepts_invalid": bad_syntax}
+               "accepts_invalid": bad_syntax,
+               "approx": sorted(APPROX.pop(wd, set()))}
         if shrunk:
             rec["shrunk_prop"] = pbt_gen.ptop(shrunk[0]); rec["shrunk_T"] = shrunk[1][0].T
         if cls not in ("OK",) or bad_syntax:
@@ -301,6 +310,52 @@ def selftest():
         ("cnt==2 |-> a", N("top", None, N("impl", N("cnteq",2), S("a"), False)), tr(a=[1,1,0,1,1,1,0,1]), [2,6]),
         ("$rose(a) |-> b", N("top", None, N("impl", N("rose","a"), S("b"), False)), tr(a=[0,1,1,0,1,1,1,1], b=[1,0,1,1,1,1,1,1]), [1]),
     ]
+    # CS-1 (2026-11-23): Annex F operators beyond v1.  Expected fire steps
+    # derived by hand from IEEE 1800-2017 16.12 / Annex F (not measured on
+    # the framework).  Finite-sim convention: an obligation still pending
+    # at the last step (weak or strong) does not fire.
+    B = lambda *v: list(v)
+    cases += [
+        # s #-# p: s must match; attempts 2 (b) and 3 (a) fail
+        ("a #-# b", N("top", None, N("followed", S("a"), S("b"), False)), tr(a=B(1,1,1,0,1,1,1,1), b=B(1,1,0,1,1,1,1,1)), [2, 3]),
+        # s #=# p: attempt 1 fails at 2 (b), attempt 4 at 4 (a); attempt 7 pending
+        ("a #=# b", N("top", None, N("followed", S("a"), S("b"), True)), tr(a=B(1,1,1,1,0,1,1,1), b=B(1,1,0,1,1,1,1,1)), [2, 4]),
+        # iff: attempt fails where a != b
+        ("a iff b", N("top", None, N("piff", S("a"), S("b"))), tr(a=B(1,1,1,0,1,1,1,1), b=B(1,0,1,0,1,1,1,0)), [1, 7]),
+        ("s_nexttime[1] a", N("top", None, N("s_nexttime", S("a"), 1)), tr(a=B(1,1,1,0,1,1,1,1)), [3]),
+        # s_always[0:1] a: attempts 2 and 3 fail at 3; attempt 7 pending
+        ("s_always[0:1] a", N("top", None, N("s_always", S("a"), 0, 1)), tr(a=B(1,1,1,0,1,1,1,1)), [3]),
+        # weak eventually[1:2] a: attempt 2 fails at 4 (a low at 3, 4), attempt 5 at 7
+        # (low at 6, 7); attempts 6, 7 run off the trace (weak: hold)
+        ("eventually[1:2] a", N("top", None, N("eventually", S("a"), 1, 2)), tr(a=B(1,1,1,0,0,1,0,0)), [4, 7]),
+        # a s_until b: attempts 0-2 fail at 2 (a low, no b); 3 holds (b); 4-7 pending
+        ("a s_until b", N("top", None, N("s_until", S("a"), S("b"), False)), tr(a=B(1,1,0,1,1,1,1,1), b=B(0,0,0,1,0,0,0,0)), [2]),
+        # s_until_with: b at 3 needs a at 3 too
+        ("a s_until_with b", N("top", None, N("s_until", S("a"), S("b"), True)), tr(a=B(1,1,1,0,1,1,1,1), b=B(0,0,0,1,0,0,0,0)), [3]),
+        # accept_on(c) (a |=> b): attempt 1 is aborted at 2 (c) before b's check -> passes;
+        # attempt 4 fails at 5 (no abort)
+        ("accept_on(c) a|=>b", N("top", None, N("accept_on", S("c"), N("impl", S("a"), S("b"), True), False)),
+            tr(a=B(0,1,0,0,1,0,0,0), b=B(1,1,0,1,1,0,1,1), c=B(0,0,1,0,0,0,0,0)), [5]),
+        # abort on the attempt's own start tick: accept_on(c) a with c, !a at 3 passes
+        ("accept_on(c) a", N("top", None, N("accept_on", S("c"), S("a"), False)), tr(a=B(1,1,1,0,1,0,1,1), c=B(0,0,0,1,0,0,0,0)), [5]),
+        # reject_on(c) (a |=> b): attempt 1 still pending at 2 when c rises -> fails at 2;
+        # attempts 0 and 2 (a low) are vacuous before/at c... attempt 2 starts on the
+        # abort tick: its letter is BOT, the antecedent a does not hold -> vacuous pass
+        ("reject_on(c) a|=>b", N("top", None, N("reject_on", S("c"), N("impl", S("a"), S("b"), True), False)),
+            tr(a=B(0,1,0,0,0,0,0,0), b=B(1,1,1,1,1,1,1,1), c=B(0,0,1,0,0,0,0,0)), [2]),
+        # 16.12.14 precedence: reject_on(c) (a |-> b) with c && !a at 3: the attempt at 3
+        # ends vacuously on the abort tick, the abort takes precedence -> fails at 3
+        # (Annex F letter substitution would pass it; the fork follows the prose)
+        ("reject_on vacuous", N("top", None, N("reject_on", S("c"), N("impl", S("a"), S("b"), False), False)),
+            tr(a=B(0,0,0,0,0,0,0,0), c=B(0,0,0,1,0,0,0,0)), [3]),
+        # reject_on(c) a: the abort tick takes precedence, so it fails there
+        ("reject_on(c) a", N("top", None, N("reject_on", S("c"), S("a"), False)), tr(a=B(1,1,1,1,1,1,1,1), c=B(0,0,0,1,0,0,0,0)), [3]),
+        # reject_on(c) (a |=> b) with the pending obligation past the trace: attempt 7
+        # starts at the abort tick on the last step: BOT letter, a fails -> vacuous; and
+        # attempt 6 (a at 6) is pending at 7 when c rises -> fails at 7
+        ("reject_on(c) last", N("top", None, N("reject_on", S("c"), N("impl", S("a"), S("b"), True), False)),
+            tr(a=B(0,0,0,0,0,0,1,1), b=B(1,1,1,1,1,1,1,1), c=B(0,0,0,0,0,0,0,1)), [7]),
+    ]
     bad = 0
     for name, top, t, want in cases:
         got = ref_sva.fire_steps(top, t)
@@ -325,6 +380,8 @@ def main():
     ap.add_argument("--unbounded", action="store_true",
                     help="generate unbounded sequences in property position (weak semantics)")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--ext", action="store_true",
+                    help="CS-1: also generate Annex F operators beyond v1 (followed-by, iff, s_nexttime, s_always, eventually, s_until, accept_on/reject_on)")
     args = ap.parse_args()
     if args.selftest:
         sys.exit(selftest())

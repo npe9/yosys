@@ -29,6 +29,20 @@ was measured, not assumed:
 Design shell for every case: inputs `a b c d rst`, `r <= a`, `cnt <= cnt+1`
 (so `r == $past(a)` is a tautology and `cnt(k) = k mod 4`).
 
+## Extended operators (`--ext`, CS-1 2026-11-23)
+
+`pbt.py --ext` also generates followed-by (`#-#`, `#=#`), `iff`,
+`s_nexttime`, `s_always[m:n]`, weak `eventually[m:n]`, `s_until(_with)`
+and `(sync_)accept_on` / `(sync_)reject_on`; the default stream (no
+`--ext`) is unchanged.  Finite-sim convention: an obligation still
+pending at the last step does not fire, strong or weak.  Abort operators
+follow IEEE 1800 16.12.14's precedence rule (an abort on the tick where
+the operand's evaluation ends wins, including a vacuous success);
+Annex F's letter substitution differs on that one shape and is kept as
+`ref_sva.annexf_abort` for triage.  `notes.json` records sva2check's
+approximation tags (`approx`) so tagged disagreements split from
+untagged ones.
+
 ## Result classes
 
 | class | meaning | severity |

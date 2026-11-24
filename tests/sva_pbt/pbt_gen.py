@@ -19,6 +19,7 @@ class Gen:
         self.max_depth = max_depth
         self.budget = budget
         self.nodes = 0
+        self.ext = False   # CS-1: Annex F operators beyond v1 (pbt.py --ext)
 
     def spend(self):
         self.nodes += 1
@@ -91,6 +92,8 @@ class Gen:
     def prop(self, d=0):
         if self.spend() or d >= self.max_depth:
             return self.seq(d)
+        if self.ext and self.r.random() < 0.3:
+            return self.ext_prop(d)
         r = self.r.random()
         if r < 0.12:
             return self.seq(d)
@@ -116,7 +119,31 @@ class Gen:
         if r < 0.93:
             lo = self.r.randint(0, 2); hi = lo + self.r.randint(1, 2)
             return N("s_eventually", self.prop(d + 1), lo, hi)
+        if r < 0.955:
+            return N("until", self.boolean(), self.boolean(), self.r.random() < 0.4)
+        if self.ext:
+            return self.ext_prop(d)
         return N("until", self.boolean(), self.boolean(), self.r.random() < 0.4)
+
+    # CS-1 (2026-11-23): Annex F operators beyond v1, enabled by --ext
+    def ext_prop(self, d):
+        r = self.r.random()
+        if r < 0.15:
+            return N("followed", self.seq(d + 1), self.prop(d + 1), self.r.random() < 0.5)
+        if r < 0.25:
+            return N("piff", self.prop(d + 1), self.prop(d + 1))
+        if r < 0.37:
+            return N("s_nexttime", self.prop(d + 1), self.r.randint(1, 2))
+        if r < 0.49:
+            lo = self.r.randint(0, 2); hi = lo + self.r.randint(0, 2)
+            return N("s_always", self.prop(d + 1), lo, hi)
+        if r < 0.61:
+            lo = self.r.randint(0, 2); hi = lo + self.r.randint(1, 2)
+            return N("eventually", self.prop(d + 1), lo, hi)
+        if r < 0.75:
+            return N("s_until", self.boolean(), self.boolean(), self.r.random() < 0.4)
+        kind = "accept_on" if self.r.random() < 0.5 else "reject_on"
+        return N(kind, self.boolean(), self.prop(d + 1), self.r.random() < 0.5)
 
     def top(self):
         dis = self.boolean() if self.r.random() < 0.25 else None
@@ -177,6 +204,14 @@ def pp(p):
     if k == "always": return "(always[%d:%d] %s)" % (p.a[1], p.a[2], pp(p.a[0]))
     if k == "s_eventually": return "(s_eventually[%d:%d] %s)" % (p.a[1], p.a[2], pp(p.a[0]))
     if k == "until": return "(%s %s %s)" % (pb(p.a[0]), "until_with" if p.a[2] else "until", pb(p.a[1]))
+    if k == "followed": return "(%s %s %s)" % (ps(p.a[0]), "#=#" if p.a[2] else "#-#", pp(p.a[1]))
+    if k == "piff": return "(%s iff %s)" % (pp(p.a[0]), pp(p.a[1]))
+    if k == "s_nexttime": return "(s_nexttime[%d] %s)" % (p.a[1], pp(p.a[0]))
+    if k == "s_always": return "(s_always[%d:%d] %s)" % (p.a[1], p.a[2], pp(p.a[0]))
+    if k == "eventually": return "(eventually[%d:%d] %s)" % (p.a[1], p.a[2], pp(p.a[0]))
+    if k == "s_until": return "(%s %s %s)" % (pb(p.a[0]), "s_until_with" if p.a[2] else "s_until", pb(p.a[1]))
+    if k in ("accept_on", "reject_on"):
+        return "(%s%s(%s) %s)" % ("sync_" if p.a[2] else "", k, pb(p.a[0]), pp(p.a[1]))
     raise ValueError(k)
 
 def ptop(top):
@@ -235,9 +270,9 @@ def shrink_node(n):
 def valid_numbers(n):
     if n.k in ("delay", "rep", "always"):
         return n.a[1] <= n.a[2] if n.k != "delay" else n.a[1] <= n.a[2]
-    if n.k == "s_eventually":
+    if n.k in ("s_eventually", "s_always", "eventually"):
         return n.a[1] <= n.a[2]
-    if n.k in ("goto", "noncons", "past", "nexttime"):
+    if n.k in ("goto", "noncons", "past", "nexttime", "s_nexttime"):
         return n.a[1] >= 1
     return True
 

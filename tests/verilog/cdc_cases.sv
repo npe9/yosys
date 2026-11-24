@@ -283,7 +283,8 @@ module cdc_clk_div (
     logic kin;
     always_ff @(posedge div_clk) kin <= src_a;
 
-    // true CDC: div domain -> clk_b, properly synchronized
+    // true CDC: div domain -> clk_b, a 4-bit binary counter synced bit by bit:
+    // the incoherent-bus pattern (cdc reports synced-bus WARNING; CV-2 2026-11-23)
     logic [3:0] m1, m2;
     always_ff @(posedge clk_b) m1 <= cnt_div;
     always_ff @(posedge clk_b) m2 <= m1;

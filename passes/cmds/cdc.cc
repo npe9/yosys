@@ -285,7 +285,7 @@ struct CdcAnalyzer
 	// latch)?  An enable that passes through a register or latch cannot
 	// change while the parent clock is active; a bare comb enable can,
 	// which is what makes combinatorial clock ANDing glitch-prone.
-	bool cone_has_hold(SigBit bit, bool &has_latch, int depth = 0)
+	bool cone_has_hold(SigBit bit, bool &has_latch, int depth = 0, Cell **latch_out = nullptr)
 	{
 		pool<SigBit> seen;
 		std::vector<SigBit> work;
@@ -308,6 +308,8 @@ struct CdcAnalyzer
 			// first
 			if (drv->type.in(ID($dl), ID($dlatch))) {
 				has_latch = true;
+				if (latch_out)
+					*latch_out = drv;
 				return true;
 			}
 			if (drv->is_builtin_ff())
@@ -490,7 +492,8 @@ struct CdcAnalyzer
 				bool any_glitch = false, any_reg = false, all_latch = true;
 				for (SigBit en : enbits) {
 					bool has_latch = false;
-					bool hold = cone_has_hold(en, has_latch);
+					Cell *latch = nullptr;
+					bool hold = cone_has_hold(en, has_latch, 0, &latch);
 					// enable not generated in (one of) the parent
 					// domain(s): it can change asynchronously w.r.t.
 					// the gate it feeds -> glitch, held or not
@@ -498,6 +501,24 @@ struct CdcAnalyzer
 					for (int ed : bit_domains(en))
 						if (!parents.count(ed))
 							foreign = true;
+					// a latch-held enable (ICG): the latch output carries
+					// no domain, so judge the enable by the latch's D
+					// input; a D with no known domain is not evidence of
+					// safety (CV-2 cg_foreign_en, 2026-11-23)
+					if (latch && latch->hasPort(ID::D)) {
+						bool known = false;
+						for (auto db : sigmap(latch->getPort(ID::D))) {
+							if (!db.wire)
+								continue;
+							for (int ed : bit_domains(db)) {
+								known = true;
+								if (!parents.count(ed))
+									foreign = true;
+							}
+						}
+						if (!known)
+							ambiguous = true;
+					}
 					if (foreign || !hold)
 						any_glitch = true;
 					else if (!has_latch)
@@ -1523,7 +1544,20 @@ struct CdcAnalyzer
 					q_cone(chain.back().first, chain.back().second,
 							comb_tail[a], tail_sinks);
 				}
+				// a word launched by one source register and captured by
+				// one destination register is one bus even when its bits'
+				// cones never meet inside this module (they meet in the
+				// consumer: CV-2 mb_bus_2ff, 2026-11-23)
+				auto src_ff = [&](int a) -> Cell * {
+					auto dit = drivers.find(crossings[synced[a]].dbit);
+					if (dit == drivers.end() || !dit->second.first->is_builtin_ff())
+						return nullptr;
+					return dit->second.first;
+				};
 				auto share = [&](int a, int b) {
+					if (crossings[synced[a]].ffcell == crossings[synced[b]].ffcell &&
+							src_ff(a) != nullptr && src_ff(a) == src_ff(b))
+						return true;
 					for (Cell *c : comb[a])
 						if (comb[b].count(c))
 							return true;
@@ -1635,14 +1669,27 @@ struct CdcAnalyzer
 			else if (design && design->module(cell->type) != nullptr)
 				subs++;
 		}
-		if (latches)
+		// CV-1/CV-2 (2026-11-23): every skip is also a finding, so a -json
+		// consumer cannot read "not analyzed" as "clean"
+		auto skip = [&](const char *sev, const char *cls, int n) {
+			findings.push_back({sev, cls, "", "", stringf("%d", n), ""});
+		};
+		if (latches) {
 			log_warning("cdc: module %s: %d latch(es) not analyzed: crossings through latches are not reported.\n", log_id(module), latches);
-		if (mems)
+			skip("WARNING", "unanalyzed-latch", latches);
+		}
+		if (mems) {
 			log_warning("cdc: module %s: %d memory cell(s) not analyzed: run memory_map before cdc.\n", log_id(module), mems);
-		if (subs)
+			skip("ERROR", "unanalyzed-memory", mems);
+		}
+		if (subs) {
 			log_warning("cdc: module %s: %d submodule instance(s): crossings into or out of them are not analyzed; run flatten before cdc.\n", log_id(module), subs);
-		if (noclk)
+			skip("ERROR", "unanalyzed-hierarchy", subs);
+		}
+		if (noclk) {
 			log_warning("cdc: module %s: %d flip-flop(s) without a single clock bit ($ff/global-clock or multi-bit clock) not analyzed.\n", log_id(module), noclk);
+			skip("WARNING", "unanalyzed-ff", noclk);
+		}
 		// input ports reaching FF data inputs: no launch domain is known
 		// (an SDC set_input_delay -clock is stored but not used)
 		pool<std::string> ports;
@@ -1684,9 +1731,13 @@ struct CdcAnalyzer
 				list += stringf(", ... (%d total)", GetSize(v));
 			log_warning("cdc: module %s: input port(s) %s reach flip-flop data inputs with no known launch clock: those paths are not checked.\n",
 					log_id(module), list.c_str());
+			for (auto &pn : v)
+				findings.push_back({"UNANALYZED", "unanalyzed-input", "(external)", "", pn, ""});
 		}
-		if (bound_hits)
+		if (bound_hits) {
 			log_warning("cdc: module %s: %d bounded search(es) gave up; their findings take the conservative answer.\n", log_id(module), bound_hits);
+			skip("WARNING", "search-bound", bound_hits);
+		}
 	}
 };
 
@@ -1771,6 +1822,18 @@ struct CdcPass : public Pass {
 		log("  - synced-bus         (WARNING) all bits of a multi-bit crossing use 2+\n");
 		log("                                 stage synchronizers; check Gray coding or\n");
 		log("                                 handshake coherence between the domains\n");
+		log("                                 (bits launched by one source register and\n");
+		log("                                 captured by one destination register are\n");
+		log("                                 one bus even if they never reconverge here)\n");
+		log("\n");
+		log("What the analysis skips is reported as findings too (bit = count or port):\n");
+		log("  - unanalyzed-hierarchy (ERROR)  submodule instances: run flatten first\n");
+		log("  - unanalyzed-memory  (ERROR)    memory cells: run memory_map first\n");
+		log("  - unanalyzed-latch   (WARNING)  latches (crossings through them unchecked)\n");
+		log("  - unanalyzed-ff      (WARNING)  FFs without a single clock bit\n");
+		log("  - search-bound       (WARNING)  bounded searches that gave up\n");
+		log("  - unanalyzed-input   (UNANALYZED) input port reaching FF data with no\n");
+		log("                                 known launch clock\n");
 		log("  (Handshake / multi-cycle-path data buses qualified by a synchronized\n");
 		log("  enable are not recognized: their data bits report unsynchronized-bus.)\n");
 		log("  - unsynchronized-bus (ERROR)   a multi-bit crossing with unsynchronized bits\n");
@@ -1822,7 +1885,7 @@ struct CdcPass : public Pass {
 		log_header(design, "Executing CDC pass (structural clock-domain crossing analysis).\n");
 
 		std::vector<CdcFinding> all_findings;
-		int total = 0, num_errors = 0, num_warnings = 0, num_ok = 0, num_nets = 0;
+		int total = 0, num_errors = 0, num_warnings = 0, num_ok = 0, num_unanalyzed = 0, num_nets = 0;
 
 		for (auto module : design->selected_whole_modules_warn())
 		{
@@ -1855,12 +1918,14 @@ struct CdcPass : public Pass {
 					num_errors++;
 				else if (f.severity == "WARNING")
 					num_warnings++;
+				else if (f.severity == "UNANALYZED")
+					num_unanalyzed++;
 				else
 					num_ok++;
 			}
 		}
 
-		log("%d crossings analyzed, %d errors, %d warnings, %d ok.\n", total, num_errors, num_warnings, num_ok);
+		log("%d findings: %d errors, %d warnings, %d ok, %d unanalyzed.\n", total, num_errors, num_warnings, num_ok, num_unanalyzed);
 		if (num_nets)
 			log_debug("cdc: %d multi-domain crossing nets recorded.\n", num_nets);
 

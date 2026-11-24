@@ -1,0 +1,61 @@
+# CDC validation round CV-2 (2026-11-23): false OKs found by an independent,
+# blind-labelled suite (work/cdcv/suite in the sv-yosys harness).
+read_verilog -sv <<EOT
+// a word synced bit by bit, bits never reconverge here -> one bus, WARNING
+module v1_bus_2ff(input clk_a, clk_b, input [3:0] d_a, output [3:0] q_b);
+  reg [3:0] a_q, m, s;
+  always @(posedge clk_a) a_q <= d_a;
+  always @(posedge clk_b) begin m <= a_q; s <= m; end
+  assign q_b = s;
+endmodule
+// independent flags from separate source registers into separate syncs -> OK
+module v1_flags(input clk_a, clk_b, input f0, f1, output q0, q1);
+  reg a0, a1, m0, m1, s0, s1;
+  always @(posedge clk_a) a0 <= f0;
+  always @(posedge clk_a) a1 <= f1;
+  always @(posedge clk_b) begin m0 <= a0; s0 <= m0; end
+  always @(posedge clk_b) begin m1 <= a1; s1 <= m1; end
+  assign q0 = s0; assign q1 = s1;
+endmodule
+// latch-held clock-gate enable launched by a foreign clock -> ERROR
+module v2_icg_foreign(input clk_a, clk_b, en_in, d_b, output reg q);
+  reg a_en, en_lat, b_d;
+  always @(posedge clk_a) a_en <= en_in;
+  always @(posedge clk_b) b_d <= d_b;
+  always @* if (!clk_b) en_lat = a_en;
+  wire gclk = clk_b & en_lat;
+  always @(posedge gclk) q <= b_d;
+endmodule
+// the same gate with an enable from its own clock -> OK
+module v2_icg_ok(input clk_b, en_in, d_b, output reg q);
+  reg b_en, en_lat, b_d;
+  always @(posedge clk_b) begin b_en <= en_in; b_d <= d_b; end
+  always @* if (!clk_b) en_lat = b_en;
+  wire gclk = clk_b & en_lat;
+  always @(posedge gclk) q <= b_d;
+endmodule
+// hierarchy left unflattened -> an ERROR finding, not an empty report
+module v3_reg1(input clk, d, output reg q); always @(posedge clk) q <= d; endmodule
+module v3_hier(input clk_a, clk_b, d, output q);
+  reg a; always @(posedge clk_a) a <= d;
+  v3_reg1 u(.clk(clk_b), .d(a), .q(q));
+endmodule
+EOT
+proc
+opt_clean
+
+logger -expect log "WARNING: +synced-bus +clk_a -> clk_b" 4
+cdc v1_bus_2ff
+logger -check-expected
+logger -expect log "OK: +synchronizer-2ff +clk_a -> clk_b" 2
+cdc v1_flags
+logger -check-expected
+logger -expect log "ERROR: +clock-gating-glitch" 1
+cdc v2_icg_foreign
+logger -check-expected
+logger -expect log "OK: +clock-gate-icg" 1
+cdc v2_icg_ok
+logger -check-expected
+logger -expect log "ERROR: +unanalyzed-hierarchy" 1
+cdc v3_hier
+logger -check-expected

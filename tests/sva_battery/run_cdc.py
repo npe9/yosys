@@ -20,8 +20,10 @@ Expected findings (one table line per crossing bit, plus reset findings):
                    |                                EQ compare is not Gray)
   cdc_clk_div    | 1x OK       generated-clock     (divide-by-2 from clk_a)
                    | 1x OK       same-clock-family   (clk_a -> div_clk)
-                   | 4x OK       synchronizer-2ff    (div_clk -> clk_b sync)
-  cdc_gate_icg   | 1x OK       clock-gate-icg      (latch-held enable)
+                   | 4x WARNING  synced-bus          (div_clk -> clk_b: a 4-bit binary
+                   |                                counter synced per bit; was 4x OK)
+  cdc_gate_icg   | 1x WARNING  clock-gating-ambiguous (latch-held enable from a
+                   |                                port: no known launch clock; was OK)
   cdc_gate_reg   | 1x WARNING  clock-gate-reg      (registered comb AND)
   cdc_gate_bad   | 1x ERROR    clock-gating-glitch (async enable)
   cdc_reset_sync | 2x OK       reset-sync-stage    (the 2 synchronizer FFs)
@@ -65,8 +67,12 @@ EXPECTED = {
     # clock network analysis (generated clocks, gating, families)
     ("cdc_clk_div", "OK", "generated-clock"): 1,
     ("cdc_clk_div", "OK", "same-clock-family"): 1,
-    ("cdc_clk_div", "OK", "synchronizer-2ff"): 4,
-    ("cdc_gate_icg", "OK", "clock-gate-icg"): 1,
+    # CV-2 (2026-11-23): cnt_div is a 4-bit binary counter synced bit by
+    # bit -- the incoherent-bus pattern; this table used to expect 4x OK
+    ("cdc_clk_div", "WARNING", "synced-bus"): 4,
+    # the latch-held enable comes from an input port: no known launch
+    # clock, so the ICG is not evidence of safety (was OK clock-gate-icg)
+    ("cdc_gate_icg", "WARNING", "clock-gating-ambiguous"): 1,
     ("cdc_gate_reg", "WARNING", "clock-gate-reg"): 1,
     ("cdc_gate_bad", "ERROR", "clock-gating-glitch"): 1,
     # reset deassert sequencing
@@ -75,6 +81,17 @@ EXPECTED = {
     # SDC pairing (cdc_cases.sdc declares cclk_a/cclk_b async)
     ("cdc_constrained", "WARNING", "async-declared"): 1,
     ("cdc_constrained", "OK", "synchronizer-2ff"): 1,
+    # what the analysis skips is a finding, not silence (CV-1, 2026-11-23)
+    ("cdc_async_fifo", "ERROR", "unanalyzed-memory"): 1,
+    ("cdc_gate_icg", "WARNING", "unanalyzed-latch"): 1,
+    ("cdc_async_fifo", "UNANALYZED", "unanalyzed-input"): 3,
+    ("cdc_bare", "UNANALYZED", "unanalyzed-input"): 1,
+    ("cdc_clk_div", "UNANALYZED", "unanalyzed-input"): 1,
+    ("cdc_constrained", "UNANALYZED", "unanalyzed-input"): 1,
+    ("cdc_eq_bin", "UNANALYZED", "unanalyzed-input"): 2,
+    ("cdc_gate_reg", "UNANALYZED", "unanalyzed-input"): 1,
+    ("cdc_gray_bus", "UNANALYZED", "unanalyzed-input"): 1,
+    ("cdc_sync_2ff", "UNANALYZED", "unanalyzed-input"): 1,
 }
 
 # read_sdc -dump lines the parser must produce for cdc_cases.sdc

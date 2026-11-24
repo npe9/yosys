@@ -1359,6 +1359,42 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_func_rettype()
 			saved.push_back((char)c);
 		return c;
 	};
+	// next character of code inside a bracketed group: a comment or a
+	// string literal reads as one blank, so brackets inside them do not count
+	int gpend = -1;
+	auto gcode = [&]() -> int {
+		int c;
+		if (gpend >= 0) {
+			c = gpend;
+			gpend = -1;
+		} else
+			c = getc();
+		if (c == '/') {
+			int n = getc();
+			if (n == '/') {
+				while ((c = getc()) > 0 && c != '\n') {}
+				return c > 0 ? ' ' : c;
+			}
+			if (n == '*') {
+				int prev = 0;
+				while ((c = getc()) > 0) {
+					if (prev == '*' && c == '/')
+						break;
+					prev = c;
+				}
+				return c > 0 ? ' ' : c;
+			}
+			gpend = n;
+			return '/';
+		}
+		if (c == '"') {
+			while ((c = getc()) > 0 && c != '"')
+				if (c == '\\' && getc() <= 0)
+					return 0;
+			return c > 0 ? ' ' : c;
+		}
+		return c;
+	};
 	auto skip_from = [&](int c) -> int {
 		while (true) {
 			if (c <= 0)
@@ -1406,7 +1442,7 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_func_rettype()
 			int m = skip_from(getc());
 			if (m == '(') {
 				int depth = 1;
-				while (depth > 0 && (m = getc()) > 0) {
+				while (depth > 0 && (m = gcode()) > 0) {
 					if (m == '(')
 						depth++;
 					else if (m == ')')
@@ -1444,6 +1480,42 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_virtual_if()
 			saved.push_back((char)c);
 		return c;
 	};
+	// next character of code inside a bracketed group: a comment or a
+	// string literal reads as one blank, so brackets inside them do not count
+	int gpend = -1;
+	auto gcode = [&]() -> int {
+		int c;
+		if (gpend >= 0) {
+			c = gpend;
+			gpend = -1;
+		} else
+			c = getc();
+		if (c == '/') {
+			int n = getc();
+			if (n == '/') {
+				while ((c = getc()) > 0 && c != '\n') {}
+				return c > 0 ? ' ' : c;
+			}
+			if (n == '*') {
+				int prev = 0;
+				while ((c = getc()) > 0) {
+					if (prev == '*' && c == '/')
+						break;
+					prev = c;
+				}
+				return c > 0 ? ' ' : c;
+			}
+			gpend = n;
+			return '/';
+		}
+		if (c == '"') {
+			while ((c = getc()) > 0 && c != '"')
+				if (c == '\\' && getc() <= 0)
+					return 0;
+			return c > 0 ? ' ' : c;
+		}
+		return c;
+	};
 	auto skip_ws = [&](int c) -> int {
 		while (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f')
 			c = getc();
@@ -1479,7 +1551,7 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_virtual_if()
 				c = skip_ws(getc());
 				if (c == '(') {
 					int depth = 1;
-					while (depth > 0 && (c = getc()) > 0) {
+					while (depth > 0 && (c = gcode()) > 0) {
 						if (c == '(') depth++;
 						else if (c == ')') depth--;
 					}
@@ -1520,6 +1592,42 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_is_typedef()
 		int c = yyinput();
 		if (c > 0)
 			saved.push_back((char)c);
+		return c;
+	};
+	// next character of code inside a bracketed group: a comment or a
+	// string literal reads as one blank, so brackets inside them do not count
+	int gpend = -1;
+	auto gcode = [&]() -> int {
+		int c;
+		if (gpend >= 0) {
+			c = gpend;
+			gpend = -1;
+		} else
+			c = getc();
+		if (c == '/') {
+			int n = getc();
+			if (n == '/') {
+				while ((c = getc()) > 0 && c != '\n') {}
+				return c > 0 ? ' ' : c;
+			}
+			if (n == '*') {
+				int prev = 0;
+				while ((c = getc()) > 0) {
+					if (prev == '*' && c == '/')
+						break;
+					prev = c;
+				}
+				return c > 0 ? ' ' : c;
+			}
+			gpend = n;
+			return '/';
+		}
+		if (c == '"') {
+			while ((c = getc()) > 0 && c != '"')
+				if (c == '\\' && getc() <= 0)
+					return 0;
+			return c > 0 ? ' ' : c;
+		}
 		return c;
 	};
 	auto skip_from = [&](int c) -> int {
@@ -1578,7 +1686,7 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_is_typedef()
 		int n = skip_from(getc());
 		if (n == '(') {
 			int depth = 1;
-			while (depth > 0 && (n = getc()) > 0) {
+			while (depth > 0 && (n = gcode()) > 0) {
 				if (n == '(')
 					depth++;
 				else if (n == ')')
@@ -1588,7 +1696,7 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_is_typedef()
 			while (sig == '[') {
 				int rd = 1;
 				int m;
-				while (rd > 0 && (m = getc()) > 0) {
+				while (rd > 0 && (m = gcode()) > 0) {
 					if (m == '[')
 						rd++;
 					else if (m == ']')
@@ -1602,7 +1710,7 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_is_typedef()
 				while (sig2 == '[') {
 					int rd = 1;
 					int m;
-					while (rd > 0 && (m = getc()) > 0) {
+					while (rd > 0 && (m = gcode()) > 0) {
 						if (m == '[')
 							rd++;
 						else if (m == ']')
@@ -1619,7 +1727,7 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_is_typedef()
 		while (sig == '[') {
 			int depth = 1;
 			int n;
-			while (depth > 0 && (n = getc()) > 0) {
+			while (depth > 0 && (n = gcode()) > 0) {
 				if (n == '[')
 					depth++;
 				else if (n == ']')
@@ -1636,7 +1744,7 @@ bool VERILOG_FRONTEND::VerilogLexer::lookahead_is_typedef()
 		int sig = '[';
 		while (sig == '[') {
 			int depth = 1;
-			while (depth > 0 && (n = getc()) > 0) {
+			while (depth > 0 && (n = gcode()) > 0) {
 				if (n == '[')
 					depth++;
 				else if (n == ']')

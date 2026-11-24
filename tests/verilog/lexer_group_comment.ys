@@ -1,0 +1,24 @@
+# fe227: the typedef / instance lookaheads skip a bracketed group; a bracket inside a comment or a string
+# within that group must not end or extend it (wb2axip easyaxil.v: `// ... 2) since` in a parameter list
+# under -formal turned the module name into a type token: syntax error).
+read_verilog -sv -formal <<EOT
+module m #(
+    // is fixed at a width of 32-bits by Xilinx def'n, and 2) since
+    parameter A = 4,
+    /* a ) b */ parameter B = 2
+) (input wire [A-1:0] a, output wire [A-1:0] y);
+  assign y = ~a;
+endmodule
+typedef logic [7:0] byte_t;
+module top(input wire [3:0] a, output wire [3:0] y, output wire ok);
+  m #(.A(4) /* ) x */, .B(2) // ) y
+  ) u (.a(a), .y(y));
+  byte_t /* ] */ v;
+  assign v = {4'b0, a};
+  assign ok = (y == ~a) && (v[3:0] == a);
+endmodule
+EOT
+hierarchy -top top
+proc
+flatten
+sat -verify -prove ok 1 top

@@ -48,6 +48,11 @@ write_smt2 -wires {smt}
 """
 
 
+# include directories (-I), appended to every read_verilog; prove.py passes
+# its own -I through, so both lanes read the same sources
+INCLUDE_FLAGS = ""
+
+
 def prep_extras(path):
     """Per-file opt-in prep passes from pragma comments (multiclock etc.)."""
     a2s = mem = ""
@@ -105,7 +110,7 @@ def check_covers(yosys, smtbmc, path, top, solver, bound, timeout):
     extra_a2s, extra_mem = prep_extras(path)
     with open(ys, "w") as fh:
         fh.write(PREP.format(svaflags=run_ic3.sva_flags(path), guard=run_ic3.degraded_guard(path),
-                             flags=run_ic3.read_flags(path), files=path, top=" -top " + top if top else "",
+                             flags=run_ic3.read_flags(path) + INCLUDE_FLAGS, files=path, top=" -top " + top if top else "",
                              # asserts out (assumes stay): in cover mode smtbmc
                              # stops at the first failing assert, which would
                              # truncate the cover check at that step (seen on the
@@ -187,7 +192,7 @@ def check_one(yosys, smtbmc, path, top, solver, bound, timeout, prove,
         smt = os.path.join(tempfile.gettempdir(), "bmc_%d.smt2" % os.getpid())
         ys = os.path.join(tempfile.gettempdir(), "bmc_%d.ys" % os.getpid())
         with open(ys, "w") as fh:
-            fh.write(PREP.format(svaflags=run_ic3.sva_flags(path), guard=run_ic3.degraded_guard(path), flags=run_ic3.read_flags(path), files=path, top=" -top " + top if top else "",
+            fh.write(PREP.format(svaflags=run_ic3.sva_flags(path), guard=run_ic3.degraded_guard(path), flags=run_ic3.read_flags(path) + INCLUDE_FLAGS, files=path, top=" -top " + top if top else "",
                                  deletes=deletes, smt=smt,
                                  extra_a2s=extra_a2s, extra_mem=extra_mem))
         p = run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" "$2"', "y", yosys, ys],
@@ -339,6 +344,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="+")
     ap.add_argument("--top", default=None)
+    ap.add_argument("-I", "--include", action="append", default=[])
     ap.add_argument("--yosys", default=YOSYS)
     ap.add_argument("--smtbmc", default=SMTBMC)
     ap.add_argument("-s", "--solver", default="z3")
@@ -355,6 +361,8 @@ def main():
                          "witnesses (one per BMC round, smt_rN.yw); the "
                          "conductor replays them with sim -r")
     args = ap.parse_args()
+    global INCLUDE_FLAGS
+    INCLUDE_FLAGS = "".join(" -I" + os.path.abspath(d) for d in args.include)
 
     ok = True
     for path in args.files:

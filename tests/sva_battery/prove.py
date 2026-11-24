@@ -237,7 +237,7 @@ class SmtLane:
         if self.proc.poll() is not None and not self.done:
             # process gone without DONE (crash/kill) -- surface it once
             self.events.put(("error", "smt lane exited rc=%d without DONE"
-                             % self.proc.returncode, None))
+                             % self.proc.returncode, None, None))
             self.done = True
         return self.done
 
@@ -262,6 +262,7 @@ class Ic3Lane:
 
     def __init__(self, path, top, include, workdir, cex_prefix=None):
         self.events = queue.Queue()
+        self.covers = {}   # name -> (reached|unreachable|undecided, depth)
         self.done = False
         inc = " ".join("-I" + d for d in include)
         extra_a2s, extra_mem, bmc, ctg = run_ic3.prep_extras(path)
@@ -287,6 +288,12 @@ class Ic3Lane:
     def _reader(self):
         try:
             for line in self.proc.stdout:
+                c = re.search(r"ic3: (\S+): cover (reached|unreachable|undecided)"
+                              r"(?: \(depth (\d+)\))?", line)
+                if c:
+                    self.covers[c.group(1)] = (c.group(2),
+                                               int(c.group(3)) if c.group(3) else None)
+                    continue
                 m = re.search(r"ic3: (\S+): (proved|disproved|undecided)"
                               r"(?: \(depth (\d+)\))?", line)
                 if m:
@@ -318,8 +325,69 @@ class Ic3Lane:
             self.proc.wait()
 
 
+FREE_PRAGMAS = ("// PREP-EXTRA-AFTER-MEMORY: clk2fflogic\n"
+                "// SVA2CHECK-FLAGS: -clk2fflogic\n")
+
+
+def design_clocks(path, top, include, workdir):
+    """Distinct clock nets of the edge-triggered cells after proc + flatten
+    (global-clock $ff cells excluded), or None if the design does not read."""
+    inc = " ".join("-I" + d for d in include)
+    js = os.path.join(workdir, "clocks.json")
+    ys = os.path.join(workdir, "clocks.ys")
+    with open(ys, "w") as fh:
+        fh.write("read_verilog -sv -formal %s %s %s\nhierarchy -check%s\nproc\nflatten\n"
+                 "write_json %s\n" % (run_ic3.read_flags(path), inc, path,
+                                      " -top " + top if top else "", js))
+    p = subprocess.run([YOSYS, "-q", ys], stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True)
+    if p.returncode != 0 or not os.path.exists(js):
+        return None
+    d = json.load(open(js))
+    clocks = set()
+    for mod in d.get("modules", {}).values():
+        names = {}
+        for n, net in mod.get("netnames", {}).items():
+            if not n.startswith("$"):
+                for b in net["bits"]:
+                    names.setdefault(b, n)
+        for cell in mod.get("cells", {}).values():
+            clk = cell.get("connections", {}).get("CLK")
+            if clk and cell.get("type", "").startswith("$") and \
+                    all(not isinstance(b, str) for b in clk):
+                clocks.add(names.get(clk[0], str(clk[0])))
+    return sorted(clocks)
+
+
 def prove_file(path, args, workdir):
     t0 = time.time()
+    # multi-clock designs: the default prep steps every clock on every step
+    # (lockstep).  A proof there says nothing about independent clocks, so
+    # the clock model must be chosen explicitly (`--clocks`), or by the
+    # file's own clk2fflogic pragmas.
+    has_free = any("clk2fflogic" in l and l.lstrip().startswith("//")
+                   for l in open(path))
+    clocks = design_clocks(path, args.top or run_ic3.top_pragma(path),
+                           args.include, workdir)
+    if clocks is not None and len(clocks) > 1:
+        model = "free" if has_free else args.clocks
+        if model is None:
+            print("%s: REFUSED multi-clock design (clocks: %s): choose the clock "
+                  "model with --clocks free (independent clocks, interleaved: "
+                  "the sound choice for asynchronous clocks) or --clocks lockstep "
+                  "(every clock ticks on every step: only for clocks that really "
+                  "are one clock)" % (os.path.basename(path), ", ".join(clocks)))
+            return False
+        print("%s: clock model %s (clocks: %s)" % (os.path.basename(path), model,
+                                                   ", ".join(clocks)))
+        if model == "free" and not has_free:
+            # same basename in the workdir, pragmas appended (line numbers of
+            # the source are unchanged); the original directory joins -I
+            copy = os.path.join(workdir, os.path.basename(path))
+            with open(copy, "w") as fh:
+                fh.write(open(path).read().rstrip("\n") + "\n" + FREE_PRAGMAS)
+            args.include = args.include + [os.path.dirname(os.path.abspath(path))]
+            path = copy
     exp = run_bmc.expectations(path)
     cexdir = None
     if args.cex:
@@ -466,6 +534,13 @@ def prove_file(path, args, workdir):
                                         ltags.get(name, "untagged")))
     if n_const:
         print("  (%d of the proofs are PROVED(const): the property body folded to a constant)" % n_const)
+    # covers (ic3 lane only): an unreachable cover is a vacuity finding --
+    # the antecedent / scenario it describes can never happen
+    for name, (cv, depth) in sorted(getattr(ic3, "covers", {}).items()):
+        tag = {"reached": "COVER-REACHED", "unreachable": "COVER-UNREACHABLE",
+               "undecided": "COVER-UNDECIDED"}[cv]
+        print("  %-16s %-14s%s [lowering=%s]" % (tag, name,
+              " @%d" % depth if depth is not None else "", ltags.get(name, "untagged")))
     for name in sorted(set(exp) - set(verdicts)):
         print("  MISSING          %s" % name)
         ok = False
@@ -558,6 +633,11 @@ def main():
                     help="run only the SMT (run_bmc) lane -- bisect engine "
                          "disagreements; settles every disproof with an "
                          "smtbmc witness")
+    ap.add_argument("--clocks", choices=["free", "lockstep"], default=None,
+                    help="clock model for a design with more than one clock "
+                         "(required there): free = independent clocks "
+                         "(clk2fflogic interleaving), lockstep = all clocks "
+                         "tick together")
     ap.add_argument("--ic3-only", action="store_true",
                     help="run only the IC3 lane -- bisect engine "
                          "disagreements")

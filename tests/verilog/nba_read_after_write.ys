@@ -1,0 +1,44 @@
+# A read after a nonblocking assignment in the same block sees the OLD value
+# (IEEE 1800-2017 10.4.2: the update happens in the NBA region).  The known-
+# value folding of the force/release lowering (unnamed blocks) and of disable
+# (named blocks) recorded `s <= 0` as s == 0 and erased `if (s == 2) f <= 1`,
+# so f stayed 0 (found on a flute-lx50 JTAG DTM register machine).
+read_verilog -sv <<EOT
+module nba_unnamed(input clk, output reg [1:0] s = 2, output reg f = 0);
+  always @(posedge clk) begin
+    s <= 2'd0;
+    if (s == 2'd2) f <= 1'b1;
+  end
+endmodule
+module nba_named(input clk, output reg [1:0] s = 2, output reg f = 0);
+  always @(posedge clk) begin : blk
+    s <= 2'd0;
+    if (s == 2'd2) f <= 1'b1;
+  end
+endmodule
+module nba_nested(input clk, a, output reg [1:0] s = 2, output reg f = 0);
+  always @(posedge clk) begin
+    if (a) begin
+      s <= 2'd0;
+      if (s == 2'd2) begin
+        f <= 1'b1;
+      end else if (a) begin
+        f <= 1'b0;
+      end
+    end
+  end
+endmodule
+// control: after a BLOCKING write the new value is read, so f stays 0
+module blk_ctl(input clk, output reg [1:0] s = 2, output reg f = 0);
+  always @(posedge clk) begin
+    s = 2'd0;
+    if (s == 2'd2) f <= 1'b1;
+  end
+endmodule
+EOT
+proc
+# step 1 is the initial state (s = 2), step 2 the state after one clock
+sat -seq 2 -set-init s 2 -set-init f 0 -prove-skip 1 -prove f 1 -verify nba_unnamed
+sat -seq 2 -set-init s 2 -set-init f 0 -prove-skip 1 -prove f 1 -verify nba_named
+sat -seq 2 -set-init s 2 -set-init f 0 -set-at 1 a 1 -prove-skip 1 -prove f 1 -verify nba_nested
+sat -seq 2 -set-init s 2 -prove-skip 1 -prove f 0 -verify blk_ctl

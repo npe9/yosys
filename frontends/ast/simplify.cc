@@ -2712,7 +2712,10 @@ static bool erase_uncond_disable(std::vector<std::unique_ptr<AstNode>> &stmts, c
 			stmts.erase(stmts.begin() + i, stmts.end());
 			return true;
 		}
-		if ((stmt->type == AST_ASSIGN_EQ || stmt->type == AST_ASSIGN_LE || stmt->type == AST_ASSIGN) &&
+		// a nonblocking assignment is not seen by the statements after it
+		// (IEEE 1800-2017 10.4.2: the update happens in the NBA region), so
+		// it does not change what a later compare reads
+		if ((stmt->type == AST_ASSIGN_EQ || stmt->type == AST_ASSIGN) &&
 				stmt->children.size() >= 2 && stmt->children[0]->type == AST_IDENTIFIER && stmt->children[0]->children.empty()) {
 			int val = 0;
 			if (eval_known_int(stmt->children[1].get(), known, val))
@@ -3455,8 +3458,12 @@ static dict<std::string, ForceHold> clone_holds(const dict<std::string, ForceHol
 
 static void apply_force_override(std::vector<std::unique_ptr<AstNode>> &stmts, dict<std::string, ForceHold> &held, dict<std::string, int> &known)
 {
+	// the value a later read in this block sees: a nonblocking assignment
+	// updates in the NBA region (IEEE 1800-2017 10.4.2), after every read
+	// here, so it leaves the known value as it was.  Recording it folded
+	// `s <= 0; if (s == 2) f <= 1;` to `if (0 == 2)` and erased the branch.
 	auto note_value = [&](AstNode *stmt) {
-		if ((stmt->type != AST_ASSIGN_EQ && stmt->type != AST_ASSIGN_LE && stmt->type != AST_ASSIGN) ||
+		if ((stmt->type != AST_ASSIGN_EQ && stmt->type != AST_ASSIGN) ||
 				stmt->children.size() < 2 || stmt->children[0]->type != AST_IDENTIFIER || !stmt->children[0]->children.empty())
 			return;
 		int val = 0;

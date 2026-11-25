@@ -167,8 +167,11 @@ def replay_confirm(yosys, path, top, include, witness, settle_engine,
         doc = json.load(open(summary))
     except (OSError, ValueError) as e:
         return False, "replay produced no readable summary: %s" % e
+    # a label names the assertion by its hierarchical path (`u.p` for one in
+    # instance u); sim's summary gives the path as a list of ids
     fired = [a["step"] for a in doc.get("assertions", [])
-             if a.get("path") and a["path"][-1].lstrip("\\") == label]
+             if a.get("path") and label in (".".join(p.lstrip("\\") for p in a["path"]),
+                                            a["path"][-1].lstrip("\\") if len(a["path"]) == 1 else None)]
     # a liveness-flavor check never "fires": sim lists it with the step its
     # obligation has been pending since.  The lasso witness confirms the
     # disproof iff the obligation is known (not x) and still open at the

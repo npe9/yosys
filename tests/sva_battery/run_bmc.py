@@ -4,7 +4,8 @@ SystemVerilog files via write_smt2 + yosys-smtbmc (SMT-LIBv2, z3).
 
 Pipeline per file (mirrors run_ic3.py with the SMT backend):
     read_verilog -sv -formal; hierarchy -check -top TOP; sva2check; proc;
-    async2sync; flatten; opt_clean; memory; opt_clean;
+    async2sync; flatten; opt_clean; memory; opt_clean; dffunmap (write_smt2
+    has no $sdff, which async2sync makes of an async reset);
     setundef -init -zero; write_smt2 -wires out.smt2
 Then yosys-smtbmc -s z3 -t <bound>.  Registers are zero-initialized
 (setundef -init -zero) to match the ic3 -init-zero convention, so a
@@ -43,6 +44,7 @@ opt_clean
 memory
 opt_clean
 {extra_mem}{guard}{deletes}
+dffunmap
 setundef -init -zero
 write_smt2 -wires {smt}
 """

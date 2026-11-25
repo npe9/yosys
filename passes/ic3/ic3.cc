@@ -2657,48 +2657,95 @@ struct NativeCert
 			m->connect(w, qbits[k]);
 		}
 
+		// every certified target gets a fixed public name, so the export
+		// can list the bads by that name, in bad order
+		std::vector<RTLIL::IdString> target_of;
+		{
+			std::vector<RTLIL::Cell*> targets;
+			for (auto c : m->cells())
+				if (c->attributes.count(ID(ic3_cert_id)))
+					targets.push_back(c);
+			for (auto c : targets) {
+				target_of.push_back(RTLIL::IdString(c->attributes.at(ID(ic3_cert_id)).decode_string()));
+				c->attributes.erase(ID::hdlname);
+				m->rename(c, stringf("\\ic3_cert_b%d", GetSize(target_of) - 1));
+			}
+		}
+
+		// The export runs in a separate yosys process.  Several passes on
+		// this path report a malformed input with log_error, which ends the
+		// whole process (_Exit) and would take the finished proof with it
+		// ("Conflicting init values", 2026-11-24).  A failed export only
+		// leaves the proof uncertified, with the subprocess's error as the
+		// reason.
 		std::string dir = make_temp_dir(get_base_tmpdir() + "/yosys_ic3_cert_XXXXXX");
 		std::string base = dir + "/model";
-		try {
+		{
 			auto quiet = logger().make_debug_scope(true);
-			Pass::call(d.get(), "chformal -lower");
-			Pass::call(d.get(), "memory_map");
+			Pass::call(d.get(), "write_rtlil " + base + ".il");
+		}
+		{
+			std::ofstream f(base + ".ys");
+			f << "read_rtlil " << base << ".il\n";
+			f << "chformal -lower\n";
+			f << "memory_map\n";
 			if (init_zero)
-				Pass::call(d.get(), "setundef -init -zero");
+				f << "setundef -init -zero\n";
 			// -zero first, as in the engine export above: x constants are 0
-			Pass::call(d.get(), "setundef -zero");
-			Pass::call(d.get(), "setundef -undriven -anyseq");
-			Pass::call(d.get(), "dffunmap");
-			Pass::call(d.get(), "techmap");
-			Pass::call(d.get(), "aigmap");
-			Pass::call(d.get(), "setundef -zero");
-			Pass::call(d.get(), "opt_clean");
+			f << "setundef -zero\n";
+			f << "setundef -undriven -anyseq\n";
+			f << "dffunmap\ntechmap\naigmap\nsetundef -zero\nopt_clean\n";
 			// write_aiger exits on a cell it cannot write (an async FF
-			// left by techmap): refuse here instead
-			for (auto c : m->cells())
-				if (!c->type.in(ID($_AND_), ID($_NOT_), ID($_FF_), ID($_DFF_P_), ID($_DFF_N_), ID($anyinit),
-						ID($anyconst), ID($anyseq), ID($initstate), ID($assert), ID($assume), ID($scopeinfo))) {
-					error = stringf("cell type %s has no AIGER form", log_id(c->type));
-					remove_directory(dir);
-					return;
+			// left by techmap): refuse first, with the offending cells listed
+			f << "select -assert-none t:* t:$_AND_ t:$_NOT_ t:$_FF_ t:$_DFF_P_ t:$_DFF_N_ t:$anyinit "
+					"t:$anyconst t:$anyseq t:$initstate t:$assert t:$assume t:$scopeinfo %u %u %u %u %u %u %u %u %u %u %u %d\n";
+			f << "write_aiger -map " << base << ".map " << base << ".aig\n";
+			// write_aiger numbers bads in module->cells() order; select walks
+			// the same cell dict, and nothing changes the module in between
+			f << "select -write " << base << ".bads t:$assert\n";
+		}
+		std::string yosys_bin = proc_self_dirname() + proc_program_prefix() + "yosys";
+		int st = run_command(stringf("'%s' -q -l '%s.log' -s '%s.ys' </dev/null >/dev/null 2>&1",
+				yosys_bin.c_str(), base.c_str(), base.c_str()));
+		if (st != 0) {
+			std::string why;
+			std::ifstream lf(base + ".log");
+			std::string line;
+			while (std::getline(lf, line))
+				if (line.find("ERROR") != std::string::npos) {
+					why = line;
+					if (std::getline(lf, line) && line.find_first_not_of(" \t") != std::string::npos)
+						why += " " + line.substr(line.find_first_not_of(" \t"));
+					break;
 				}
-			Pass::call(d.get(), "write_aiger -map " + base + ".map " + base + ".aig");
-		} catch (std::exception &e) {
-			error = stringf("AIGER export failed (%s)", e.what());
+			error = "AIGER export failed (" + (why.empty() ? stringf("exit status %d", st) : why) + ")";
 			remove_directory(dir);
 			return;
 		}
-		// write_aiger numbers bads in module->cells() order
-		int k = 0;
-		for (auto c : m->cells())
-			if (c->type == ID($assert)) {
-				if (c->attributes.count(ID(ic3_cert_id)))
-					bad_of[RTLIL::IdString(c->attributes.at(ID(ic3_cert_id)).decode_string())] = k;
-				k++;
+		// bad k of the model is the k-th line of the .bads list
+		int n_bads = 0;
+		{
+			std::ifstream bf(base + ".bads");
+			std::string line;
+			while (std::getline(bf, line)) {
+				size_t p = line.find("ic3_cert_b");
+				if (p != std::string::npos) {
+					int idx = atoi(line.c_str() + p + 10);
+					if (idx >= 0 && idx < GetSize(target_of))
+						bad_of[target_of[idx]] = n_bads;
+				}
+				n_bads++;
 			}
+		}
 		std::string err;
 		if (!model.parse(base + ".aig", err)) {
 			error = "AIGER model unreadable (" + err + ")";
+			remove_directory(dir);
+			return;
+		}
+		if (n_bads != GetSize(model.bad_lits())) {
+			error = stringf("AIGER model has %d bads, the export listed %d asserts", GetSize(model.bad_lits()), n_bads);
+			bad_of.clear();
 			remove_directory(dir);
 			return;
 		}

@@ -1,0 +1,18 @@
+# sat -prove refuses constraints that admit no model (2026-11-24): the
+# proof would succeed with no meaning.  eqy's -set-init-undef + -set-def-formal
+# on $anyinit was such a set and "proved" 1'1 == 1'0.
+read_verilog <<EOT
+module t(input clk, input [1:0] a, output reg [1:0] r, output [1:0] y);
+  assign y = a;
+  initial r = 0;
+  always @(posedge clk) r <= a;
+endmodule
+EOT
+proc
+# satisfiable constraints: the proof runs as before, both outcomes
+sat -seq 2 -set a 0 -prove r 0 -verify t
+sat -seq 2 -set a 1 -prove r 0 -falsify t
+# induction with satisfiable constraints still proves
+sat -tempinduct -set a 0 -prove r 0 -verify t
+logger -expect error "the constraints admit no model .*a proof would be vacuous" 1
+sat -seq 2 -set a 1 -set y 2 -prove r 0 t

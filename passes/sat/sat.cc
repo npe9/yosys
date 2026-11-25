@@ -1502,6 +1502,21 @@ struct SatPass : public Pass {
 					if (inductlen > 1)
 						basecase.force_unique_state(seq_len + 1, seq_len + inductlen);
 
+					// vacuity: the constraints (-set*, init options, assumptions)
+					// must admit a trace, or every proof passes with no meaning
+					// (eqy's -set-init-undef + -set-def-formal on $anyinit,
+					// 2026-11-24).  Checked at length 1 only: from length 2 the
+					// base case also forces distinct states, which a design with
+					// few states cannot satisfy legitimately.
+					if (inductlen == 1) {
+						if (!basecase.solve()) {
+							if (basecase.gotTimeout)
+								goto timeout;
+							log_error("sat: the constraints admit no trace (no %d-step run satisfies the -set/-set-init/"
+									"-set-def/-set-assumes options); a proof would be vacuous.\n", seq_len + 1);
+						}
+					}
+
 					if (tempinduct_skip < inductlen)
 					{
 						log("\n[base case %d] Solving problem with %d variables and %d clauses..\n",
@@ -1649,20 +1664,34 @@ struct SatPass : public Pass {
 			sathelper.satgen.ignore_div_by_zero = ignore_div_by_zero;
 			sathelper.ignore_unknown_cells = ignore_unknown_cells;
 
+			bool proving = sathelper.prove.size() || sathelper.prove_x.size() || sathelper.prove_asserts;
+			int proof_lit = 0;
 			if (seq_len == 0) {
 				sathelper.setup();
-				if (sathelper.prove.size() || sathelper.prove_x.size() || sathelper.prove_asserts)
-					sathelper.ez->assume(sathelper.ez->NOT(sathelper.setup_proof()));
+				if (proving)
+					proof_lit = sathelper.setup_proof();
 			} else {
 				std::vector<int> prove_bits;
 				for (int timestep = 1; timestep <= seq_len; timestep++) {
 					sathelper.setup(timestep, timestep == 1);
-					if (sathelper.prove.size() || sathelper.prove_x.size() || sathelper.prove_asserts)
+					if (proving)
 						if (timestep > prove_skip)
 							prove_bits.push_back(sathelper.setup_proof(timestep));
 				}
-				if (sathelper.prove.size() || sathelper.prove_x.size() || sathelper.prove_asserts)
-					sathelper.ez->assume(sathelper.ez->NOT(sathelper.ez->expression(ezSAT::OpAnd, prove_bits)));
+				if (proving)
+					proof_lit = sathelper.ez->expression(ezSAT::OpAnd, prove_bits);
+			}
+			if (proving) {
+				// vacuity: the constraints alone must admit a model, or the
+				// proof below succeeds with no meaning (2026-11-24, eqy's
+				// -set-init-undef + -set-def-formal on $anyinit)
+				if (!sathelper.solve()) {
+					if (sathelper.gotTimeout)
+						goto timeout;
+					log_error("sat: the constraints admit no model (no %d-step run satisfies the -set/-set-init/"
+							"-set-def/-set-assumes options); a proof would be vacuous.\n", std::max(seq_len, 1));
+				}
+				sathelper.ez->assume(sathelper.ez->NOT(proof_lit));
 			}
 			sathelper.generate_model();
 

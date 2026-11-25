@@ -1,0 +1,11 @@
+# sat -tempinduct refuses constraints that admit no trace (2026-11-24).
+read_verilog <<EOT
+module t(input clk, input [1:0] a, output reg [1:0] r, output [1:0] y);
+  assign y = a;
+  initial r = 0;
+  always @(posedge clk) r <= a;
+endmodule
+EOT
+proc
+logger -expect error "the constraints admit no trace .*a proof would be vacuous" 1
+sat -tempinduct -set a 1 -set y 2 -prove r 0 t

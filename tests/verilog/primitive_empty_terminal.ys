@@ -1,0 +1,10 @@
+# A gate instance terminal cannot be empty (IEEE 1800-2017 28.3, unlike module
+# port connections): a located error, not the assertion in the primitive
+# lowering (icarus ivtest pr1763333).
+logger -expect error "Terminal 1 of primitive `not' is empty" 1
+read_verilog <<EOT
+module m(input a, output y);
+  not(, a);
+  assign y = a;
+endmodule
+EOT

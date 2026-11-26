@@ -10158,7 +10158,9 @@ skip_generate_case:;
 		std::vector<std::unique_ptr<AstNode>> children_list;
 		for (auto& child : children) {
 			log_assert(child->type == AST_ARGUMENT);
-			log_assert(child->children.size() == 1);
+			if (child->children.size() != 1)
+				input_error("Terminal %d of primitive `%s' is empty; a gate terminal must be connected "
+						"(IEEE 1800-2017 28.3).\n", int(children_list.size()) + 1, str);
 			children_list.push_back(std::move(child->children[0]));
 			child->children.clear();
 		}

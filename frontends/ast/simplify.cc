@@ -13587,6 +13587,11 @@ void AstNode::expand_genblock(const std::string &prefix)
 		// prefixing them again here made `\g.g.A` for an item `A` of block g
 		if (type == AST_ENUM && child->type == AST_ENUM_ITEM)
 			continue;
+		// the target of `disable NAME` names a block or task, not a net of this
+		// scope: no prefix and no implicit wire (disable_names_match matches the
+		// bare name against the block's local name)
+		if (type == AST_SVA && str == "disable" && child->type == AST_IDENTIFIER)
+			continue;
 
 		switch (child->type) {
 		case AST_WIRE:

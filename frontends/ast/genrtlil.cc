@@ -1589,11 +1589,35 @@ void AstNode::detectSignWidthWorker(int &width_hint, bool &sign_hint, bool *foun
 			}
 			sign_hint &= wire->is_signed;
 			int result_width = 1;
+			const AstNode *range = nullptr;
+			bool sized = false;
 			if (!wire->children.empty())
 			{
 				log_assert(wire->children.size() == 1);
-				const AstNode *range = wire->children.at(0).get();
-				log_assert(range->type == AST_RANGE && range->children.size() == 2);
+				range = wire->children.at(0).get();
+				// a typedef'd return type (`function b_t f(...)`) is an AST_WIRETYPE here: resolve it
+				// through the typedef(s) to the packed range, or to a 1-bit / already-sized wire
+				for (int guard = 0; range && range->type == AST_WIRETYPE && guard < 16; guard++) {
+					const AstNode *td = current_scope.count(range->str) ? current_scope.at(range->str) : nullptr;
+					const AstNode *tw = td && td->type == AST_TYPEDEF && !td->children.empty() ? td->children[0].get() : nullptr;
+					if (!tw || tw->type != AST_WIRE) {
+						range = nullptr;	// an unpacked / dynamic array, struct or unknown type
+						break;
+					}
+					if (tw->range_valid || tw->children.empty()) {
+						result_width = tw->range_valid ? abs(tw->range_left - tw->range_right) + 1 : 1;
+						sized = true;
+						break;
+					}
+					range = tw->children.at(0).get();
+				}
+				if (!sized && (!range || range->type != AST_RANGE || range->children.size() != 2))
+					input_error("Cannot determine the width of the return type of function `%s' where it is "
+							"called here (only a packed vector type is supported in this position).\n",
+							RTLIL::unescape_id(str));
+			}
+			if (range && !sized)
+			{
 				auto left = range->children.at(0)->clone();
 				auto right = range->children.at(1)->clone();
 				left->set_in_param_flag(true);

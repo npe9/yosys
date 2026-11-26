@@ -1,0 +1,38 @@
+# A function whose return type is a typedef, called where genrtlil sizes an
+# unelaborated call (a case item), asserted `range->type == AST_RANGE': the
+# result wire's child is an AST_WIRETYPE. It is resolved through the typedef.
+read_verilog -sv <<EOT
+module td(input [7:0] a, output logic [7:0] y);
+  typedef logic [7:0] b_t;
+  function b_t f(input [7:0] x);
+    f = x + 8'd1;
+  endfunction
+  always_comb begin
+    y = 8'd0;
+    case (a)
+      f(8'd3): y = 8'd1;
+      default: y = 8'd2;
+    endcase
+  end
+endmodule
+EOT
+proc
+sat -set a 4 -prove y 1 -verify
+sat -set a 5 -prove y 2 -verify
+design -reset
+# a return type with no packed range there (a dynamic array) is a located error, not an assert
+logger -expect error "Cannot determine the width of the return type of function `f'" 1
+read_verilog -sv <<EOT
+module tq(input [7:0] a, output logic [7:0] y);
+  typedef logic [7:0] q_t[];
+  function q_t f(input [7:0] x);
+    f = new[1];
+  endfunction
+  always_comb begin
+    y = 8'd0;
+    case (a)
+      f(8'd3): y = 8'd1;
+    endcase
+  end
+endmodule
+EOT

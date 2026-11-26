@@ -873,6 +873,13 @@ struct AST_INTERNAL::ProcessGenerator
 					else
 						log_assert(current_case->compare.size() == 0);
 					current_case = backup_case;
+					// the arm's assignments (also those made directly inside a
+					// nested switch, which no case temp records) are assignments
+					// of the enclosing case: a later assignment to the same bits
+					// must remove them from the case tree.  Dropping them made
+					// `case (i) 1: r <= 0; endcase r <= 1;` keep r <= 0 for i == 1.
+					for (auto &bit : current_case_assigned_bits)
+						backup_assigned_bits.insert(bit);
 					current_case_assigned_bits = std::move(backup_assigned_bits);
 
 					subst_lvalue_map.restore();

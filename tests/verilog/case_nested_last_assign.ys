@@ -1,0 +1,45 @@
+# The last assignment in statement order wins (IEEE 1800-2017 10.4.2, 9.3.1).
+# An assignment made directly inside a nested case, followed by an
+# assignment to the same bits in the enclosing arm, kept the nested one:
+# genrtlil's ProcessGenerator dropped the arm's assigned bits when it closed
+# the arm, so the later assignment skipped removeSignalFromCaseTree (found by
+# rtlfuzz seed 2, shrunk to this).
+read_verilog -sv <<EOT
+module nested_ff(input logic clk, input logic [1:0] i0, output logic o_r1);
+  logic r1 = 1'd0;
+  always_ff @(posedge clk) begin
+    case (i0)
+      2'd2: begin end
+      default: begin
+        case (i0)
+          2'd1: r1 <= 1'd0;
+        endcase
+        r1 <= 1'd1;
+      end
+    endcase
+  end
+  assign o_r1 = r1;
+endmodule
+module nested_comb(input logic [1:0] i0, output logic y);
+  always_comb begin
+    y = 1'b0;
+    case (i0)
+      2'd2: y = 1'b0;
+      default: begin
+        case (i0)
+          2'd1: y = 1'b0;
+        endcase
+        y = 1'b1;
+      end
+    endcase
+  end
+endmodule
+EOT
+proc
+# i0 == 1 takes the nested arm, then the later r1 <= 1 must win
+sat -seq 2 -set-init r1 0 -set-at 1 i0 1 -prove-skip 1 -prove o_r1 1 -verify nested_ff
+sat -seq 2 -set-init r1 0 -set-at 1 i0 0 -prove-skip 1 -prove o_r1 1 -verify nested_ff
+# control: i0 == 2 assigns nothing, r1 keeps its value
+sat -seq 2 -set-init r1 0 -set-at 1 i0 2 -prove-skip 1 -prove o_r1 0 -verify nested_ff
+sat -set i0 1 -prove y 1 -verify nested_comb
+sat -set i0 2 -prove y 0 -verify nested_comb

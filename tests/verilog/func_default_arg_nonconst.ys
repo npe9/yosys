@@ -1,0 +1,25 @@
+# A non-constant argument default (IEEE 1800-2017 13.5.3) is legal where the
+# call is not a constant expression, and a clean error where it must be one.
+read_verilog -sv <<EOT
+module pd(input [7:0] a, b, output [7:0] x, y, output ok);
+  function [7:0] g(input [7:0] p, input [7:0] q = a + b);
+    g = p + q;
+  endfunction
+  assign x = g(8'd1);
+  assign y = g(8'd1, 8'd5);
+  assign ok = (x == a + b + 8'd1) && (y == 8'd6);
+endmodule
+EOT
+proc
+sat -prove ok 1 -verify
+design -reset
+logger -expect error "did not evaluate" 1
+read_verilog -sv <<EOT
+module pc();
+  integer a, b;
+  function integer k(integer i, integer j = a + b);
+    k = i + j;
+  endfunction
+  localparam integer result = k(3);
+endmodule
+EOT

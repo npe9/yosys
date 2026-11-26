@@ -14820,6 +14820,15 @@ std::unique_ptr<AstNode> AstNode::eval_const_function(AstNode *fcall, bool must_
 			} else if (stmt->is_input && stmt->attributes.count(RTLIL::IdString("\\sv_default"))) {
 				auto fallback = stmt->attributes.at(RTLIL::IdString("\\sv_default"))->clone();
 				while (fallback->simplify(true, 1, -1, false)) { }
+				if (fallback->type != AST_CONSTANT && fallback->type != AST_REALVALUE) {
+					// a default that reads module state (IEEE 1800-2017 13.5.3: evaluated at each call)
+					// is not a constant: no constant evaluation, and an error where one is required
+					if (!must_succeed)
+						goto finished;
+					fcall->input_error("Default value of argument `%s' of function `%s' is not a constant "
+							"expression, so the call cannot be evaluated in a constant context "
+							"(IEEE 1800-2017 13.4.3).\n", stmt->str.c_str() + 1, fcall->str.c_str() + 1);
+				}
 				temporary_nodes.push_back(std::move(fallback));
 				variable.arg = temporary_nodes.back().get();
 			}

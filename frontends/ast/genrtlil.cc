@@ -1600,6 +1600,13 @@ void AstNode::detectSignWidthWorker(int &width_hint, bool &sign_hint, bool *foun
 				for (int guard = 0; range && range->type == AST_WIRETYPE && guard < 16; guard++) {
 					const AstNode *td = current_scope.count(range->str) ? current_scope.at(range->str) : nullptr;
 					const AstNode *tw = td && td->type == AST_TYPEDEF && !td->children.empty() ? td->children[0].get() : nullptr;
+					// a packed struct / union typedef: simplify sized it (size_packed_struct)
+					if (tw && (tw->type == AST_STRUCT || tw->type == AST_UNION) && tw->range_valid &&
+							!tw->attributes.count(ID(sv_unpacked))) {
+						result_width = abs(tw->range_left - tw->range_right) + 1;
+						sized = true;
+						break;
+					}
 					if (!tw || tw->type != AST_WIRE) {
 						range = nullptr;	// an unpacked / dynamic array, struct or unknown type
 						break;
@@ -1613,7 +1620,7 @@ void AstNode::detectSignWidthWorker(int &width_hint, bool &sign_hint, bool *foun
 				}
 				if (!sized && (!range || range->type != AST_RANGE || range->children.size() != 2))
 					input_error("Cannot determine the width of the return type of function `%s' where it is "
-							"called here (only a packed vector type is supported in this position).\n",
+							"called here (only a packed type is supported in this position).\n",
 							RTLIL::unescape_id(str));
 			}
 			if (range && !sized)

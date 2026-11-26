@@ -20,6 +20,35 @@ proc
 sat -set a 4 -prove y 1 -verify
 sat -set a 5 -prove y 2 -verify
 design -reset
+# packed struct (9 bits: the top bit must take part in the compare) and enum return types
+read_verilog -sv <<EOT
+module ts(input [7:0] a, output logic [1:0] y, output logic [1:0] z);
+  typedef struct packed { logic hi; logic [7:0] lo; } s9_t;
+  typedef enum logic [7:0] { E0 = 8'd4, E1 = 8'd9 } e_t;
+  function s9_t f(input [7:0] x);
+    f = {1'b1, x};
+  endfunction
+  function e_t g(input [7:0] x);
+    g = (x == 8'd0) ? E0 : E1;
+  endfunction
+  always_comb begin
+    y = 2'd0;
+    case ({1'b1, a})
+      f(8'd3): y = 2'd1;
+      default: y = 2'd2;
+    endcase
+    z = 2'd0;
+    case (a)
+      g(8'd0): z = 2'd1;
+      default: z = 2'd2;
+    endcase
+  end
+endmodule
+EOT
+proc
+sat -set a 3 -prove y 1 -set a 3 -prove z 2 -verify
+sat -set a 4 -prove y 2 -prove z 1 -verify
+design -reset
 # a return type with no packed range there (a dynamic array) is a located error, not an assert
 logger -expect error "Cannot determine the width of the return type of function `f'" 1
 read_verilog -sv <<EOT

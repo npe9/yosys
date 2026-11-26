@@ -547,6 +547,17 @@ def prove_file(path, args, workdir):
     for name in sorted(set(exp) - set(verdicts)):
         print("  MISSING          %s" % name)
         ok = False
+    # census: an assertion with no verdict from either lane (no expectation pragma, so MISSING above
+    # does not see it) is reported, and the run is not a pass -- silence used to read as success
+    census = assert_census(YOSYS, path, args.top, args.include)
+    why = "deadline hit" if timed_out else "no lane reported it"
+    if census is None:
+        print("  NO-VERDICT       (assertion census failed: cannot show every assertion has a verdict)")
+        ok = False
+    else:
+        for name in sorted(census - set(verdicts) - set(exp)):
+            print("  NO-VERDICT       %-14s (%s)" % (name, why))
+            ok = False
     for name, (kind, n) in sorted(exp.items()):
         v = verdicts.get(name)
         if v is None:
@@ -612,6 +623,36 @@ def prove_file(path, args, workdir):
                 print("  REPLAY-FAIL  %s @%d: %s" % (name, step, detail))
                 ok = False
     return ok
+
+
+def assert_census(yosys, path, top, include, timeout=120):
+    """Every assertion of the design (name of each $check with FLAVOR assert after sva2check, the names the
+    lanes report), or None when the census itself could not be taken.  A property the lanes never
+    reported -- at the deadline they print nothing for it -- must still appear in the report."""
+    inc = " ".join("-I" + d for d in include)
+    script = "read_verilog -sv -formal %s %s %s\nhierarchy -check%s\nsva2check\ndump t:$check\n" % (
+        run_ic3.read_flags(path), inc, path, (" -top " + top) if top else "")
+    try:
+        p = subprocess.run(["zsh", "-f", "-c", 'ulimit -s 65520; exec "$1" -p "$2"', "y", yosys, script],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    if p.returncode != 0:
+        return None
+    names, cur = set(), None
+    for line in p.stdout.splitlines():
+        m = re.match(r'\s*cell \$check \\?(\S+)', line)
+        if m:
+            cur = m.group(1)
+            if cur.startswith("bad_"):
+                cur = cur[4:]
+            continue
+        m = re.match(r'\s*parameter \\FLAVOR "(\w+)"', line)
+        if m and cur is not None:
+            if m.group(1) == "assert":
+                names.add(cur)
+            cur = None
+    return names
 
 
 def main():

@@ -1,0 +1,102 @@
+# relpred + ic3 -rel (SecIC3-style cross-copy predicates, RP-2).  A
+# constant-time accumulator, self-composed: the secret operand differs, the
+# public start agrees, and done must agree.  The predicates only observe,
+# every replaced or swapped cube is checked, and a mislabelled predicate is
+# caught by the seed checks.
+read_verilog -sv -formal <<EOT
+module acc(input clk, input start, input [7:0] s, output done, output [15:0] r);
+  reg [3:0] cnt = 0;
+  reg busy = 0;
+  reg [15:0] a = 0;
+  always @(posedge clk) begin
+    if (start && !busy) begin busy <= 1; cnt <= 0; a <= 0; end
+    else if (busy) begin
+      a <= a + s;
+      cnt <= cnt + 1;
+      if (cnt == 9) busy <= 0;
+    end
+  end
+  assign done = busy && cnt == 9;
+  assign r = a;
+endmodule
+module top(input clk, input start, input [7:0] s1, input [7:0] s2);
+  wire d1, d2;
+  wire [15:0] r1, r2;
+  acc copy1(.clk(clk), .start(start), .s(s1), .done(d1), .r(r1));
+  acc copy2(.clk(clk), .start(start), .s(s2), .done(d2), .r(r2));
+  always @* ct: assert (d1 == d2);
+endmodule
+EOT
+prep -top top
+flatten
+dffunmap
+opt_clean
+design -save plain
+
+# predicates on the register words in the property's cone (busy, cnt; the
+# accumulator a feeds no output and opt_clean removed it)
+logger -expect log "relpred: top: 2 mismatch predicates added" 1
+relpred
+logger -check-expected
+select -assert-count 2 a:relpred_pair
+design -save rel
+
+logger -expect log "ct: proved .*\[certified\]" 1
+logger -expect log "-rel ct: 2 words, 10 seed clauses \(0 dropped\)" 1
+ic3 -init-zero -kind 0 -certify -rel -rel-sym
+logger -check-expected
+
+design -load rel
+logger -expect log "ct: proved .*\[certified\]" 1
+ic3 -init-zero -kind 0 -certify -rel-mode maximal
+logger -check-expected
+
+design -load rel
+logger -expect log "ct: proved .*\[certified\]" 1
+logger -expect log "replace 0/0, symmetric 0/0" 1
+ic3 -init-zero -kind 0 -certify -rel-mode seed
+logger -check-expected
+
+# a predicate whose attribute names the wrong pair: its seeds fail the
+# checks and are dropped, the verdict stands
+design -load rel
+setattr -set relpred_pair "\"copy1.busy copy2.busy\"" w:relpred_neq.cnt
+logger -expect log "ct: proved" 1
+ic3 -init-zero -kind 0 -rel -rel-sym
+logger -check-expected
+
+# leaky variant (the end condition reads the secret): still disproved
+design -reset
+read_verilog -sv -formal <<EOT
+module acc(input clk, input start, input [7:0] s, output done);
+  reg [3:0] cnt = 0;
+  reg busy = 0;
+  always @(posedge clk) begin
+    if (start && !busy) begin busy <= 1; cnt <= 0; end
+    else if (busy) begin
+      cnt <= cnt + 1;
+      if (cnt == 9 || (cnt == 3 && s[0])) busy <= 0;
+    end
+  end
+  assign done = busy && (cnt == 9 || (cnt == 3 && s[0]));
+endmodule
+module top(input clk, input start, input [7:0] s1, input [7:0] s2);
+  wire d1, d2;
+  acc copy1(.clk(clk), .start(start), .s(s1), .done(d1));
+  acc copy2(.clk(clk), .start(start), .s(s2), .done(d2));
+  always @* ct: assert (d1 == d2);
+endmodule
+EOT
+prep -top top
+flatten
+dffunmap
+opt_clean
+relpred
+logger -expect log "ct: disproved" 1
+ic3 -init-zero -kind 0 -rel -rel-sym
+logger -check-expected
+
+# -rel without predicates is refused
+design -load plain
+logger -expect error "has no relpred predicates; run `relpred` first" 1
+ic3 -init-zero -rel

@@ -7,6 +7,7 @@ if (BITWUZLA_INCLUDE_DIR AND BITWUZLA_LIBRARY AND NOT YOSYS_WITHOUT_BITWUZLA)
 		ic3.cc
 		aiger_cert.cc
 		smt_bitwuzla.cc
+		relpred.cc
 		DEFINITIONS YOSYS_ENABLE_BITWUZLA
 		INCLUDE_DIRS ${BITWUZLA_INCLUDE_DIR}
 		LIBRARIES ${BITWUZLA_LIBRARY}
@@ -16,5 +17,6 @@ else()
 		ic3.cc
 		aiger_cert.cc
 		smt_bitwuzla.cc
+		relpred.cc
 	)
 endif()

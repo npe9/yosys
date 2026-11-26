@@ -394,6 +394,20 @@ struct Ic3Solver
 	// CTG-guided generalization recursion depth (0 = disabled)
 	int ctg_depth_max;
 
+	// -rel: cross-copy mismatch predicates (relpred pass; SecIC3, Tan et al.
+	// DATE 2026).  rel_mode 0 off, 1 seed clauses only, 2 + all-or-nothing
+	// predicate replacement, 3 + word-by-word ("maximal") replacement;
+	// rel_sym also tries the copy-swapped cube.  Nothing is trusted: seeds
+	// are checked once at encode time, every replaced or swapped cube passes
+	// the same Init and relative-induction queries as generalize().
+	int rel_mode = 0;
+	bool rel_sym = false;
+	struct RelWord { std::vector<int> b1, b2; int neq; };
+	std::vector<RelWord> rel_words;
+	std::vector<std::vector<int>> rel_seeds;
+	std::vector<int> rel_swap;
+	long long n_seed_drop = 0, n_rel_try = 0, n_rel_ok = 0, n_sym_try = 0, n_sym_ok = 0;
+
 	// state bits whose initial value is an explicit 1 (encode())
 	int n_init_ones = 0;
 
@@ -663,6 +677,7 @@ struct Ic3Solver
 			seed(cell->getPort(ID::A));
 			seed(cell->getPort(ID::EN));
 		}
+		auto walk = [&]() {
 		while (!worklist.empty()) {
 			RTLIL::SigBit bit = worklist.back();
 			worklist.pop_back();
@@ -679,6 +694,24 @@ struct Ic3Solver
 							if (bit.wire)
 								worklist.push_back(bit);
 			}
+		}
+		};
+		walk();
+		if (rel_mode > 0) {
+			// a predicate is useful only when both words are in the cone
+			for (auto wire : module->wires()) {
+				std::vector<RTLIL::Wire*> pw = rel_pair_wires(wire);
+				if (pw.empty())
+					continue;
+				bool in = true;
+				for (auto w : pw)
+					for (auto bit : sigmap(w))
+						if (bit.wire && !visited.count(bit))
+							in = false;
+				if (in)
+					seed(wire);
+			}
+			walk();
 		}
 
 		// two-timeframe unraveling: comb logic at each timestep, FF
@@ -811,6 +844,9 @@ struct Ic3Solver
 			}
 		}
 
+		if (rel_mode > 0)
+			rel_setup();
+
 		// bad := en && !a  (per bit, padded vacuously with zeros)
 		auto build_bad = [&](int t) {
 			std::vector<int> a = satgen.importSigSpec(prop->getPort(ID::A), t);
@@ -831,7 +867,185 @@ struct Ic3Solver
 		int i = act.size();
 		act.push_back(ez.frozen_literal(stringf("act%d", i)));
 		frames.emplace_back();
+		for (auto &c : rel_seeds)
+			add_clause(c, i, i);
 		return i;
+	}
+
+	// the two words named by a relpred_pair attribute ("<X1> <X2>"), or {}
+	std::vector<RTLIL::Wire*> rel_pair_wires(RTLIL::Wire *wire)
+	{
+		if (!wire->has_attribute(ID(relpred_pair)) || GetSize(wire) != 1)
+			return {};
+		std::string a, b;
+		std::istringstream is(wire->get_string_attribute(ID(relpred_pair)));
+		is >> a >> b;
+		RTLIL::Wire *w1 = module->wire(RTLIL::escape_id(a)), *w2 = module->wire(RTLIL::escape_id(b));
+		if (!w1 || !w2 || GetSize(w1) != GetSize(w2))
+			return {};
+		return {w1, w2};
+	}
+
+	// state literal for index x with the given polarity
+	int rel_lit(int x, bool pos) { return pos ? state1[x] : -state1[x]; }
+
+	void rel_setup()
+	{
+		dict<RTLIL::SigBit, int> idx;
+		for (int i = 0; i < GetSize(istate_bits); i++)
+			idx[istate_bits[i]] = i;
+		rel_swap.assign(GetSize(state1), -1);
+		for (int i = 0; i < GetSize(state1); i++)
+			rel_swap[i] = i;
+		for (auto wire : module->wires()) {
+			std::vector<RTLIL::Wire*> pw = rel_pair_wires(wire);
+			if (pw.empty())
+				continue;
+			RTLIL::SigSpec q1 = sigmap(pw[0]), q2 = sigmap(pw[1]), qn = sigmap(wire);
+			auto in = idx.find(qn[0]);
+			if (in == idx.end())
+				continue;
+			RelWord w;
+			w.neq = in->second;
+			bool ok = true;
+			for (int i = 0; i < GetSize(q1) && ok; i++) {
+				auto i1 = idx.find(q1[i]), i2 = idx.find(q2[i]);
+				if (i1 == idx.end() || i2 == idx.end() || i1->second == i2->second)
+					ok = false;
+				else {
+					w.b1.push_back(i1->second);
+					w.b2.push_back(i2->second);
+				}
+			}
+			if (!ok)
+				continue;
+			for (int i = 0; i < GetSize(w.b1); i++) {
+				rel_swap[w.b1[i]] = w.b2[i];
+				rel_swap[w.b2[i]] = w.b1[i];
+				// neq = 0 and the copies differ in bit i: never a state
+				for (int pol = 0; pol < 2; pol++) {
+					std::vector<int> c(GetSize(state1), 0);
+					c[w.neq] = rel_lit(w.neq, false);
+					c[w.b1[i]] = rel_lit(w.b1[i], pol == 0);
+					c[w.b2[i]] = rel_lit(w.b2[i], pol != 0);
+					if (rel_cube_init_free(c) && rel_cube_no_pred(c))
+						rel_seeds.push_back(c);
+					else
+						n_seed_drop++;
+				}
+			}
+			log_debug("ic3: -rel: word %s / %s, predicate %s, %d bits\n", log_id(pw[0]), log_id(pw[1]), log_id(wire), GetSize(w.b1));
+			rel_words.push_back(w);
+		}
+	}
+
+	// no initial state in the cube
+	bool rel_cube_init_free(const std::vector<int> &c)
+	{
+		if (init_fixed) {
+			for (int i = 0; i < GetSize(c); i++)
+				if (c[i] && (c[i] > 0 ? 1 : 0) != init_val[i])
+					return true;
+			return false;
+		}
+		std::vector<int> a;
+		push_cube(a, c, state1);
+		push_assum(a, -init_act);
+		n_init++;
+		return !solve_assum(a);
+	}
+
+	// no state at all has a successor in the cube (no frame constraint)
+	bool rel_cube_no_pred(const std::vector<int> &c)
+	{
+		std::vector<int> a;
+		for (int i = 1; i < (int)act.size(); i++)
+			push_assum(a, act[i]);
+		push_assum(a, init_act);
+		push_cube(a, c, state2);
+		return !solve_assum(a);
+	}
+
+	// Init-disjoint and inductive relative to frame lvl (generalize's test)
+	bool rel_cube_ok(const std::vector<int> &c, int lvl)
+	{
+		std::vector<int> a = act_assumptions(lvl);
+		push_cube(a, c, state2);
+		n_gen++;
+		if (solve_assum(a))
+			return false;
+		return rel_cube_init_free(c);
+	}
+
+	// SecIC3 predicate replacement: the bit groups x1[i] != x2[i] of a word
+	// become the one literal neq_X = 1
+	std::vector<int> rel_replace(std::vector<int> g, int lvl)
+	{
+		std::vector<int> touched;
+		for (int k = 0; k < GetSize(rel_words); k++) {
+			auto &w = rel_words[k];
+			if (g[w.neq] < 0)
+				continue;
+			for (int i = 0; i < GetSize(w.b1); i++)
+				if (g[w.b1[i]] && g[w.b2[i]] && (g[w.b1[i]] > 0) != (g[w.b2[i]] > 0)) {
+					touched.push_back(k);
+					break;
+				}
+		}
+		if (touched.empty())
+			return g;
+		auto apply = [&](std::vector<int> c, int k) {
+			auto &w = rel_words[k];
+			for (int i = 0; i < GetSize(w.b1); i++)
+				if (c[w.b1[i]] && c[w.b2[i]] && (c[w.b1[i]] > 0) != (c[w.b2[i]] > 0))
+					c[w.b1[i]] = c[w.b2[i]] = 0;
+			c[w.neq] = rel_lit(w.neq, true);
+			return c;
+		};
+		bool changed = false;
+		if (rel_mode == 2) {
+			std::vector<int> c = g;
+			for (int k : touched)
+				c = apply(c, k);
+			n_rel_try++;
+			if (rel_cube_ok(c, lvl)) {
+				n_rel_ok++;
+				g = c;
+				changed = true;
+			}
+		} else {
+			for (int k : touched) {
+				std::vector<int> c = apply(g, k);
+				n_rel_try++;
+				if (rel_cube_ok(c, lvl)) {
+					n_rel_ok++;
+					g = c;
+					changed = true;
+				}
+			}
+		}
+		return changed ? generalize(g, lvl) : g;
+	}
+
+	// the copy-swapped cube, blocked only when it passes its own queries
+	void rel_symmetric(const std::vector<int> &g, int lvl, int lo, int hi)
+	{
+		std::vector<int> c(GetSize(g), 0);
+		bool differs = false;
+		for (int x = 0; x < GetSize(g); x++)
+			if (g[x]) {
+				int t = rel_swap[x];
+				c[t] = rel_lit(t, g[x] > 0);
+				if (t != x)
+					differs = true;
+			}
+		if (!differs)
+			return;
+		n_sym_try++;
+		if (rel_cube_ok(c, lvl)) {
+			n_sym_ok++;
+			add_clause(c, lo, hi);
+		}
 	}
 
 	// assumptions are expression ids or positive literal ids; a negated
@@ -1042,7 +1256,12 @@ struct Ic3Solver
 				push_cube(assumptions, cube, state2);
 				std::vector<bool> model;
 				if (!solve_model(assumptions, state1, model)) {
-					add_clause(generalize(cube, j-1, ctg_depth), j, k);
+					std::vector<int> g = generalize(cube, j-1, ctg_depth);
+					if (rel_mode >= 2 && !rel_words.empty())
+						g = rel_replace(g, j-1);
+					add_clause(g, j, k);
+					if (rel_sym && !rel_words.empty())
+						rel_symmetric(g, j-1, j, k);
 					return true;
 				}
 				std::vector<int> cti;
@@ -1134,6 +1353,15 @@ struct Ic3Solver
 		auto t0 = std::chrono::steady_clock::now();
 		encode(prop);
 		t_encode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+		struct RelLog {
+			Ic3Solver *s; RTLIL::Cell *p;
+			~RelLog() {
+				if (s->rel_mode > 0)
+					log("ic3: -rel %s: %d words, %d seed clauses (%lld dropped), replace %lld/%lld, symmetric %lld/%lld\n",
+							log_id(p), GetSize(s->rel_words), GetSize(s->rel_seeds), s->n_seed_drop,
+							s->n_rel_ok, s->n_rel_try, s->n_sym_ok, s->n_sym_try);
+			}
+		} rel_log{this, prop};
 		if (getenv("IC3_DEBUG"))
 			fprintf(stderr, "ic3-debug: proving %s clauses=%d vars=%d states=%d t_encode=%.3fs\n", log_id(prop), ez.numCnfClauses(), ez.numCnfVariables(), GetSize(state1), t_encode);
 
@@ -3013,6 +3241,18 @@ struct Ic3Pass : Pass
 		log("        logged per depth\n");
 		log("        (default: 0 = disabled)\n");
 		log("\n");
+		log("    -rel, -rel-mode seed|aon|maximal, -rel-sym\n");
+		log("        use the cross-copy mismatch predicates added by `relpred`\n");
+		log("        (SecIC3, Tan et al., DATE 2026).  seed: every frame gets the\n");
+		log("        clauses (neq_X | x1_i == x2_i), each checked once to hold at init\n");
+		log("        and in every successor state.  aon (-rel): also, after\n");
+		log("        generalization, the bit groups x1_i != x2_i of a blocked cube\n");
+		log("        are replaced by neq_X = 1 all at once; maximal: word by word.\n");
+		log("        -rel-sym also blocks the copy-swapped cube.  Every replaced or\n");
+		log("        swapped cube must pass the same Init and relative-induction\n");
+		log("        queries as generalization, so nothing is assumed (symmetry\n");
+		log("        included).  Native engine only.\n");
+		log("\n");
 		log("    -ctg <depth>\n");
 		log("        CTG-guided generalization recursion depth, abc-pdr style\n");
 		log("        (default: 0 = disabled; experimental, can multiply\n");
@@ -3199,6 +3439,8 @@ struct Ic3Pass : Pass
 		int kind_max = 8;
 		int bmc_max = 0;
 		int ctg_depth_max = 0;
+		int rel_mode = 0;
+		bool rel_sym = false;
 		std::string engine_name = "native", engine_format;
 		ExtEngine ext;
 
@@ -3253,6 +3495,23 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-ctg") {
 				ctg_depth_max = atoi(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-rel") {
+				rel_mode = std::max(rel_mode, 2);
+				continue;
+			}
+			if (args[argidx] == "-rel-mode" && argidx+1 < args.size()) {
+				std::string m = args[++argidx];
+				if (m == "seed") rel_mode = 1;
+				else if (m == "aon") rel_mode = 2;
+				else if (m == "maximal") rel_mode = 3;
+				else log_cmd_error("ic3: -rel-mode takes seed, aon or maximal.\n");
+				continue;
+			}
+			if (args[argidx] == "-rel-sym") {
+				rel_sym = true;
+				rel_mode = std::max(rel_mode, 1);
 				continue;
 			}
 			if (args[argidx] == "-bmc") {
@@ -3348,6 +3607,16 @@ struct Ic3Pass : Pass
 				log_error("ic3: no top module found, use -top to specify one.\n");
 		}
 		(void) check_cells;
+		if (rel_mode > 0) {
+			if (engine_ext || engine_smt)
+				log_cmd_error("ic3: -rel works with the native engine only.\n");
+			int n = 0;
+			for (auto w : module->wires())
+				if (w->has_attribute(ID(relpred_pair)))
+					n++;
+			if (n == 0)
+				log_cmd_error("ic3: -rel: module %s has no relpred predicates; run `relpred` first.\n", log_id(module));
+		}
 
 		// -probe-reset: vacuity probes (fe63 found OpenTitan's
 		// TriggerAfterAlertInit assumes holding csrng in reset, every
@@ -3423,6 +3692,11 @@ struct Ic3Pass : Pass
 			for (auto cell : m2->cells())
 				if (cell->type.in(ID($assert), ID($assume), ID($cover), ID($check), ID($live), ID($fair), ID($initstate)))
 					cell->set_bool_attribute(ID::keep);
+			// relpred predicates read nothing downstream: keep them (and so
+			// their registers) for -rel
+			for (auto wire : m2->wires())
+				if (wire->has_attribute(ID(relpred_pair)))
+					wire->set_bool_attribute(ID::keep);
 			if (init_zero) {
 				FfInitVals initvals;
 				SigMap sm(m2);
@@ -4132,6 +4406,8 @@ struct Ic3Pass : Pass
 			solver.kind_max = kind_max;
 			solver.bmc_max = 0;	// run batched above
 			solver.ctg_depth_max = ctg_depth_max;
+			solver.rel_mode = rel_mode;
+			solver.rel_sym = rel_sym;
 
 			int depth = 0;
 			int result;
@@ -4241,6 +4517,8 @@ struct Ic3Pass : Pass
 			solver.kind_max = kind_max;
 			solver.bmc_max = 0;	// run batched above
 			solver.ctg_depth_max = ctg_depth_max;
+			solver.rel_mode = rel_mode;
+			solver.rel_sym = rel_sym;
 			int depth = 0;
 			int result;
 			if (bmc_hit.count(cell)) {
@@ -4308,6 +4586,8 @@ struct Ic3Pass : Pass
 			solver.kind_max = kind_max;
 			solver.bmc_max = 0;	// run batched above
 			solver.ctg_depth_max = ctg_depth_max;
+			solver.rel_mode = rel_mode;
+			solver.rel_sym = rel_sym;
 
 			std::string cex_file;
 			if (!cex_prefix.empty()) {

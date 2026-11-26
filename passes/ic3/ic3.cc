@@ -2585,6 +2585,12 @@ struct NativeCert
 	dict<std::pair<RTLIL::IdString, int>, int> latch_of;	// native state bit (wire, offset) -> model latch
 	double timeout_s = 0;
 	int n_certified = 0, n_uncertified = 0;
+	// -certify-keep: export of every certified proof (SA-0 second check)
+	std::string keep_dir;
+	int n_kept = 0;
+	// the certificate of the last check_proof call
+	int last_bad = -1, last_k = -1;
+	std::vector<std::vector<int>> last_clauses;
 
 	void build(RTLIL::Design *design, RTLIL::Module *module, bool init_zero)
 	{
@@ -2760,6 +2766,13 @@ struct NativeCert
 					latch_of_alias[atoi(name.c_str() + p + 10)] = l;
 			}
 		}
+		if (!keep_dir.empty()) {
+			std::ifstream src(base + ".aig", std::ios::binary);
+			std::ofstream dst(keep_dir + "/model.aig", std::ios::binary);
+			dst << src.rdbuf();
+			if (!dst)
+				log_warning("ic3: -certify-keep: cannot write %s/model.aig\n", keep_dir.c_str());
+		}
 		remove_directory(dir);
 		for (auto &it : alias_at) {
 			auto lt = latch_of_alias.find(it.second);
@@ -2775,11 +2788,35 @@ struct NativeCert
 	std::string certify(RTLIL::Cell *check, const Ic3Solver &solver)
 	{
 		std::string status = check_proof(check, solver);
-		if (status == "certified")
+		if (status == "certified") {
 			n_certified++;
-		else
+			if (!keep_dir.empty())
+				keep(check);
+		} else
 			n_uncertified++;
 		return status;
+	}
+
+	void keep(RTLIL::Cell *check)
+	{
+		std::ofstream idx(keep_dir + "/index.txt", std::ios::app);
+		std::string name = log_id(check->name);
+		for (auto &ch : name)
+			if (ch == ' ' || ch == '\t' || ch == '\n')
+				ch = '_';
+		if (last_k >= 0) {
+			idx << name << " kinduction " << last_bad << " " << last_k << "\n";
+		} else {
+			std::string fn = stringf("frame%d.txt", n_kept);
+			std::ofstream f(keep_dir + "/" + fn);
+			for (auto &cl : last_clauses) {
+				for (int i = 0; i < GetSize(cl); i++)
+					f << (i ? " " : "") << cl[i];
+				f << "\n";
+			}
+			idx << name << " clauses " << last_bad << " " << fn << "\n";
+		}
+		n_kept++;
 	}
 
 	std::string check_proof(RTLIL::Cell *check, const Ic3Solver &solver)
@@ -2790,7 +2827,11 @@ struct NativeCert
 		if (bt == bad_of.end())
 			return "uncertified: check missing from the AIGER model";
 		std::string err;
+		last_bad = bt->second;
+		last_k = -1;
+		last_clauses.clear();
 		if (solver.proof_kind) {
+			last_k = solver.proof_k;
 			if (!ic3_cert::check_kinduction(model, bt->second, solver.proof_k, timeout_s, err))
 				return "uncertified: " + err;
 			return "certified";
@@ -2812,6 +2853,7 @@ struct NativeCert
 			}
 			clauses.push_back(cl);
 		}
+		last_clauses = clauses;
 		if (!ic3_cert::check_clauses(model, bt->second, clauses, timeout_s, err))
 			return "uncertified: " + err;
 		return "certified";
@@ -3043,6 +3085,14 @@ struct Ic3Pass : Pass
 		log("        model (base and step at its depth).  Liveness proofs carry no\n");
 		log("        certificate yet and are labelled so.\n");
 		log("\n");
+		log("    -certify-keep <dir>\n");
+		log("        -certify, and write every certified native proof to <dir> for an\n");
+		log("        independent re-check (conformance/cert_check.py): model.aig, one\n");
+		log("        frame<n>.txt per IC3 proof (clauses over model latches, +(l+1) /\n");
+		log("        -(l+1) = latch l is 1 / 0) and index.txt, one line per proof:\n");
+		log("        \"<property> clauses <bad> frame<n>.txt\" or\n");
+		log("        \"<property> kinduction <bad> <k>\".\n");
+		log("\n");
 		log("    -engine-require-cert\n");
 		log("        count an external proof only when it is certified; an uncertified\n");
 		log("        one is undecided\n");
@@ -3120,6 +3170,7 @@ struct Ic3Pass : Pass
 		// before encoding (q_same: 223 s -> 0.01 s)
 		bool preopt = true;
 		bool certify = false;
+		std::string certify_keep;
 		bool verbose = false;
 		bool print_src = false;
 		int max_frames = 1000;
@@ -3165,6 +3216,11 @@ struct Ic3Pass : Pass
 			}
 			if (args[argidx] == "-certify") {
 				certify = true;
+				continue;
+			}
+			if (args[argidx] == "-certify-keep" && argidx+1 < args.size()) {
+				certify = true;
+				certify_keep = args[++argidx];
 				continue;
 			}
 			if (args[argidx] == "-preopt") {
@@ -3966,6 +4022,12 @@ struct Ic3Pass : Pass
 		bool ncert_on = certify && !engine_ext;
 		if (ncert_on) {
 			ncert.timeout_s = timeout_s;
+			if (!certify_keep.empty()) {
+				if (run_command("mkdir -p '" + certify_keep + "'") != 0)
+					log_cmd_error("ic3: cannot create -certify-keep directory %s.\n", certify_keep.c_str());
+				ncert.keep_dir = certify_keep;
+				remove(std::string(certify_keep + "/index.txt").c_str());
+			}
 			ncert.build(design, module, init_zero);
 			if (!ncert.error.empty())
 				log("ic3: -certify: no AIGER model: %s\n", ncert.error.c_str());

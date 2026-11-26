@@ -1,0 +1,42 @@
+# ic3 -certify-keep DIR (SA-0): every certified native proof is written out for
+# an independent re-check (conformance/cert_check.py in the sv-yosys tree):
+# DIR/model.aig, one frame<n>.txt of clauses per IC3 proof, and index.txt with
+# one line per certified proof.  A rerun replaces index.txt.
+read_verilog -sv -formal <<EOT
+module t(input clk, input rst, input en);
+  reg [3:0] cnt = 0;
+  reg [3:0] sh = 0;
+  always @(posedge clk)
+    if (rst) begin cnt <= 0; sh <= 0; end
+    else if (en) begin cnt <= cnt == 9 ? 0 : cnt + 1; sh <= cnt; end
+  always @* begin
+    p_lt10: assert (cnt < 10);
+    p_sh:   assert (sh < 10);
+    p_bad:  assert (cnt != 7);
+    c_13:   cover (cnt == 13);
+  end
+endmodule
+EOT
+prep -top t
+async2sync
+design -save t
+
+# IC3 frames: three certified proofs, three clause files
+! rm -rf temp/ic3_certkeep
+logger -expect log "native proofs: 3 certified, 0 uncertified" 1
+ic3 -certify-keep temp/ic3_certkeep -kind 0
+logger -check-expected
+! test -s temp/ic3_certkeep/model.aig
+! test "$(grep -c ' clauses [0-9][0-9]* frame[0-9]*\.txt$' temp/ic3_certkeep/index.txt)" = 3
+! test "$(wc -l < temp/ic3_certkeep/index.txt)" -eq 3
+! test -s temp/ic3_certkeep/frame0.txt
+! test -z "$(cat temp/ic3_certkeep/frame*.txt | grep -vE '^-?[1-9][0-9]*( -?[1-9][0-9]*)*$')"
+! grep -q '^p_lt10 clauses ' temp/ic3_certkeep/index.txt
+
+# rerun with the k-induction pre-pass: index.txt is replaced, not appended
+design -load t
+logger -expect log "native proofs: 3 certified, 0 uncertified" 1
+ic3 -certify-keep temp/ic3_certkeep
+logger -check-expected
+! test "$(wc -l < temp/ic3_certkeep/index.txt)" -eq 3
+! test -z "$(grep -vE '^[^ ]+ (clauses [0-9]+ frame[0-9]+\.txt|kinduction [0-9]+ [1-9][0-9]*)$' temp/ic3_certkeep/index.txt)"

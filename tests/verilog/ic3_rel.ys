@@ -57,11 +57,40 @@ logger -expect log "replace 0/0, symmetric 0/0" 1
 ic3 -init-zero -kind 0 -certify -rel-mode seed
 logger -check-expected
 
-# a predicate whose attribute names the wrong pair: its seeds fail the
-# checks and are dropped, the verdict stands
+# a predicate whose attribute names the wrong pair (neq of cnt labelled
+# busy/busy): its seeds fail the checks and are dropped, replacement no
+# longer fires on cubes with neq = 0 (it made a clause that did not block
+# its cube, and block() looped forever: RP-2 hang), the verdict stands
 design -load rel
-setattr -set relpred_pair "\"copy1.busy copy2.busy\"" w:relpred_neq.cnt
+setattr -set relpred_pair "copy1.busy copy2.busy" w:relpred_neq.cnt
+design -save mis
 logger -expect log "ct: proved" 1
+logger -expect log "-rel ct: 2 words, 2 seed clauses \(2 dropped\)" 1
+ic3 -init-zero -kind 0 -rel
+logger -check-expected
+
+design -load mis
+logger -expect log "ct: proved .*\[certified\]" 1
+logger -expect log "-rel ct: 2 words, 2 seed clauses \(2 dropped\)" 1
+ic3 -init-zero -kind 0 -certify -rel -rel-sym
+logger -check-expected
+
+design -load mis
+logger -expect log "ct: proved" 1
+ic3 -init-zero -kind 0 -rel-mode maximal
+logger -check-expected
+
+design -load mis
+logger -expect log "ct: proved" 1
+logger -expect log "replace 0/0" 1
+ic3 -init-zero -kind 0 -rel-mode seed -rel-sym
+logger -check-expected
+
+# the other direction: neq of busy labelled with the cnt words
+design -load rel
+setattr -set relpred_pair "copy1.cnt copy2.cnt" w:relpred_neq.busy
+logger -expect log "ct: proved" 1
+logger -expect log "-rel ct: 2 words, 8 seed clauses \(8 dropped\)" 1
 ic3 -init-zero -kind 0 -rel -rel-sym
 logger -check-expected
 
@@ -92,6 +121,12 @@ flatten
 dffunmap
 opt_clean
 relpred
+logger -expect log "ct: disproved" 1
+ic3 -init-zero -kind 0 -rel -rel-sym
+logger -check-expected
+
+# mislabelled on the leaky design: still disproved
+setattr -set relpred_pair "copy1.busy copy2.busy" w:relpred_neq.cnt
 logger -expect log "ct: disproved" 1
 ic3 -init-zero -kind 0 -rel -rel-sym
 logger -check-expected

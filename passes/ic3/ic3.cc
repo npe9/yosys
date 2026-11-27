@@ -978,13 +978,16 @@ struct Ic3Solver
 	}
 
 	// SecIC3 predicate replacement: the bit groups x1[i] != x2[i] of a word
-	// become the one literal neq_X = 1
-	std::vector<int> rel_replace(std::vector<int> g, int lvl)
+	// become the one literal neq_X = 1.  Only where the cube being blocked
+	// has neq_X = 1 itself: with a wrong predicate (its seeds dropped) the
+	// cube can have neq_X = 0, the replaced clause would then not block it,
+	// and block() would meet the same cube forever (RP-2 hang)
+	std::vector<int> rel_replace(std::vector<int> g, const std::vector<int> &cube, int lvl)
 	{
 		std::vector<int> touched;
 		for (int k = 0; k < GetSize(rel_words); k++) {
 			auto &w = rel_words[k];
-			if (g[w.neq] < 0)
+			if (g[w.neq] < 0 || cube[w.neq] != rel_lit(w.neq, true))
 				continue;
 			for (int i = 0; i < GetSize(w.b1); i++)
 				if (g[w.b1[i]] && g[w.b2[i]] && (g[w.b1[i]] > 0) != (g[w.b2[i]] > 0)) {
@@ -1258,7 +1261,12 @@ struct Ic3Solver
 				if (!solve_model(assumptions, state1, model)) {
 					std::vector<int> g = generalize(cube, j-1, ctg_depth);
 					if (rel_mode >= 2 && !rel_words.empty())
-						g = rel_replace(g, j-1);
+						g = rel_replace(g, cube, j-1);
+					// the learned clause must block the cube, or this loop
+					// meets it again and never ends
+					for (int x = 0; x < GetSize(g); x++)
+						if (g[x] && g[x] != cube[x])
+							log_error("ic3: internal error: a learned clause does not block its cube (state bit %d).\n", x);
 					add_clause(g, j, k);
 					if (rel_sym && !rel_words.empty())
 						rel_symmetric(g, j-1, j, k);
@@ -3611,9 +3619,29 @@ struct Ic3Pass : Pass
 			if (engine_ext || engine_smt)
 				log_cmd_error("ic3: -rel works with the native engine only.\n");
 			int n = 0;
-			for (auto w : module->wires())
-				if (w->has_attribute(ID(relpred_pair)))
-					n++;
+			// a predicate that names no pair is an error, not a silent skip
+			for (auto w : module->wires()) {
+				if (!w->has_attribute(ID(relpred_pair)))
+					continue;
+				n++;
+				std::string v = w->get_string_attribute(ID(relpred_pair)), a, b, extra;
+				std::istringstream is(v);
+				is >> a >> b >> extra;
+				const char *why = nullptr;
+				RTLIL::Wire *w1 = nullptr, *w2 = nullptr;
+				if (GetSize(w) != 1)
+					why = "the predicate wire is not 1 bit wide";
+				else if (a.empty() || b.empty() || !extra.empty())
+					why = "the value is not two wire names";
+				else if (!(w1 = module->wire(RTLIL::escape_id(a))))
+					why = "the first wire does not exist";
+				else if (!(w2 = module->wire(RTLIL::escape_id(b))))
+					why = "the second wire does not exist";
+				else if (GetSize(w1) != GetSize(w2))
+					why = "the two wires differ in width";
+				if (why)
+					log_cmd_error("ic3: -rel: %s.%s: relpred_pair \"%s\": %s.\n", log_id(module), log_id(w), v.c_str(), why);
+			}
 			if (n == 0)
 				log_cmd_error("ic3: -rel: module %s has no relpred predicates; run `relpred` first.\n", log_id(module));
 		}
